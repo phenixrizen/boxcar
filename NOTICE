@@ -13,6 +13,9 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
     Used for: x86_64 boot setup (memory layout, MP table, page tables, GDT,
     registers, MSRs), the device bus, the virtio-mmio transport tests, the
     vsock Unix-socket protocol, and the guest kernel configuration.
+    guest/kernel/base/microvm-kernel-ci-x86_64-6.18.config is copied verbatim
+    from resources/guest_configs/microvm-kernel-ci-x86_64-6.18.config at
+    commit 21f19ed8109578108568c8a8f3623ddb6f097878 of that repository. Apache-2.0.
 
   Cloud Hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor)
     Copyright Intel Corporation and contributors. Apache-2.0.

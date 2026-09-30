@@ -3,13 +3,26 @@
 
 //! Build tasks for boxcar: guest kernel, initramfs, rootfs, and gated tests.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+mod kernel;
 
 /// Build tasks for boxcar.
 #[derive(Parser)]
 #[command(version)]
-struct Cli {}
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-fn main() {
-    let _cli = Cli::parse();
+#[derive(Subcommand)]
+enum Command {
+    /// Build the guest kernel into target/guest (in Docker unless --native).
+    Kernel(kernel::KernelArgs),
+}
+
+fn main() -> anyhow::Result<()> {
+    match Cli::parse().command {
+        Command::Kernel(args) => kernel::run(&args),
+    }
 }
