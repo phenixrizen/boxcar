@@ -5,6 +5,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod initramfs;
 mod kernel;
 
 /// Build tasks for boxcar.
@@ -19,10 +20,13 @@ struct Cli {
 enum Command {
     /// Build the guest kernel into target/guest (in Docker unless --native).
     Kernel(kernel::KernelArgs),
+    /// Build the guest init and pack target/guest/initramfs.cpio.
+    Initramfs,
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Kernel(args) => kernel::run(&args),
+        Command::Initramfs => initramfs::run(),
     }
 }
