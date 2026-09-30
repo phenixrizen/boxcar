@@ -395,6 +395,31 @@ fn reset_after_activation_resets_the_device_and_clears_the_transport() {
 }
 
 #[test]
+fn the_vmm_resets_an_activated_device_as_a_status_0_write_does() {
+    let mut t = transport();
+    activate(&mut t, VERSION_1 | EVENT_IDX);
+
+    t.reset();
+    assert_eq!(t.device().reset_calls, 1);
+    assert!(t.device().activation.is_none());
+    assert_eq!(status(&mut t), 0);
+    assert!(!t.config().activated);
+
+    // Once reset, a second one has nothing to do.
+    t.reset();
+    assert_eq!(t.device().reset_calls, 1);
+}
+
+#[test]
+fn the_vmm_reset_of_a_device_never_activated_leaves_the_device_alone() {
+    let mut t = transport();
+    negotiate(&mut t, VERSION_1 | EVENT_IDX);
+    t.reset();
+    assert_eq!(t.device().reset_calls, 0);
+    assert_eq!(status(&mut t), 0);
+}
+
+#[test]
 fn failed_keeps_the_device_active_until_the_driver_resets_it() {
     let mut t = transport();
     activate(&mut t, VERSION_1 | EVENT_IDX);

@@ -10,9 +10,12 @@
 //! VM is then `Stopping` and later triggers are ignored.
 //!
 //! The stop sequence, run on the main thread: kick and join every vCPU,
-//! close the devices, emit `vmm.stop` through the audit sink, restore the
-//! terminal, and return the `VmExit`. The caller (`boxcar run`) then closes
-//! the audit writer, which drains, checkpoints and syncs the log.
+//! close the devices (reset every virtio-fs device through its transport,
+//! which joins its workers and records the close of every file the guest
+//! left open, then flush the console), emit `vmm.stop` through the audit
+//! sink, restore the terminal, and return the `VmExit`. The caller
+//! (`boxcar run`) then closes the audit writer, which drains, checkpoints
+//! and syncs the log, so every record the devices made is in it.
 
 use std::fmt;
 use std::io;
@@ -28,7 +31,7 @@ use event_manager::{EventManager, EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 use vmm_sys_util::signal::create_sigset;
 
-use crate::devices::LegacyDevices;
+use crate::devices::{FsDevices, LegacyDevices};
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
 
@@ -356,6 +359,7 @@ pub(crate) fn wait_for_stop(
 /// What the stop sequence takes apart.
 pub(crate) struct Teardown<'a> {
     pub(crate) vcpus: VcpuSet,
+    pub(crate) fs: &'a FsDevices,
     pub(crate) devices: &'a LegacyDevices,
     pub(crate) audit: &'a AuditSink,
     pub(crate) terminal: Option<RawModeGuard>,
@@ -366,11 +370,13 @@ pub(crate) struct Teardown<'a> {
 pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     let Teardown {
         vcpus,
+        fs,
         devices,
         audit,
         terminal,
     } = teardown;
     vcpus.stop_and_join();
+    fs.close();
     devices.close();
     record_stop(audit, reason, exit_code);
     drop(terminal);

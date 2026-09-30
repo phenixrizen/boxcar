@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Run AI coding agents in a microVM with a tamper-evident audit log.
 #[derive(Debug, Parser)]
@@ -29,9 +29,12 @@ pub enum Command {
     Doctor,
     /// Boot a microVM.
     ///
-    /// Prints the session id and its audit log directory on stderr, runs the
-    /// guest with its serial console on stdout (or in `--console-log`), and
-    /// exits when it stops: 0 when the guest reset or shut down, 1 after a
+    /// Shares `--rootfs` with the guest as its root filesystem and
+    /// `--workspace` at /workspace, both over virtio-fs, and records what
+    /// the guest does to them. Prints the session id, its audit log
+    /// directory and the workspace on stderr, runs the guest with its serial
+    /// console on stdout (or in `--console-log`), and exits when it stops:
+    /// 0 when the guest reset or shut down, 1 after a
     /// vCPU error, 130 after SIGINT (Ctrl-C) or the console escape, 143
     /// after SIGTERM. When stdin is a terminal and the console is on stdout,
     /// every key goes to the guest, Ctrl-C included; press Ctrl-] twice
@@ -79,9 +82,28 @@ pub struct RunArgs {
         value_parser = clap::value_parser!(u8).range(1..)
     )]
     pub vcpus: u8,
-    /// Boot without filesystem shares. Required: this build has none yet.
+    /// The guest's root filesystem: a host directory shared over virtio-fs
+    /// as tag `root`. Required unless `--no-fs`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        required_unless_present = "no_fs",
+        conflicts_with = "no_fs"
+    )]
+    pub rootfs: Option<PathBuf>,
+    /// A host directory shared over virtio-fs as tag `workspace`, which the
+    /// guest mounts at /workspace. Default: a new `workspace/` directory in
+    /// the session's audit directory.
+    #[arg(long, value_name = "DIR", conflicts_with = "no_fs")]
+    pub workspace: Option<PathBuf>,
+    /// Boot without filesystem shares.
     #[arg(long)]
     pub no_fs: bool,
+    /// What the shares record: `normal` (opens, closes with content hashes,
+    /// changes and denials) or `verbose` (also every read, write and
+    /// directory listing).
+    #[arg(long, value_enum, value_name = "LEVEL", default_value_t = AuditLevelArg::Normal)]
+    pub audit_level: AuditLevelArg,
     /// An extra kernel command line argument. Repeatable.
     #[arg(long, value_name = "STR")]
     pub cmdline_extra: Vec<String>,
@@ -95,4 +117,11 @@ pub struct RunArgs {
     /// forwarded to the guest.
     #[arg(long, value_name = "PATH")]
     pub console_log: Option<PathBuf>,
+}
+
+/// `--audit-level`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AuditLevelArg {
+    Normal,
+    Verbose,
 }

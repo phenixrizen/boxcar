@@ -130,6 +130,7 @@ dependencies = [
  "boxcar-vmm",
  "clap",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -158,6 +159,7 @@ dependencies = [
  "boxcar-proto",
  "boxcar-virtio",
  "crossbeam-channel",
+ "event-manager",
  "fuse-backend-rs",
  "libc",
  "tempfile",

@@ -19,3 +19,6 @@ boxcar-proto = { workspace = true, features = ["hash"] }
 boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

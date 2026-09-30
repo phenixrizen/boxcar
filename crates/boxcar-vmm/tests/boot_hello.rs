@@ -4,8 +4,10 @@
 //! The first real boot: the guest kernel and the hello initramfs, with no
 //! filesystem shares. The init prints `BOXCAR_INIT_HELLO` on the console and
 //! reboots through the i8042, so the VM must end in `GuestReset`, and the
-//! session log must hold a verifiable `vmm.start` and `vmm.stop`. A second
-//! test stops a guest that never ends on its own through `VmmHandle`.
+//! session log must hold a verifiable `vmm.start` and `vmm.stop`. The same
+//! boot with the `root` and `workspace` shares attached must end the same
+//! way, with the guest's virtiofs driver finding both tags. Another test
+//! stops a guest that never ends on its own through `VmmHandle`.
 //!
 //! Skips with a printed reason unless `BOXCAR_TEST_KERNEL` and
 //! `BOXCAR_TEST_INITRAMFS` are set and `/dev/kvm` is accessible. Relative
@@ -20,6 +22,7 @@ use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use boxcar_audit::{verify_session, LogReader, WriterConfig};
+use boxcar_fs::{CachePolicyKind, FsShareConfig};
 use boxcar_proto::SessionId;
 use boxcar_vmm::kvm::kvm_available;
 use boxcar_vmm::vmm::{ConsoleOut, StopReason, VmConfig, VmExit, Vmm};
@@ -122,6 +125,83 @@ fn hello_init_prints_its_marker_and_resets_the_guest() {
         matches!((start, stop), (Some(a), Some(b)) if a < b),
         "{kinds:?}"
     );
+}
+
+/// The hello boot with both shares: the hello init mounts neither, so the
+/// guest only probes the two virtio-fs devices, which must not change how
+/// it ends. `--debug-boot`'s kernel messages show the probe.
+#[test]
+fn hello_boots_with_the_root_and_workspace_shares_attached() {
+    const TEST: &str = "boot_hello_with_shares";
+    let Some((kernel, initramfs)) = guest_or_skip(TEST) else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let (rootfs, workspace) = (dir.path().join("rootfs"), dir.path().join("workspace"));
+    fs::create_dir(&rootfs).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    let (sink, writer) =
+        boxcar_audit::spawn(WriterConfig::new(dir.path().join("data"), SessionId::new())).unwrap();
+    let session_dir = writer.session_dir().to_path_buf();
+    let console = dir.path().join("console.log");
+    let share = |tag: &str, host_dir, guest_path: &str, cache| FsShareConfig {
+        tag: tag.into(),
+        host_dir,
+        guest_path: guest_path.into(),
+        cache,
+    };
+    let cfg = VmConfig {
+        cmdline_extra: vec!["boxcar.mode=hello".into()],
+        debug_boot: true,
+        console: ConsoleOut::File(console.clone()),
+        initramfs: Some(initramfs),
+        fs_shares: vec![
+            share("root", rootfs, "/", CachePolicyKind::Always),
+            share("workspace", workspace, "/workspace", CachePolicyKind::Auto),
+        ],
+        ..VmConfig::new(kernel, sink)
+    };
+    let vmm = Vmm::new(cfg).unwrap();
+    let handle = vmm.handle();
+    let (done, finished) = mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        if finished.recv_timeout(LIMIT).is_err() {
+            handle.request_stop(StopReason::Requested);
+        }
+    });
+    let exit = vmm.run().unwrap();
+    drop(done);
+    watchdog.join().unwrap();
+    writer.close().unwrap();
+
+    let output = String::from_utf8_lossy(&fs::read(&console).unwrap()).into_owned();
+    eprintln!("{TEST}: {exit:?}");
+    for line in [
+        "virtio-mmio: Registering device virtio-mmio.0 at 0xc0000000-0xc0000fff, IRQ 5.",
+        "virtio-mmio: Registering device virtio-mmio.1 at 0xc0001000-0xc0001fff, IRQ 6.",
+        "virtiofs virtio0: discovered new tag: root",
+        "virtiofs virtio1: discovered new tag: workspace",
+        HELLO,
+    ] {
+        assert!(
+            output.contains(line),
+            "no {line:?} on the console:\n{output}"
+        );
+    }
+    assert!(!output.contains("probe of"), "a probe failed:\n{output}");
+    assert!(
+        matches!(exit, VmExit::GuestReset),
+        "{exit:?}; console:\n{output}"
+    );
+
+    let kinds = record_kinds(&session_dir);
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("vmm.start"),
+        "{kinds:?}"
+    );
+    assert!(kinds.contains(&"vmm.stop".to_owned()), "{kinds:?}");
 }
 
 /// A guest with no init panics and, with `panic=0`, spins forever: two vCPUs,

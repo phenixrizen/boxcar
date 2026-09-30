@@ -440,9 +440,12 @@ impl<D: VirtioDevice> MmioTransport<D> {
         )
     }
 
-    /// A status-0 write: the device is reset only if it was activated, then
-    /// the transport returns to its initial state.
-    fn reset(&mut self) {
+    /// What a status-0 write does: the device is reset only if it was
+    /// activated, then the transport returns to its initial state. The VMM
+    /// calls it for every device when the VM stops, after the vCPUs are
+    /// joined, so the devices' workers are stopped and joined before it goes
+    /// on.
+    pub fn reset(&mut self) {
         if self.cfg.activated {
             self.device.reset();
         }

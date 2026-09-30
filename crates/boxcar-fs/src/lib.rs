@@ -4,6 +4,7 @@
 //! Audited virtio-fs: `AuditFs` over the fuse-backend-rs passthrough filesystem.
 //!
 //! - [`share`]: a share's configuration and its passthrough `Config`.
+//! - [`device`]: [`VirtioFs`], the virtio-fs device serving a share.
 //! - [`audit_fs`]: [`AuditFs`], the `FileSystem` decorator that records.
 //! - [`path_map`]: inode to path, without syscalls.
 //! - [`handles`]: open handles and what went through them.
@@ -15,6 +16,7 @@
 mod forward;
 
 pub mod audit_fs;
+pub mod device;
 mod events;
 pub mod handles;
 pub mod hasher;
@@ -22,6 +24,7 @@ pub mod path_map;
 pub mod share;
 
 pub use audit_fs::{AuditFs, AuditFsOptions, AuditLevel};
+pub use device::{FsError, FsServer, OpcodeCounts, VirtioFs};
 pub use handles::{HandleEntry, HandleTable};
 pub use hasher::{HashJob, HashWorker};
 pub use path_map::{FileId, PathMap, ROOT_INO};

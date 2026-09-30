@@ -15,6 +15,7 @@ vm-memory = { workspace = true }
 virtio-queue = { workspace = true }
 virtio-bindings = { workspace = true }
 vmm-sys-util = { workspace = true }
+event-manager = { workspace = true }
 blake3 = { workspace = true }
 crossbeam-channel = { workspace = true }
 libc = { workspace = true }
@@ -23,6 +24,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `boxcar_virtio::testing`: guest memory and register helpers, so the
+# device tests drive the virtio-fs device through a transport without KVM.
+boxcar-virtio = { workspace = true, features = ["testing"] }
 # Pin-set canary: it must resolve against the same virtio-queue and vm-memory
 # as fuse-backend-rs, so a pin change that splits those types fails here.
 virtio-vsock = { workspace = true }

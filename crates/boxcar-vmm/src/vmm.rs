@@ -6,9 +6,11 @@
 //!
 //! Boot order in `Vmm::new`: open KVM and check its capabilities, raise
 //! `RLIMIT_NOFILE`, create the VM with its TSS, in-kernel irqchip and PIT,
-//! map guest memory, load the kernel and the initramfs, create the devices,
-//! write the command line, write the zero page and MP table, create and set
-//! up the vCPUs, and record `vmm.start`.
+//! map guest memory, load the kernel and the initramfs, create the devices
+//! (the legacy PIO devices, then one virtio-fs device per share in the
+//! fixed slot order), write the command line with a `virtio_mmio.device=`
+//! entry per virtio device, write the zero page and MP table, create and
+//! set up the vCPUs, and record `vmm.start`.
 
 use std::fs::File;
 use std::io;
@@ -18,8 +20,10 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
+use boxcar_fs::{AuditFsOptions, FsShareConfig};
 use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
+use boxcar_virtio::{SlotAllocator, SlotError};
 use event_manager::{EventManager, EventSet, Events, MutEventSubscriber, SubscriberOps};
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::{VcpuFd, VmFd};
@@ -35,7 +39,7 @@ use crate::arch::x86_64::layout::{CMDLINE_START, HIMEM_START, KVM_TSS_ADDRESS};
 use crate::arch::x86_64::{cpuid, interrupts, msr, regs};
 use crate::cmdline::build_cmdline;
 use crate::devices::legacy::COM1_GSI;
-use crate::devices::LegacyDevices;
+use crate::devices::{DeviceError, FsDevices, LegacyDevices};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
@@ -87,14 +91,19 @@ pub struct VmConfig {
     /// Where the serial console's output goes. With [`ConsoleOut::Stdio`]
     /// and a TTY on stdin, stdin is forwarded to the guest.
     pub console: ConsoleOut,
-    /// Receives `vmm.start` and `vmm.stop`.
+    /// Receives `vmm.start` and `vmm.stop`, and every share's records.
     pub audit: AuditSink,
+    /// The directories shared with the guest over virtio-fs, in slot order:
+    /// `root`, then `workspace` (see [`crate::devices::FS_TAGS`]).
+    pub fs_shares: Vec<FsShareConfig>,
+    /// How much the shares record.
+    pub fs_audit: AuditFsOptions,
 }
 
 impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
-    /// boot, and the console on stdio.
+    /// boot, the console on stdio, and no shares.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
         VmConfig {
             kernel: kernel.into(),
@@ -105,6 +114,8 @@ impl VmConfig {
             debug_boot: false,
             console: ConsoleOut::Stdio,
             audit,
+            fs_shares: Vec::new(),
+            fs_audit: AuditFsOptions::default(),
         }
     }
 }
@@ -157,6 +168,10 @@ pub enum VmmError {
     },
     #[error("cannot place a device on the bus")]
     Bus(#[from] BusError),
+    #[error("cannot set up the virtio-mmio slots")]
+    Slots(#[from] SlotError),
+    #[error(transparent)]
+    Device(#[from] DeviceError),
     #[error("cannot record vmm.start")]
     Audit(#[from] EmitError),
     #[error("the main event loop failed")]
@@ -174,14 +189,16 @@ fn setup(what: &'static str) -> impl FnOnce(io::Error) -> VmmError {
 /// A VM, built and ready to run.
 pub struct Vmm {
     // Field order is drop order: the vCPU fds before the VM, the VM before
-    // the memory it maps.
+    // the memory it maps. The virtio devices share the memory, so it may
+    // outlive `_mem`, never the VM.
     vcpus: Vec<VcpuFd>,
     _vm: VmFd,
-    _mem: GuestMemoryMmap,
+    _mem: Arc<GuestMemoryMmap>,
     _kvm: KvmContext,
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
     legacy: LegacyDevices,
+    fs: FsDevices,
     latch: Arc<StopLatch>,
     audit: AuditSink,
     /// Forward stdin to the console and put the terminal in raw mode.
@@ -223,7 +240,7 @@ impl Vmm {
         })
         .map_err(kvm_ioctl("create_pit2"))?;
 
-        let mem = create_guest_memory(mem_size)?;
+        let mem = Arc::new(create_guest_memory(mem_size)?);
         register_memory(&vm, &mem)?;
 
         let (entry, kernel_end) = load_kernel(&mem, &cfg.kernel)?;
@@ -241,13 +258,22 @@ impl Vmm {
             vm.register_irqfd(serial.interrupt_evt(), COM1_GSI)
                 .map_err(kvm_ioctl("register_irqfd"))?;
         }
-        // The virtio-mmio devices go on this bus; there are none yet.
-        let mmio = Bus::new();
+        let mut mmio = Bus::new();
+        let mut slots = SlotAllocator::new()?;
+        let fs = FsDevices::attach(
+            &vm,
+            &mem,
+            &mut mmio,
+            &mut slots,
+            &cfg.fs_shares,
+            &cfg.audit,
+            cfg.fs_audit,
+        )?;
 
         let base = base_cmdline(cfg.debug_boot);
         let extras: Vec<&str> = cfg.cmdline_extra.iter().map(String::as_str).collect();
-        let cmdline = build_cmdline(&base, &extras, &[])?;
-        load_cmdline(&mem, GuestAddress(CMDLINE_START), &cmdline).map_err(VmmError::Cmdline)?;
+        let cmdline = build_cmdline(&base, &extras, fs.cmdline_entries())?;
+        load_cmdline(&*mem, GuestAddress(CMDLINE_START), &cmdline).map_err(VmmError::Cmdline)?;
         let cmdline = cmdline
             .as_cstring()
             .map_err(|e| VmmError::Arch(crate::arch::Error::Cmdline(e)))?;
@@ -294,6 +320,7 @@ impl Vmm {
             pio: Arc::new(pio),
             mmio: Arc::new(mmio),
             legacy,
+            fs,
             latch,
             interactive: matches!(cfg.console, ConsoleOut::Stdio) && stdin_is_tty(),
             audit: cfg.audit,
@@ -318,6 +345,7 @@ impl Vmm {
         } = match self.start(vcpus) {
             Ok(started) => started,
             Err(error) => {
+                self.fs.close();
                 record_stop(&self.audit, "vmm_error", 1);
                 return Err(error);
             }
@@ -329,6 +357,7 @@ impl Vmm {
         };
         let teardown = Teardown {
             vcpus,
+            fs: &self.fs,
             devices: &self.legacy,
             audit: &self.audit,
             terminal,
