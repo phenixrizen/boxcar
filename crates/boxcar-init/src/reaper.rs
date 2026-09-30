@@ -22,6 +22,7 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::Pid;
 
 use crate::console::{warn, write_console, Failed, Step};
+use crate::session::Terminal;
 
 /// How long the processes the session leaves behind have between `SIGTERM`
 /// and `SIGKILL`.
@@ -62,12 +63,20 @@ impl Reaper {
     }
 
     /// Step 8: reaps children until `session` has ended and none is left,
-    /// and returns how the session ended.
-    pub fn wait(&self, session: Pid) -> Result<Ended, Failed> {
+    /// and returns how the session ended. As soon as the session has ended,
+    /// init takes the foreground of `terminal` back, before it writes a
+    /// line of its own.
+    pub fn wait(&self, session: Pid, terminal: &Terminal) -> Result<Ended, Failed> {
         let mut ended = None;
         let mut phase = Phase::Session;
         loop {
-            if reap_ready(session, &mut ended, wait_any).step("waitpid")? == Left::None {
+            let left = reap_ready(session, &mut ended, wait_any).step("waitpid")?;
+            // The phase moves on from Session at the first reap that saw
+            // the session end, so this runs once.
+            if ended.is_some() && phase == Phase::Session {
+                terminal.take_foreground();
+            }
+            if left == Left::None {
                 return ended.ok_or_else(|| {
                     Failed::new("waitpid", "no child is left and the session was not seen")
                 });

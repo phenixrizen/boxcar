@@ -2,8 +2,16 @@
 // Copyright 2026 The boxcar Authors
 
 //! The session: the command init runs on the serial console, as the host
-//! user, in a session of its own with `/dev/ttyS0` as its controlling
-//! terminal.
+//! user, in a process group of its own in the foreground of `/dev/ttyS0`.
+//!
+//! The terminal belongs to init ([`Terminal`]): PID 1 is the leader of the
+//! session `/dev/ttyS0` is the controlling terminal of, and the session
+//! command is a process group within it. When a session leader exits, the
+//! kernel hangs up its controlling terminal and discards the output the
+//! serial port has not sent yet, so the command's last lines could be lost;
+//! init never exits, so that never happens. A shell still gets job control:
+//! it leads its own process group, in the foreground, on a terminal it can
+//! open as `/dev/tty`.
 //!
 //! Everything the child needs is prepared before the fork ([`Exec`]), so
 //! that between `fork` and `execve` it only makes system calls on memory
@@ -13,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::{iter, ptr};
 
 use boxcar_proto::guestcmd;
@@ -23,8 +31,8 @@ use nix::sys::prctl;
 use nix::sys::signal::SigSet;
 use nix::sys::stat::Mode;
 use nix::unistd::{
-    chdir, dup2_stderr, dup2_stdin, dup2_stdout, fork, getpid, setgroups, setresgid, setresuid,
-    setsid, ForkResult, Gid, Pid, Uid,
+    chdir, fork, getpgrp, getpid, getsid, setgroups, setpgid, setresgid, setresuid, setsid,
+    tcsetpgrp, ForkResult, Gid, Pid, Uid,
 };
 
 use crate::console::{warn, write_console, Failed, StackLine, Step};
@@ -42,7 +50,8 @@ pub const ENV: [&CStr; 4] = [
     c"USER=agent",
 ];
 
-/// The serial console, which becomes the session's terminal.
+/// The serial console: init's controlling terminal, and the session's
+/// terminal.
 const TTY: &CStr = c"/dev/ttyS0";
 
 /// Where the session starts.
@@ -155,6 +164,64 @@ fn pointers<'a>(strings: impl Iterator<Item = &'a CStr>) -> Vec<*const libc::c_c
         .collect()
 }
 
+/// `/dev/ttyS0` as init's controlling terminal, open in init for as long
+/// as it runs.
+pub struct Terminal {
+    fd: OwnedFd,
+}
+
+impl Terminal {
+    /// Makes init the leader of a session of its own (the kernel starts
+    /// PID 1 in session 0, which has no leader) and `/dev/ttyS0` that
+    /// session's controlling terminal, and ignores `SIGTTOU` from here on.
+    ///
+    /// Init takes the terminal's foreground back from a background process
+    /// group ([`Terminal::take_foreground`]) and writes its own lines
+    /// whatever terminal modes (`tostop`) the session left. From the
+    /// background, the kernel lets either through only when `SIGTTOU` is
+    /// ignored; otherwise, since init's group has no parent in its session
+    /// (it is orphaned), the call fails with `EIO`.
+    pub fn claim() -> Result<Terminal, Failed> {
+        match setsid() {
+            Ok(_) => {}
+            // Already a process group leader: fine if it leads its session.
+            Err(Errno::EPERM) if getsid(None) == Ok(getpid()) => {}
+            Err(errno) => return Err(Failed::new("setsid", errno)),
+        }
+        // SAFETY: SIG_IGN installs no handler; this only changes the action
+        // of SIGTTOU in init, which the session child sets back.
+        if unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(Failed::new("ignore SIGTTOU", Errno::last()));
+        }
+        // O_CLOEXEC: the session gets the terminal as 0, 1 and 2 only.
+        let fd = open(
+            TTY,
+            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .step("open /dev/ttyS0")?;
+        // SAFETY: TIOCSCTTY takes an int by value; 0 refuses to take the
+        // terminal from another session.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSCTTY, 0) } != 0 {
+            return Err(Failed::new("TIOCSCTTY /dev/ttyS0", Errno::last()));
+        }
+        Ok(Terminal { fd })
+    }
+
+    /// Makes init's process group the terminal's foreground again, once the
+    /// session has ended, before init writes its own lines. Best effort: a
+    /// failure gets a warning.
+    pub fn take_foreground(&self) {
+        if let Err(errno) = tcsetpgrp(&self.fd, getpgrp()) {
+            warn(&format!("tcsetpgrp /dev/ttyS0: {errno}"));
+        }
+    }
+
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 /// Step 6: creates [`CGROUPS`]. Returns whether the session can join its
 /// cgroup: without `cgroup2` mounted there is none, which gets a warning.
 pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
@@ -172,7 +239,12 @@ pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
 /// itself up ([`setup`]) and execs the command; if it cannot, it says why
 /// on the console (`boxcar-init: session: <step>: <error>`) and exits with
 /// [`SPAWN_FAILED`].
-pub fn spawn(session: &Session, exec: &Exec, join_cgroup: bool) -> Result<Pid, Failed> {
+pub fn spawn(
+    session: &Session,
+    exec: &Exec,
+    terminal: &Terminal,
+    join_cgroup: bool,
+) -> Result<Pid, Failed> {
     let signals = CleanSignals {
         unblocked: SigSet::empty(),
         sigrtmax: libc::SIGRTMAX(),
@@ -182,7 +254,7 @@ pub fn spawn(session: &Session, exec: &Exec, join_cgroup: bool) -> Result<Pid, F
     // system calls on memory prepared before the fork, then execs or exits.
     match unsafe { fork() }.step("fork")? {
         ForkResult::Parent { child } => Ok(child),
-        ForkResult::Child => child(session, exec, join_cgroup, &signals),
+        ForkResult::Child => child(session, exec, terminal.as_fd(), join_cgroup, &signals),
     }
 }
 
@@ -207,8 +279,14 @@ struct ChildFailure {
 }
 
 /// The session child, from `fork` to `execve`. Never returns.
-fn child(session: &Session, exec: &Exec, join_cgroup: bool, signals: &CleanSignals) -> ! {
-    let failure = match setup(session, join_cgroup, signals) {
+fn child(
+    session: &Session,
+    exec: &Exec,
+    tty: BorrowedFd<'_>,
+    join_cgroup: bool,
+    signals: &CleanSignals,
+) -> ! {
+    let failure = match setup(session, tty, join_cgroup, signals) {
         Ok(()) => ChildFailure {
             step: "execve",
             errno: exec.exec(),
@@ -232,15 +310,20 @@ fn child(session: &Session, exec: &Exec, join_cgroup: bool, signals: &CleanSigna
     unsafe { libc::_exit(SPAWN_FAILED) }
 }
 
-/// The child's setup, in order: a new session; `/dev/ttyS0` as its
-/// controlling terminal and as stdin, stdout and stderr; the `session`
-/// cgroup; an empty capability bounding set and ambient set; no
-/// supplementary groups; the session's gid and uid, real, effective and
-/// saved; no new privileges; `/workspace`; then every signal back at its
-/// default action and unblocked, since an ignored signal and the mask both
-/// survive exec (Rust ignores SIGPIPE in init, and init blocks SIGCHLD for
-/// its signalfd).
-fn setup(session: &Session, join_cgroup: bool, signals: &CleanSignals) -> Result<(), ChildFailure> {
+/// The child's setup, in order: a process group of its own, in the
+/// foreground of the terminal `tty` (init's `/dev/ttyS0`), which becomes
+/// stdin, stdout and stderr; the `session` cgroup; an empty capability
+/// bounding set and ambient set; no supplementary groups; the session's gid
+/// and uid, real, effective and saved; no new privileges; `/workspace`; then
+/// every signal back at its default action and unblocked, since an ignored
+/// signal and the mask both survive exec (Rust ignores SIGPIPE in init, init
+/// ignores SIGTTOU and blocks SIGCHLD for its signalfd).
+fn setup(
+    session: &Session,
+    tty: BorrowedFd<'_>,
+    join_cgroup: bool,
+    signals: &CleanSignals,
+) -> Result<(), ChildFailure> {
     let fail = |step: &'static str, on_tty: bool| {
         move |errno: Errno| ChildFailure {
             step,
@@ -248,25 +331,11 @@ fn setup(session: &Session, join_cgroup: bool, signals: &CleanSignals) -> Result
             on_tty,
         }
     };
-    setsid().map_err(fail("setsid", false))?;
-    // Not O_CLOEXEC: should it land on 0, 1 or 2, dup2 onto itself would
-    // leave the flag set and exec would close it.
-    let tty = open(TTY, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())
-        .map_err(fail("open /dev/ttyS0", false))?;
-    // SAFETY: TIOCSCTTY takes an int by value; 0 refuses to take the
-    // terminal from another session.
-    if unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCSCTTY, 0) } != 0 {
-        return Err(fail("TIOCSCTTY /dev/ttyS0", false)(Errno::last()));
-    }
-    dup2_stdin(&tty).map_err(fail("dup2 stdin", false))?;
-    dup2_stdout(&tty).map_err(fail("dup2 stdout", false))?;
-    dup2_stderr(&tty).map_err(fail("dup2 stderr", false))?;
-    if tty.as_raw_fd() > 2 {
-        drop(tty);
-    } else {
-        // It is one of 0, 1 and 2 now: keep it open.
-        let _ = tty.into_raw_fd();
-    }
+    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(fail("setpgid", false))?;
+    foreground(tty).map_err(fail("tcsetpgrp /dev/ttyS0", false))?;
+    onto(tty, libc::STDIN_FILENO).map_err(fail("dup2 stdin", false))?;
+    onto(tty, libc::STDOUT_FILENO).map_err(fail("dup2 stdout", false))?;
+    onto(tty, libc::STDERR_FILENO).map_err(fail("dup2 stderr", false))?;
     if join_cgroup {
         join_session_cgroup().map_err(fail("join the session cgroup", true))?;
     }
@@ -285,6 +354,41 @@ fn setup(session: &Session, join_cgroup: bool, signals: &CleanSignals) -> Result
         .unblocked
         .thread_set_mask()
         .map_err(fail("unblock all signals", true))
+}
+
+/// Makes this process's group the foreground of `tty`. The group is in the
+/// background until then, where the kernel lets `tcsetpgrp` through only
+/// when `SIGTTOU` is ignored (the group's parent is init, so it counts as
+/// orphaned and the call would fail with `EIO`): it is ignored for the call
+/// and set back to its default after.
+fn foreground(tty: BorrowedFd<'_>) -> Result<(), Errno> {
+    // SAFETY: SIG_IGN and SIG_DFL install no handler; this only changes the
+    // action of SIGTTOU in this process.
+    unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+    let result = tcsetpgrp(tty, getpid());
+    // SAFETY: as above.
+    unsafe { libc::signal(libc::SIGTTOU, libc::SIG_DFL) };
+    result
+}
+
+/// Makes `target` a copy of `tty` that stays open across exec. `tty` is
+/// close-on-exec, and `dup2` onto itself would keep the flag, so when they
+/// are the same descriptor the flag is cleared instead.
+fn onto(tty: BorrowedFd<'_>, target: RawFd) -> Result<(), Errno> {
+    let tty = tty.as_raw_fd();
+    // SAFETY: fcntl and dup2 on descriptors, with integer arguments only.
+    let rc = unsafe {
+        if tty == target {
+            libc::fcntl(target, libc::F_SETFD, 0)
+        } else {
+            libc::dup2(tty, target)
+        }
+    };
+    if rc < 0 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
 }
 
 /// Empties the capability bounding set: `PR_CAPBSET_DROP` for each
@@ -528,6 +632,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Whether `fd` is open with `FD_CLOEXEC` set.
+    fn cloexec(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD takes no argument.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fd {fd} is not open");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    /// The terminal is close-on-exec in init; its copies on 0, 1 and 2 must
+    /// not be, including when it is itself one of them. Descriptors other
+    /// than 0, 1 and 2 stand in for them here.
+    #[test]
+    fn the_terminal_lands_on_a_descriptor_that_survives_exec() {
+        let tty = open(
+            c"/dev/null",
+            OFlag::O_RDWR | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let other = open(
+            c"/dev/null",
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let (tty_fd, other_fd) = (tty.as_raw_fd(), other.as_raw_fd());
+
+        onto(tty.as_fd(), other_fd).unwrap();
+        assert!(!cloexec(other_fd), "the copy survives exec");
+        assert!(cloexec(tty_fd), "the original stays close-on-exec");
+        // SAFETY: F_GETFL takes no argument.
+        let access = unsafe { libc::fcntl(other_fd, libc::F_GETFL) } & libc::O_ACCMODE;
+        assert_eq!(access, libc::O_RDWR, "the copy is the terminal's");
+
+        onto(tty.as_fd(), tty_fd).unwrap();
+        assert!(!cloexec(tty_fd), "onto itself clears the flag");
     }
 
     #[test]

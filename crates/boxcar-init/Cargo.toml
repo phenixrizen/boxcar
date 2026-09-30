@@ -9,5 +9,5 @@ repository.workspace = true
 [dependencies]
 # Default features off: no `hash`, so no blake3 and no C compiler for musl.
 boxcar-proto = { workspace = true, default-features = false }
-nix = { workspace = true, features = ["mount", "fs", "process", "signal", "user", "reboot", "poll", "ioctl", "hostname"] }
+nix = { workspace = true, features = ["mount", "fs", "process", "signal", "user", "reboot", "poll", "ioctl", "hostname", "term"] }
 libc = { workspace = true }

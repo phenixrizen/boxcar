@@ -10,9 +10,10 @@
 //!   whole boot path from the VMM to a Rust PID 1 and back.
 //! - `console` runs the session: it mounts the `root` and `workspace`
 //!   virtio-fs shares, makes the root share `/`, hardens the kernel
-//!   settings, runs the session command (`boxcar.cmd`, or a login shell) on
-//!   `/dev/ttyS0` as `boxcar.uid` and `boxcar.gid`, reaps until no child is
-//!   left, reports how the session ended and reboots.
+//!   settings, makes `/dev/ttyS0` its own controlling terminal, runs the
+//!   session command (`boxcar.cmd`, or a login shell) in the foreground of
+//!   it as `boxcar.uid` and `boxcar.gid`, reaps until no child is left,
+//!   reports how the session ended and reboots.
 //!
 //! Every fatal step reports `boxcar-init: <step>: <error>` on the console
 //! and reboots; PID 1 never exits on its own.
@@ -32,7 +33,7 @@ use std::panic;
 use console::{die, write_console, write_to, Failed, StackLine, Step};
 use nix::unistd::sethostname;
 use reaper::{Ended, Reaper};
-use session::{Exec, Session};
+use session::{Exec, Session, Terminal};
 use shutdown::reboot_now;
 
 /// What `hello` mode prints. Task 9's boot test looks for this line.
@@ -91,9 +92,10 @@ fn run_session(args: &BTreeMap<String, String>) -> Result<Ended, Failed> {
     sysctl::apply();
     let join_cgroup = session::create_cgroups(mounted.cgroup2)?;
 
+    let terminal = Terminal::claim()?;
     let reaper = Reaper::new()?;
-    let pid = session::spawn(&session, &exec, join_cgroup)?;
-    reaper.wait(pid)
+    let pid = session::spawn(&session, &exec, &terminal, join_cgroup)?;
+    reaper.wait(pid, &terminal)
 }
 
 /// Sends a panic to `/dev/kmsg` and `/dev/console`, then aborts.

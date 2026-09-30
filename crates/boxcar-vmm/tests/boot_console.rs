@@ -36,12 +36,12 @@ const LIMIT: Duration = Duration::from_secs(30);
 /// `/proc/self/status` [`status_field`] reads back from the console.
 ///
 /// `grep` must not be the last command: busybox ash ignores SIGQUIT itself
-/// and execs a last command without forking, which then inherits that. The
-/// `sleep` keeps the session leader alive until the console has sent the
-/// lines: when the leader exits, the kernel hangs up its controlling
-/// terminal and discards output not yet sent.
+/// and execs a last command without forking, which then inherits that.
+/// Nothing waits for the console after it: the terminal belongs to init,
+/// so the shell's exit does not hang it up and discard what the serial
+/// port has not sent yet.
 const SESSION: &str = "echo hi > /workspace/a.txt; \
-     grep -E '^(SigIgn|SigBlk|CapBnd):' /proc/self/status; sleep 1";
+     grep -E '^(SigIgn|SigBlk|CapBnd):' /proc/self/status; true";
 
 /// The value of `field` in the `/proc/<pid>/status` lines on the console
 /// (`SigIgn:\t0000000000001000`), if one is there.
