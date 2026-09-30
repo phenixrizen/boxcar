@@ -1,0 +1,21 @@
+[package]
+name = "boxcar"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+kvm-tests = []
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+boxcar-proto = { workspace = true, features = ["hash"] }
+boxcar-audit = { workspace = true }
+boxcar-vmm = { workspace = true }
+boxcar-fs = { workspace = true }

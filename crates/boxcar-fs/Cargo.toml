@@ -1,0 +1,27 @@
+[package]
+name = "boxcar-fs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxcar-proto = { workspace = true, features = ["hash"] }
+boxcar-audit = { workspace = true }
+boxcar-virtio = { workspace = true }
+fuse-backend-rs = { workspace = true }
+vm-memory = { workspace = true }
+virtio-queue = { workspace = true }
+virtio-bindings = { workspace = true }
+vmm-sys-util = { workspace = true }
+blake3 = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Pin-set canary: it must resolve against the same virtio-queue and vm-memory
+# as fuse-backend-rs, so a pin change that splits those types fails here.
+virtio-vsock = { workspace = true }

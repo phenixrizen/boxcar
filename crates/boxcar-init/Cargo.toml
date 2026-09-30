@@ -1,0 +1,13 @@
+[package]
+name = "boxcar-init"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Default features off: no `hash`, so no blake3 and no C compiler for musl.
+boxcar-proto = { workspace = true, default-features = false }
+nix = { workspace = true, features = ["mount", "fs", "process", "signal", "term", "user", "reboot", "poll", "ioctl"] }
+libc = { workspace = true }

@@ -1,0 +1,28 @@
+[package]
+name = "boxcar-vmm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+kvm-tests = []
+
+[dependencies]
+boxcar-proto = { workspace = true, features = ["hash"] }
+boxcar-audit = { workspace = true }
+boxcar-virtio = { workspace = true }
+boxcar-fs = { workspace = true }
+kvm-ioctls = { workspace = true }
+kvm-bindings = { workspace = true }
+vm-memory = { workspace = true }
+linux-loader = { workspace = true }
+vm-superio = { workspace = true }
+event-manager = { workspace = true }
+vm-allocator = { workspace = true }
+vmm-sys-util = { workspace = true }
+blake3 = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
