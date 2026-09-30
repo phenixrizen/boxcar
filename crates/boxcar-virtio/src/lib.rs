@@ -4,7 +4,8 @@
 //! boxcar's virtio device layer: the [`VirtioDevice`] trait every device
 //! implements, the virtio-mmio transport the guest's `virtio_mmio` driver
 //! talks to, the IRQ trigger, MMIO slot and GSI allocation, the queue-drain
-//! helper, and the PIO/MMIO [`Bus`] the VMM dispatches exits on.
+//! helper, the PIO/MMIO [`Bus`] the VMM dispatches exits on, and
+//! [`limited!`], which keeps a guest from flooding the host's log.
 //!
 //! Ring handling is `virtio-queue`'s ([`virtio_queue::Queue`]); constants are
 //! `virtio-bindings`'.
@@ -17,6 +18,7 @@ pub mod features;
 pub mod irq;
 pub mod mmio;
 pub mod queue;
+pub mod ratelimit;
 pub mod slots;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

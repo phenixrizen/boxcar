@@ -22,11 +22,12 @@
 //! `EventManager` of its own, drains a queue when the driver kicks it, and
 //! interrupts the guest when the driver wants to hear about used buffers.
 //!
-//! A request that cannot be parsed or answered is logged and handed back
-//! with no reply bytes, and the queue goes on. A queue that cannot be
-//! drained at all, because the driver corrupted it, is fatal for that
-//! queue: the worker asks the driver for a reset (DEVICE_NEEDS_RESET) and
-//! leaves the queue alone until it gets one.
+//! A request that cannot be parsed or answered is logged, at most once a
+//! second from each place that logs it ([`boxcar_virtio::limited!`]), and
+//! handed back with no reply bytes, and the queue goes on. A queue that
+//! cannot be drained at all, because the driver corrupted it, is fatal for
+//! that queue: the worker asks the driver for a reset (DEVICE_NEEDS_RESET)
+//! and leaves the queue alone until it gets one.
 //!
 //! [`VirtioDevice::reset`], which runs when the driver writes status 0 and
 //! when the VMM stops the VM, stops and joins the workers, waits for the
@@ -209,7 +210,8 @@ impl VirtioDevice for VirtioFs {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        warn!(
+        boxcar_virtio::limited!(
+            warn,
             tag = %self.tag,
             "virtio-fs: the driver wrote {} bytes at {offset:#x} of the read-only config space; \
              ignored",
@@ -367,14 +369,19 @@ fn handle_request(
     let reader = match Reader::from_descriptor_chain(mem, chain.clone()) {
         Ok(reader) => reader,
         Err(err) => {
-            warn!(tag, head, "virtio-fs: cannot read the request: {err}");
+            boxcar_virtio::limited!(warn, tag, head, "virtio-fs: cannot read the request: {err}");
             return 0;
         }
     };
     let writer: Writer<'_, ()> = match VirtioFsWriter::new(mem, chain) {
         Ok(writer) => writer.into(),
         Err(err) => {
-            warn!(tag, head, "virtio-fs: cannot use the reply buffer: {err}");
+            boxcar_virtio::limited!(
+                warn,
+                tag,
+                head,
+                "virtio-fs: cannot use the reply buffer: {err}"
+            );
             return 0;
         }
     };
@@ -384,7 +391,7 @@ fn handle_request(
         // more than 4 GiB of them could hold a longer one.
         Ok(len) => u32::try_from(len).unwrap_or(u32::MAX),
         Err(err) => {
-            warn!(tag, head, "virtio-fs: request not answered: {err}");
+            boxcar_virtio::limited!(warn, tag, head, "virtio-fs: request not answered: {err}");
             0
         }
     }

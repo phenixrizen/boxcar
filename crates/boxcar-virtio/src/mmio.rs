@@ -37,6 +37,10 @@
 //! The virtio-mmio transport (virtio 1.2 section 4.2.2, version 2): the
 //! register map the guest's `virtio_mmio` driver talks to, in front of one
 //! [`VirtioDevice`].
+//!
+//! A register access the transport refuses is logged, at most once a second
+//! from each place that logs it ([`limited!`](crate::limited)): the guest
+//! decides how often it makes one.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -278,9 +282,11 @@ impl<D: VirtioDevice> MmioTransport<D> {
                     self.cfg
                         .set_driver_features_page(self.cfg.driver_features_select, v);
                 } else {
-                    warn!(
+                    crate::limited!(
+                        warn,
                         "virtio-mmio {:#x}: driver features written in status {:#x}",
-                        self.slot.base, self.cfg.device_status
+                        self.slot.base,
+                        self.cfg.device_status
                     );
                 }
             }
@@ -310,7 +316,8 @@ impl<D: VirtioDevice> MmioTransport<D> {
             regs::QUEUE_DEVICE_HIGH => {
                 self.update_queue(|q| q.set_used_ring_address(None, Some(v)))
             }
-            _ => warn!(
+            _ => crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: write to unknown or read-only register {offset:#x}",
                 self.slot.base
             ),
@@ -321,16 +328,19 @@ impl<D: VirtioDevice> MmioTransport<D> {
     /// FEATURES_OK and DRIVER_OK; writes at any other time are ignored.
     fn update_queue<F: FnOnce(&mut Queue)>(&mut self, f: F) {
         if !self.check_status(status::FEATURES_OK, status::DRIVER_OK | status::FAILED) {
-            warn!(
+            crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: queue register written in status {:#x}",
-                self.slot.base, self.cfg.device_status
+                self.slot.base,
+                self.cfg.device_status
             );
             return;
         }
         let selected = self.cfg.queue_select;
         match self.cfg.selected_queue_mut() {
             Some(queue) => f(queue),
-            None => warn!(
+            None => crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: queue register written for absent queue {selected}",
                 self.slot.base
             ),
@@ -346,7 +356,8 @@ impl<D: VirtioDevice> MmioTransport<D> {
     /// FAILED can be set at any time. Writing 0 resets.
     fn write_status(&mut self, v: u32) {
         let Ok(new) = u8::try_from(v) else {
-            warn!(
+            crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: status {v:#x} does not fit in 8 bits",
                 self.slot.base
             );
@@ -365,7 +376,8 @@ impl<D: VirtioDevice> MmioTransport<D> {
             }
             (ACK_DRIVER, ACK_DRIVER_FEATURES) => self.features_ok(),
             (ACK_DRIVER_FEATURES, ALL_OK) => self.driver_ok(),
-            _ => warn!(
+            _ => crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: invalid status transition {current:#x} -> {new:#x}",
                 self.slot.base
             ),
@@ -378,7 +390,8 @@ impl<D: VirtioDevice> MmioTransport<D> {
     fn features_ok(&mut self) {
         let unoffered = self.cfg.driver_features & !self.cfg.device_features;
         if unoffered != 0 {
-            warn!(
+            crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: driver accepted features {unoffered:#x} the device did not \
                  offer; FEATURES_OK refused",
                 self.slot.base
@@ -399,14 +412,16 @@ impl<D: VirtioDevice> MmioTransport<D> {
         match self.activate() {
             Ok(()) => self.cfg.activated = true,
             Err(err) => {
-                error!(
+                crate::limited!(
+                    error,
                     "virtio-mmio {:#x}: device type {} failed to activate: {err}",
                     self.slot.base,
                     self.device.device_type()
                 );
                 self.cfg.device_status |= status::DEVICE_NEEDS_RESET;
                 if let Err(err) = self.irq.signal_config_change() {
-                    error!(
+                    crate::limited!(
+                        error,
                         "virtio-mmio {:#x}: could not signal DEVICE_NEEDS_RESET: {err}",
                         self.slot.base
                     );
@@ -458,13 +473,15 @@ impl<D: VirtioDevice> BusDevice for MmioTransport<D> {
         match offset {
             0..=REGS_END if data.len() == 4 => match self.read_register(offset) {
                 Some(v) => data.copy_from_slice(&v.to_le_bytes()),
-                None => warn!(
+                None => crate::limited!(
+                    warn,
                     "virtio-mmio {:#x}: read of unknown or write-only register {offset:#x}",
                     self.slot.base
                 ),
             },
             regs::CONFIG..=CONFIG_END => self.device.read_config(offset - regs::CONFIG, data),
-            _ => warn!(
+            _ => crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: invalid read of {} bytes at {offset:#x}",
                 self.slot.base,
                 data.len()
@@ -476,7 +493,8 @@ impl<D: VirtioDevice> BusDevice for MmioTransport<D> {
         match offset {
             0..=REGS_END => match <[u8; 4]>::try_from(data) {
                 Ok(bytes) => self.write_register(offset, u32::from_le_bytes(bytes)),
-                Err(_) => warn!(
+                Err(_) => crate::limited!(
+                    warn,
                     "virtio-mmio {:#x}: invalid write of {} bytes at {offset:#x}",
                     self.slot.base,
                     data.len()
@@ -486,13 +504,16 @@ impl<D: VirtioDevice> BusDevice for MmioTransport<D> {
                 if self.check_status(status::DRIVER, status::FAILED | status::DEVICE_NEEDS_RESET) {
                     self.device.write_config(offset - regs::CONFIG, data);
                 } else {
-                    warn!(
+                    crate::limited!(
+                        warn,
                         "virtio-mmio {:#x}: config space written in status {:#x}",
-                        self.slot.base, self.cfg.device_status
+                        self.slot.base,
+                        self.cfg.device_status
                     );
                 }
             }
-            _ => warn!(
+            _ => crate::limited!(
+                warn,
                 "virtio-mmio {:#x}: invalid write of {} bytes at {offset:#x}",
                 self.slot.base,
                 data.len()
@@ -508,7 +529,8 @@ fn set_queue_size(base: u64, queue: &mut Queue, v: u32) {
         .map_err(|_| virtio_queue::Error::InvalidSize)
         .and_then(|size| queue.try_set_size(size));
     if let Err(err) = result {
-        warn!(
+        crate::limited!(
+            warn,
             "virtio-mmio {base:#x}: queue size {v} refused (maximum {}): {err}",
             queue.max_size()
         );
