@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 boxcar-proto = { workspace = true, features = ["hash"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 crossbeam-channel = { workspace = true }

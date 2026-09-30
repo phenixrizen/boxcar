@@ -142,6 +142,7 @@ dependencies = [
  "boxcar-proto",
  "crossbeam-channel",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
