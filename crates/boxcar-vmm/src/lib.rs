@@ -6,5 +6,10 @@
 pub mod arch;
 pub mod cmdline;
 pub mod devices;
+pub mod kick;
 pub mod kvm;
+pub mod lifecycle;
 pub mod memory;
+pub mod stdin;
+pub mod vcpu;
+pub mod vmm;

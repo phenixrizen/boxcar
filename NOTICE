@@ -13,8 +13,9 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
     Portions Copyright © 2020, Oracle and/or its affiliates. Apache-2.0.
     Used for: x86_64 boot setup (memory layout, MP table, page tables, GDT,
     registers, MSRs), the device bus, the virtio-mmio transport, its IRQ
-    trigger and tests, the legacy serial and i8042 wiring, the vsock
-    Unix-socket protocol, and the guest kernel configuration.
+    trigger and tests, the vCPU run loop and kick, the legacy serial and
+    i8042 wiring and serial input, the vsock Unix-socket protocol, and the
+    guest kernel configuration.
     guest/kernel/base/microvm-kernel-ci-x86_64-6.18.config is copied verbatim
     from resources/guest_configs/microvm-kernel-ci-x86_64-6.18.config at
     commit 21f19ed8109578108568c8a8f3623ddb6f097878 of that repository. Apache-2.0.
@@ -39,9 +40,12 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
       crates/boxcar-virtio/src/testing.rs  from src/vmm/src/devices/virtio/transport/mmio.rs
       crates/boxcar-virtio/tests/mmio.rs   from src/vmm/src/devices/virtio/transport/mmio.rs
     Apache-2.0; the Chromium OS portions BSD-3-Clause.
-    The legacy devices follow the same commit,
+    The vCPU loop, the kick and the legacy devices follow the same commit,
     21f19ed8109578108568c8a8f3623ddb6f097878:
+      crates/boxcar-vmm/src/kick.rs            from src/vmm/src/vstate/vcpu.rs
+      crates/boxcar-vmm/src/vcpu.rs            from src/vmm/src/vstate/vcpu.rs
       crates/boxcar-vmm/src/devices/legacy.rs  from src/vmm/src/devices/legacy/mod.rs and serial.rs
+      crates/boxcar-vmm/src/stdin.rs           from src/vmm/src/devices/legacy/serial.rs
     Apache-2.0; the Chromium OS portions BSD-3-Clause.
 
   Cloud Hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor)
