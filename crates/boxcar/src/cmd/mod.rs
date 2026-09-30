@@ -5,6 +5,7 @@
 
 mod audit;
 mod doctor;
+mod run;
 
 use std::process::ExitCode;
 
@@ -15,5 +16,6 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Audit(command) => audit::run(command),
         Command::Doctor => doctor::run(),
+        Command::Run(args) => run::run(args),
     }
 }

@@ -220,6 +220,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "linux-loader",
+ "tempfile",
  "thiserror",
  "tracing",
  "vm-allocator",
