@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
 use nix::sys::reboot::{reboot, RebootMode};
+use nix::sys::termios::tcdrain;
 use nix::unistd::sync;
 
 /// The console node the initramfs carries.
@@ -34,12 +35,30 @@ pub fn write_console(bytes: &[u8]) -> io::Result<()> {
     write_to(CONSOLE, bytes)
 }
 
-/// Flushes filesystems and reboots. Never returns.
+/// Waits until the terminal at `path` has sent everything written to it.
+///
+/// A write to a tty only queues the bytes; the serial driver sends them from
+/// its interrupt, so a reboot right after the write can drop them. Best
+/// effort: when `path` cannot be opened or is not a terminal (`tcdrain`
+/// fails with `ENOTTY`, as in a namespace without a real console), this
+/// returns at once and the caller carries on.
+fn drain(path: &str) {
+    if let Ok(file) = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path)
+    {
+        let _ = tcdrain(&file);
+    }
+}
+
+/// Drains the console, flushes filesystems and reboots. Never returns.
 ///
 /// If the reboot syscall itself fails (it cannot for PID 1 in the initial
 /// namespace), the error goes to the console and init exits, which panics the
 /// kernel: loud and terminal, rather than a hang.
 pub fn reboot_now() -> ! {
+    drain(CONSOLE);
     sync();
     let Err(errno) = reboot(RebootMode::RB_AUTOBOOT);
     let _ = write_console(format!("boxcar-init: reboot failed: {errno}\n").as_bytes());
@@ -52,4 +71,17 @@ pub fn reboot_now() -> ! {
 pub fn die(msg: &str) -> ! {
     let _ = write_console(format!("boxcar-init: {msg}\n").as_bytes());
     reboot_now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drain before a reboot must never stop the reboot: a node that is
+    /// not a terminal, or no node at all, returns at once.
+    #[test]
+    fn drain_ignores_a_missing_or_non_terminal_console() {
+        drain("/dev/null");
+        drain("/nonexistent/console");
+    }
 }
