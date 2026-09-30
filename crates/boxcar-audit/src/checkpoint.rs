@@ -25,12 +25,13 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use boxcar_proto::{Checkpoint, Hash};
 use serde::{Deserialize, Serialize};
 
-use crate::segment::sync_dir;
+use crate::segment::{sync_dir, FILE_MODE};
 
 pub(crate) const INDEX_FILE: &str = "checkpoints.jsonl";
 
@@ -143,7 +144,11 @@ impl CheckpointIndex {
             wanted.push(b'\n');
         }
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(FILE_MODE)
+            .open(&path)?;
         if created {
             sync_dir(dir)?;
         }

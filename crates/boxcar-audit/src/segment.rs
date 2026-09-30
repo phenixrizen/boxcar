@@ -17,10 +17,15 @@
 //! ends it with a checkpoint, syncs it, and starts the next one. The chain
 //! runs on across segments; the first record of a segment names the last
 //! record of the one before as its `prev`.
+//!
+//! Every directory the writer creates gets mode [`DIR_MODE`] and every file
+//! [`FILE_MODE`], whatever the process umask: `PassthroughFs::import` sets
+//! the umask to 0 for the whole process, and the log must not become
+//! writable by others once a share is imported.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use boxcar_proto::{genesis_prev, Hash, SessionId};
@@ -32,6 +37,10 @@ use crate::writer::realtime_ns;
 
 pub(crate) const META_FILE: &str = "meta.json";
 const META_TMP: &str = "meta.json.tmp";
+/// The mode of every directory the writer creates, the session's included.
+pub(crate) const DIR_MODE: u32 = 0o700;
+/// The mode of every file the writer creates.
+pub(crate) const FILE_MODE: u32 = 0o600;
 const WRITE_BUFFER: usize = 256 * 1024;
 
 /// Makes a segment's written bytes durable. The writer calls it for every
@@ -106,7 +115,12 @@ fn write_meta(dir: &Path, meta: &Meta) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(meta)?;
     bytes.push(b'\n');
     let tmp = dir.join(META_TMP);
-    let mut file = File::create(&tmp)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(FILE_MODE)
+        .open(&tmp)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&tmp, dir.join(META_FILE))?;
@@ -198,7 +212,11 @@ impl<S: Syncer> SegmentWriter<S> {
         syncer: S,
     ) -> io::Result<(Self, Resume)> {
         if !dir.exists() {
-            fs::create_dir_all(dir)?;
+            // The mode applies to every directory created on the way.
+            DirBuilder::new()
+                .recursive(true)
+                .mode(DIR_MODE)
+                .create(dir)?;
             if let Some(parent) = dir.parent() {
                 sync_dir(parent)?;
             }
@@ -459,6 +477,7 @@ fn create_segment(dir: &Path, n: u32) -> io::Result<File> {
     let file = OpenOptions::new()
         .append(true)
         .create_new(true)
+        .mode(FILE_MODE)
         .open(dir.join(segment_name(n)))?;
     sync_dir(dir)?;
     Ok(file)
