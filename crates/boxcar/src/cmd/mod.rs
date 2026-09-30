@@ -4,6 +4,7 @@
 //! The subcommands, one module each.
 
 mod audit;
+mod doctor;
 
 use std::process::ExitCode;
 
@@ -13,5 +14,6 @@ use crate::cli::{Cli, Command};
 pub fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Audit(command) => audit::run(command),
+        Command::Doctor => doctor::run(),
     }
 }

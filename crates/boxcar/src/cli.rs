@@ -20,6 +20,13 @@ pub enum Command {
     /// Work with audit logs.
     #[command(subcommand)]
     Audit(AuditCommand),
+    /// Check that this machine can build and run boxcar.
+    ///
+    /// Prints one line per check: KVM access and capabilities, Docker, the
+    /// musl target, and the guest kernel and initramfs. Exits 1 when a
+    /// required check fails; a guest artifact that is not built yet is not a
+    /// failure.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
