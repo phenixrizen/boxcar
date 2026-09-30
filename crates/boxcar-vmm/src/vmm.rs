@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
-use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, VmmStart};
+use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
 use event_manager::{EventManager, EventSet, Events, MutEventSubscriber, SubscriberOps};
@@ -349,6 +349,7 @@ impl Vmm {
             cmdline,
             vcpus: u32::from(cfg.vcpus),
             mem_mib: cfg.mem_mib,
+            shares: share_refs(&cfg.fs_shares),
         };
         tracing::debug!("vmm.start: {start:?}");
         cfg.audit.emit(Submission {
@@ -610,6 +611,18 @@ fn create_vcpus(
     Ok(vcpus)
 }
 
+/// The shares as `vmm.start` names them: each tag and the host directory
+/// the guest may change through it, in slot order.
+fn share_refs(shares: &[FsShareConfig]) -> Vec<ShareRef> {
+    shares
+        .iter()
+        .map(|share| ShareRef {
+            tag: share.tag.clone(),
+            host_root: share.host_dir.to_string_lossy().into_owned(),
+        })
+        .collect()
+}
+
 /// The file at `path` as the audit log names it: its absolute path and the
 /// blake3 of its contents.
 fn artifact(what: &'static str, path: &Path) -> Result<ArtifactRef, VmmError> {
@@ -715,6 +728,23 @@ mod tests {
             cmdline_size(false, &[], 3),
             Err(VmmError::Config(_))
         ));
+    }
+
+    #[test]
+    fn vmm_start_names_every_share_and_its_host_directory() {
+        let share = |tag: &str, dir: &str| FsShareConfig {
+            tag: tag.into(),
+            host_dir: PathBuf::from(dir),
+            guest_path: "/".into(),
+            cache: boxcar_fs::CachePolicyKind::Auto,
+        };
+        let refs = share_refs(&[share("root", "/r/rootfs"), share("workspace", "/w")]);
+        let named: Vec<(&str, &str)> = refs
+            .iter()
+            .map(|s| (s.tag.as_str(), s.host_root.as_str()))
+            .collect();
+        assert_eq!(named, [("root", "/r/rootfs"), ("workspace", "/w")]);
+        assert!(share_refs(&[]).is_empty());
     }
 
     #[test]

@@ -28,8 +28,8 @@ pub use audit::genesis_prev;
 pub use audit::{
     ArtifactRef, Attrib, Checkpoint, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
     FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hash,
-    HashStatus, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, Source, SpanRef, Subject,
-    VmmStart, VmmStop, SCHEMA_VERSION,
+    HashStatus, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, ShareRef, Source,
+    SpanRef, Subject, VmmStart, VmmStop, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

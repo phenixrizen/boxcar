@@ -43,7 +43,7 @@ mod payloads;
 pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
     FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
-    HashStatus, OpResult, SetAttr, VmmStart, VmmStop,
+    HashStatus, OpResult, SetAttr, ShareRef, VmmStart, VmmStop,
 };
 
 /// The value of a record's `v` field.
@@ -381,9 +381,32 @@ impl Payload {
         }
     }
 
-    /// The source of the record that carries this payload.
+    /// The source of the record that carries this payload: the VMM for
+    /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, as
+    /// [`Source::from_kind`] says. A new variant does not compile until it
+    /// is given one.
     pub fn source(&self) -> Source {
-        Source::from_kind(self.kind()).expect("every Payload kind belongs to a source")
+        match self {
+            Payload::VmmStart(_) | Payload::VmmStop(_) | Payload::Checkpoint(_) => Source::Vmm,
+            Payload::FsMount(_)
+            | Payload::FsOpen(_)
+            | Payload::FsCreate(_)
+            | Payload::FsClose(_)
+            | Payload::FsRead(_)
+            | Payload::FsWrite(_)
+            | Payload::FsUnlink(_)
+            | Payload::FsRmdir(_)
+            | Payload::FsMkdir(_)
+            | Payload::FsMknod(_)
+            | Payload::FsSymlink(_)
+            | Payload::FsLink(_)
+            | Payload::FsRename(_)
+            | Payload::FsSetattr(_)
+            | Payload::FsFallocate(_)
+            | Payload::FsXattr(_)
+            | Payload::FsDenied(_)
+            | Payload::FsReaddir(_) => Source::Fs,
+        }
     }
 
     /// The record's `type` and `data` for this payload, such as
@@ -487,6 +510,16 @@ mod tests {
                     cmdline: "console=ttyS0 quiet".into(),
                     vcpus: 2,
                     mem_mib: 512,
+                    shares: vec![
+                        ShareRef {
+                            tag: "root".into(),
+                            host_root: "/k/rootfs".into(),
+                        },
+                        ShareRef {
+                            tag: "workspace".into(),
+                            host_root: "/tmp/ws".into(),
+                        },
+                    ],
                 }),
                 json!({
                     "version": "0.1.0",
@@ -495,6 +528,10 @@ mod tests {
                     "cmdline": "console=ttyS0 quiet",
                     "vcpus": 2,
                     "mem_mib": 512,
+                    "shares": [
+                        {"tag": "root", "host_root": "/k/rootfs"},
+                        {"tag": "workspace", "host_root": "/tmp/ws"},
+                    ],
                 }),
             ),
             (
@@ -805,6 +842,7 @@ mod tests {
                     cmdline: String::new(),
                     vcpus: 1,
                     mem_mib: 128,
+                    shares: Vec::new(),
                 }),
                 json!({
                     "version": "0.1.0",
@@ -906,6 +944,25 @@ mod tests {
                 payload.kind()
             );
             assert!(data.is_object(), "{}: data is an object", payload.kind());
+        }
+    }
+
+    /// `shares` came after the first logs: a `vmm.start` without it (no
+    /// shares, or written before it existed) still reads, as no shares.
+    #[test]
+    fn a_vmm_start_without_shares_reads_as_none() {
+        let data = json!({
+            "version": "0.1.0",
+            "kernel": {"path": "/k/vmlinux", "blake3": b3(0x11)},
+            "initramfs": null,
+            "cmdline": "",
+            "vcpus": 1,
+            "mem_mib": 128,
+        });
+        let rec = record("vmm.start", Source::Vmm, data);
+        match Payload::from_record(&rec).unwrap() {
+            Payload::VmmStart(start) => assert!(start.shares.is_empty()),
+            other => panic!("not a vmm.start: {other:?}"),
         }
     }
 

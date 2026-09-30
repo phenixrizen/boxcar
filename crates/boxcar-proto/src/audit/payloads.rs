@@ -53,6 +53,15 @@ pub struct ArtifactRef {
     pub blake3: Hash,
 }
 
+/// A directory the VM was given over virtio-fs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShareRef {
+    /// The share's tag, such as `root` or `workspace`.
+    pub tag: String,
+    /// The host directory it serves.
+    pub host_root: String,
+}
+
 /// `vmm.start`: the VM was built and is about to run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmmStart {
@@ -63,6 +72,10 @@ pub struct VmmStart {
     pub cmdline: String,
     pub vcpus: u32,
     pub mem_mib: u64,
+    /// The virtio-fs shares, in slot order. Omitted when there are none,
+    /// and read as none when absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<ShareRef>,
 }
 
 /// `vmm.stop`: the VM stopped.

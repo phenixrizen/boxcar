@@ -98,6 +98,7 @@ fn golden_records() -> Vec<Record> {
             cmdline: "console=ttyS0 reboot=k panic=1".into(),
             vcpus: 2,
             mem_mib: 512,
+            shares: Vec::new(),
         }),
         None,
         None,
