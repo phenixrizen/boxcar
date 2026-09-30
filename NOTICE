@@ -1,0 +1,30 @@
+boxcar
+Copyright 2026 The boxcar Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes code derived from the following projects. Each derived file keeps
+its original copyright header in addition to the boxcar header, and the
+original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
+
+  Firecracker (https://github.com/firecracker-microvm/firecracker)
+    Copyright Amazon.com, Inc. or its affiliates. Apache-2.0.
+    Portions Copyright 2017 The Chromium OS Authors. BSD-3-Clause.
+    Used for: x86_64 boot setup (memory layout, MP table, page tables, GDT,
+    registers, MSRs), the device bus, the virtio-mmio transport tests, the
+    vsock Unix-socket protocol, and the guest kernel configuration.
+
+  Cloud Hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor)
+    Copyright Intel Corporation and contributors. Apache-2.0.
+    Portions Copyright 2017 The Chromium OS Authors. BSD-3-Clause.
+    Used for: the vsock connection state machine and Unix muxer, CPUID patching.
+
+  rust-vmm virtio-device (https://github.com/rust-vmm/vm-virtio, tag virtio-queue-v0.17.0)
+    Copyright The Chromium OS Authors and rust-vmm contributors. Apache-2.0 OR MIT.
+    Used for: the virtio device trait and virtio-mmio register map in boxcar-virtio.
+
+  rust-vmm vmm-reference (https://github.com/rust-vmm/vmm-reference)
+    Apache-2.0 OR BSD-3-Clause. Used for: structure of the MMIO bus and IRQ wiring.
+
+Entries are added here whenever a file is ported. A file that is ported must
+name its source repository and commit in its header.
