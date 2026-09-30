@@ -17,7 +17,7 @@
 - **No git dependencies and no `[patch]` sections.** `Cargo.lock` must contain no `git+` source. `cargo tree -d` must show no duplicate rust-vmm crate.
 - Every new source file starts with `// SPDX-License-Identifier: Apache-2.0` and `// Copyright 2026 The boxcar Authors`. A file ported from Firecracker, Cloud Hypervisor, or rust-vmm keeps that project's original header above ours, names the source repository, path, and commit in a comment, and gets an entry in `NOTICE`.
 - Commands are argv arrays. Never build a shell string from user input.
-- Every commit: `git commit -s` (adds `Signed-off-by`), subject `area: summary` in the imperative, and the body ends with these two lines exactly:
+- Every commit: `git commit -s` (which appends `Signed-off-by` last), subject `area: summary` in the imperative, and the body's trailer block contains these two lines exactly:
   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
   `Claude-Session: https://claude.ai/code/session_01Xm6wxRmFTbEVJQ7zrfbuJX`
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace` (or `cargo test --workspace`), and `cargo deny check` must pass at the end of every task. Test output must be pristine: no warnings.
@@ -94,7 +94,7 @@
 - [ ] Add the dev-dependency features, make it compile and pass.
 - [ ] Commit: `fs: pin-set canary for virtio-queue type unification`.
 
-**Verify:** `cargo test -p boxcar-fs dep_check` passes; `cargo tree -d` still prints no rust-vmm duplicate.
+**Verify:** `cargo test -p boxcar-fs dep_check` passes; no rust-vmm crate appears as a duplicated root line in `cargo tree -d` (dependents listed under a duplicated transitive crate do not count) and `cargo deny check bans` passes.
 
 ---
 
@@ -326,7 +326,7 @@ Smoke test (`tests/smoke.rs`, `#![cfg(feature = "kvm-tests")]`, skips with a pri
 - [ ] Run `cargo xtask initramfs`.
 - [ ] Commit: `init: PID 1 hello mode; xtask: reproducible initramfs`.
 
-**Verify:** `cpio -itv < target/guest/initramfs.cpio` lists `init` with mode `-rwxr-xr-x` and `dev/console` with `crw-------` and `5, 1`; `file target/x86_64-unknown-linux-musl/guest/boxcar-init` reports `statically linked`; running `cargo xtask initramfs` twice prints the same blake3.
+**Verify:** `cpio -itv < target/guest/initramfs.cpio` lists `init` with mode `-rwxr-xr-x` and `dev/console` with `crw-------` and `5, 1`; `readelf -l target/x86_64-unknown-linux-musl/guest/boxcar-init | grep -c INTERP` prints `0` (a static-pie; `file` 5.38 misreports it as dynamically linked); running `cargo xtask initramfs` twice prints the same blake3.
 
 ---
 
