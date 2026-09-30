@@ -207,8 +207,8 @@ pub enum Priority { Normal, Critical }   // Critical forces fdatasync right afte
 pub struct Submission { pub ring: Ring, pub ts_guest_ns: Option<u64>, pub subject: Option<Subject>, pub payload: Payload, pub span: Option<SpanRef>, pub priority: Priority }
 #[derive(Clone)] pub struct AuditSink { /* crossbeam Sender<Submission>, plus an Arc<AtomicU64> dropped counter */ }
 impl AuditSink {
-    pub fn emit(&self, s: Submission) -> Result<(), SinkClosed>;   // blocking send; for never-drop events
-    pub fn try_emit(&self, s: Submission) -> bool;                  // non-blocking; increments dropped on full
+    pub fn emit(&self, s: Submission) -> Result<(), EmitError>;    // blocking send; for never-drop events. EmitError::{Closed, Checkpoint} (a producer may not submit Payload::Checkpoint)
+    pub fn try_emit(&self, s: Submission) -> bool;                  // never waits (try_read on the close gate); increments dropped only when the channel is full
     pub fn dropped(&self) -> u64;
 }
 
