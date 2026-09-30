@@ -10,7 +10,7 @@ repository.workspace = true
 # `hash` gates everything that needs blake3 (a C build). The static musl guest
 # init depends on this crate with default features off so it needs no C compiler.
 default = ["hash"]
-hash = ["dep:blake3", "dep:hex"]
+hash = ["dep:blake3"]
 
 [dependencies]
 serde = { workspace = true }
@@ -19,4 +19,3 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
