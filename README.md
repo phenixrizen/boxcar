@@ -41,6 +41,17 @@ says otherwise). To check that its log is intact:
 cargo run -p boxcar -- audit verify ~/.local/share/boxcar/sessions/<session-id>
 ```
 
+### Rootfs persistence
+
+The guest owns the `--rootfs` directory and changes it in place: what a
+session writes outside `/workspace` (a package installed, a file in `/tmp`
+or `/root`) is there for the next session that boots from the same
+directory. Sessions must not share one rootfs directory at the same time.
+Until the per-session overlay lands, give each session a fresh copy (for
+example `cp -a target/guest/rootfs-alpine /tmp/rootfs-1`), or run
+`cargo xtask rootfs alpine` again to start from a clean one. The session's
+`vmm.start` record names the host directory behind each share.
+
 ## What you get
 
 Every file operation the guest makes on its root filesystem and its
@@ -79,6 +90,35 @@ and the blake3 of the file as it was when it was closed. Each record's
   "hash": "b3:c383911bcb6384aa0f182498dd8d7be0cdc2ed36245fcdda8d92dd5e11f9ed04"
 }
 ```
+
+## What the log does and does not capture
+
+- At the default (`--audit-level normal`) the log records opens, creates,
+  closes and every change (unlink, rename, mkdir, setattr, ...), and denied
+  lookups. It does not record reads, writes, lookups, `getattr` or
+  directory listings one by one: what went through a handle is summed up in
+  its `fs.close`. `--audit-level verbose` adds reads, writes and listings,
+  which may be dropped (and counted) when the log is busy.
+- The hash in `fs.close` is best effort. The file is read again by path
+  after the close; if it changed in the meantime (another handle wrote to
+  it, or the path now names another file) the close says `raced` instead
+  of giving a hash, and a file over 64 MiB is `skipped_size`.
+- `fs.denied` is mostly dormant. The guest's kernel checks permissions
+  itself and refuses most accesses before they reach the host, and on the
+  host every request is served with your permissions (the guest's ids are
+  recorded, not enforced there), so a denial is recorded only when your
+  own permissions refuse it.
+- Reads the guest kernel serves from its page cache never reach the host
+  and are not seen. The root filesystem is cached aggressively; the
+  workspace is revalidated.
+- If the log cannot be written (a full disk, an I/O error), boxcar stops
+  the VM, refuses every further change to the shares with EIO in the
+  meantime, and exits 3 with `audit log failed: <why>`. The records the
+  guest's last operations produced before the failure may be lost; the log
+  is cut back to its last complete record and still verifies.
+- `boxcar audit verify` proves that the chain is intact and complete up to
+  its last record: nothing was changed, removed or reordered. It does not
+  prove that the session ended cleanly; look for its `vmm.stop`.
 
 Licensed under Apache-2.0. Ported code keeps its original notices; see
 [NOTICE](NOTICE).
