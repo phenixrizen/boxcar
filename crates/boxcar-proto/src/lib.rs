@@ -4,6 +4,7 @@
 //! Audit record schema and wire types shared by the host and the guest.
 //!
 //! - [`audit`]: the record envelope, its hash chain, and the typed payloads.
+//! - [`guestcmd`]: the session command on the kernel command line.
 //! - [`ids`]: session identifiers.
 //! - [`limits`]: size limits for record fields, and the cut that enforces them.
 //! - [`redact`]: scrubbing secrets out of a value before it is recorded.
@@ -17,6 +18,7 @@
 //! way.
 
 pub mod audit;
+pub mod guestcmd;
 pub mod ids;
 pub mod limits;
 pub mod redact;
@@ -29,4 +31,5 @@ pub use audit::{
     HashStatus, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, Source, SpanRef, Subject,
     VmmStart, VmmStop, SCHEMA_VERSION,
 };
+pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};
