@@ -50,17 +50,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     eprintln!("session: {session_id}");
     eprintln!("audit: {}", writer.session_dir().display());
 
-    let fs_shares = match rootfs {
+    let (fs_shares, mode) = match rootfs {
         Some(rootfs) => {
             let workspace = match workspace {
                 Some(dir) => dir,
                 None => new_workspace(writer.session_dir())?,
             };
             eprintln!("workspace: {}", workspace.display());
-            shares(rootfs, workspace)
+            let (uid, gid) = invoking_user();
+            (shares(rootfs, workspace), GuestMode::Console { uid, gid })
         }
         // clap requires --rootfs unless --no-fs.
-        None => Vec::new(),
+        None => (Vec::new(), GuestMode::Hello),
     };
 
     let cfg = VmConfig {
@@ -68,7 +69,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         initramfs: args.initramfs,
         mem_mib: args.mem_mib,
         vcpus: args.vcpus,
-        cmdline_extra: args.cmdline_extra,
+        cmdline_extra: guest_cmdline(mode, &args.cmdline_extra),
         debug_boot: args.debug_boot,
         console: match args.console_log {
             Some(path) => ConsoleOut::File(path),
@@ -155,4 +156,85 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+/// What the guest init is told to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestMode {
+    /// Mount the shares and run the session on the serial console as this
+    /// user and group.
+    Console { uid: u32, gid: u32 },
+    /// Print a marker and reboot: a boot without shares has nothing to run.
+    Hello,
+}
+
+/// The `boxcar.*` keys for `mode`, then `extra` (`--cmdline-extra`), in
+/// order. The user's values come last so they win: init keeps the last of
+/// a repeated key.
+fn guest_cmdline(mode: GuestMode, extra: &[String]) -> Vec<String> {
+    let mut cmdline = match mode {
+        GuestMode::Console { uid, gid } => vec![
+            "boxcar.mode=console".to_owned(),
+            format!("boxcar.uid={uid}"),
+            format!("boxcar.gid={gid}"),
+        ],
+        GuestMode::Hello => vec!["boxcar.mode=hello".to_owned()],
+    };
+    cmdline.extend_from_slice(extra);
+    cmdline
+}
+
+/// The invoking user's real uid and gid, which the guest session runs as:
+/// the host-side filesystem acts as this user, so files the session creates
+/// belong to it on both sides.
+fn invoking_user() -> (u32, u32) {
+    // SAFETY: getuid and getgid take no arguments, touch no memory and
+    // cannot fail.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|&a| a.to_owned()).collect()
+    }
+
+    #[test]
+    fn shares_run_the_console_init_as_the_invoking_user() {
+        let mode = GuestMode::Console {
+            uid: 1000,
+            gid: 1001,
+        };
+        assert_eq!(
+            guest_cmdline(mode, &[]),
+            ["boxcar.mode=console", "boxcar.uid=1000", "boxcar.gid=1001"]
+        );
+    }
+
+    #[test]
+    fn the_extras_follow_so_they_can_override() {
+        let mode = GuestMode::Console { uid: 0, gid: 0 };
+        let extra = strings(&["boxcar.mode=hello", "loglevel=7"]);
+        assert_eq!(
+            guest_cmdline(mode, &extra),
+            [
+                "boxcar.mode=console",
+                "boxcar.uid=0",
+                "boxcar.gid=0",
+                "boxcar.mode=hello",
+                "loglevel=7"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_shares_boot_the_hello_init() {
+        let extra = strings(&["panic=0"]);
+        assert_eq!(
+            guest_cmdline(GuestMode::Hello, &extra),
+            ["boxcar.mode=hello", "panic=0"]
+        );
+    }
 }

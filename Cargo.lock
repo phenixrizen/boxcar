@@ -129,6 +129,7 @@ dependencies = [
  "boxcar-proto",
  "boxcar-vmm",
  "clap",
+ "libc",
  "serde_json",
  "tempfile",
  "tracing",

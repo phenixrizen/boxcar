@@ -635,10 +635,43 @@ pub const AUDITED_OPCODES: [u32; 25] = [
     45, // RENAME2
 ];
 
+/// The FUSE opcodes `AuditFs` forwards without recording, deliberately:
+/// they read (attributes, links, extended attributes, directory handles,
+/// offsets) or carry no state the audit tracks (flushes, syncs, interrupts,
+/// and the ioctl and poll the passthrough refuses). `SYNCFS` comes with
+/// every `sync()` in the guest, init's before it reboots too; fuse-backend-rs
+/// 0.14.0 has no `Opcode` for it and answers `ENOSYS` without reaching the
+/// filesystem. With [`AUDITED_OPCODES`] these make up the opcodes the audit
+/// models.
+pub const UNRECORDED_OPCODES: [u32; 15] = [
+    3,  // GETATTR
+    5,  // READLINK
+    17, // STATFS
+    20, // FSYNC
+    22, // GETXATTR
+    23, // LISTXATTR
+    25, // FLUSH
+    27, // OPENDIR
+    29, // RELEASEDIR
+    30, // FSYNCDIR
+    36, // INTERRUPT
+    39, // IOCTL
+    40, // POLL
+    46, // LSEEK
+    50, // SYNCFS
+];
+
+/// Whether the audit models `opcode`: records it ([`AUDITED_OPCODES`]) or
+/// deliberately leaves it out ([`UNRECORDED_OPCODES`]).
+fn is_modelled(opcode: u32) -> bool {
+    AUDITED_OPCODES.contains(&opcode) || UNRECORDED_OPCODES.contains(&opcode)
+}
+
 /// Counts the requests a device sees by opcode, as the server's
 /// [`MetricsHook`], and logs a warning the first time the guest uses an
-/// opcode the audit does not record ([`AUDITED_OPCODES`]). Opcodes from 64
-/// up are counted, and warned about, together.
+/// opcode the audit does not model: one in neither [`AUDITED_OPCODES`] nor
+/// [`UNRECORDED_OPCODES`]. Opcodes from 64 up are counted, and warned
+/// about, together.
 pub struct OpcodeCounts {
     tag: String,
     counts: [AtomicU64; OPCODE_SLOTS + 1],
@@ -662,11 +695,11 @@ impl OpcodeCounts {
     }
 
     /// Counts one request with `opcode`. Returns whether it is to be
-    /// logged: the first time an opcode the audit does not record is seen.
+    /// logged: the first time an opcode the audit does not model is seen.
     fn note(&self, opcode: u32) -> bool {
         let slot = slot(opcode);
         self.counts[slot].fetch_add(1, Ordering::Relaxed);
-        !AUDITED_OPCODES.contains(&opcode) && !self.warned[slot].swap(true, Ordering::Relaxed)
+        !is_modelled(opcode) && !self.warned[slot].swap(true, Ordering::Relaxed)
     }
 }
 
@@ -675,7 +708,7 @@ impl MetricsHook for OpcodeCounts {
         if self.note(ih.opcode) {
             warn!(
                 tag = %self.tag,
-                "virtio-fs: the guest sent FUSE_{} ({}), which the audit does not record; \
+                "virtio-fs: the guest sent FUSE_{} ({}), which the audit does not model; \
                  further requests of this kind are only counted",
                 opcode_name(ih.opcode),
                 ih.opcode
@@ -760,18 +793,24 @@ mod tests {
     const GETATTR: u32 = 3;
     const OPEN: u32 = 14;
     const FLUSH: u32 = 25;
+    const GETLK: u32 = 31;
+    const COPY_FILE_RANGE: u32 = 47;
 
     #[test]
-    fn every_opcode_is_counted_and_each_unaudited_one_logged_once() {
+    fn every_opcode_is_counted_and_each_unmodelled_one_logged_once() {
         let counts = OpcodeCounts::new("root");
         assert!(!counts.note(LOOKUP), "lookups are audited");
         assert!(!counts.note(LOOKUP));
-        assert!(counts.note(GETATTR), "the first getattr is logged");
-        assert!(!counts.note(GETATTR), "and only the first");
-        assert!(counts.note(FLUSH), "each opcode once");
+        assert!(!counts.note(GETATTR), "getattr is read-only: never logged");
+        assert!(!counts.note(FLUSH), "flush is state-free: never logged");
+        assert!(counts.note(GETLK), "the first getlk is logged");
+        assert!(!counts.note(GETLK), "and only the first");
+        assert!(counts.note(COPY_FILE_RANGE), "each opcode once");
         assert_eq!(counts.count(LOOKUP), 2);
-        assert_eq!(counts.count(GETATTR), 2);
+        assert_eq!(counts.count(GETATTR), 1);
         assert_eq!(counts.count(FLUSH), 1);
+        assert_eq!(counts.count(GETLK), 2);
+        assert_eq!(counts.count(COPY_FILE_RANGE), 1);
         assert_eq!(counts.count(OPEN), 0);
 
         // Opcodes from 64 up share one counter and one warning.
@@ -788,6 +827,55 @@ mod tests {
         counts.collect(&header);
         counts.release(None);
         assert_eq!(counts.count(OPEN), 1);
+    }
+
+    #[test]
+    fn the_unrecorded_opcodes_are_the_read_only_and_state_free_ones() {
+        let names: Vec<&str> = UNRECORDED_OPCODES
+            .iter()
+            .map(|&op| opcode_name(op))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "GETATTR",
+                "READLINK",
+                "STATFS",
+                "FSYNC",
+                "GETXATTR",
+                "LISTXATTR",
+                "FLUSH",
+                "OPENDIR",
+                "RELEASEDIR",
+                "FSYNCDIR",
+                "INTERRUPT",
+                "IOCTL",
+                "POLL",
+                "LSEEK",
+                "SYNCFS",
+            ]
+        );
+        for op in UNRECORDED_OPCODES {
+            assert!(
+                !AUDITED_OPCODES.contains(&op),
+                "{} is in both",
+                opcode_name(op)
+            );
+        }
+    }
+
+    /// What a shell session can still be warned about: locks, mappings,
+    /// server-side copies and whatever `linux/fuse.h` adds, which the audit
+    /// would have to model before they go quiet.
+    #[test]
+    fn the_rest_is_still_logged() {
+        let logged: Vec<u32> = (1..=52).filter(|&op| !is_modelled(op)).collect();
+        assert_eq!(
+            logged,
+            [7, 19, 31, 32, 33, 37, 41, 47, 48, 49, 51, 52],
+            "{:?}",
+            logged.iter().map(|&op| opcode_name(op)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

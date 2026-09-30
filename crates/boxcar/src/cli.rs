@@ -31,10 +31,11 @@ pub enum Command {
     ///
     /// Shares `--rootfs` with the guest as its root filesystem and
     /// `--workspace` at /workspace, both over virtio-fs, and records what
-    /// the guest does to them. Prints the session id, its audit log
-    /// directory and the workspace on stderr, runs the guest with its serial
-    /// console on stdout (or in `--console-log`), and exits when it stops:
-    /// 0 when the guest reset or shut down, 1 after a
+    /// the guest does to them. The guest runs a login shell on its serial
+    /// console as the invoking user's uid and gid. Prints the session id,
+    /// its audit log directory and the workspace on stderr, runs the guest
+    /// with its serial console on stdout (or in `--console-log`), and exits
+    /// when it stops: 0 when the guest reset or shut down, 1 after a
     /// vCPU error, 130 after SIGINT (Ctrl-C) or the console escape, 143
     /// after SIGTERM. When stdin is a terminal and the console is on stdout,
     /// every key goes to the guest, Ctrl-C included; press Ctrl-] twice
@@ -96,7 +97,8 @@ pub struct RunArgs {
     /// the session's audit directory.
     #[arg(long, value_name = "DIR", conflicts_with = "no_fs")]
     pub workspace: Option<PathBuf>,
-    /// Boot without filesystem shares.
+    /// Boot without filesystem shares: the guest init prints a marker and
+    /// reboots.
     #[arg(long)]
     pub no_fs: bool,
     /// What the shares record: `normal` (opens, closes with content hashes,
@@ -104,7 +106,9 @@ pub struct RunArgs {
     /// directory listing).
     #[arg(long, value_enum, value_name = "LEVEL", default_value_t = AuditLevelArg::Normal)]
     pub audit_level: AuditLevelArg,
-    /// An extra kernel command line argument. Repeatable.
+    /// An extra kernel command line argument. Repeatable. These follow the
+    /// `boxcar.mode`, `boxcar.uid` and `boxcar.gid` keys boxcar sets, so
+    /// they can override them.
     #[arg(long, value_name = "STR")]
     pub cmdline_extra: Vec<String>,
     /// Early printk on the serial console and every kernel message.
