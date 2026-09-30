@@ -5,5 +5,6 @@
 
 pub mod arch;
 pub mod cmdline;
+pub mod devices;
 pub mod kvm;
 pub mod memory;
