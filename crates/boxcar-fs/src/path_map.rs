@@ -28,7 +28,7 @@ pub const ROOT_INO: u64 = 1;
 const MAX_DEPTH: usize = 4096;
 
 /// A host file's identity: `st_dev` and `st_ino`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId {
     pub dev: u64,
     pub ino: u64,

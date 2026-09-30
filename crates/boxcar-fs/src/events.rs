@@ -22,9 +22,17 @@
 //! `fs.readdir`, and never waits: on a full channel the event is dropped
 //! and counted by the sink.
 //!
-//! A closed log does not fail the guest's filesystem: the operation has
-//! already happened, and refusing its reply would only break the guest
-//! during shutdown. The first refusal is logged at error level.
+//! A closed log does not fail the guest's filesystem: the log is closed
+//! only once the VM has stopped, the operation has already happened, and
+//! refusing its reply would only break the guest during shutdown. The first
+//! refusal is logged at error level.
+//!
+//! A failed log is different: the writer thread hit an I/O error (a full
+//! disk, say) while the guest runs. Then nothing more can be recorded, so
+//! nothing more may change: [`Events::log_failed`] turns true and `AuditFs`
+//! refuses every change with EIO from then on (it fails closed), while the
+//! VMM stops the VM. The first refusal is logged at error level with the
+//! writer's reason.
 
 use std::ffi::CStr;
 use std::io;
@@ -73,6 +81,12 @@ impl Events {
         }
     }
 
+    /// Whether the audit log's writer has failed, so that nothing more can
+    /// be recorded.
+    pub(crate) fn log_failed(&self) -> bool {
+        self.sink.has_failed()
+    }
+
     /// The share's tag, for the `mount` field of every event.
     pub(crate) fn mount(&self) -> String {
         self.mount.clone()
@@ -99,7 +113,7 @@ impl Events {
                     tracing::error!(
                         mount = %self.mount,
                         "the audit log failed ({reason}); filesystem events are no longer \
-                         recorded"
+                         recorded and changes are refused with EIO"
                     );
                 }
             }

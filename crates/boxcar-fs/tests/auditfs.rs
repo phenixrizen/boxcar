@@ -14,8 +14,11 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use boxcar_audit::{spawn, verify_session, LogReader, WriterConfig, WriterHandle};
+use boxcar_audit::{
+    spawn, spawn_with_syncer, verify_session, LogReader, Syncer, WriterConfig, WriterHandle,
+};
 use boxcar_fs::{
     passthrough_config, AuditFs, AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig,
 };
@@ -70,13 +73,42 @@ struct Share {
     writer: WriterHandle,
 }
 
+/// A disk that refuses every sync.
+struct FullDisk;
+
+impl Syncer for FullDisk {
+    fn sync(&self, _: &File) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+}
+
 impl Share {
     fn new(level: AuditLevel, hash_max_bytes: u64) -> Share {
         let dir = TempDir::new().unwrap();
+        let log = WriterConfig::new(dir.path().join("data"), SessionId::new());
+        let (sink, writer) = spawn(log).expect("start the audit writer");
+        Share::with_log(dir, level, hash_max_bytes, sink, writer)
+    }
+
+    /// A share whose audit log fails at its first record: every record is
+    /// checkpointed, and every sync fails.
+    fn failing_log() -> Share {
+        let dir = TempDir::new().unwrap();
+        let mut log = WriterConfig::new(dir.path().join("data"), SessionId::new());
+        log.checkpoint_every = 1;
+        let (sink, writer) = spawn_with_syncer(log, FullDisk).expect("start the audit writer");
+        Share::with_log(dir, AuditLevel::Normal, HASH_MAX, sink, writer)
+    }
+
+    fn with_log(
+        dir: TempDir,
+        level: AuditLevel,
+        hash_max_bytes: u64,
+        sink: boxcar_audit::AuditSink,
+        writer: WriterHandle,
+    ) -> Share {
         let root = dir.path().join("share");
         fs::create_dir(&root).unwrap();
-        let (sink, writer) = spawn(WriterConfig::new(dir.path().join("data"), SessionId::new()))
-            .expect("start the audit writer");
         let config = share_config(&root);
         let inner = PassthroughFs::<()>::new(passthrough_config(&config)).unwrap();
         inner.import().unwrap();
@@ -1023,6 +1055,125 @@ fn other_mutations_are_recorded() {
         }
         other => panic!("not an fs.setattr: {other:?}"),
     }
+}
+
+fn is_eio<T: std::fmt::Debug>(result: io::Result<T>) -> bool {
+    match result {
+        Err(e) => e.raw_os_error() == Some(libc::EIO),
+        Ok(v) => panic!("succeeded: {v:?}"),
+    }
+}
+
+/// Once the audit log has failed, nothing the guest changes could be
+/// recorded, so every change is refused with EIO and reaches no host file;
+/// reads are still served.
+#[test]
+fn once_the_log_fails_changes_are_refused_with_eio_and_reads_still_work() {
+    let share = Share::failing_log();
+    fs::write(share.root.join("data"), b"old contents").unwrap();
+    fs::create_dir(share.root.join("dir")).unwrap();
+    let fs = &share.fs;
+    let data = lookup(fs, ROOT_ID, "data");
+    let dir = lookup(fs, ROOT_ID, "dir");
+    // The fs.open is the first record, and its checkpoint fails the log.
+    let rw = open(fs, data.inode, libc::O_RDWR as u32);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while share.writer.failure().is_none() {
+        assert!(Instant::now() < deadline, "the audit log did not fail");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let name = cstr("new");
+    assert!(is_eio(fs.write(
+        &GUEST,
+        data.inode,
+        rw,
+        &mut payload(b"new"),
+        3,
+        0,
+        None,
+        false,
+        RW_CREATE,
+        0
+    )));
+    assert!(is_eio(fs.create(
+        &GUEST,
+        ROOT_ID,
+        &name,
+        create_args(RW_CREATE)
+    )));
+    for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC] {
+        assert!(
+            is_eio(fs.open(&GUEST, data.inode, flags as u32, 0)),
+            "{flags:#o}"
+        );
+    }
+    assert!(is_eio(fs.unlink(&GUEST, ROOT_ID, &cstr("data"))));
+    assert!(is_eio(fs.rmdir(&GUEST, ROOT_ID, &cstr("dir"))));
+    assert!(is_eio(fs.rename(
+        &GUEST,
+        ROOT_ID,
+        &cstr("data"),
+        dir.inode,
+        &name,
+        0
+    )));
+    assert!(is_eio(fs.mkdir(&GUEST, ROOT_ID, &name, 0o755, 0o022)));
+    assert!(is_eio(fs.mknod(
+        &GUEST,
+        ROOT_ID,
+        &name,
+        libc::S_IFIFO | 0o644,
+        0,
+        0o022
+    )));
+    assert!(is_eio(fs.symlink(&GUEST, &cstr("data"), ROOT_ID, &name)));
+    assert!(is_eio(fs.link(&GUEST, data.inode, ROOT_ID, &name)));
+    // SAFETY: stat64 is plain data; all-zero is a valid value.
+    let attr: libc::stat64 = unsafe { std::mem::zeroed() };
+    assert!(is_eio(fs.setattr(
+        &GUEST,
+        data.inode,
+        attr,
+        Some(rw),
+        SetattrValid::SIZE
+    )));
+    assert!(is_eio(fs.fallocate(&GUEST, data.inode, rw, 0, 0, 4096)));
+    assert!(is_eio(fs.setxattr(
+        &GUEST,
+        data.inode,
+        &cstr("user.k"),
+        b"v",
+        0
+    )));
+    assert!(is_eio(fs.removexattr(&GUEST, data.inode, &cstr("user.k"))));
+
+    // Nothing reached the host.
+    assert_eq!(fs::read(share.root.join("data")).unwrap(), b"old contents");
+    assert!(share.root.join("dir").is_dir());
+    let mut names: Vec<_> = fs::read_dir(&share.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data", "dir"]);
+
+    // Reads are still served, through a new read-only handle and the old
+    // read-write one.
+    let ro = open(fs, data.inode, libc::O_RDONLY as u32);
+    for fh in [ro, rw] {
+        let mut out = tempfile::tempfile().unwrap();
+        let n = fs
+            .read(&GUEST, data.inode, fh, &mut out, 64, 0, None, 0)
+            .expect("read");
+        assert_eq!(n, 12);
+        let mut back = String::new();
+        out.seek(SeekFrom::Start(0)).unwrap();
+        out.read_to_string(&mut back).unwrap();
+        assert_eq!(back, "old contents");
+    }
+    release(fs, data.inode, ro);
+    release(fs, data.inode, rw);
 }
 
 /// Lookups are recorded only when refused for lack of permission; at the

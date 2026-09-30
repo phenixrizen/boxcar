@@ -18,12 +18,18 @@
 //!   file the guest closed (same `st_dev` and `st_ino`) and a regular file;
 //!   its size and mtime must not change while it is read, and exactly its
 //!   size must be read.
+//! - the fstat checks catch only a change made while the file is read. A
+//!   change made after the close but before the hash starts, through
+//!   another handle, is caught by [`Generations`]: from the close on, the
+//!   job watches its file, every write, truncate, fallocate or create that
+//!   reaches the file moves the file's generation, and a hash whose file's
+//!   generation moved is `raced`, not `ok`.
 //!
 //! `hash_status` says how that went: `ok` (with `blake3` and `size`), `raced`
-//! (the file changed, or the path now names another file), `gone` (the path
-//! no longer exists), `skipped_size` (larger than `hash_max_bytes`, with
-//! `size`), or `error` (anything else, such as a path that now crosses a
-//! symlink or leaves the share).
+//! (the file changed after the close, or the path now names another file),
+//! `gone` (the path no longer exists), `skipped_size` (larger than
+//! `hash_max_bytes`, with `size`), or `error` (anything else, such as a path
+//! that now crosses a symlink or leaves the share).
 //!
 //! The job queue is bounded, and when it is full `release` waits for room.
 //! That bounded wait on the reply path is deliberate: dropping hashes when
@@ -39,6 +45,7 @@
 //! [`HashWorker::flush`] cannot wait for it forever; `flush` also returns
 //! once every worker has stopped, leaving any jobs still queued unhashed.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read};
@@ -83,6 +90,101 @@ pub struct HashJob {
     /// The record to complete: everything but `size`, `blake3` and
     /// `hash_status`.
     pub close: FsClose,
+    /// The file's generation as of the close; a hash made after it moved is
+    /// `raced`.
+    pub(crate) watch: Option<Watch>,
+}
+
+/// A file as [`Generations`] tells files apart: by its host identity when
+/// that is known, else by its inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FileKey {
+    Host(FileId),
+    Inode(u64),
+}
+
+impl FileKey {
+    pub(crate) fn of(ino: u64, host: Option<FileId>) -> Self {
+        host.map_or(FileKey::Inode(ino), FileKey::Host)
+    }
+}
+
+/// Content changes to the files whose close is waiting to be hashed.
+///
+/// Only files a queued hash [`watch`](Generations::watch)es are tracked:
+/// an entry lives from the first close that queues a hash of the file
+/// until the last such hash is done, so the table holds at most as many
+/// files as there are jobs.
+#[derive(Debug, Default)]
+pub(crate) struct Generations {
+    files: Mutex<HashMap<FileKey, Tracked>>,
+}
+
+#[derive(Debug)]
+struct Tracked {
+    generation: u64,
+    /// Queued hashes watching the file.
+    watchers: u32,
+}
+
+impl Generations {
+    fn lock(&self) -> MutexGuard<'_, HashMap<FileKey, Tracked>> {
+        // Every update leaves the table consistent.
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The file's content may have changed. Moves its generation if a hash
+    /// of it is pending; otherwise nothing is tracked.
+    pub(crate) fn changed(&self, key: FileKey) {
+        if let Some(tracked) = self.lock().get_mut(&key) {
+            tracked.generation = tracked.generation.wrapping_add(1);
+        }
+    }
+
+    /// Starts watching the file for a hash about to be queued.
+    pub(crate) fn watch(self: &Arc<Self>, key: FileKey) -> Watch {
+        let mut files = self.lock();
+        let tracked = files.entry(key).or_insert(Tracked {
+            generation: 0,
+            watchers: 0,
+        });
+        tracked.watchers += 1;
+        Watch {
+            files: Arc::clone(self),
+            key,
+            generation: tracked.generation,
+        }
+    }
+}
+
+/// One queued hash's watch on its file. Dropping it stops watching.
+#[derive(Debug)]
+pub(crate) struct Watch {
+    files: Arc<Generations>,
+    key: FileKey,
+    generation: u64,
+}
+
+impl Watch {
+    /// Whether nothing changed the file since the watch began.
+    fn unchanged(&self) -> bool {
+        self.files
+            .lock()
+            .get(&self.key)
+            .is_some_and(|tracked| tracked.generation == self.generation)
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let mut files = self.files.lock();
+        if let Some(tracked) = files.get_mut(&self.key) {
+            tracked.watchers = tracked.watchers.saturating_sub(1);
+            if tracked.watchers == 0 {
+                files.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// What hashing one file found.
@@ -148,7 +250,16 @@ impl Shared {
             shared: self,
             inline,
         };
-        let outcome = (self.hash)(&self.root, &job.rel_path, job.expected, self.max_bytes);
+        let mut outcome = (self.hash)(&self.root, &job.rel_path, job.expected, self.max_bytes);
+        let moved = job.watch.as_ref().is_some_and(|watch| !watch.unchanged());
+        if outcome.status == HashStatus::Ok && moved {
+            // The content read is not the content the closer left.
+            outcome = HashOutcome {
+                size: outcome.size,
+                blake3: None,
+                status: HashStatus::Raced,
+            };
+        }
         let close = FsClose {
             size: outcome.size,
             blake3: outcome.blake3,
@@ -199,13 +310,9 @@ pub struct HashWorker {
 }
 
 impl HashWorker {
-    /// Starts the threads, named `fs-<tag>-hash<N>`. `root` is the share's
-    /// host directory; files larger than `max_bytes` are not hashed.
-    pub(crate) fn new(tag: &str, root: OwnedFd, max_bytes: u64, events: Arc<Events>) -> Self {
-        Self::with_hash(tag, root, max_bytes, events, hash_file)
-    }
-
-    /// [`new`](Self::new), hashing with `hash`.
+    /// Starts the threads, named `fs-<tag>-hash<N>`, which hash with `hash`
+    /// ([`hash_file`], except in tests). `root` is the share's host
+    /// directory; files larger than `max_bytes` are not hashed.
     pub(crate) fn with_hash(
         tag: &str,
         root: OwnedFd,
@@ -559,6 +666,7 @@ mod tests {
                 open_seq: None,
                 attrib: Attrib::Caller,
             },
+            watch: None,
         }
     }
 
@@ -613,6 +721,35 @@ mod tests {
         assert_eq!(worker.shared.counts().pending, 0);
         worker.shutdown();
         assert_eq!(closes(writer), [(2, HashStatus::Ok)]);
+    }
+
+    #[test]
+    fn generations_track_a_file_only_while_a_hash_watches_it() {
+        let generations = Arc::new(Generations::default());
+        let file = FileKey::Host(FileId { dev: 1, ino: 2 });
+        let other = FileKey::Inode(9);
+        // A change nothing watches is not remembered.
+        generations.changed(file);
+        assert!(generations.lock().is_empty());
+
+        let first = generations.watch(file);
+        assert!(first.unchanged());
+        generations.changed(other);
+        assert!(first.unchanged(), "another file's change");
+        generations.changed(file);
+        assert!(!first.unchanged());
+        // A second close of the file watches from its own close.
+        let second = generations.watch(file);
+        assert!(second.unchanged());
+        assert!(!first.unchanged());
+
+        drop(first);
+        assert_eq!(generations.lock().len(), 1);
+        drop(second);
+        assert!(
+            generations.lock().is_empty(),
+            "the last watch takes the entry away"
+        );
     }
 
     static GATE: Mutex<bool> = Mutex::new(false);

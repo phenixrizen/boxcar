@@ -31,6 +31,19 @@
 //! `lookup`, `create`, `mkdir`, `mknod`, `symlink`, `link` and each
 //! `readdirplus` entry add to the path map, `forget` and `batch_forget`
 //! take away, and `rename`, `unlink` and `rmdir` rename and delete in it.
+//!
+//! `write`, a `setattr` of the size, `fallocate`, `create` and an `open`
+//! with `O_TRUNC` move the file's generation (see
+//! [`Generations`](crate::hasher)), so a close whose hash is still queued
+//! when another handle changes the file is `raced`.
+//!
+//! Once the audit log has failed ([`Events::log_failed`]), every method
+//! that changes the share (`create`, `write`, `unlink`, `rmdir`, `rename`,
+//! `mkdir`, `mknod`, `symlink`, `link`, `setattr`, `fallocate`,
+//! `setxattr`, `removexattr`, and an `open` for writing or with `O_TRUNC`)
+//! returns EIO without reaching the wrapped filesystem: a change the log
+//! cannot record does not happen. Reads, lookups and releases are still
+//! served. A log closed cleanly, as the VM stops, refuses nothing.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -55,7 +68,7 @@ use crate::events::{
 };
 use crate::forward::squash;
 use crate::handles::{HandleEntry, HandleTable};
-use crate::hasher::{HashJob, HashWorker};
+use crate::hasher::{hash_file, FileKey, Generations, HashFn, HashJob, HashWorker};
 use crate::path_map::{FileId, PathMap};
 use crate::share::FsShareConfig;
 
@@ -111,6 +124,7 @@ pub struct AuditFs<F: FileSystem<Inode = u64, Handle = u64>> {
     handles: HandleTable,
     events: Arc<Events>,
     hasher: HashWorker,
+    generations: Arc<Generations>,
 }
 
 impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
@@ -124,12 +138,25 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
         sink: AuditSink,
         opts: AuditFsOptions,
     ) -> Self {
+        Self::with_hash(inner, share, host_root_fd, sink, opts, hash_file)
+    }
+
+    /// [`new`](Self::new), hashing closed files with `hash`.
+    pub(crate) fn with_hash(
+        inner: F,
+        share: &FsShareConfig,
+        host_root_fd: OwnedFd,
+        sink: AuditSink,
+        opts: AuditFsOptions,
+        hash: HashFn,
+    ) -> Self {
         let events = Arc::new(Events::new(sink, share.tag.clone()));
-        let hasher = HashWorker::new(
+        let hasher = HashWorker::with_hash(
             &share.tag,
             host_root_fd,
             opts.hash_max_bytes,
             Arc::clone(&events),
+            hash,
         );
         AuditFs {
             inner,
@@ -141,6 +168,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
             handles: HandleTable::new(),
             events,
             hasher,
+            generations: Arc::default(),
         }
     }
 
@@ -178,6 +206,23 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
 
     fn verbose(&self) -> bool {
         self.level == AuditLevel::Verbose
+    }
+
+    /// EIO once the audit log has failed: the change would go unrecorded,
+    /// so it is not made (see the module docs).
+    fn refuse_if_log_failed(&self) -> io::Result<()> {
+        if self.events.log_failed() {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The content of `ino` may have changed: a close of it still waiting
+    /// for its hash is `raced`.
+    fn content_changed(&self, ino: u64) {
+        let host = self.read_paths().host_id(ino);
+        self.generations.changed(FileKey::of(ino, host));
     }
 
     /// The path of `ino`, for a record.
@@ -258,6 +303,10 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
     /// Records `entry`'s close as `subject`: at once when nothing needs
     /// hashing, else once the hash worker has hashed the file.
     fn record_close(&self, fh: u64, entry: HandleEntry, subject: Subject, attrib: Attrib) {
+        if self.events.log_failed() {
+            // Nothing is recorded any more; the file need not be read.
+            return;
+        }
         let (path, rel_path, deleted, expected) = {
             let paths = self.read_paths();
             (
@@ -288,11 +337,15 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
         } else {
             match rel_path.map(CString::new) {
                 Some(Ok(rel_path)) => {
+                    // Watched from the close, before any later change can
+                    // reach the file.
+                    let watch = self.generations.watch(FileKey::of(entry.ino, expected));
                     self.hasher.submit(HashJob {
                         rel_path,
                         expected,
                         subject,
                         close,
+                        watch: Some(watch),
                     });
                     return;
                 }
@@ -314,6 +367,12 @@ fn host_id(attr: &stat64) -> FileId {
         dev: attr.st_dev,
         ino: attr.st_ino,
     }
+}
+
+/// Whether an open's access mode lets the handle write: anything but
+/// `O_RDONLY` (mode 3, "no access", counts as writing).
+fn opens_for_writing(flags: u32) -> bool {
+    flags as libc::c_int & libc::O_ACCMODE != libc::O_RDONLY
 }
 
 /// The mode a node is created with.
@@ -477,10 +536,12 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         handle: Option<u64>,
         valid: SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
+        self.refuse_if_log_failed()?;
         let path = self.path(inode);
         let result = self.inner.setattr(&squash(ctx), inode, attr, handle, valid);
-        if let (Ok(_), Some(fh)) = (&result, handle) {
-            if valid.contains(SetattrValid::SIZE) {
+        if result.is_ok() && valid.contains(SetattrValid::SIZE) {
+            self.content_changed(inode);
+            if let Some(fh) = handle {
                 self.handles.update(fh, |e| e.truncated = true);
             }
         }
@@ -502,6 +563,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         parent: u64,
         name: &CStr,
     ) -> io::Result<Entry> {
+        self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
         let result = self.inner.symlink(&squash(ctx), linkname, parent, name);
         if let Ok(entry) = &result {
@@ -526,6 +588,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         rdev: u32,
         umask: u32,
     ) -> io::Result<Entry> {
+        self.refuse_if_log_failed()?;
         let path = self.child(inode, name);
         let result = self
             .inner
@@ -552,6 +615,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         mode: u32,
         umask: u32,
     ) -> io::Result<Entry> {
+        self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
         let result = self.inner.mkdir(&squash(ctx), parent, name, mode, umask);
         if let Ok(entry) = &result {
@@ -568,6 +632,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn unlink(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
+        self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
         let result = self.inner.unlink(&squash(ctx), parent, name);
         if result.is_ok() {
@@ -583,6 +648,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn rmdir(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
+        self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
         let result = self.inner.rmdir(&squash(ctx), parent, name);
         if result.is_ok() {
@@ -606,6 +672,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
+        self.refuse_if_log_failed()?;
         let from = self.child(olddir, oldname);
         let to = self.child(newdir, newname);
         let result = self
@@ -632,6 +699,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn link(&self, ctx: &Context, inode: u64, newparent: u64, newname: &CStr) -> io::Result<Entry> {
+        self.refuse_if_log_failed()?;
         let target_path = self.path(inode);
         let path = self.child(newparent, newname);
         let result = self.inner.link(&squash(ctx), inode, newparent, newname);
@@ -655,12 +723,19 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
+        let truncates = flags & libc::O_TRUNC as u32 != 0;
+        if opens_for_writing(flags) || truncates {
+            self.refuse_if_log_failed()?;
+        }
         let path = self.path(inode);
         let result = self.inner.open(&squash(ctx), inode, flags, fuse_flags);
         let fh = match &result {
             Ok((handle, _, _)) => handle.unwrap_or(0),
             Err(_) => 0,
         };
+        if result.is_ok() && truncates {
+            self.content_changed(inode);
+        }
         if result.is_ok() {
             let entry = HandleEntry {
                 ino: inode,
@@ -672,7 +747,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                 bytes_written: 0,
                 wrote: false,
                 created: false,
-                truncated: flags & libc::O_TRUNC as u32 != 0,
+                truncated: truncates,
             };
             self.opened(fh, entry);
         }
@@ -696,6 +771,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+        self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
         let result = self.inner.create(&squash(ctx), parent, name, args);
         let fh = match &result {
@@ -704,6 +780,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         };
         if let Ok((entry, _, _, _)) = &result {
             self.remember(parent, name.to_bytes(), entry);
+            // Creating an existing file without O_EXCL opens it, and may
+            // truncate it.
+            self.content_changed(entry.inode);
             let handle = HandleEntry {
                 ino: entry.inode,
                 path_at_open: path.clone(),
@@ -789,6 +868,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
+        self.refuse_if_log_failed()?;
         let result = self.inner.write(
             &squash(ctx),
             inode,
@@ -802,6 +882,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
             fuse_flags,
         );
         let done = result.as_ref().map_or(0, |&n| n as u64);
+        if done > 0 {
+            self.content_changed(inode);
+        }
         let opener = self.handles.update(handle, |e| {
             e.bytes_written = e.bytes_written.saturating_add(done);
             e.wrote |= done > 0;
@@ -839,6 +922,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
+        self.refuse_if_log_failed()?;
         let path = self.path(inode);
         let result = self
             .inner
@@ -846,6 +930,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if result.is_ok() {
             // Allocating past the end, punching a hole or zeroing a range
             // all change what the file reads as.
+            self.content_changed(inode);
             self.handles.update(handle, |e| e.wrote = true);
         }
         let payload = Payload::FsFallocate(FsFallocate {
@@ -895,6 +980,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
+        self.refuse_if_log_failed()?;
         let path = self.path(inode);
         let result = self.inner.setxattr(&squash(ctx), inode, name, value, flags);
         let payload = Payload::FsXattr(FsXattr {
@@ -909,6 +995,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn removexattr(&self, ctx: &Context, inode: u64, name: &CStr) -> io::Result<()> {
+        self.refuse_if_log_failed()?;
         let path = self.path(inode);
         let result = self.inner.removexattr(&squash(ctx), inode, name);
         let payload = Payload::FsXattr(FsXattr {
@@ -1006,7 +1093,138 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::{Condvar, Mutex};
+
+    use boxcar_audit::{spawn, LogReader, WriterConfig};
+    use boxcar_proto::SessionId;
+    use fuse_backend_rs::api::filesystem::ROOT_ID;
+    use fuse_backend_rs::passthrough::PassthroughFs;
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::share::{passthrough_config, CachePolicyKind};
+
+    static GATE: Mutex<bool> = Mutex::new(false);
+    static GATE_OPENED: Condvar = Condvar::new();
+
+    /// Waits until the gate opens, then hashes as in production.
+    fn hash_after_the_gate(
+        root: &OwnedFd,
+        rel_path: &CString,
+        expected: Option<FileId>,
+        max: u64,
+    ) -> crate::hasher::HashOutcome {
+        let mut open = GATE.lock().unwrap();
+        while !*open {
+            open = GATE_OPENED.wait(open).unwrap();
+        }
+        drop(open);
+        hash_file(root, rel_path, expected, max)
+    }
+
+    fn payload(data: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(data).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
+    }
+
+    const GUEST: Context = Context {
+        uid: 1000,
+        gid: 1000,
+        pid: 42,
+    };
+
+    /// The content the first close hashed is the content its handle left
+    /// behind, or it is `raced`: a write through another handle after the
+    /// close, before the queued hash runs, is not the closer's.
+    #[test]
+    fn a_write_after_the_close_before_the_hash_makes_it_raced() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let (sink, writer) =
+            spawn(WriterConfig::new(dir.path().join("data"), SessionId::new())).unwrap();
+        let share = FsShareConfig {
+            tag: "workspace".into(),
+            host_dir: root.clone(),
+            guest_path: "/workspace".into(),
+            cache: CachePolicyKind::Auto,
+        };
+        let inner = PassthroughFs::<()>::new(passthrough_config(&share)).unwrap();
+        inner.import().unwrap();
+        let root_fd = OwnedFd::from(File::open(&root).unwrap());
+        let fs = AuditFs::with_hash(
+            inner,
+            &share,
+            root_fd,
+            sink,
+            AuditFsOptions::default(),
+            hash_after_the_gate,
+        );
+        let rw = (libc::O_RDWR | libc::O_CREAT) as u32;
+        let args = CreateIn {
+            flags: rw,
+            mode: libc::S_IFREG | 0o644,
+            umask: 0o022,
+            fuse_flags: 0,
+        };
+        let write = |ino, fh, data: &[u8]| {
+            let size = data.len() as u32;
+            fs.write(
+                &GUEST,
+                ino,
+                fh,
+                &mut payload(data),
+                size,
+                0,
+                None,
+                false,
+                rw,
+                0,
+            )
+            .unwrap()
+        };
+
+        let name = CString::new("f").unwrap();
+        let (entry, first, _, _) = fs.create(&GUEST, ROOT_ID, &name, args).unwrap();
+        let (ino, first) = (entry.inode, first.unwrap());
+        write(ino, first, b"one");
+        // The close's hash waits behind the gate.
+        fs.release(&GUEST, ino, rw, first, false, false, None)
+            .unwrap();
+        let (second, _, _) = fs.open(&GUEST, ino, libc::O_RDWR as u32, 0).unwrap();
+        let second = second.unwrap();
+        write(ino, second, b"two!");
+        *GATE.lock().unwrap() = true;
+        GATE_OPENED.notify_all();
+        fs.release(&GUEST, ino, rw, second, false, false, None)
+            .unwrap();
+        fs.flush_hashes();
+
+        let session = writer.session_dir().to_owned();
+        drop(fs);
+        writer.close().unwrap();
+        let closes: Vec<FsClose> = LogReader::open(&session)
+            .unwrap()
+            .records()
+            .filter_map(|r| match Payload::from_record(&r.unwrap()) {
+                Ok(Payload::FsClose(c)) => Some(c),
+                _ => None,
+            })
+            .collect();
+        let of = |fh| closes.iter().find(|c| c.fh == fh).expect("a close");
+        let (first, second) = (of(first), of(second));
+        assert_eq!(first.hash_status, HashStatus::Raced, "{first:?}");
+        assert_eq!(first.blake3, None, "{first:?}");
+        assert_eq!(second.hash_status, HashStatus::Ok, "{second:?}");
+        assert_eq!(
+            second.blake3,
+            Some(boxcar_proto::Hash::from_blake3(blake3::hash(b"two!")))
+        );
+    }
 
     fn zero_stat() -> stat64 {
         // SAFETY: stat64 is plain data; all-zero is a valid value.
