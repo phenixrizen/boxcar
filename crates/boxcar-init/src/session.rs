@@ -37,6 +37,7 @@ use nix::unistd::{
 
 use crate::console::{warn, write_console, Failed, StackLine, Step};
 use crate::mounts::ensure_dir;
+use crate::search::{self, Probe};
 
 /// What runs when the command line names no command: a login shell, which
 /// reads `/etc/profile`.
@@ -108,12 +109,16 @@ fn id(args: &BTreeMap<String, String>, key: &str) -> Result<u32, Failed> {
 }
 
 /// The session's command, ready for `execve` without allocating: the
-/// argument strings and the NULL-terminated pointer arrays of the arguments
-/// and of [`ENV`] are all built before the fork.
+/// argument strings, the file to run and the NULL-terminated pointer arrays
+/// of the arguments and of [`ENV`] are all built before the fork.
 pub struct Exec {
     argv: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
     env_ptrs: Vec<*const libc::c_char>,
+    /// The file `execve` runs: the first argument as it is until
+    /// [`Exec::resolve`], then what the search found, or why it found
+    /// nothing.
+    program: Result<CString, Errno>,
 }
 
 impl Exec {
@@ -131,29 +136,61 @@ impl Exec {
         Ok(Exec {
             argv_ptrs: pointers(argv.iter().map(CString::as_c_str)),
             env_ptrs: pointers(ENV.into_iter()),
+            program: Ok(argv[0].clone()),
             argv,
         })
     }
 
-    /// The program: the first argument.
-    fn program(&self) -> &CStr {
-        &self.argv[0]
+    /// Finds the file to run as `execvp` would, through [`session_path`]
+    /// in the root the session will see: once the root share is `/`, before
+    /// the fork. A first argument holding a `/` is run as it is.
+    pub fn resolve(&mut self) {
+        self.resolve_with(search::probe);
     }
 
-    /// Runs the program in this process, which returns only if that failed.
+    /// [`Exec::resolve`] with `probe` telling what is at each path tried.
+    fn resolve_with(&mut self, probe: impl Fn(&str) -> Probe) {
+        self.program = search::resolve(self.name(), session_path(), probe)
+            .and_then(|path| CString::new(path).map_err(|_| Errno::EINVAL));
+    }
+
+    /// The command's name: the first argument, as given.
+    fn name(&self) -> &str {
+        // Every argument came from a String.
+        self.argv[0].to_str().unwrap_or("?")
+    }
+
+    /// The file `execve` runs, or why there is none.
+    fn program(&self) -> Result<&CStr, Errno> {
+        self.program.as_deref().map_err(|&errno| errno)
+    }
+
+    /// Runs the program in this process, which returns only if that failed
+    /// (or there is no program to run).
     fn exec(&self) -> Errno {
+        let program = match self.program() {
+            Ok(program) => program,
+            Err(errno) => return errno,
+        };
         // SAFETY: the path and every pointer of both arrays point at C
         // strings that `self` owns or that are static, and both arrays end
         // with a null pointer.
         unsafe {
             libc::execve(
-                self.program().as_ptr(),
+                program.as_ptr(),
                 self.argv_ptrs.as_ptr(),
                 self.env_ptrs.as_ptr(),
             );
         }
         Errno::last()
     }
+}
+
+/// The `PATH` of [`ENV`], which the session's command is searched in.
+pub fn session_path() -> &'static str {
+    ENV.iter()
+        .find_map(|var| var.to_str().ok()?.strip_prefix("PATH="))
+        .unwrap_or("")
 }
 
 /// Pointers to each of `strings`, then a null pointer.
@@ -237,8 +274,7 @@ pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
 
 /// Step 7: forks the session child and returns its pid. The child sets
 /// itself up ([`setup`]) and execs the command; if it cannot, it says why
-/// on the console (`boxcar-init: session: <step>: <error>`) and exits with
-/// [`SPAWN_FAILED`].
+/// on the console ([`failure_line`]) and exits with [`SPAWN_FAILED`].
 pub fn spawn(
     session: &Session,
     exec: &Exec,
@@ -268,6 +304,9 @@ struct CleanSignals {
     sigrtmax: libc::c_int,
 }
 
+/// The step of the child that runs the command.
+const EXEC_STEP: &str = "execve";
+
 /// A step of the child that failed.
 struct ChildFailure {
     step: &'static str,
@@ -288,18 +327,13 @@ fn child(
 ) -> ! {
     let failure = match setup(session, tty, join_cgroup, signals) {
         Ok(()) => ChildFailure {
-            step: "execve",
+            step: EXEC_STEP,
             errno: exec.exec(),
             on_tty: true,
         },
         Err(failure) => failure,
     };
-    let mut line = StackLine::new();
-    let _ = write!(line, "boxcar-init: session: {}", failure.step);
-    if failure.step == "execve" {
-        let _ = write!(line, " {}", exec.program().to_str().unwrap_or("?"));
-    }
-    let _ = write!(line, ": {}", failure.errno);
+    let mut line = failure_line(&failure, exec);
     let bytes = line.finish();
     if failure.on_tty {
         let _ = nix::unistd::write(std::io::stderr(), bytes);
@@ -308,6 +342,29 @@ fn child(
     }
     // SAFETY: _exit ends the process at once, running nothing of init's.
     unsafe { libc::_exit(SPAWN_FAILED) }
+}
+
+/// The console line for `failure`: `boxcar-init: exec: <command>: <error>`
+/// when the command could not be run (`ENOENT` when it was not found), else
+/// `boxcar-init: session: <step>: <error>`. Built on the stack: the child
+/// may not allocate.
+fn failure_line(failure: &ChildFailure, exec: &Exec) -> StackLine {
+    let mut line = StackLine::new();
+    let _ = if failure.step == EXEC_STEP {
+        write!(
+            line,
+            "boxcar-init: exec: {}: {}",
+            exec.name(),
+            failure.errno
+        )
+    } else {
+        write!(
+            line,
+            "boxcar-init: session: {}: {}",
+            failure.step, failure.errno
+        )
+    };
+    line
 }
 
 /// The child's setup, in order: a process group of its own, in the
@@ -575,7 +632,7 @@ mod tests {
     #[test]
     fn the_pointer_arrays_point_at_the_strings_and_end_in_null() {
         let exec = Exec::new(&strings(&["/bin/sh", "-c", "exit 7"])).unwrap();
-        assert_eq!(exec.program(), c"/bin/sh");
+        assert_eq!(exec.program(), Ok(c"/bin/sh"));
         let argv: Vec<&CStr> = exec.argv.iter().map(CString::as_c_str).collect();
         for (strings, ptrs) in [(&argv[..], &exec.argv_ptrs), (&ENV[..], &exec.env_ptrs)] {
             assert_eq!(ptrs.len(), strings.len() + 1);
@@ -670,6 +727,60 @@ mod tests {
 
         onto(tty.as_fd(), tty_fd).unwrap();
         assert!(!cloexec(tty_fd), "onto itself clears the flag");
+    }
+
+    #[test]
+    fn the_search_path_is_the_one_in_the_environment() {
+        assert_eq!(
+            session_path(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+    }
+
+    /// `ls` is found through PATH; argv[0] stays what was asked for.
+    #[test]
+    fn a_bare_name_runs_the_file_found_through_path() {
+        let mut exec = Exec::new(&strings(&["ls", "/workspace"])).unwrap();
+        exec.resolve_with(|candidate| match candidate {
+            "/bin/ls" => Probe::Executable,
+            _ => Probe::Missing,
+        });
+        assert_eq!(exec.program(), Ok(c"/bin/ls"));
+        assert_eq!(exec.name(), "ls");
+        assert_eq!(exec.argv_ptrs[0], exec.argv[0].as_ptr());
+    }
+
+    #[test]
+    fn a_name_found_nowhere_fails_the_exec_with_enoent() {
+        let mut exec = Exec::new(&strings(&["nosuchcmd"])).unwrap();
+        exec.resolve_with(|_| Probe::Missing);
+        assert_eq!(exec.program(), Err(Errno::ENOENT));
+        assert_eq!(exec.exec(), Errno::ENOENT);
+        let failure = ChildFailure {
+            step: EXEC_STEP,
+            errno: Errno::ENOENT,
+            on_tty: true,
+        };
+        assert_eq!(
+            failure_line(&failure, &exec).finish(),
+            b"boxcar-init: exec: nosuchcmd: ENOENT: No such file or directory\n"
+        );
+        let setup = ChildFailure {
+            step: "setresuid",
+            errno: Errno::EPERM,
+            on_tty: true,
+        };
+        assert_eq!(
+            failure_line(&setup, &exec).finish(),
+            b"boxcar-init: session: setresuid: EPERM: Operation not permitted\n"
+        );
+    }
+
+    #[test]
+    fn a_path_is_run_as_given() {
+        let mut exec = Exec::new(&strings(&["/bin/sh", "-c", "true"])).unwrap();
+        exec.resolve_with(|candidate| panic!("searched for {candidate}"));
+        assert_eq!(exec.program(), Ok(c"/bin/sh"));
     }
 
     #[test]

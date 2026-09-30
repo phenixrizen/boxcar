@@ -11,3 +11,6 @@ repository.workspace = true
 boxcar-proto = { workspace = true, default-features = false }
 nix = { workspace = true, features = ["mount", "fs", "process", "signal", "user", "reboot", "poll", "ioctl", "hostname", "term"] }
 libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

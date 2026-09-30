@@ -22,6 +22,7 @@ mod cmdline;
 mod console;
 mod mounts;
 mod reaper;
+mod search;
 mod session;
 mod shutdown;
 mod sysctl;
@@ -82,11 +83,14 @@ fn run_session(args: &BTreeMap<String, String>) -> Result<Ended, Failed> {
     // Everything the command line says is checked before anything is
     // mounted, and the command is ready for exec before the fork.
     let session = Session::from_cmdline(args)?;
-    let exec = Exec::new(&session.argv)?;
+    let mut exec = Exec::new(&session.argv)?;
 
     mounts::mount_shares()?;
     let mounted = mounts::mount_api()?;
     mounts::switch_root()?;
+    // In the root the session sees, and before the fork: the search
+    // allocates.
+    exec.resolve();
 
     sethostname(HOSTNAME).step(&format!("sethostname {HOSTNAME}"))?;
     sysctl::apply();
