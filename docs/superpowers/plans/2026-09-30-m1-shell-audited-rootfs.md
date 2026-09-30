@@ -17,7 +17,7 @@
 - **No git dependencies and no `[patch]` sections.** `Cargo.lock` must contain no `git+` source. `cargo tree -d` must show no duplicate rust-vmm crate.
 - Every new source file starts with `// SPDX-License-Identifier: Apache-2.0` and `// Copyright 2026 The boxcar Authors`. A file ported from Firecracker, Cloud Hypervisor, or rust-vmm keeps that project's original header above ours, names the source repository, path, and commit in a comment, and gets an entry in `NOTICE`.
 - Commands are argv arrays. Never build a shell string from user input.
-- Every commit: `git commit -s` (which appends `Signed-off-by` last), subject `area: summary` in the imperative, and the body's trailer block contains these two lines exactly:
+- Every commit: `git commit -s` (which appends `Signed-off-by` last), subject `area: short summary` (the subjects given in each task are used verbatim), and the body's trailer block contains these two lines exactly:
   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
   `Claude-Session: https://claude.ai/code/session_01Xm6wxRmFTbEVJQ7zrfbuJX`
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace` (or `cargo test --workspace`), and `cargo deny check` must pass at the end of every task. Test output must be pristine: no warnings.
