@@ -1165,6 +1165,7 @@ dependencies = [
  "cpio",
  "hex",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

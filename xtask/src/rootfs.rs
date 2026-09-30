@@ -7,9 +7,10 @@
 //! from dl-cdn.alpinelinux.org into `target/rootfs-cache`, checks the
 //! tarball's SHA-256 against the hash pinned here (for the default version)
 //! and against the published `.sha256`, and unpacks it with `tar` into
-//! `target/guest/rootfs-alpine` as the invoking user, with
-//! `etc/boxcar-rootfs.json` saying what it is. `curl`, `sha256sum` and `tar`
-//! run as argv arrays; nothing goes through a shell.
+//! `target/guest/rootfs-alpine` as the invoking user, with `/tmp` and
+//! `/var/tmp` at mode 1777 and `etc/boxcar-rootfs.json` saying what it is.
+//! `curl`, `sha256sum` and `tar` run as argv arrays; nothing goes through a
+//! shell.
 
 use std::ffi::OsString;
 use std::fs;
@@ -279,6 +280,7 @@ fn unpack(tarball: &Path, out: &Path, metadata: &serde_json::Value) -> Result<()
         .status()
         .context("failed to start tar")?;
     ensure!(status.success(), "tar failed: {status}");
+    open_tmp_dirs(&partial)?;
 
     let json = partial.join("etc/boxcar-rootfs.json");
     let mut text = serde_json::to_string_pretty(metadata)?;
@@ -289,6 +291,35 @@ fn unpack(tarball: &Path, out: &Path, metadata: &serde_json::Value) -> Result<()
         fs::remove_dir_all(out).with_context(|| format!("remove {}", out.display()))?;
     }
     fs::rename(&partial, out).with_context(|| format!("rename to {}", out.display()))
+}
+
+/// The directories of a root filesystem everyone may create files in,
+/// relative to its root.
+const TMP_DIRS: [&str; 2] = ["tmp", "var/tmp"];
+
+/// Gives each of [`TMP_DIRS`] in the tree at `root` mode 1777: tar, run as
+/// the invoking user, applies the umask and drops the sticky bit. One that
+/// is not there is fine, and one that is not a directory all the way down
+/// (a symbolic link at any step would take chmod out of the tree) is left
+/// alone.
+fn open_tmp_dirs(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    'dirs: for rel in TMP_DIRS {
+        let mut dir = root.to_path_buf();
+        for part in Path::new(rel).components() {
+            dir.push(part);
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => continue 'dirs,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue 'dirs,
+                Err(e) => return Err(e).with_context(|| format!("stat {}", dir.display())),
+            }
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777))
+            .with_context(|| format!("chmod 1777 {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// `path` with `suffix` appended to its last component.
@@ -418,6 +449,63 @@ mod tests {
                 "sha256": DEFAULT_SHA256,
             })
         );
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// tar, as the invoking user, applies the umask and drops the sticky
+    /// bit: /tmp and /var/tmp come out 0755.
+    #[test]
+    fn tmp_and_var_tmp_become_world_writable_and_sticky() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["tmp", "var/tmp", "etc"] {
+            fs::create_dir_all(root.path().join(dir)).unwrap();
+            set_mode(&root.path().join(dir), 0o755);
+        }
+        open_tmp_dirs(root.path()).unwrap();
+        assert_eq!(mode(&root.path().join("tmp")), 0o1777);
+        assert_eq!(mode(&root.path().join("var/tmp")), 0o1777);
+        assert_eq!(mode(&root.path().join("etc")), 0o755);
+        // Again, on a tree that already has them.
+        open_tmp_dirs(root.path()).unwrap();
+        assert_eq!(mode(&root.path().join("tmp")), 0o1777);
+    }
+
+    /// A rootfs without /var/tmp is fine; one whose /var/tmp is a symbolic
+    /// link is left alone, since chmod would follow it out of the tree.
+    #[test]
+    fn a_missing_or_linked_var_tmp_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        set_mode(outside.path(), 0o700);
+        fs::create_dir(root.path().join("tmp")).unwrap();
+        open_tmp_dirs(root.path()).unwrap();
+        assert_eq!(mode(&root.path().join("tmp")), 0o1777);
+
+        fs::create_dir(root.path().join("var")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("var/tmp")).unwrap();
+        open_tmp_dirs(root.path()).unwrap();
+        assert_eq!(mode(outside.path()), 0o700);
+    }
+
+    /// Nor does a link higher up take the chmod out of the tree.
+    #[test]
+    fn a_linked_var_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("tmp")).unwrap();
+        set_mode(&outside.path().join("tmp"), 0o700);
+        std::os::unix::fs::symlink(outside.path(), root.path().join("var")).unwrap();
+        open_tmp_dirs(root.path()).unwrap();
+        assert_eq!(mode(&outside.path().join("tmp")), 0o700);
     }
 
     #[test]

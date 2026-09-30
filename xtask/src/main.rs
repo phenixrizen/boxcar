@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 mod initramfs;
 mod kernel;
 mod rootfs;
+mod test_kvm;
 
 /// Build tasks for boxcar.
 #[derive(Parser)]
@@ -25,6 +26,9 @@ enum Command {
     Initramfs,
     /// Download, verify and unpack a guest root filesystem into target/guest.
     Rootfs(rootfs::RootfsArgs),
+    /// Run a milestone's KVM-gated tests; skips (exit 0) without /dev/kvm or
+    /// the guest artifacts.
+    TestKvm(test_kvm::TestKvmArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -32,5 +36,21 @@ fn main() -> anyhow::Result<()> {
         Command::Kernel(args) => kernel::run(&args),
         Command::Initramfs => initramfs::run(),
         Command::Rootfs(args) => rootfs::run(&args),
+        Command::TestKvm(args) => test_kvm::run(&args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `m1` is the only milestone with gated tests so far.
+    #[test]
+    fn test_kvm_takes_m1_only() {
+        assert!(Cli::try_parse_from(["xtask", "test-kvm", "m1"]).is_ok());
+        for bad in [&["xtask", "test-kvm", "m2"][..], &["xtask", "test-kvm"]] {
+            let error = Cli::try_parse_from(bad).err().unwrap();
+            assert_eq!(error.exit_code(), 2, "{bad:?}: {error}");
+        }
     }
 }
