@@ -170,8 +170,9 @@ fn parse_sha256_file(text: &str, name: &str) -> Result<String> {
     Ok(hash.to_ascii_lowercase())
 }
 
-/// The arguments after `curl` that fetch `url` over HTTPS only, failing on
-/// an HTTP error, into `out` (or to stdout without one).
+/// The arguments after `curl` that fetch `url` over HTTPS only, redirects
+/// included, failing on an HTTP error, into `out` (or to stdout without
+/// one).
 fn curl_args(url: &str, out: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--fail",
@@ -179,6 +180,8 @@ fn curl_args(url: &str, out: Option<&Path>) -> Vec<OsString> {
         "--show-error",
         "--location",
         "--proto",
+        "=https",
+        "--proto-redir",
         "=https",
     ]
     .map(OsString::from)
@@ -360,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn curl_is_https_only_and_fails_on_http_errors() {
+    fn curl_is_https_only_redirects_included_and_fails_on_http_errors() {
         assert_eq!(
             strings(curl_args("https://x/y", Some(Path::new("/c/y.partial")))),
             [
@@ -369,6 +372,8 @@ mod tests {
                 "--show-error",
                 "--location",
                 "--proto",
+                "=https",
+                "--proto-redir",
                 "=https",
                 "--output",
                 "/c/y.partial",

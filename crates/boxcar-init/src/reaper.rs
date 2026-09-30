@@ -7,7 +7,10 @@
 //!
 //! Once the session has ended, the processes it left behind would keep the
 //! VM up for as long as they run, so they are asked to stop (`SIGTERM`) and,
-//! after [`GRACE`], made to (`SIGKILL`). Init returns when no child is left.
+//! after [`GRACE`], made to (`SIGKILL`). Init returns when no child is left,
+//! or, should some outlive even `SIGKILL` (stuck in the kernel), after
+//! [`KILL_WAIT`] with `boxcar-init: reaper: stragglers remain, rebooting` on
+//! the console.
 
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
@@ -18,11 +21,18 @@ use nix::sys::signal::{kill, SigSet, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::Pid;
 
-use crate::console::{warn, Failed, Step};
+use crate::console::{warn, write_console, Failed, Step};
 
 /// How long the processes the session leaves behind have between `SIGTERM`
 /// and `SIGKILL`.
 pub const GRACE: Duration = Duration::from_secs(2);
+
+/// How long init waits, after `SIGKILL`, for the last of them before it
+/// reboots anyway.
+pub const KILL_WAIT: Duration = Duration::from_secs(10);
+
+/// What init says when it stops waiting for them.
+const GAVE_UP: &[u8] = b"boxcar-init: reaper: stragglers remain, rebooting\n";
 
 /// How the session ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,12 +72,17 @@ impl Reaper {
                     Failed::new("waitpid", "no child is left and the session was not seen")
                 });
             }
-            if ended.is_some() {
-                let (next, signal) = phase.after_session(Instant::now());
-                if let Some(signal) = signal {
-                    signal_all(signal);
-                }
+            if let Some(how) = ended {
+                let (next, action) = phase.after_session(Instant::now());
                 phase = next;
+                match action {
+                    Action::Wait => {}
+                    Action::Signal(signal) => signal_all(signal),
+                    Action::GiveUp => {
+                        let _ = write_console(GAVE_UP);
+                        return Ok(how);
+                    }
+                }
             }
             let mut fds = [PollFd::new(self.signals.as_fd(), PollFlags::POLLIN)];
             match poll(&mut fds, phase.timeout(Instant::now())) {
@@ -95,39 +110,54 @@ enum Phase {
     /// The session has ended and the rest were sent `SIGTERM`; at
     /// `deadline` they get `SIGKILL`.
     Terminating { deadline: Instant },
-    /// `SIGKILL` was sent: wait for the last of them.
-    Killing,
+    /// `SIGKILL` was sent: wait for the last of them until `deadline`.
+    Killing { deadline: Instant },
+}
+
+/// What the wait does next, once the session has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    /// Keep reaping.
+    Wait,
+    /// Send this to every process but init.
+    Signal(Signal),
+    /// Stop waiting: what is left survived `SIGKILL` for [`KILL_WAIT`].
+    GiveUp,
 }
 
 impl Phase {
-    /// With the session ended and children left: the next phase, and the
-    /// signal to send every other process now, if any.
-    fn after_session(self, now: Instant) -> (Phase, Option<Signal>) {
+    /// With the session ended and children left: the next phase, and what
+    /// to do now.
+    fn after_session(self, now: Instant) -> (Phase, Action) {
         match self {
             Phase::Session => (
                 Phase::Terminating {
                     deadline: now + GRACE,
                 },
-                Some(Signal::SIGTERM),
+                Action::Signal(Signal::SIGTERM),
             ),
-            Phase::Terminating { deadline } if now >= deadline => {
-                (Phase::Killing, Some(Signal::SIGKILL))
-            }
-            phase => (phase, None),
+            Phase::Terminating { deadline } if now >= deadline => (
+                Phase::Killing {
+                    deadline: now + KILL_WAIT,
+                },
+                Action::Signal(Signal::SIGKILL),
+            ),
+            Phase::Killing { deadline } if now >= deadline => (self, Action::GiveUp),
+            phase => (phase, Action::Wait),
         }
     }
 
-    /// How long to wait for the next `SIGCHLD`: until the deadline while
-    /// terminating (rounded up to the millisecond, so that it has passed
-    /// when the poll times out), and otherwise for as long as it takes.
+    /// How long to wait for the next `SIGCHLD`: until the phase's deadline
+    /// (rounded up to the millisecond, so that it has passed when the poll
+    /// times out), and while the session runs for as long as it takes.
     fn timeout(self, now: Instant) -> PollTimeout {
         match self {
-            Phase::Terminating { deadline } => {
+            Phase::Terminating { deadline } | Phase::Killing { deadline } => {
                 let left = deadline.saturating_duration_since(now);
                 PollTimeout::try_from(left.as_nanos().div_ceil(1_000_000))
                     .unwrap_or(PollTimeout::MAX)
             }
-            Phase::Session | Phase::Killing => PollTimeout::NONE,
+            Phase::Session => PollTimeout::NONE,
         }
     }
 }
@@ -268,45 +298,85 @@ mod tests {
         assert_eq!(left, Err(Errno::EINVAL));
     }
 
+    /// A clock for the phases: `at(ms)` is `ms` milliseconds after the
+    /// session ended.
+    fn clock() -> impl Fn(u64) -> Instant {
+        let start = Instant::now();
+        move |ms| start + Duration::from_millis(ms)
+    }
+
+    fn millis(ms: u32) -> PollTimeout {
+        PollTimeout::try_from(ms).unwrap()
+    }
+
     #[test]
     fn the_session_ending_sends_sigterm_and_starts_the_grace() {
-        let now = Instant::now();
+        let at = clock();
         assert_eq!(
-            Phase::Session.after_session(now),
+            Phase::Session.after_session(at(0)),
             (
-                Phase::Terminating {
-                    deadline: now + GRACE
-                },
-                Some(Signal::SIGTERM)
+                Phase::Terminating { deadline: at(2000) },
+                Action::Signal(Signal::SIGTERM)
             )
         );
     }
 
+    /// The whole sweep on the clock: SIGTERM at once, SIGKILL after the
+    /// grace, and giving up KILL_WAIT after that, waiting in between.
     #[test]
-    fn sigkill_follows_at_the_deadline_and_only_once() {
-        let now = Instant::now();
-        let terminating = Phase::Terminating { deadline: now };
-        let before = now - Duration::from_millis(1);
-        assert_eq!(terminating.after_session(before), (terminating, None));
+    fn the_sweep_sends_sigterm_then_sigkill_then_gives_up() {
+        let at = clock();
+        let mut phase = Phase::Session;
+        let mut actions = Vec::new();
+        for ms in [0, 1, 1999, 2000, 2001, 11_999, 12_000] {
+            let (next, action) = phase.after_session(at(ms));
+            phase = next;
+            actions.push((ms, action, phase.timeout(at(ms))));
+        }
         assert_eq!(
-            terminating.after_session(now),
-            (Phase::Killing, Some(Signal::SIGKILL))
+            actions,
+            [
+                (0, Action::Signal(Signal::SIGTERM), millis(2000)),
+                (1, Action::Wait, millis(1999)),
+                (1999, Action::Wait, millis(1)),
+                (2000, Action::Signal(Signal::SIGKILL), millis(10_000)),
+                (2001, Action::Wait, millis(9999)),
+                (11_999, Action::Wait, millis(1)),
+                (12_000, Action::GiveUp, PollTimeout::ZERO),
+            ]
         );
-        assert_eq!(Phase::Killing.after_session(now), (Phase::Killing, None));
+        assert_eq!(GRACE, Duration::from_secs(2));
+        assert_eq!(KILL_WAIT, Duration::from_secs(10));
     }
 
     #[test]
-    fn the_poll_waits_for_ever_except_until_the_deadline() {
-        let now = Instant::now();
-        assert_eq!(Phase::Session.timeout(now), PollTimeout::NONE);
-        assert_eq!(Phase::Killing.timeout(now), PollTimeout::NONE);
-        let deadline = now + Duration::from_micros(1500);
-        let terminating = Phase::Terminating { deadline };
-        assert_eq!(terminating.timeout(now), PollTimeout::from(2u8));
-        assert_eq!(terminating.timeout(deadline), PollTimeout::ZERO);
+    fn sigkill_is_sent_only_once_and_giving_up_repeats() {
+        let at = clock();
+        let killing = Phase::Killing {
+            deadline: at(10_000),
+        };
+        assert_eq!(killing.after_session(at(5000)), (killing, Action::Wait));
+        assert_eq!(killing.after_session(at(10_000)), (killing, Action::GiveUp));
+        assert_eq!(killing.after_session(at(20_000)), (killing, Action::GiveUp));
+    }
+
+    #[test]
+    fn the_poll_waits_for_ever_only_while_the_session_runs() {
+        let at = clock();
+        assert_eq!(Phase::Session.timeout(at(0)), PollTimeout::NONE);
+        let deadline = at(0) + Duration::from_micros(1500);
+        for phase in [Phase::Terminating { deadline }, Phase::Killing { deadline }] {
+            assert_eq!(phase.timeout(at(0)), millis(2), "{phase:?}");
+            assert_eq!(phase.timeout(deadline), PollTimeout::ZERO, "{phase:?}");
+            assert_eq!(phase.timeout(at(5000)), PollTimeout::ZERO, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn the_give_up_line() {
         assert_eq!(
-            terminating.timeout(deadline + Duration::from_secs(1)),
-            PollTimeout::ZERO
+            GAVE_UP,
+            b"boxcar-init: reaper: stragglers remain, rebooting\n"
         );
     }
 }

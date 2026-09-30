@@ -173,14 +173,27 @@ pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
 /// on the console (`boxcar-init: session: <step>: <error>`) and exits with
 /// [`SPAWN_FAILED`].
 pub fn spawn(session: &Session, exec: &Exec, join_cgroup: bool) -> Result<Pid, Failed> {
-    let unblocked = SigSet::empty();
+    let signals = CleanSignals {
+        unblocked: SigSet::empty(),
+        sigrtmax: libc::SIGRTMAX(),
+    };
     // SAFETY: init is single-threaded, so the child is a whole copy of it
     // with no lock held by a thread that is gone. The child only makes
     // system calls on memory prepared before the fork, then execs or exits.
     match unsafe { fork() }.step("fork")? {
         ForkResult::Parent { child } => Ok(child),
-        ForkResult::Child => child(session, exec, join_cgroup, &unblocked),
+        ForkResult::Child => child(session, exec, join_cgroup, &signals),
     }
+}
+
+/// What the child needs, gathered before the fork, to hand the command the
+/// signal state of a fresh process: every signal unblocked and at its
+/// default action.
+struct CleanSignals {
+    /// The empty mask.
+    unblocked: SigSet,
+    /// The highest signal number.
+    sigrtmax: libc::c_int,
 }
 
 /// A step of the child that failed.
@@ -194,8 +207,8 @@ struct ChildFailure {
 }
 
 /// The session child, from `fork` to `execve`. Never returns.
-fn child(session: &Session, exec: &Exec, join_cgroup: bool, unblocked: &SigSet) -> ! {
-    let failure = match setup(session, join_cgroup, unblocked) {
+fn child(session: &Session, exec: &Exec, join_cgroup: bool, signals: &CleanSignals) -> ! {
+    let failure = match setup(session, join_cgroup, signals) {
         Ok(()) => ChildFailure {
             step: "execve",
             errno: exec.exec(),
@@ -221,10 +234,13 @@ fn child(session: &Session, exec: &Exec, join_cgroup: bool, unblocked: &SigSet) 
 
 /// The child's setup, in order: a new session; `/dev/ttyS0` as its
 /// controlling terminal and as stdin, stdout and stderr; the `session`
-/// cgroup; no supplementary groups; the session's gid and uid, real,
-/// effective and saved; no new privileges; `/workspace`; SIGCHLD unblocked
-/// again (init blocks it for its signalfd, and the mask survives exec).
-fn setup(session: &Session, join_cgroup: bool, unblocked: &SigSet) -> Result<(), ChildFailure> {
+/// cgroup; an empty capability bounding set and ambient set; no
+/// supplementary groups; the session's gid and uid, real, effective and
+/// saved; no new privileges; `/workspace`; then every signal back at its
+/// default action and unblocked, since an ignored signal and the mask both
+/// survive exec (Rust ignores SIGPIPE in init, and init blocks SIGCHLD for
+/// its signalfd).
+fn setup(session: &Session, join_cgroup: bool, signals: &CleanSignals) -> Result<(), ChildFailure> {
     let fail = |step: &'static str, on_tty: bool| {
         move |errno: Errno| ChildFailure {
             step,
@@ -254,14 +270,88 @@ fn setup(session: &Session, join_cgroup: bool, unblocked: &SigSet) -> Result<(),
     if join_cgroup {
         join_session_cgroup().map_err(fail("join the session cgroup", true))?;
     }
+    // While still root (dropping needs CAP_SETPCAP). With both sets empty
+    // and no inheritable capabilities, no exec grants one again, even when
+    // the session's uid is 0.
+    drop_bounding_set().map_err(fail("PR_CAPBSET_DROP", true))?;
+    clear_ambient_set().map_err(fail("PR_CAP_AMBIENT_CLEAR_ALL", true))?;
     setgroups(&[]).map_err(fail("setgroups", true))?;
     setresgid(session.gid, session.gid, session.gid).map_err(fail("setresgid", true))?;
     setresuid(session.uid, session.uid, session.uid).map_err(fail("setresuid", true))?;
     prctl::set_no_new_privs().map_err(fail("PR_SET_NO_NEW_PRIVS", true))?;
     chdir(WORKDIR).map_err(fail("chdir /workspace", true))?;
-    unblocked
+    reset_signals(signals.sigrtmax).map_err(fail("reset signal actions", true))?;
+    signals
+        .unblocked
         .thread_set_mask()
-        .map_err(fail("unblock signals", true))
+        .map_err(fail("unblock all signals", true))
+}
+
+/// Empties the capability bounding set: `PR_CAPBSET_DROP` for each
+/// capability from 0 until the kernel answers `EINVAL`, for the first one
+/// past the last it knows.
+fn drop_bounding_set() -> Result<(), Errno> {
+    // The capability sets are 64 bits wide.
+    for cap in 0..64 {
+        // SAFETY: prctl with integer arguments only.
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                cap as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if rc != 0 {
+            return match Errno::last() {
+                Errno::EINVAL if cap > 0 => Ok(()),
+                errno => Err(errno),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Empties the ambient capability set.
+fn clear_ambient_set() -> Result<(), Errno> {
+    // SAFETY: prctl with integer arguments only; the kernel requires the
+    // unused ones to be 0.
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last())
+    }
+}
+
+/// Sets every signal from 1 to `sigrtmax` back to its default action,
+/// SIGKILL and SIGSTOP aside (they cannot be changed). libc refuses, with
+/// `EINVAL`, the few real-time signals it keeps for itself, which init
+/// never changes; that is not a failure.
+fn reset_signals(sigrtmax: libc::c_int) -> Result<(), Errno> {
+    for signal in 1..=sigrtmax {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: SIG_DFL installs no handler; this only changes the
+        // action of `signal` in this process.
+        if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+            match Errno::last() {
+                Errno::EINVAL => {}
+                errno => return Err(errno),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Writes this process's pid to the `session` cgroup's `cgroup.procs`.
@@ -392,6 +482,52 @@ mod tests {
         }
         let argv: Vec<&str> = exec.argv.iter().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(argv, ["/bin/sh", "-c", "exit 7"]);
+    }
+
+    /// Whether `signal`'s action in this process is the default one.
+    fn is_default(signal: libc::c_int) -> bool {
+        // SAFETY: a zeroed sigaction is a valid out-parameter, and a null
+        // new action only reads the current one.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_DFL
+        }
+    }
+
+    /// Rust ignores SIGPIPE in every program, init included, and an ignored
+    /// signal stays ignored across execve. In a child, so that the test
+    /// harness keeps its own dispositions.
+    #[test]
+    fn reset_signals_restores_the_default_of_ignored_signals() {
+        // SAFETY: the child makes only async-signal-safe calls, then _exits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let code = unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                    libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                    libc::signal(libc::SIGRTMIN() + 1, libc::SIG_IGN);
+                    let reset = reset_signals(libc::SIGRTMAX()).is_ok();
+                    let defaults = [libc::SIGPIPE, libc::SIGUSR1, libc::SIGRTMIN() + 1]
+                        .into_iter()
+                        .all(is_default);
+                    match (reset, defaults) {
+                        (true, true) => 0,
+                        (false, _) => 1,
+                        (true, false) => 2,
+                    }
+                };
+                // SAFETY: ends the child without running the harness.
+                unsafe { libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => {
+                let status = nix::sys::wait::waitpid(child, None).unwrap();
+                assert_eq!(
+                    status,
+                    nix::sys::wait::WaitStatus::Exited(child, 0),
+                    "1: reset_signals failed, 2: a signal is still ignored"
+                );
+            }
+        }
     }
 
     #[test]

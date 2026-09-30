@@ -3,10 +3,12 @@
 
 //! The M1 session boot: the console init with the `root` share (the guest
 //! rootfs) and a fresh `workspace` share runs a `boxcar.cmd` that writes
-//! `/workspace/a.txt` as the invoking user. The VM must end in `GuestReset`
-//! with `boxcar: session exited 0` on the console, the file must be on the
-//! host, and the session log must verify and hold the file's `fs.close`
-//! with its size, its blake3 and a guest pid.
+//! `/workspace/a.txt` as the invoking user and prints its own ignored and
+//! blocked signals and capability bounding set. The VM must end in
+//! `GuestReset` with `boxcar: session exited 0` on the console, the session
+//! must ignore and block no signal and have an empty bounding set, the file
+//! must be on the host, and the session log must verify and hold the file's
+//! `fs.close` with its size, its blake3 and a guest pid.
 //!
 //! Skips with a printed reason unless `BOXCAR_TEST_KERNEL`,
 //! `BOXCAR_TEST_INITRAMFS` and `BOXCAR_TEST_ROOTFS` are set and `/dev/kvm`
@@ -29,6 +31,26 @@ use boxcar_vmm::vmm::{ConsoleOut, StopReason, VmConfig, VmExit, Vmm};
 
 const TEST: &str = "boot_console";
 const LIMIT: Duration = Duration::from_secs(30);
+
+/// What the session runs: the write the audit must see, then the lines of
+/// `/proc/self/status` [`status_field`] reads back from the console.
+///
+/// `grep` must not be the last command: busybox ash ignores SIGQUIT itself
+/// and execs a last command without forking, which then inherits that. The
+/// `sleep` keeps the session leader alive until the console has sent the
+/// lines: when the leader exits, the kernel hangs up its controlling
+/// terminal and discards output not yet sent.
+const SESSION: &str = "echo hi > /workspace/a.txt; \
+     grep -E '^(SigIgn|SigBlk|CapBnd):' /proc/self/status; sleep 1";
+
+/// The value of `field` in the `/proc/<pid>/status` lines on the console
+/// (`SigIgn:\t0000000000001000`), if one is there.
+fn status_field<'a>(console: &'a str, field: &str) -> Option<&'a str> {
+    console.lines().find_map(|line| {
+        let value = line.trim_end_matches('\r').strip_prefix(field)?;
+        Some(value.strip_prefix(':')?.trim())
+    })
+}
 
 /// The artifact `var` names, or `None` when it is unset.
 fn artifact(var: &str) -> Option<PathBuf> {
@@ -86,7 +108,7 @@ fn a_session_command_writes_a_file_the_audit_hashes() {
 
     // SAFETY: getuid and getgid take no arguments and cannot fail.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let argv = ["/bin/sh", "-c", "echo hi > /workspace/a.txt"].map(String::from);
+    let argv = ["/bin/sh", "-c", SESSION].map(String::from);
     let cfg = VmConfig {
         cmdline_extra: vec![
             "boxcar.mode=console".into(),
@@ -133,6 +155,17 @@ fn a_session_command_writes_a_file_the_audit_hashes() {
         matches!(exit, VmExit::GuestReset),
         "{exit:?}; console:\n{output}"
     );
+    // Rust sets SIGPIPE to SIG_IGN in init, and an ignored signal or a
+    // blocked mask survives execve: the session must start with neither.
+    // Nor may it keep a capability it could regain.
+    for field in ["SigIgn", "SigBlk", "CapBnd"] {
+        eprintln!("{TEST}: {field}: {:?}", status_field(&output, field));
+        assert_eq!(
+            status_field(&output, field),
+            Some("0000000000000000"),
+            "{field}; console:\n{output}"
+        );
+    }
     assert_eq!(fs::read(workspace.join("a.txt")).unwrap(), b"hi\n");
 
     let report = verify_session(&session_dir).unwrap();
