@@ -23,16 +23,23 @@
 //! that order, so a changed value is a [`VerifyError::Chain`] at its record,
 //! a removed or reordered record a [`VerifyError::Gap`].
 //!
+//! A line with the same key twice in one object, at any depth, is not a
+//! record ([`VerifyError::Parse`]). serde_json keeps the last of duplicate
+//! keys, so a key injected before the real one would hash like the original,
+//! while a reader that keeps the first would see the injected value.
+//!
 //! For a session directory it also checks `meta.json` against the segment
 //! files, and `checkpoints.jsonl` against the checkpoint records: that is
 //! what catches a log cut off cleanly at a record boundary.
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use boxcar_proto::{genesis_prev, Checkpoint, Hash, SessionId};
-use serde_json::{Map, Value};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 
 use crate::checkpoint::{IndexEntry, INDEX_FILE};
 use crate::segment::{list_segments, numbered_from_one, read_meta, segment_name, META_FILE};
@@ -177,9 +184,11 @@ pub(crate) struct RawLine {
 
 impl RawLine {
     /// Parses a line (without its newline) and hashes it. Fails if it is not
-    /// a JSON object with `seq`, `prev` and `hash` of the right types.
+    /// a JSON object with `seq`, `prev` and `hash` of the right types, or if
+    /// any object in it has a key twice.
     pub(crate) fn parse(bytes: &[u8]) -> Result<RawLine, String> {
-        let value: Value = serde_json::from_slice(bytes).map_err(|e| format!("not JSON: {e}"))?;
+        let StrictValue(value) =
+            serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
         let Value::Object(mut fields) = value else {
             return Err("not a JSON object".into());
         };
@@ -233,6 +242,83 @@ impl RawLine {
         serde_json::from_value(data)
             .map(Some)
             .map_err(|e| format!("checkpoint data: {e}"))
+    }
+}
+
+/// A JSON value parsed exactly as `serde_json::Value` parses it, except that
+/// an object with the same key twice, at any depth, is an error.
+struct StrictValue(Value);
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor).map(StrictValue)
+    }
+}
+
+/// serde_json's own `Value` visitor, with the duplicate-key check added.
+struct StrictVisitor;
+
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        StrictValue::deserialize(deserializer).map(|StrictValue(value)| value)
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(StrictValue(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom(format_args!("duplicate key `{key}`")));
+            }
+            let StrictValue(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(Value::Object(object))
     }
 }
 
@@ -482,4 +568,54 @@ fn mismatch(entry: &IndexEntry, record: &IndexEntry) -> Option<String> {
                 entry.seq
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strict(text: &str) -> Result<Value, serde_json::Error> {
+        serde_json::from_str::<StrictValue>(text).map(|StrictValue(value)| value)
+    }
+
+    #[test]
+    fn strict_parsing_matches_serde_json_on_lines_without_duplicates() {
+        for text in [
+            r#"{"a":1,"b":[1,-2,3.5,1e300,18446744073709551615,-9223372036854775808],"c":{"d":null,"e":true,"f":"x\u00e9\n","g":{}},"h":[]}"#,
+            r#"[{"k":1},{"k":2},[{"k":3}]]"#,
+            r#"{"big":18446744073709551616,"neg":-9223372036854775809,"nested":{"deep":[{"a":{"b":{"c":[0]}}}]}}"#,
+            r#""just a string""#,
+            "null",
+            "  {\"spaced\" : [ 1 , 2 ] }  ",
+            "{\"path\":\"/naïve-日本語-\\\"<>&\\\"-\u{2028}-tab\\t-😀\",\"ts\":9007199254740993}",
+        ] {
+            let lenient: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(strict(text).unwrap(), lenient, "{text}");
+            assert_eq!(
+                serde_json::to_vec(&strict(text).unwrap()).unwrap(),
+                serde_json::to_vec(&lenient).unwrap(),
+                "{text}: same canonical bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_twice_in_one_object_is_rejected_at_every_depth() {
+        for text in [
+            r#"{"a":1,"a":1}"#,
+            r#"{"a":1,"b":2,"a":3}"#,
+            r#"{"data":{"path":"/x","path":"/y"}}"#,
+            r#"{"list":[{"k":1},{"k":2,"k":3}]}"#,
+            r#"[[{"deep":{"x":0,"x":0}}]]"#,
+        ] {
+            let err = strict(text).unwrap_err().to_string();
+            assert!(err.contains("duplicate key"), "{text}: {err}");
+            assert!(
+                serde_json::from_str::<Value>(text).is_ok(),
+                "serde_json alone accepts {text}"
+            );
+        }
+        // The same key in different objects is fine.
+        assert!(strict(r#"{"a":{"k":1},"b":{"k":1},"k":[{"k":1}]}"#).is_ok());
+    }
 }

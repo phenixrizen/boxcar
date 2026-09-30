@@ -32,6 +32,6 @@ pub mod writer;
 pub use chain::{Chainer, PartialRecord};
 pub use reader::LogReader;
 pub use segment::{Fdatasync, Syncer};
-pub use sink::{AuditSink, Priority, SinkClosed, Submission};
+pub use sink::{AuditSink, EmitError, Priority, Submission};
 pub use verify::{verify_jsonl, verify_session, VerifyError, VerifyReport};
 pub use writer::{spawn, spawn_with_syncer, CloseStats, WriterConfig, WriterHandle};

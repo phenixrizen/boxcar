@@ -271,11 +271,8 @@ impl<S: Syncer> Writer<S> {
         self.segments.flush()
     }
 
+    /// Writes one submission. It is never a checkpoint: the sink refuses those.
     fn write(&mut self, s: Submission) -> io::Result<()> {
-        if matches!(s.payload, Payload::Checkpoint(_)) {
-            tracing::warn!("ignored a checkpoint sent to the audit sink; the writer makes its own");
-            return Ok(());
-        }
         let record = self.chain_next(s.ring, s.ts_guest_ns, s.subject, &s.payload, s.span);
         self.append(&record)?;
         self.window.push(&record.hash);
@@ -388,7 +385,10 @@ fn clock_ns(clock: libc::clockid_t) -> u64 {
     // is the only memory clock_gettime writes.
     let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
     if rc != 0 {
-        // Only an invalid clock id fails, and both ids here are valid.
+        // Only an invalid clock id fails, and both ids here are valid. A zero
+        // timestamp stays visible in the record; this says why.
+        let error = io::Error::last_os_error();
+        tracing::warn!(clock, %error, "clock_gettime failed; stamping 0");
         return 0;
     }
     let secs = u64::try_from(ts.tv_sec).unwrap_or(0);

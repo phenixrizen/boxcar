@@ -87,6 +87,62 @@ impl Drop for Restore {
 }
 
 #[test]
+fn a_duplicated_key_is_not_a_record() {
+    let tmp = TempDir::new().unwrap();
+    let dir = session(&tmp, 20, |_| {});
+    let file = segment(&dir, 1);
+    let index = dir.join("checkpoints.jsonl");
+
+    // Each tampering puts a second copy of a key before the real one.
+    // serde_json keeps the last of duplicate keys, so a last-wins parse sees
+    // the original record (and the original hash), while a first-wins reader
+    // would see the injected value.
+    for (what, anchor, injected) in [
+        ("a top-level key", "{", r#""data":{"injected":true},"#),
+        ("a key inside data", r#""data":{"#, r#""path":"/injected","#),
+    ] {
+        let _restore = (Restore::new(&file), Restore::new(&index));
+        let mut lines = read_lines(&file);
+        let original: Value = serde_json::from_str(&lines[4]).unwrap();
+        let at = lines[4].find(anchor).unwrap() + anchor.len();
+        lines[4].insert_str(at, injected);
+        write_lines(&file, &lines);
+        let last_wins: Value = serde_json::from_str(&lines[4]).unwrap();
+        assert_eq!(
+            last_wins, original,
+            "{what}: invisible to a last-wins parse"
+        );
+
+        // checkpoints.jsonl is not hashed, so the attacker also moves the
+        // offsets of the checkpoints after the longer line.
+        let entries: Vec<String> = read_lines(&index)
+            .iter()
+            .map(|line| {
+                let mut entry: Value = serde_json::from_str(line).unwrap();
+                let offset = entry["offset"].as_u64().unwrap() + injected.len() as u64;
+                entry["offset"] = offset.into();
+                entry.to_string()
+            })
+            .collect();
+        write_lines(&index, &entries);
+        assert!(
+            verify_jsonl(&file).is_err(),
+            "{what}: the segment alone is not accepted"
+        );
+
+        match verify_session(&dir) {
+            Err(VerifyError::Parse {
+                segment: 1,
+                line: 5,
+                reason,
+            }) => assert!(reason.contains("duplicate"), "{what}: {reason}"),
+            other => panic!("{what}: expected a parse error at line 5, got {other:?}"),
+        }
+    }
+    verify_session(&dir).unwrap();
+}
+
+#[test]
 fn an_injected_key_or_null_breaks_the_chain() {
     let tmp = TempDir::new().unwrap();
     let dir = session(&tmp, 20, |_| {});

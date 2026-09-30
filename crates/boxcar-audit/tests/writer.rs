@@ -15,10 +15,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{
-    spawn, spawn_with_syncer, verify_session, LogReader, Priority, SinkClosed, Submission, Syncer,
+    spawn, spawn_with_syncer, verify_session, EmitError, LogReader, Priority, Submission, Syncer,
     VerifyError, WriterConfig,
 };
-use boxcar_proto::{FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject};
+use boxcar_proto::{Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -462,6 +462,44 @@ fn recovery_does_not_keep_a_complete_but_corrupted_record() {
 }
 
 #[test]
+fn recovery_does_not_keep_a_record_with_a_duplicated_key() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = config(tmp.path());
+    let (sink, writer) = spawn(cfg.clone()).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    for n in 0..20 {
+        sink.emit(event(n)).unwrap();
+    }
+    writer.close().unwrap();
+
+    // A second `path` before the real one inside seq 20's data: last-wins
+    // parsing still hashes it like the original, so only duplicate-key
+    // rejection can tell it apart.
+    let file = segment_files(&dir).remove(0);
+    let text = fs::read_to_string(&file).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let at = lines[19].find(r#""data":{"#).unwrap() + r#""data":{"#.len();
+    lines[19].insert_str(at, r#""path":"/injected","#);
+    let tampered: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&file, tampered).unwrap();
+
+    let (sink, writer) = spawn(cfg).unwrap();
+    for n in 100..103 {
+        sink.emit(event(n)).unwrap();
+    }
+    writer.close().unwrap();
+
+    assert_eq!(meta(&dir)["recovered_from_seq"], 19);
+    let events: Vec<u64> = read_records(&dir)
+        .iter()
+        .filter(|r| !is_checkpoint(r))
+        .map(event_number)
+        .collect();
+    assert_eq!(events, (0..19).chain(100..103).collect::<Vec<_>>());
+    verify_session(&dir).unwrap();
+}
+
+#[test]
 fn a_torn_first_line_resumes_from_the_previous_segment() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = config(tmp.path());
@@ -776,9 +814,39 @@ fn droppable_events_count_drops_and_never_drop_events_wait() {
     assert_eq!(last.data["dropped"], 3, "the checkpoint reports the drops");
 
     // After close the sink refuses everything, and refusals are not drops.
-    assert_eq!(sink.emit(event(9)), Err(SinkClosed));
+    assert_eq!(sink.emit(event(9)), Err(EmitError::Closed));
     assert!(!sink.try_emit(event(10)));
     assert_eq!(sink.dropped(), 3);
+    verify_session(&dir).unwrap();
+}
+
+#[test]
+fn a_submitted_checkpoint_is_refused_at_the_sink() {
+    let tmp = TempDir::new().unwrap();
+    let (sink, writer) = spawn(config(tmp.path())).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+
+    // Only the writer can compute a checkpoint; a submitted one is refused
+    // at once, and a refusal is not a drop.
+    let forged = Submission {
+        payload: Payload::Checkpoint(Checkpoint {
+            records_since: 0,
+            dropped: 0,
+            root_hash: Hash([0; 32]),
+        }),
+        ..event(0)
+    };
+    assert_eq!(sink.emit(forged.clone()), Err(EmitError::Checkpoint));
+    assert!(!sink.try_emit(forged));
+    assert_eq!(sink.dropped(), 0);
+
+    sink.emit(event(1)).unwrap();
+    let stats = writer.close().unwrap();
+    assert_eq!(stats.dropped, 0);
+    let records = read_records(&dir);
+    assert_eq!(records.len(), 2, "the event and the final checkpoint");
+    assert_eq!(event_number(&records[0]), 1);
+    assert_eq!(check_checkpoints(&records), [2]);
     verify_session(&dir).unwrap();
 }
 
@@ -792,7 +860,7 @@ fn dropping_the_handle_finishes_the_log() {
     }
     drop(writer);
 
-    assert_eq!(sink.emit(event(5)), Err(SinkClosed));
+    assert_eq!(sink.emit(event(5)), Err(EmitError::Closed));
     let records = read_records(&dir);
     assert_eq!(records.len(), 6);
     assert!(is_checkpoint(&records[5]));
