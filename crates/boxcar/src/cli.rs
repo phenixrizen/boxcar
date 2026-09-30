@@ -3,9 +3,11 @@
 
 //! What `boxcar` accepts on its command line.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// Run AI coding agents in a microVM with a tamper-evident audit log.
 #[derive(Debug, Parser)]
@@ -13,6 +15,38 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Parses `args` (the program name first), and also refuses a `--`
+    /// after `run` with no command after it. clap cannot see that one: it
+    /// parses as no command at all, which would start an interactive shell
+    /// instead of the command meant. clap refuses `--` as the value of an
+    /// option, so a `--` in arguments it accepted is the separator.
+    pub fn try_parse_args<I, T>(args: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+        let cli = Cli::try_parse_from(&args)?;
+        if let Command::Run(run) = &cli.command {
+            if run.command.is_empty() && args.iter().any(|arg| arg == "--") {
+                let (kind, message) = (
+                    ErrorKind::MissingRequiredArgument,
+                    "a command is required after `--`",
+                );
+                // Built, so that the error shows `boxcar run`'s usage.
+                let mut command = Cli::command();
+                command.build();
+                return Err(match command.find_subcommand_mut("run") {
+                    Some(run) => run.error(kind, message),
+                    None => command.error(kind, message),
+                });
+            }
+        }
+        Ok(cli)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,7 +153,7 @@ pub struct RunArgs {
     pub debug_boot: bool,
     /// Where audit logs go: DIR/sessions/<session-id>/. Default:
     /// $XDG_DATA_HOME/boxcar, or ~/.local/share/boxcar. It may not be
-    /// inside `--rootfs` or `--workspace`, nor either of them inside it.
+    /// inside `--rootfs` or `--workspace`.
     #[arg(long, value_name = "DIR")]
     pub audit_dir: Option<PathBuf>,
     /// Write the serial console to PATH instead of stdout. Stdin is then not
@@ -128,9 +162,9 @@ pub struct RunArgs {
     pub console_log: Option<PathBuf>,
     /// The command the guest runs instead of a login shell, and its
     /// arguments, after `--`: an argv, run without a shell, with CMD looked
-    /// up in the guest's PATH unless it holds a `/`. The run is not
-    /// interactive: stdin is not forwarded and the terminal is left as it
-    /// is.
+    /// up in the guest's PATH unless it holds a `/`. A `--` must be
+    /// followed by one. The run is not interactive: stdin is not forwarded
+    /// and the terminal is left as it is.
     #[arg(last = true, value_name = "CMD", conflicts_with = "no_fs")]
     pub command: Vec<String>,
 }
@@ -140,4 +174,47 @@ pub struct RunArgs {
 pub enum AuditLevelArg {
     Normal,
     Verbose,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(args: &[&str]) -> Result<Cli, clap::Error> {
+        let base = ["boxcar", "run", "--kernel", "vmlinux", "--rootfs", "root"];
+        Cli::try_parse_args(base.iter().chain(args))
+    }
+
+    fn command(cli: &Cli) -> &[String] {
+        match &cli.command {
+            Command::Run(args) => &args.command,
+            _ => panic!("not a run"),
+        }
+    }
+
+    #[test]
+    fn a_command_follows_the_separator() {
+        assert_eq!(command(&run(&["--", "ls", "-l"]).unwrap()), ["ls", "-l"]);
+        assert_eq!(
+            command(&run(&["--", "sh", "-c", "x", "--", "y"]).unwrap()),
+            ["sh", "-c", "x", "--", "y"]
+        );
+        assert!(command(&run(&[]).unwrap()).is_empty());
+    }
+
+    /// clap parses `--` with nothing after it as no command at all, which
+    /// would be an interactive shell instead of the command meant.
+    #[test]
+    fn a_separator_with_no_command_is_refused() {
+        let error = run(&["--"]).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("after `--`"), "{error}");
+    }
+
+    #[test]
+    fn other_subcommands_parse_as_before() {
+        let cli = Cli::try_parse_args(["boxcar", "audit", "verify", "--", "log.jsonl"]).unwrap();
+        assert!(matches!(cli.command, Command::Audit(_)));
+    }
 }

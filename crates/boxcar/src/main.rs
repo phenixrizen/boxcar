@@ -8,10 +8,8 @@ mod cmd;
 
 use std::process::ExitCode;
 
-use clap::Parser;
-
 fn main() -> ExitCode {
-    let cli = cli::Cli::parse();
+    let cli = cli::Cli::try_parse_args(std::env::args_os()).unwrap_or_else(|error| error.exit());
     match cmd::run(cli) {
         Ok(code) => code,
         Err(err) => {

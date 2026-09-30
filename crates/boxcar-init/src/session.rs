@@ -37,7 +37,7 @@ use nix::unistd::{
 
 use crate::console::{warn, write_console, Failed, StackLine, Step};
 use crate::mounts::ensure_dir;
-use crate::search::{self, Probe};
+use crate::search::{self, Miss};
 
 /// What runs when the command line names no command: a login shell, which
 /// reads `/etc/profile`.
@@ -109,22 +109,28 @@ fn id(args: &BTreeMap<String, String>, key: &str) -> Result<u32, Failed> {
 }
 
 /// The session's command, ready for `execve` without allocating: the
-/// argument strings, the file to run and the NULL-terminated pointer arrays
-/// of the arguments and of [`ENV`] are all built before the fork.
+/// argument strings, the files it may be and the NULL-terminated pointer
+/// arrays of the arguments and of [`ENV`] are all built before the fork.
 pub struct Exec {
     argv: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
     env_ptrs: Vec<*const libc::c_char>,
-    /// The file `execve` runs: the first argument as it is until
-    /// [`Exec::resolve`], then what the search found, or why it found
-    /// nothing.
-    program: Result<CString, Errno>,
+    /// Where the program may be, in the order they are tried
+    /// ([`search::candidates`] of the first argument on the session's
+    /// PATH).
+    candidates: Vec<CString>,
 }
 
 impl Exec {
-    /// `argv` with the environment [`ENV`]. Fails when `argv` is empty or an
-    /// argument holds a NUL byte, which `execve` cannot pass.
+    /// `argv` with the environment [`ENV`], its program looked for on
+    /// [`session_path`]. Fails when `argv` is empty or an argument holds a
+    /// NUL byte, which `execve` cannot pass.
     pub fn new(argv: &[String]) -> Result<Exec, Failed> {
+        Exec::new_in(argv, session_path())
+    }
+
+    /// [`Exec::new`] with the program looked for on `path`.
+    fn new_in(argv: &[String], path: &str) -> Result<Exec, Failed> {
         if argv.is_empty() {
             return Err(Failed::new("session command", "empty"));
         }
@@ -133,25 +139,18 @@ impl Exec {
             .map(|arg| CString::new(arg.as_str()))
             .collect::<Result<Vec<_>, _>>()
             .step("session command")?;
+        let name = argv[0].to_str().step("session command")?;
+        let candidates = search::candidates(name, path)
+            .into_iter()
+            .map(CString::new)
+            .collect::<Result<Vec<_>, _>>()
+            .step("session command")?;
         Ok(Exec {
             argv_ptrs: pointers(argv.iter().map(CString::as_c_str)),
             env_ptrs: pointers(ENV.into_iter()),
-            program: Ok(argv[0].clone()),
+            candidates,
             argv,
         })
-    }
-
-    /// Finds the file to run as `execvp` would, through [`session_path`]
-    /// in the root the session will see: once the root share is `/`, before
-    /// the fork. A first argument holding a `/` is run as it is.
-    pub fn resolve(&mut self) {
-        self.resolve_with(search::probe);
-    }
-
-    /// [`Exec::resolve`] with `probe` telling what is at each path tried.
-    fn resolve_with(&mut self, probe: impl Fn(&str) -> Probe) {
-        self.program = search::resolve(self.name(), session_path(), probe)
-            .and_then(|path| CString::new(path).map_err(|_| Errno::EINVAL));
     }
 
     /// The command's name: the first argument, as given.
@@ -160,29 +159,43 @@ impl Exec {
         self.argv[0].to_str().unwrap_or("?")
     }
 
-    /// The file `execve` runs, or why there is none.
-    fn program(&self) -> Result<&CStr, Errno> {
-        self.program.as_deref().map_err(|&errno| errno)
-    }
-
-    /// Runs the program in this process, which returns only if that failed
-    /// (or there is no program to run).
+    /// Runs the first of the candidates this process may run, as `execvp`
+    /// would; returns only if none could be run, with why.
+    ///
+    /// Called in the session child once it is the session's user, so that
+    /// `access(X_OK)`, which checks the real uid and gid, answers for it,
+    /// and only async-signal-safe calls are made. A candidate `access`
+    /// passes may still fail `execve` (a directory does, with `EACCES`);
+    /// either error is read with [`search::miss`]: the search goes on past
+    /// a file that is not there or may not be run, and ends at any other
+    /// error. Running out of candidates is `EACCES` if one was refused,
+    /// else `ENOENT`.
     fn exec(&self) -> Errno {
-        let program = match self.program() {
-            Ok(program) => program,
-            Err(errno) => return errno,
-        };
-        // SAFETY: the path and every pointer of both arrays point at C
-        // strings that `self` owns or that are static, and both arrays end
-        // with a null pointer.
-        unsafe {
-            libc::execve(
-                program.as_ptr(),
-                self.argv_ptrs.as_ptr(),
-                self.env_ptrs.as_ptr(),
-            );
+        let mut refused = false;
+        for candidate in &self.candidates {
+            // SAFETY: access only reads the C string, which `self` owns.
+            let errno = if unsafe { libc::access(candidate.as_ptr(), libc::X_OK) } == 0 {
+                // SAFETY: the path and every pointer of both arrays point at
+                // C strings that `self` owns or that are static, and both
+                // arrays end with a null pointer.
+                unsafe {
+                    libc::execve(
+                        candidate.as_ptr(),
+                        self.argv_ptrs.as_ptr(),
+                        self.env_ptrs.as_ptr(),
+                    );
+                }
+                Errno::last()
+            } else {
+                Errno::last()
+            };
+            match search::miss(errno) {
+                Miss::Absent => {}
+                Miss::Refused => refused = true,
+                Miss::Fatal => return errno,
+            }
         }
-        Errno::last()
+        search::not_run(refused)
     }
 }
 
@@ -345,7 +358,8 @@ fn child(
 }
 
 /// The console line for `failure`: `boxcar-init: exec: <command>: <error>`
-/// when the command could not be run (`ENOENT` when it was not found), else
+/// when the command could not be run (`ENOENT` when it was found nowhere,
+/// `EACCES` when what was found may not be run), else
 /// `boxcar-init: session: <step>: <error>`. Built on the stack: the child
 /// may not allocate.
 fn failure_line(failure: &ChildFailure, exec: &Exec) -> StackLine {
@@ -533,6 +547,10 @@ fn join_session_cgroup() -> Result<(), Errno> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
     use super::*;
 
     fn args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -632,7 +650,6 @@ mod tests {
     #[test]
     fn the_pointer_arrays_point_at_the_strings_and_end_in_null() {
         let exec = Exec::new(&strings(&["/bin/sh", "-c", "exit 7"])).unwrap();
-        assert_eq!(exec.program(), Ok(c"/bin/sh"));
         let argv: Vec<&CStr> = exec.argv.iter().map(CString::as_c_str).collect();
         for (strings, ptrs) in [(&argv[..], &exec.argv_ptrs), (&ENV[..], &exec.env_ptrs)] {
             assert_eq!(ptrs.len(), strings.len() + 1);
@@ -737,25 +754,102 @@ mod tests {
         );
     }
 
-    /// `ls` is found through PATH; argv[0] stays what was asked for.
+    fn candidates(exec: &Exec) -> Vec<&str> {
+        exec.candidates
+            .iter()
+            .map(|c| c.to_str().unwrap())
+            .collect()
+    }
+
+    /// `ls` is looked for through the session's PATH; argv[0] stays what
+    /// was asked for.
     #[test]
-    fn a_bare_name_runs_the_file_found_through_path() {
-        let mut exec = Exec::new(&strings(&["ls", "/workspace"])).unwrap();
-        exec.resolve_with(|candidate| match candidate {
-            "/bin/ls" => Probe::Executable,
-            _ => Probe::Missing,
-        });
-        assert_eq!(exec.program(), Ok(c"/bin/ls"));
+    fn a_bare_name_is_looked_for_in_the_session_path() {
+        let exec = Exec::new(&strings(&["ls", "/workspace"])).unwrap();
+        assert_eq!(
+            candidates(&exec),
+            [
+                "/usr/local/sbin/ls",
+                "/usr/local/bin/ls",
+                "/usr/sbin/ls",
+                "/usr/bin/ls",
+                "/sbin/ls",
+                "/bin/ls"
+            ]
+        );
         assert_eq!(exec.name(), "ls");
         assert_eq!(exec.argv_ptrs[0], exec.argv[0].as_ptr());
     }
 
     #[test]
-    fn a_name_found_nowhere_fails_the_exec_with_enoent() {
-        let mut exec = Exec::new(&strings(&["nosuchcmd"])).unwrap();
-        exec.resolve_with(|_| Probe::Missing);
-        assert_eq!(exec.program(), Err(Errno::ENOENT));
+    fn a_path_is_its_own_only_candidate() {
+        let exec = Exec::new(&strings(&["/bin/sh", "-c", "true"])).unwrap();
+        assert_eq!(candidates(&exec), ["/bin/sh"]);
+    }
+
+    /// Three PATH entries under a scratch directory, `a:b:c`.
+    fn scratch_path(dir: &Path) -> String {
+        ["a", "b", "c"]
+            .map(|entry| {
+                let entry = dir.join(entry);
+                fs::create_dir(&entry).unwrap();
+                entry.to_str().unwrap().to_owned()
+            })
+            .join(":")
+    }
+
+    /// Neither of these runs anything, so they can run in the test process.
+    #[test]
+    fn a_name_found_nowhere_fails_with_enoent_and_one_not_runnable_with_eacces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch_path(dir.path());
+        let exec = Exec::new_in(&strings(&["tool"]), &path).unwrap();
         assert_eq!(exec.exec(), Errno::ENOENT);
+
+        fs::write(dir.path().join("b/tool"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(dir.path().join("b/tool"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(exec.exec(), Errno::EACCES);
+    }
+
+    /// The first candidate the session may run is the one that runs: a
+    /// directory (which `access` passes and `execve` refuses) and a file
+    /// without an execute bit are passed over. In a child, which the
+    /// command replaces.
+    #[test]
+    fn the_first_candidate_that_can_be_run_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch_path(dir.path());
+        fs::create_dir(dir.path().join("a/tool")).unwrap();
+        fs::write(dir.path().join("b/tool"), b"").unwrap();
+        fs::set_permissions(dir.path().join("b/tool"), fs::Permissions::from_mode(0o644)).unwrap();
+        let exit_0 = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap();
+        std::os::unix::fs::symlink(exit_0, dir.path().join("c/tool")).unwrap();
+        let exec = Exec::new_in(&strings(&["tool"]), &path).unwrap();
+
+        // SAFETY: the child only calls access and execve, then _exits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let errno = exec.exec();
+                // SAFETY: ends the child without running the harness.
+                unsafe { libc::_exit(100 + errno as i32 % 100) }
+            }
+            ForkResult::Parent { child } => {
+                let status = nix::sys::wait::waitpid(child, None).unwrap();
+                assert_eq!(
+                    status,
+                    nix::sys::wait::WaitStatus::Exited(child, 0),
+                    "100 + errno: the exec failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_exec_failure_line_names_the_command() {
+        let exec = Exec::new(&strings(&["nosuchcmd"])).unwrap();
         let failure = ChildFailure {
             step: EXEC_STEP,
             errno: Errno::ENOENT,
@@ -774,13 +868,6 @@ mod tests {
             failure_line(&setup, &exec).finish(),
             b"boxcar-init: session: setresuid: EPERM: Operation not permitted\n"
         );
-    }
-
-    #[test]
-    fn a_path_is_run_as_given() {
-        let mut exec = Exec::new(&strings(&["/bin/sh", "-c", "true"])).unwrap();
-        exec.resolve_with(|candidate| panic!("searched for {candidate}"));
-        assert_eq!(exec.program(), Ok(c"/bin/sh"));
     }
 
     #[test]

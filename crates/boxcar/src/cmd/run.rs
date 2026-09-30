@@ -12,6 +12,7 @@ use anyhow::{bail, Context};
 use boxcar_audit::WriterConfig;
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_proto::{guestcmd, SessionId};
+use boxcar_vmm::devices::FS_TAGS;
 use boxcar_vmm::lifecycle::block_stop_signals;
 use boxcar_vmm::vmm::{cmdline_size, ConsoleOut, VmConfig, Vmm, CMDLINE_MAX_SIZE};
 use tracing_subscriber::EnvFilter;
@@ -40,8 +41,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => default_audit_dir(env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))
             .context("no --audit-dir, and neither XDG_DATA_HOME nor HOME is an absolute path")?,
     };
-    // The default workspace is boxcar's own, fresh in the session
-    // directory: only the directories the user names are checked.
+    // The default workspace, made later in the session directory, cannot
+    // hold the audit directory: only the directories the user names are
+    // checked.
     let named: Vec<&Path> = [rootfs.as_deref(), workspace.as_deref()]
         .into_iter()
         .flatten()
@@ -51,7 +53,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let (mode, share_count) = match &rootfs {
         Some(_) => {
             let (uid, gid) = invoking_user();
-            (GuestMode::Console { uid, gid }, 2)
+            (GuestMode::Console { uid, gid }, SHARE_COUNT)
         }
         // clap requires --rootfs unless --no-fs.
         None => (GuestMode::Hello, 0),
@@ -124,19 +126,26 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(u8::try_from(exit.exit_code()).unwrap_or(1)))
 }
 
-/// The two shares, in slot order: the root filesystem, which only the guest
-/// changes, cached freely; the workspace, which the host may edit too,
-/// revalidated.
+/// How many shares a run with `--rootfs` gives the VM ([`shares`]), for
+/// the size of its command line.
+const SHARE_COUNT: usize = FS_TAGS.len();
+
+/// The shares, one per tag of the VMM's [`FS_TAGS`], in its slot order:
+/// the root filesystem, which only the guest changes, cached freely; the
+/// workspace, which the host may edit too, revalidated.
 fn shares(rootfs: PathBuf, workspace: PathBuf) -> Vec<FsShareConfig> {
+    // Fails to compile when the VMM's shares change, so the two cannot
+    // drift apart.
+    let [root_tag, workspace_tag] = FS_TAGS;
     vec![
         FsShareConfig {
-            tag: "root".into(),
+            tag: root_tag.into(),
             host_dir: rootfs,
             guest_path: "/".into(),
             cache: CachePolicyKind::Always,
         },
         FsShareConfig {
-            tag: "workspace".into(),
+            tag: workspace_tag.into(),
             host_dir: workspace,
             guest_path: "/workspace".into(),
             cache: CachePolicyKind::Auto,
@@ -187,8 +196,10 @@ fn default_audit_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) ->
 
 /// The audit directory `audit_dir` as an absolute path with every symbolic
 /// link resolved, once it is known to lie outside each of `shares` (real
-/// paths already) and none of them lies inside it: the guest writes to its
-/// shares, and must not reach the log that records what it does.
+/// paths already): the guest writes to its shares, and must not reach the
+/// log that records what it does. A share below the audit directory holds
+/// no log, and an old session's workspace is one, so it may be shared
+/// again.
 fn check_audit_dir(audit_dir: &Path, shares: &[&Path]) -> anyhow::Result<PathBuf> {
     let audit =
         resolve_path(audit_dir).with_context(|| format!("--audit-dir {}", audit_dir.display()))?;
@@ -198,13 +209,6 @@ fn check_audit_dir(audit_dir: &Path, shares: &[&Path]) -> anyhow::Result<PathBuf
                 "audit dir {} is inside share {}",
                 audit.display(),
                 share.display()
-            );
-        }
-        if share.starts_with(&audit) {
-            bail!(
-                "share {} is inside audit dir {}",
-                share.display(),
-                audit.display()
             );
         }
     }
@@ -492,18 +496,27 @@ mod tests {
         assert!(!tree.at("root/new").exists(), "nothing was created");
     }
 
+    /// A share below the audit dir holds no log, and an old session's
+    /// workspace is one: it may be shared again.
     #[test]
-    fn a_share_inside_the_audit_dir_is_refused() {
+    fn a_workspace_under_an_old_session_is_accepted() {
         let tree = Tree::new();
-        let error = check_audit_dir(tree.dir.path(), &[&tree.at("root")]).unwrap_err();
+        let old = tree.at("audit/sessions/01a0f42e-4fdf-74e9-95de-4e59c0ac45eb/workspace");
+        fs::create_dir_all(&old).unwrap();
         assert_eq!(
-            error.to_string(),
-            format!(
-                "share {} is inside audit dir {}",
-                tree.at("root").display(),
-                tree.dir.path().canonicalize().unwrap().display()
-            )
+            check_audit_dir(&tree.at("audit"), &[&tree.at("root"), &old]).unwrap(),
+            tree.at("audit")
         );
+    }
+
+    /// The shares `boxcar run` counts for the command line are the shares it
+    /// gives the VM: the VMM's tags, in its slot order.
+    #[test]
+    fn the_shares_are_the_vmm_s_tags_in_slot_order() {
+        let shares = shares(PathBuf::from("/r"), PathBuf::from("/w"));
+        let tags: Vec<&str> = shares.iter().map(|share| share.tag.as_str()).collect();
+        assert_eq!(tags, FS_TAGS);
+        assert_eq!(shares.len(), SHARE_COUNT);
     }
 
     /// The comparison is between real paths: a symbolic link into a share,

@@ -244,3 +244,42 @@ fn without_xdg_data_home_sessions_go_under_the_home_directory() {
         sessions.display()
     );
 }
+
+#[test]
+fn a_separator_with_no_command_is_refused() {
+    let output = boxcar(&["run", "--kernel", "vmlinux", "--rootfs", "/tmp", "--"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("after `--`"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// An old session's workspace may be shared again: the run gets past the
+/// audit dir check, and fails only for want of a kernel.
+#[test]
+fn an_old_session_workspace_can_be_shared_again() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    let audit = scratch.path().join("audit");
+    let old = audit.join("sessions/01a0f42e-4fdf-74e9-95de-4e59c0ac45eb/workspace");
+    std::fs::create_dir(&rootfs).unwrap();
+    std::fs::create_dir_all(&old).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["run", "--kernel", "/nonexistent/vmlinux", "--rootfs"])
+        .arg(&rootfs)
+        .arg("--audit-dir")
+        .arg(&audit)
+        .arg("--workspace")
+        .arg(&old)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let old = old.canonicalize().unwrap();
+    assert!(
+        stderr(&output).contains(&format!("workspace: {}", old.display())),
+        "{}",
+        stderr(&output)
+    );
+}
