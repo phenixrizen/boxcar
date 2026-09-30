@@ -9,18 +9,22 @@ use std::process::ExitCode;
 use std::{env, fs, io};
 
 use anyhow::{bail, Context};
-use boxcar_audit::WriterConfig;
+use boxcar_audit::{AuditSink, WriterConfig, WriterHandle};
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::FS_TAGS;
-use boxcar_vmm::lifecycle::block_stop_signals;
-use boxcar_vmm::vmm::{cmdline_size, ConsoleOut, VmConfig, Vmm, CMDLINE_MAX_SIZE};
+use boxcar_vmm::lifecycle::{block_stop_signals, AUDIT_FAILED_EXIT};
+use boxcar_vmm::vmm::{cmdline_size, ConsoleOut, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{AuditLevelArg, RunArgs};
 
 /// Starts the session's audit writer, boots the VM, and waits for it to
-/// stop. The exit code is the VM's (see `VmExit::exit_code`).
+/// stop. The exit code is the VM's (see `VmExit::exit_code`), except that
+/// a run whose audit log failed at any point, while the VM ran or while
+/// the log was closed, exits [`AUDIT_FAILED_EXIT`] (3) after saying
+/// `audit log failed: <why>` on stderr: the log is incomplete, whatever the
+/// guest did.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     init_tracing();
     // Everything that can be refused is checked before the session exists,
@@ -63,11 +67,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
     // Before any thread starts, so that every thread inherits the mask and
     // the signals reach only the VMM's signalfd.
-    block_stop_signals().context("cannot block SIGINT and SIGTERM")?;
+    block_stop_signals().context("cannot block the stop signals")?;
 
     let session_id = SessionId::new();
-    let (sink, writer) = boxcar_audit::spawn(WriterConfig::new(&audit_dir, session_id.clone()))
+    let (sink, writer) = start_audit_log(WriterConfig::new(&audit_dir, session_id.clone()))
         .with_context(|| format!("cannot start the audit log under {}", audit_dir.display()))?;
+    // Outlives the writer, to ask it afterwards whether it failed.
+    let audit = sink.clone();
     eprintln!("session: {session_id}");
     eprintln!("audit: {}", writer.session_dir().display());
 
@@ -112,6 +118,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // Drains every accepted record (vmm.stop included), checkpoints, syncs.
     let closed = writer.close();
 
+    if let Some(failure) = audit.failure() {
+        match outcome {
+            // It says the same as the line below.
+            Ok(VmExit::AuditFailed(_)) => {}
+            Ok(exit) => eprintln!("{exit}"),
+            Err(error) => eprintln!("error: {:#}", anyhow::Error::from(error)),
+        }
+        eprintln!("audit log failed: {failure}");
+        return Ok(ExitCode::from(u8::try_from(AUDIT_FAILED_EXIT).unwrap_or(1)));
+    }
     let exit = match outcome {
         Ok(exit) => exit,
         Err(error) => {
@@ -124,6 +140,68 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     eprintln!("{exit}");
     closed.context("cannot close the audit log")?;
     Ok(ExitCode::from(u8::try_from(exit.exit_code()).unwrap_or(1)))
+}
+
+/// Starts the session's audit writer.
+#[cfg(not(feature = "kvm-tests"))]
+fn start_audit_log(cfg: WriterConfig) -> io::Result<(AuditSink, WriterHandle)> {
+    boxcar_audit::spawn(cfg)
+}
+
+/// Starts the session's audit writer, which fails on purpose when the
+/// gated tests ask for it with `BOXCAR_TEST_FAIL_AUDIT_AFTER=<n>`: every
+/// record is checkpointed, so every record is synced, and after `n` syncs
+/// every sync fails with ENOSPC, as on a full disk. The first `n` do not
+/// reach the disk: the test needs the log to fail at a known record, not
+/// to be durable, and an `fdatasync` per record would leave the writer far
+/// behind the guest. Only a `kvm-tests` build looks at the variable.
+#[cfg(feature = "kvm-tests")]
+fn start_audit_log(mut cfg: WriterConfig) -> io::Result<(AuditSink, WriterHandle)> {
+    let Some(value) = env::var_os("BOXCAR_TEST_FAIL_AUDIT_AFTER") else {
+        return boxcar_audit::spawn(cfg);
+    };
+    let ok = value.to_str().and_then(|v| v.parse().ok()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("BOXCAR_TEST_FAIL_AUDIT_AFTER={value:?} is not a number"),
+        )
+    })?;
+    cfg.checkpoint_every = 1;
+    boxcar_audit::spawn_with_syncer(cfg, fault::FailAfter::new(ok))
+}
+
+#[cfg(feature = "kvm-tests")]
+mod fault {
+    use std::fs::File;
+    use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use boxcar_audit::Syncer;
+
+    /// Succeeds, without syncing, `ok` times; then fails with ENOSPC.
+    pub(super) struct FailAfter {
+        ok: u64,
+        calls: AtomicU64,
+    }
+
+    impl FailAfter {
+        pub(super) fn new(ok: u64) -> Self {
+            FailAfter {
+                ok,
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl Syncer for FailAfter {
+        fn sync(&self, _: &File) -> io::Result<()> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) < self.ok {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+        }
+    }
 }
 
 /// How many shares a run with `--rootfs` gives the VM ([`shares`]), for

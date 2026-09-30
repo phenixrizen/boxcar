@@ -435,8 +435,14 @@ impl Vmm {
             exited.push(evt);
         }
         let (exits_tx, exits) = mpsc::channel();
-        let control =
-            ControlSubscriber::new(self.latch.clone(), reset_evt, signals, exited_watch, exits);
+        let control = ControlSubscriber::new(
+            self.latch.clone(),
+            reset_evt,
+            signals,
+            exited_watch,
+            exits,
+            self.audit.clone(),
+        );
         let fds = control.fds();
         add_subscriber(&mut main_loop, Box::new(control), &fds)?;
 

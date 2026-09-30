@@ -4,10 +4,13 @@
 //! How a VM stops.
 //!
 //! Stop triggers: the i8042 reset event, a vCPU's `Shutdown` or
-//! `SystemEvent` exit, a vCPU error, `SIGTERM` or `SIGINT` (read from a
-//! signalfd on the main thread), Ctrl-] twice on the console, and
-//! [`VmmHandle::request_stop`]. The first trigger decides the [`VmExit`]; the
-//! VM is then `Stopping` and later triggers are ignored.
+//! `SystemEvent` exit, a vCPU error, `SIGTERM`, `SIGINT`, `SIGHUP` or
+//! `SIGQUIT` (read from a signalfd on the main thread), Ctrl-] twice on the
+//! console, [`VmmHandle::request_stop`], and the audit log writer failing
+//! (its failure eventfd, [`AuditSink::failure_event`]): a VM whose actions
+//! can no longer be recorded does not keep running. The first trigger
+//! decides the [`VmExit`]; the VM is then `Stopping` and later triggers are
+//! ignored.
 //!
 //! The stop sequence, run on the main thread: kick and join every vCPU,
 //! close the devices (reset every virtio-fs device through its transport,
@@ -15,7 +18,9 @@
 //! left open, then flush the console), emit `vmm.stop` through the audit
 //! sink, restore the terminal, and return the `VmExit`. The caller
 //! (`boxcar run`) then closes the audit writer, which drains, checkpoints
-//! and syncs the log, so every record the devices made is in it.
+//! and syncs the log, so every record the devices made is in it. After an
+//! audit failure the sequence is the same; the records it makes are
+//! refused, and each refusal is logged.
 
 use std::fmt;
 use std::io;
@@ -35,10 +40,14 @@ use crate::devices::{FsDevices, LegacyDevices};
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
 
+/// The exit code of a run whose audit log failed.
+pub const AUDIT_FAILED_EXIT: i32 = 3;
+
 /// Why the VMM was asked to stop the VM.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// `SIGINT` or `SIGTERM` arrived; the signal number.
+    /// `SIGINT`, `SIGTERM`, `SIGHUP` or `SIGQUIT` arrived; the signal
+    /// number.
     Signal(i32),
     /// Ctrl-] was pressed twice within a second on the console.
     ConsoleEscape,
@@ -58,16 +67,20 @@ pub enum VmExit {
     StopRequested(StopReason),
     /// A vCPU failed; the message says which and how.
     VcpuError(String),
+    /// The audit log's writer failed; the message says where and how.
+    AuditFailed(String),
 }
 
 impl VmExit {
     /// The process exit code `boxcar run` uses: 0 when the guest reset or
-    /// shut down, 1 after a vCPU error, 128 plus the signal number after a
-    /// signal (130 for Ctrl-C), and 130 for any other requested stop.
+    /// shut down, 1 after a vCPU error, [`AUDIT_FAILED_EXIT`] (3) after the
+    /// audit log failed, 128 plus the signal number after a signal (130 for
+    /// Ctrl-C, 129 for a hangup), and 130 for any other requested stop.
     pub fn exit_code(&self) -> i32 {
         match self {
             VmExit::GuestReset | VmExit::GuestShutdown => 0,
             VmExit::VcpuError(_) => 1,
+            VmExit::AuditFailed(_) => AUDIT_FAILED_EXIT,
             VmExit::StopRequested(StopReason::Signal(signo)) => 128 + signo,
             VmExit::StopRequested(_) => 130,
         }
@@ -82,6 +95,7 @@ impl VmExit {
             VmExit::StopRequested(StopReason::ConsoleEscape) => "console_escape",
             VmExit::StopRequested(StopReason::Requested) => "stop_requested",
             VmExit::VcpuError(_) => "vcpu_error",
+            VmExit::AuditFailed(_) => "audit_failed",
         }
     }
 }
@@ -99,6 +113,7 @@ impl fmt::Display for VmExit {
             }
             VmExit::StopRequested(StopReason::Requested) => f.write_str("stop requested"),
             VmExit::VcpuError(message) => write!(f, "vCPU error: {message}"),
+            VmExit::AuditFailed(message) => write!(f, "audit log failed: {message}"),
         }
     }
 }
@@ -188,13 +203,18 @@ impl VmmHandle {
     }
 }
 
-/// `SIGINT` and `SIGTERM`, the signals that stop the VM.
+/// The signals that stop the VM: `SIGINT` (Ctrl-C), `SIGTERM`, `SIGHUP`
+/// (the terminal or the ssh session went away) and `SIGQUIT` (`Ctrl-\`).
+/// Each would otherwise kill the process with no stop sequence: no
+/// `fs.close` for the files left open, no `vmm.stop`, no final checkpoint,
+/// and a terminal left raw.
+pub const STOP_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
 fn stop_sigset() -> io::Result<libc::sigset_t> {
-    create_sigset(&[libc::SIGINT, libc::SIGTERM])
-        .map_err(|e| io::Error::from_raw_os_error(e.errno()))
+    create_sigset(&STOP_SIGNALS).map_err(|e| io::Error::from_raw_os_error(e.errno()))
 }
 
-/// Blocks `SIGINT` and `SIGTERM` on the calling thread, and so on every
+/// Blocks the [`STOP_SIGNALS`] on the calling thread, and so on every
 /// thread it starts afterwards, so that they reach the VMM only through its
 /// signalfd. Call it before starting any thread: a thread that leaves them
 /// unblocked would take the signal's default action and kill the process.
@@ -209,7 +229,7 @@ pub fn block_stop_signals() -> io::Result<()> {
     Ok(())
 }
 
-/// A non-blocking signalfd for `SIGINT` and `SIGTERM`.
+/// A non-blocking signalfd for the [`STOP_SIGNALS`].
 pub(crate) struct SignalFd(OwnedFd);
 
 impl SignalFd {
@@ -259,15 +279,16 @@ impl AsRawFd for SignalFd {
 pub(crate) type MainLoop = EventManager<Box<dyn MutEventSubscriber>>;
 
 /// Turns the main loop's stop events into [`StopLatch::trigger`] calls: the
-/// latch's own wake-up, the i8042 reset, the stop signals, and each vCPU's
+/// latch's own wake-up, the i8042 reset, the stop signals, each vCPU's
 /// "exited" eventfd (the vCPU sends its `VmExit` over `exits` before writing
-/// it).
+/// it), and the audit writer's failure eventfd.
 pub(crate) struct ControlSubscriber {
     latch: Arc<StopLatch>,
     reset_evt: EventFd,
     signals: SignalFd,
     vcpu_exited: Vec<EventFd>,
     exits: Receiver<VmExit>,
+    audit: AuditSink,
 }
 
 impl ControlSubscriber {
@@ -277,6 +298,7 @@ impl ControlSubscriber {
         signals: SignalFd,
         vcpu_exited: Vec<EventFd>,
         exits: Receiver<VmExit>,
+        audit: AuditSink,
     ) -> Self {
         ControlSubscriber {
             latch,
@@ -284,6 +306,7 @@ impl ControlSubscriber {
             signals,
             vcpu_exited,
             exits,
+            audit,
         }
     }
 
@@ -294,6 +317,7 @@ impl ControlSubscriber {
             self.latch.wake.as_raw_fd(),
             self.reset_evt.as_raw_fd(),
             self.signals.as_raw_fd(),
+            self.audit.failure_event().as_raw_fd(),
         ];
         fds.extend(self.vcpu_exited.iter().map(AsRawFd::as_raw_fd));
         fds
@@ -315,6 +339,21 @@ impl ControlSubscriber {
         }
     }
 
+    /// The audit writer failed. Its eventfd is not read, so it stays
+    /// readable for anyone else who waits on it; this subscriber stops
+    /// watching it instead, and stops the VM.
+    fn on_audit_failed(&self, events: Events, ops: &mut EventOps) {
+        if let Err(error) = ops.remove(events) {
+            tracing::warn!("cannot stop watching the audit failure eventfd: {error}");
+        }
+        let reason = self.audit.failure().map_or_else(
+            || "the audit log writer failed".to_owned(),
+            |failure| failure.to_string(),
+        );
+        tracing::error!("audit log failed: {reason}; stopping the VM");
+        self.latch.trigger(VmExit::AuditFailed(reason));
+    }
+
     fn on_vcpu_exited(&self, evt: &EventFd) {
         let _ = evt.read();
         while let Ok(exit) = self.exits.try_recv() {
@@ -324,9 +363,11 @@ impl ControlSubscriber {
 }
 
 impl MutEventSubscriber for ControlSubscriber {
-    fn process(&mut self, events: Events, _ops: &mut EventOps) {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
         let fd = events.fd();
-        if fd == self.latch.wake.as_raw_fd() {
+        if fd == self.audit.failure_event().as_raw_fd() {
+            self.on_audit_failed(events, ops);
+        } else if fd == self.latch.wake.as_raw_fd() {
             let _ = self.latch.wake.read();
         } else if fd == self.reset_evt.as_raw_fd() {
             if self.reset_evt.read().is_ok() {
@@ -402,6 +443,8 @@ pub(crate) fn record_stop(audit: &AuditSink, reason: &str, exit_code: i32) {
 
 #[cfg(test)]
 mod tests {
+    use event_manager::SubscriberOps;
+
     use super::*;
 
     #[test]
@@ -428,10 +471,28 @@ mod tests {
                 "stopped from the console",
             ),
             (
+                VmExit::StopRequested(StopReason::Signal(libc::SIGHUP)),
+                129,
+                "signal",
+                "stopped by signal 1",
+            ),
+            (
+                VmExit::StopRequested(StopReason::Signal(libc::SIGQUIT)),
+                131,
+                "signal",
+                "stopped by signal 3",
+            ),
+            (
                 VmExit::VcpuError("vCPU 0: KVM_EXIT_FAIL_ENTRY".into()),
                 1,
                 "vcpu_error",
                 "vCPU error: vCPU 0: KVM_EXIT_FAIL_ENTRY",
+            ),
+            (
+                VmExit::AuditFailed("cannot sync /a/events.000001.jsonl at seq 9: EIO".into()),
+                3,
+                "audit_failed",
+                "audit log failed: cannot sync /a/events.000001.jsonl at seq 9: EIO",
             ),
         ];
         for (exit, code, reason, text) in cases {
@@ -458,6 +519,76 @@ mod tests {
     }
 
     #[test]
+    fn a_hangup_or_quit_stops_the_vm_like_an_interrupt() {
+        let set = stop_sigset().unwrap();
+        for signo in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            // SAFETY: `set` is a valid, initialized sigset.
+            let member = unsafe { libc::sigismember(&set, signo) };
+            assert_eq!(member, 1, "signal {signo} is a stop signal");
+        }
+    }
+
+    /// Syncs nothing: every sync fails.
+    struct BrokenDisk;
+
+    impl boxcar_audit::Syncer for BrokenDisk {
+        fn sync(&self, _: &std::fs::File) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }
+    }
+
+    /// The main loop, with only the control subscriber on it, turns the
+    /// writer's failure into the VM's outcome: `AuditFailed`, with the
+    /// writer's reason.
+    #[test]
+    fn an_audit_log_failure_stops_the_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = boxcar_audit::WriterConfig::new(tmp.path(), boxcar_proto::SessionId::new());
+        let (sink, writer) = boxcar_audit::spawn_with_syncer(cfg, BrokenDisk).unwrap();
+        let segment = writer.session_dir().join("events.000001.jsonl");
+
+        let latch = Arc::new(StopLatch::new().unwrap());
+        let (_exits_tx, exits) = std::sync::mpsc::channel();
+        let control = ControlSubscriber::new(
+            latch.clone(),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            SignalFd::new().unwrap(),
+            Vec::new(),
+            exits,
+            sink.clone(),
+        );
+        let fds = control.fds();
+        let mut main_loop: MainLoop = EventManager::new().unwrap();
+        let id = main_loop.add_subscriber(Box::new(control));
+        let mut ops = main_loop.event_ops(id).unwrap();
+        for fd in fds {
+            ops.add(Events::new_raw(fd, event_manager::EventSet::IN))
+                .unwrap();
+        }
+
+        // A critical record is synced at once, and the sync fails.
+        record_stop(&sink, "test", 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let exit = loop {
+            if let Some(exit) = latch.outcome() {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the audit failure did not stop the VM"
+            );
+            main_loop.run_with_timeout(100).unwrap();
+        };
+        let failure = sink.failure().expect("the writer failed");
+        assert_eq!(exit, VmExit::AuditFailed(failure.to_string()));
+        assert_eq!(failure.path, segment);
+        assert_eq!(exit.exit_code(), AUDIT_FAILED_EXIT);
+        // The eventfd is left readable for anyone else who waits on it.
+        assert_eq!(sink.failure_event().read().unwrap(), 1);
+        assert!(writer.close().is_err());
+    }
+
+    #[test]
     fn a_blocked_signal_is_read_from_the_signalfd() {
         // Run on a thread of its own: the block must not leak into other
         // tests, and the signal goes to this thread only.
@@ -465,11 +596,14 @@ mod tests {
             block_stop_signals().unwrap();
             let signals = SignalFd::new().unwrap();
             assert_eq!(signals.read().unwrap(), None);
-            // SAFETY: signals the calling thread, which blocks SIGTERM.
-            let ret = unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
-            assert_eq!(ret, 0);
-            assert_eq!(signals.read().unwrap(), Some(libc::SIGTERM));
-            assert_eq!(signals.read().unwrap(), None);
+            for signo in STOP_SIGNALS {
+                // SAFETY: signals the calling thread, which blocks every
+                // stop signal.
+                let ret = unsafe { libc::pthread_kill(libc::pthread_self(), signo) };
+                assert_eq!(ret, 0);
+                assert_eq!(signals.read().unwrap(), Some(signo));
+                assert_eq!(signals.read().unwrap(), None);
+            }
         })
         .join()
         .unwrap();

@@ -134,6 +134,16 @@ impl Run {
 /// console in `console.log`, the audit log under `audit/` and `workspace/`
 /// as the workspace. A run past [`LIMIT`] is killed and fails the test.
 fn boxcar_run(guest: &Guest, scratch: &Scratch, command: &[&str]) -> Run {
+    boxcar_run_with(guest, scratch, command, &[])
+}
+
+/// [`boxcar_run`] with the variables `env` set for boxcar.
+fn boxcar_run_with(
+    guest: &Guest,
+    scratch: &Scratch,
+    command: &[&str],
+    env: &[(&str, String)],
+) -> Run {
     let console = scratch.path("console.log");
     let stderr = scratch.path("stderr.log");
     let start = Instant::now();
@@ -153,6 +163,7 @@ fn boxcar_run(guest: &Guest, scratch: &Scratch, command: &[&str]) -> Run {
         .arg(&console)
         .arg("--")
         .args(command)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(File::create(scratch.path("stdout.log")).unwrap())
         .stderr(File::create(&stderr).unwrap())
@@ -347,4 +358,99 @@ fn the_last_line_of_a_command_is_never_lost() {
         MARK_RUNS - lost.len()
     );
     assert!(lost.is_empty(), "lost in runs {lost:?}");
+}
+
+/// A loop of 200 file writes in the workspace, then `AFTER`.
+const WRITE_LOOP: [&str; 3] = [
+    "/bin/sh",
+    "-c",
+    "for i in $(seq 200); do echo $i > /workspace/f$i; done; echo AFTER",
+];
+
+/// Files in the workspace.
+fn workspace_files(scratch: &Scratch) -> usize {
+    fs::read_dir(scratch.workspace()).unwrap().count()
+}
+
+/// The audit log fails in the middle of a command, as it would on a full
+/// disk: boxcar stops the VM, exits 3 and says why, the command does not
+/// finish, and the log it leaves verifies up to its last good record.
+///
+/// The failure comes from `BOXCAR_TEST_FAIL_AUDIT_AFTER=<n>`, which a
+/// `kvm-tests` build of boxcar honours: the log checkpoints after every
+/// record, and the first `n` syncs succeed while every later one fails with
+/// ENOSPC. A clean run of the same command first counts the records the
+/// boot makes before the loop, so that `n` lands about 10 files into it
+/// (each file is an `fs.create` and an `fs.close`): the writer runs behind
+/// the guest, and the 190 files left are the margin by which it may.
+#[test]
+fn an_audit_log_failure_stops_the_vm_and_exits_3() {
+    let Some(guest) = guest_or_skip("kvm_m1 audit failure") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let clean = boxcar_run(&guest, &scratch, &WRITE_LOOP);
+    assert_eq!(clean.status.code(), Some(0), "{}", clean.describe());
+    assert!(clean.console.contains("AFTER"), "{}", clean.describe());
+    assert_eq!(workspace_files(&scratch), 200);
+    let boot = clean
+        .records()
+        .iter()
+        .filter(|r| r.kind != "checkpoint")
+        .position(|r| r.kind == "fs.create" && r.data["path"] == "/f1")
+        .expect("the clean run created /f1");
+
+    let ok_syncs = boot + 20;
+    let scratch = Scratch::new();
+    let env = [("BOXCAR_TEST_FAIL_AUDIT_AFTER", ok_syncs.to_string())];
+    let run = boxcar_run_with(&guest, &scratch, &WRITE_LOOP, &env);
+    eprintln!(
+        "kvm_m1 audit failure: {} after {:?}; the boot makes {boot} records",
+        run.status, run.elapsed
+    );
+    assert_eq!(run.status.code(), Some(3), "{}", run.describe());
+    assert!(!run.console.contains("AFTER"), "{}", run.describe());
+
+    // Every record is followed by its checkpoint, so sync n + 1 is the one
+    // after record n + 1, the checkpoint at seq 2n + 2.
+    let n = ok_syncs as u64;
+    let line = run
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("audit log failed: "))
+        .unwrap_or_else(|| panic!("no failure line: {}", run.describe()));
+    eprintln!("kvm_m1 audit failure: {line}");
+    let segment = run.session_dir().join("events.000001.jsonl");
+    let reason = io::Error::from_raw_os_error(libc::ENOSPC);
+    assert_eq!(
+        line,
+        format!(
+            "audit log failed: cannot sync {} at seq {}: {reason}",
+            segment.display(),
+            2 * n + 2
+        ),
+        "{}",
+        run.describe()
+    );
+
+    // The unsynced checkpoint was taken back: the log verifies and ends
+    // with the last record the writer wrote whole.
+    let records = run.records();
+    let last = records.last().unwrap();
+    assert_eq!(last.seq, 2 * n + 1, "{last:?}");
+    assert_ne!(last.kind, "checkpoint", "{last:?}");
+    let events = records.iter().filter(|r| r.kind != "checkpoint").count();
+    assert_eq!(events as u64, n + 1);
+
+    // The loop was cut short: its writes failed with EIO or the VM had
+    // stopped before it got to them.
+    let creates = records.iter().filter(|r| r.kind == "fs.create").count();
+    let files = workspace_files(&scratch);
+    eprintln!("kvm_m1 audit failure: {creates} creates recorded, {files} files on the host");
+    assert!(creates > 0, "the failure came before the loop");
+    assert!(files < 200, "{files} files");
+    assert!(
+        !records.iter().any(|r| r.kind == "vmm.stop"),
+        "vmm.stop was refused"
+    );
 }

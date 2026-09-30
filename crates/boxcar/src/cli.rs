@@ -72,10 +72,12 @@ pub enum Command {
     /// stdout (or in `--console-log`), and exits when it stops: 0 when the
     /// guest reset or shut down (whatever the session's own exit status,
     /// which the console shows as `boxcar: session exited <code>`), 1 after
-    /// a vCPU error, 130 after SIGINT (Ctrl-C) or the console escape, 143
-    /// after SIGTERM. When stdin is a terminal, the console is on stdout and
-    /// no command is given, every key goes to the guest, Ctrl-C included;
-    /// press Ctrl-] twice within a second to stop the VM.
+    /// a vCPU error, 3 when the audit log could not be written (the VM is
+    /// stopped and stderr says `audit log failed: <why>`), 130 after SIGINT
+    /// (Ctrl-C) or the console escape, 143 after SIGTERM, 129 after SIGHUP
+    /// and 131 after SIGQUIT. When stdin is a terminal, the console is on
+    /// stdout and no command is given, every key goes to the guest, Ctrl-C
+    /// included; press Ctrl-] twice within a second to stop the VM.
     Run(RunArgs),
 }
 
