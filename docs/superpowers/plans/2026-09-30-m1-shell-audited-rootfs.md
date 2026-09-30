@@ -154,7 +154,7 @@ pub struct FsCreate { pub mount: String, pub path: String, pub fh: u64, pub mode
 pub enum HashStatus { Ok, Raced, Gone, SkippedSize, NotHashed, Error }     // snake_case strings
 pub enum Attrib { Caller, Handle }                                          // "caller" | "handle"
 pub struct FsClose { pub mount: String, pub path: String, pub path_at_open: String, pub fh: u64, pub bytes_read: u64, pub bytes_written: u64, pub size: Option<u64>, pub blake3: Option<Hash>, pub hash_status: HashStatus, pub open_seq: Option<u64>, pub attrib: Attrib }
-pub struct FsIo { pub mount: String, pub path: String, pub fh: u64, pub offset: u64, pub len: u32, pub result: OpResult }
+pub struct FsIo { pub mount: String, pub path: String, pub fh: u64, pub offset: u64, pub len: u32, pub result: OpResult, pub attrib: Attrib }
 pub struct FsPathOp { pub mount: String, pub path: String, pub result: OpResult }
 pub struct FsMkdir { pub mount: String, pub path: String, pub mode: u32, pub result: OpResult }
 pub struct FsMknod { pub mount: String, pub path: String, pub mode: u32, pub rdev: u32, pub result: OpResult }
