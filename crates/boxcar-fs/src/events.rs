@@ -56,6 +56,8 @@ pub(crate) struct Events {
     mount: String,
     /// Whether a refusal from a closed log has been logged yet.
     closed_reported: AtomicBool,
+    /// Whether a refusal from a failed log has been logged yet.
+    failed_reported: AtomicBool,
     /// Whether a refused checkpoint has been logged yet.
     checkpoint_reported: AtomicBool,
 }
@@ -66,6 +68,7 @@ impl Events {
             sink,
             mount,
             closed_reported: AtomicBool::new(false),
+            failed_reported: AtomicBool::new(false),
             checkpoint_reported: AtomicBool::new(false),
         }
     }
@@ -84,6 +87,19 @@ impl Events {
                     tracing::error!(
                         mount = %self.mount,
                         "the audit log is closed; filesystem events are no longer recorded"
+                    );
+                }
+            }
+            Err(EmitError::Failed) => {
+                if !self.failed_reported.swap(true, Ordering::Relaxed) {
+                    let reason = self
+                        .sink
+                        .failure()
+                        .map_or_else(|| "unknown".to_owned(), |f| f.to_string());
+                    tracing::error!(
+                        mount = %self.mount,
+                        "the audit log failed ({reason}); filesystem events are no longer \
+                         recorded"
                     );
                 }
             }

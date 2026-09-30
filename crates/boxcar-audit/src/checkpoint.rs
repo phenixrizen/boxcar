@@ -26,12 +26,12 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use boxcar_proto::{Checkpoint, Hash};
 use serde::{Deserialize, Serialize};
 
-use crate::segment::{sync_dir, FILE_MODE};
+use crate::segment::{on, sync_dir, FileResult, FILE_MODE};
 
 pub(crate) const INDEX_FILE: &str = "checkpoints.jsonl";
 
@@ -99,7 +99,10 @@ impl Window {
 
 /// `checkpoints.jsonl`, open for appending.
 pub(crate) struct CheckpointIndex {
+    path: PathBuf,
     file: File,
+    /// The file's length after the last line appended whole.
+    len: u64,
 }
 
 impl CheckpointIndex {
@@ -163,18 +166,50 @@ impl CheckpointIndex {
                 "rebuilt the tail of the checkpoint index from the log"
             );
         }
-        Ok(CheckpointIndex { file })
+        Ok(CheckpointIndex {
+            path,
+            file,
+            len: wanted.len() as u64,
+        })
     }
 
     /// Appends one line with a single write.
-    pub(crate) fn append(&mut self, entry: &IndexEntry) -> io::Result<()> {
-        let mut line = serde_json::to_vec(entry)?;
+    pub(crate) fn append(&mut self, entry: &IndexEntry) -> FileResult<()> {
+        let append = on("append to", &self.path);
+        let mut line = serde_json::to_vec(entry).map_err(|e| append(e.into()))?;
         line.push(b'\n');
-        self.file.write_all(&line)
+        self.file
+            .write_all(&line)
+            .map_err(on("append to", &self.path))?;
+        self.len += line.len() as u64;
+        Ok(())
     }
 
-    pub(crate) fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+    pub(crate) fn sync(&self) -> FileResult<()> {
+        self.file.sync_data().map_err(on("sync", &self.path))
+    }
+
+    /// After a failure: cuts off whatever an append that failed left after
+    /// the last whole line. Best effort: a failure to cut is logged.
+    pub(crate) fn roll_back(&mut self) {
+        let cut = self.file.metadata().and_then(|m| {
+            if m.len() > self.len {
+                self.file.set_len(self.len)?;
+            }
+            Ok(m.len().saturating_sub(self.len))
+        });
+        match cut {
+            Ok(0) => {}
+            Ok(bytes) => tracing::warn!(
+                path = %self.path.display(),
+                cut_bytes = bytes,
+                "cut a partial line off the checkpoint index"
+            ),
+            Err(error) => tracing::error!(
+                path = %self.path.display(),
+                "cannot cut a partial line off the checkpoint index: {error}"
+            ),
+        }
     }
 }
 

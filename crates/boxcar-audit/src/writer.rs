@@ -16,8 +16,21 @@
 //! `segment_max_bytes` is sealed with a checkpoint and the next one started.
 //! [`WriterHandle::close`] drains every accepted event, writes a final
 //! checkpoint, and syncs.
+//!
+//! Failure: the first I/O error, or a panic, ends the thread. It is
+//! published as a [`WriteFailure`] (the file, what was being done to it, and
+//! the seq being written) before anything else happens, so that from then on
+//! every sink refuses events with
+//! [`EmitError::Failed`](crate::EmitError::Failed), including one waiting
+//! for room, and the failure eventfd ([`AuditSink::failure_event`]) becomes
+//! readable. Then the thread drops what it still buffers and cuts the
+//! current segment back to the end of the last record the log is
+//! consistent after: a checkpoint that could not be synced, and so is not
+//! in `checkpoints.jsonl`, is taken back out, as is a line only partly
+//! written. What is left verifies.
 
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,10 +39,11 @@ use std::time::{Duration, Instant};
 
 use boxcar_proto::{Hash, Payload, Record, Ring, SessionId, SpanRef, Subject};
 use crossbeam_channel::{at, bounded, never, select, Receiver, Sender};
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::chain::{Chainer, PartialRecord};
 use crate::checkpoint::{CheckpointIndex, IndexEntry, Window};
-use crate::segment::{Fdatasync, SegmentWriter, Syncer};
+use crate::segment::{on, Fdatasync, FileError, FileResult, SegmentWriter, Syncer};
 use crate::sink::{AuditSink, Priority, Shared, Submission};
 
 /// Most submissions written between two buffer flushes.
@@ -95,6 +109,40 @@ pub struct CloseStats {
     pub last_hash: Hash,
 }
 
+/// Why the writer thread stopped: what it was doing, to which file, while
+/// it wrote which record. From then on every sink refuses events with
+/// [`EmitError::Failed`](crate::EmitError::Failed).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("cannot {op} {} at seq {seq}: {message}", path.display())]
+pub struct WriteFailure {
+    /// What the writer was doing to the file: `write to`, `sync`, `create`,
+    /// `replace` or `append to`.
+    pub op: &'static str,
+    /// The segment, `meta.json` or `checkpoints.jsonl`.
+    pub path: PathBuf,
+    /// The seq of the last record the writer had chained: the one it was
+    /// writing, or the last one a failed flush or sync covered.
+    pub seq: u64,
+    pub kind: io::ErrorKind,
+    /// The OS error number, when the error has one.
+    pub errno: Option<i32>,
+    /// The error's own text.
+    pub message: String,
+}
+
+impl WriteFailure {
+    fn new(e: FileError, seq: u64) -> Self {
+        WriteFailure {
+            op: e.op,
+            path: e.path,
+            seq,
+            kind: e.error.kind(),
+            errno: e.error.raw_os_error(),
+            message: e.error.to_string(),
+        }
+    }
+}
+
 /// Owns the writer thread. Dropping it closes the writer as
 /// [`close`](Self::close) does, logging any error.
 pub struct WriterHandle {
@@ -109,6 +157,16 @@ impl WriterHandle {
     /// `<data_dir>/sessions/<session_id>`.
     pub fn session_dir(&self) -> &Path {
         &self.session_dir
+    }
+
+    /// Why the writer thread failed, once it has.
+    pub fn failure(&self) -> Option<WriteFailure> {
+        self.shared.failure.get().cloned()
+    }
+
+    /// See [`AuditSink::failure_event`].
+    pub fn failure_event(&self) -> &EventFd {
+        &self.shared.failure_evt
     }
 
     /// Stops the sinks, waits for sends in flight, drains the channel,
@@ -164,8 +222,9 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
 
     let (tx, rx) = bounded(cfg.channel_capacity);
     let (stop, stopped) = bounded(0);
-    let shared = Arc::new(Shared::default());
+    let shared = Arc::new(Shared::new()?);
     let pending_since = (!resume.window.is_empty()).then(Instant::now);
+    let consistent_len = segments.len();
     let writer = Writer {
         session_id: cfg.session_id,
         chain: Chainer::resume(resume.last_seq, resume.last_hash),
@@ -179,6 +238,7 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
         shared: shared.clone(),
         dropped_reported: 0,
         written: 0,
+        consistent_len,
     };
     let thread = thread::Builder::new()
         .name("audit-writer".into())
@@ -210,22 +270,50 @@ struct Writer<S: Syncer> {
     dropped_reported: u64,
     /// Records this writer appended.
     written: u64,
+    /// The length of the current segment after the last record the log is
+    /// consistent after: every checkpoint before it is listed in
+    /// `checkpoints.jsonl`. A failure cuts the segment back to it.
+    consistent_len: u64,
 }
 
 impl<S: Syncer> Writer<S> {
     fn run(mut self, rx: Receiver<Submission>, stop: Receiver<()>) -> io::Result<CloseStats> {
-        let result = self.serve(rx, stop);
-        if let Err(e) = &result {
-            tracing::error!(session = %self.session_id, "the audit log writer failed: {e}");
-        }
-        result
+        // Keeps the channel connected until the failure is published, so a
+        // sink waiting for room is refused as `Failed`, not `Closed`.
+        let held = rx.clone();
+        // A panic ends the writer as an I/O error does, so that the sinks
+        // fail closed rather than read it as a clean close.
+        let served = panic::catch_unwind(AssertUnwindSafe(|| self.serve(rx, stop)));
+        let failure = match served {
+            Ok(Ok(stats)) => return Ok(stats),
+            Ok(Err(error)) => WriteFailure::new(error, self.chain.last_seq()),
+            Err(_) => WriteFailure {
+                op: "write to",
+                path: self.segments.path().to_owned(),
+                seq: self.chain.last_seq(),
+                kind: io::ErrorKind::Other,
+                errno: None,
+                message: "the audit writer thread panicked".to_owned(),
+            },
+        };
+        self.shared.fail(failure.clone());
+        drop(held);
+        let kept = self.segments.roll_back(self.consistent_len);
+        self.index.roll_back();
+        tracing::error!(
+            session = %self.session_id,
+            segment = %self.segments.path().display(),
+            kept_bytes = kept,
+            "the audit log writer failed: {failure}"
+        );
+        Err(io::Error::new(failure.kind, failure))
     }
 
     fn serve(
         &mut self,
         mut rx: Receiver<Submission>,
         stop: Receiver<()>,
-    ) -> io::Result<CloseStats> {
+    ) -> FileResult<CloseStats> {
         loop {
             let deadline = self
                 .pending_since
@@ -260,7 +348,7 @@ impl<S: Syncer> Writer<S> {
         self.finish()
     }
 
-    fn batch(&mut self, first: Submission, rx: &Receiver<Submission>) -> io::Result<()> {
+    fn batch(&mut self, first: Submission, rx: &Receiver<Submission>) -> FileResult<()> {
         self.write(first)?;
         for _ in 1..MAX_BATCH {
             match rx.try_recv() {
@@ -272,9 +360,10 @@ impl<S: Syncer> Writer<S> {
     }
 
     /// Writes one submission. It is never a checkpoint: the sink refuses those.
-    fn write(&mut self, s: Submission) -> io::Result<()> {
+    fn write(&mut self, s: Submission) -> FileResult<()> {
         let record = self.chain_next(s.ring, s.ts_guest_ns, s.subject, &s.payload, s.span);
         self.append(&record)?;
+        self.consistent_len = self.segments.len();
         self.window.push(&record.hash);
         self.pending_since.get_or_insert_with(Instant::now);
         if s.priority == Priority::Critical {
@@ -313,8 +402,9 @@ impl<S: Syncer> Writer<S> {
     }
 
     /// Appends a record's line; returns its segment and offset.
-    fn append(&mut self, record: &Record) -> io::Result<(u32, u64)> {
-        let mut line = serde_json::to_vec(record)?;
+    fn append(&mut self, record: &Record) -> FileResult<(u32, u64)> {
+        let mut line = serde_json::to_vec(record)
+            .map_err(|e| on("write to", self.segments.path())(e.into()))?;
         line.push(b'\n');
         let at = self.segments.append(&line)?;
         self.written += 1;
@@ -322,8 +412,8 @@ impl<S: Syncer> Writer<S> {
     }
 
     /// Chains a checkpoint over the window, syncs it to disk, then lists it
-    /// in `checkpoints.jsonl`.
-    fn checkpoint(&mut self) -> io::Result<()> {
+    /// in `checkpoints.jsonl`. Only then is the log consistent after it.
+    fn checkpoint(&mut self) -> FileResult<()> {
         let dropped = self.shared.dropped.load(Ordering::Relaxed);
         let checkpoint = self
             .window
@@ -334,6 +424,7 @@ impl<S: Syncer> Writer<S> {
         self.segments.sync()?;
         self.index
             .append(&IndexEntry::new(record.seq, segment, offset, &checkpoint))?;
+        self.consistent_len = self.segments.len();
         self.dropped_reported = dropped;
         self.pending_since = None;
         Ok(())
@@ -341,16 +432,18 @@ impl<S: Syncer> Writer<S> {
 
     /// Ends the current segment with a checkpoint and starts the next. The
     /// index is synced first, so every sealed segment is listed durably.
-    fn seal(&mut self) -> io::Result<()> {
+    fn seal(&mut self) -> FileResult<()> {
         if !self.window.is_empty() {
             self.checkpoint()?;
         }
         self.index.sync()?;
-        self.segments.rotate()
+        self.segments.rotate()?;
+        self.consistent_len = 0;
+        Ok(())
     }
 
     /// The final checkpoint, for whatever the last one does not cover.
-    fn finish(&mut self) -> io::Result<CloseStats> {
+    fn finish(&mut self) -> FileResult<CloseStats> {
         let dropped = self.shared.dropped.load(Ordering::Relaxed);
         if !self.window.is_empty() || dropped > self.dropped_reported {
             self.checkpoint()?;

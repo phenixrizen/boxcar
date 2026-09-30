@@ -150,6 +150,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "vmm-sys-util",
 ]
 
 [[package]]

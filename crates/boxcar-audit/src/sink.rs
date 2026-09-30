@@ -15,15 +15,22 @@
 //!
 //! Once the writer is closed both refuse every event: `emit` returns
 //! [`EmitError::Closed`] and `try_emit` returns `false`. While it is closing,
-//! `try_emit` refuses too rather than wait. Both also refuse a
-//! [`Payload::Checkpoint`], which only the writer may make. A refusal is
-//! never counted as a drop.
+//! `try_emit` refuses too rather than wait. Once the writer thread has failed
+//! (an I/O error it cannot recover from) they refuse in the same way, `emit`
+//! with [`EmitError::Failed`], also an `emit` that was waiting for room;
+//! [`AuditSink::failure`] says why and [`AuditSink::failure_event`] is an
+//! eventfd to wait on. Both also refuse a [`Payload::Checkpoint`], which only
+//! the writer may make. A refusal is never counted as a drop.
 
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, TryLockError};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, TryLockError};
 
 use boxcar_proto::{Payload, Ring, SpanRef, Subject};
 use crossbeam_channel::{Sender, TrySendError};
+use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
+
+use crate::writer::WriteFailure;
 
 /// How soon a record must be on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +63,10 @@ pub enum EmitError {
     /// The writer is closed.
     #[error("the audit log writer is closed")]
     Closed,
+    /// The writer thread failed (see [`AuditSink::failure`]) and records
+    /// nothing any more.
+    #[error("the audit log writer failed")]
+    Failed,
     /// The event is a checkpoint. The writer makes those itself, from the
     /// records it has written; a submitted one could not verify.
     #[error("checkpoint records are made by the audit log writer, not submitted")]
@@ -63,7 +74,7 @@ pub enum EmitError {
 }
 
 /// What the sinks share with the writer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Shared {
     /// Events `try_emit` dropped because the channel was full.
     pub(crate) dropped: AtomicU64,
@@ -71,15 +82,51 @@ pub(crate) struct Shared {
     /// the send itself, so the write lock is granted only when no send is in
     /// flight.
     closed: RwLock<bool>,
+    /// Set once, by [`Shared::fail`], when the writer thread fails.
+    pub(crate) failure: OnceLock<WriteFailure>,
+    /// Written once, right after `failure` is set.
+    pub(crate) failure_evt: EventFd,
 }
 
 impl Shared {
+    pub(crate) fn new() -> io::Result<Self> {
+        Ok(Shared {
+            dropped: AtomicU64::new(0),
+            closed: RwLock::new(false),
+            failure: OnceLock::new(),
+            failure_evt: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
+        })
+    }
+
     /// Stops the sinks and returns once no send is in flight. From then on
     /// nothing new enters the channel, so a drain after this sees every event
     /// that was ever accepted. The writer thread must keep draining while
     /// this waits, or an `emit` blocked on a full channel would never finish.
     pub(crate) fn close(&self) {
         *self.closed.write().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    /// Publishes the writer thread's failure: the sinks refuse everything
+    /// from now on, and the failure eventfd becomes readable.
+    pub(crate) fn fail(&self, failure: WriteFailure) {
+        // Only the writer thread calls this, once, as it ends.
+        let _ = self.failure.set(failure);
+        if let Err(error) = self.failure_evt.write(1) {
+            tracing::error!("cannot signal the audit log writer's failure: {error}");
+        }
+    }
+
+    fn has_failed(&self) -> bool {
+        self.failure.get().is_some()
+    }
+
+    /// Why a send on a disconnected channel was refused.
+    fn refusal(&self) -> EmitError {
+        if self.has_failed() {
+            EmitError::Failed
+        } else {
+            EmitError::Closed
+        }
     }
 }
 
@@ -107,10 +154,13 @@ impl AuditSink {
             .closed
             .read()
             .unwrap_or_else(PoisonError::into_inner);
+        if self.shared.has_failed() {
+            return Err(EmitError::Failed);
+        }
         if *closed {
             return Err(EmitError::Closed);
         }
-        self.tx.send(s).map_err(|_| EmitError::Closed)
+        self.tx.send(s).map_err(|_| self.shared.refusal())
     }
 
     /// Sends an event if the channel has room, without waiting, and says
@@ -129,7 +179,7 @@ impl AuditSink {
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => return false,
         };
-        if *closed {
+        if *closed || self.shared.has_failed() {
             return false;
         }
         match self.tx.try_send(s) {
@@ -147,6 +197,22 @@ impl AuditSink {
     /// How many events [`try_emit`](Self::try_emit) has dropped so far.
     pub fn dropped(&self) -> u64 {
         self.shared.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Whether the writer thread has failed.
+    pub fn has_failed(&self) -> bool {
+        self.shared.has_failed()
+    }
+
+    /// Why the writer thread failed, once it has.
+    pub fn failure(&self) -> Option<WriteFailure> {
+        self.shared.failure.get().cloned()
+    }
+
+    /// An eventfd that becomes readable when the writer thread fails, and
+    /// stays readable until it is read.
+    pub fn failure_event(&self) -> &EventFd {
+        &self.shared.failure_evt
     }
 }
 
@@ -183,7 +249,7 @@ mod tests {
     #[test]
     fn try_emit_does_not_wait_while_close_waits_out_a_blocked_emit() {
         let (tx, rx) = bounded(1);
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new().unwrap());
         let sink = AuditSink::new(tx, shared.clone());
         sink.emit(event(0)).unwrap(); // the channel is now full
 

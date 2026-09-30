@@ -8,15 +8,16 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{
     spawn, spawn_with_syncer, verify_session, EmitError, LogReader, Priority, Submission, Syncer,
-    VerifyError, WriterConfig,
+    VerifyError, WriteFailure, WriterConfig,
 };
 use boxcar_proto::{
     Attrib, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject,
@@ -821,6 +822,262 @@ fn droppable_events_count_drops_and_never_drop_events_wait() {
     assert!(!sink.try_emit(event(10)));
     assert_eq!(sink.dropped(), 3);
     verify_session(&dir).unwrap();
+}
+
+// A writer that fails.
+
+/// Syncs `ok` times, then fails every sync with ENOSPC, as a full disk
+/// would.
+#[derive(Clone)]
+struct FailAfter {
+    ok: u64,
+    calls: Arc<AtomicU64>,
+}
+
+impl FailAfter {
+    fn new(ok: u64) -> Self {
+        FailAfter {
+            ok,
+            calls: Arc::default(),
+        }
+    }
+}
+
+impl Syncer for FailAfter {
+    fn sync(&self, file: &File) -> io::Result<()> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < self.ok {
+            file.sync_data()
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+    }
+}
+
+/// Whether `fd` becomes readable within `limit`.
+fn readable_within(fd: &impl AsRawFd, limit: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(limit.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `pfd` is one valid pollfd, the only memory poll touches.
+    let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+    n == 1 && pfd.revents & libc::POLLIN != 0
+}
+
+/// The failure a closed writer's error carries.
+fn failure_of(error: &io::Error) -> Option<&WriteFailure> {
+    error.get_ref()?.downcast_ref::<WriteFailure>()
+}
+
+#[test]
+fn a_failed_sync_stops_the_writer_and_says_where() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    let (sink, writer) = spawn_with_syncer(cfg, FailAfter::new(2)).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    assert!(!readable_within(sink.failure_event(), Duration::ZERO));
+    assert!(!sink.has_failed());
+
+    // Seq 1 and 2 are synced; seq 3 is not synced on its own; the sync
+    // after seq 4 fails.
+    sink.emit(critical(0)).unwrap();
+    sink.emit(critical(1)).unwrap();
+    sink.emit(event(2)).unwrap();
+    sink.emit(critical(3)).unwrap();
+    assert!(
+        readable_within(sink.failure_event(), Duration::from_secs(10)),
+        "the failure event fires"
+    );
+    assert!(readable_within(writer.failure_event(), Duration::ZERO));
+    assert!(sink.has_failed());
+
+    let failure = sink.failure().expect("the sink knows why");
+    assert_eq!(writer.failure().as_ref(), Some(&failure));
+    assert_eq!(failure.op, "sync");
+    assert_eq!(failure.path, dir.join("events.000001.jsonl"));
+    assert_eq!(failure.seq, 4);
+    assert_eq!(failure.errno, Some(libc::ENOSPC));
+    assert_eq!(failure.kind, io::ErrorKind::StorageFull);
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "cannot sync {} at seq 4: {}",
+            dir.join("events.000001.jsonl").display(),
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        )
+    );
+
+    // Failed, not closed: the writer stopped on its own.
+    assert_eq!(sink.emit(event(4)), Err(EmitError::Failed));
+    assert!(!sink.try_emit(event(5)));
+    assert_eq!(sink.dropped(), 0, "a refusal is not a drop");
+
+    let error = writer.close().unwrap_err();
+    assert_eq!(failure_of(&error), Some(&failure), "{error}");
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+    assert_eq!(sink.emit(event(6)), Err(EmitError::Failed));
+
+    // What the writer left verifies, up to the last record it wrote.
+    let report = verify_session(&dir).unwrap();
+    assert_eq!(report.last_seq, 4);
+    assert_eq!(report.checkpoints, 0);
+}
+
+#[test]
+fn a_checkpoint_that_cannot_be_synced_is_taken_back() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.checkpoint_every = 3;
+    cfg.checkpoint_interval = HOUR;
+    let (sink, writer) = spawn_with_syncer(cfg, FailAfter::new(1)).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    // 1 2 3, the checkpoint at 4 (synced), 5 6 7, the checkpoint at 8,
+    // whose sync fails.
+    for n in 0..6 {
+        sink.emit(event(n)).unwrap();
+    }
+    assert!(readable_within(
+        sink.failure_event(),
+        Duration::from_secs(10)
+    ));
+    let failure = sink.failure().unwrap();
+    assert_eq!((failure.op, failure.seq), ("sync", 8), "{failure}");
+    assert!(writer.close().is_err());
+
+    // The checkpoint at 8 is neither synced nor listed in
+    // checkpoints.jsonl, so the writer took it back out of the segment:
+    // the log ends at 7 and agrees with its index.
+    let report = verify_session(&dir).unwrap();
+    assert_eq!(report.last_seq, 7);
+    assert_eq!(report.checkpoints, 1);
+    let records = read_records(&dir);
+    assert_eq!(seqs(&records), one_to(7));
+    assert_eq!(check_checkpoints(&records), [4]);
+}
+
+#[test]
+fn a_segment_that_cannot_be_created_fails_the_writer_with_its_name() {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root may create files in a read-only directory");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.segment_max_bytes = 1;
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    let (sink, writer) = spawn(cfg).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    let mode = |m| fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(m));
+    mode(0o500).unwrap();
+
+    // Seq 1 fills the segment, which is sealed with the checkpoint at 2;
+    // the next segment cannot be created.
+    sink.emit(event(0)).unwrap();
+    assert!(readable_within(
+        sink.failure_event(),
+        Duration::from_secs(10)
+    ));
+    let failure = sink.failure().unwrap();
+    mode(0o700).unwrap();
+    assert_eq!(failure.op, "create", "{failure}");
+    assert_eq!(failure.path, dir.join("events.000002.jsonl"));
+    assert_eq!(failure.seq, 2);
+    assert_eq!(failure.errno, Some(libc::EACCES));
+    assert!(writer.close().is_err());
+
+    let report = verify_session(&dir).unwrap();
+    assert_eq!(
+        (report.segments, report.last_seq, report.checkpoints),
+        (1, 2, 1)
+    );
+}
+
+/// A syncer with a bug.
+struct Panics;
+
+impl Syncer for Panics {
+    fn sync(&self, _: &File) -> io::Result<()> {
+        panic!("the syncer panicked");
+    }
+}
+
+#[test]
+fn a_writer_that_panics_fails_closed() {
+    let tmp = TempDir::new().unwrap();
+    let (sink, writer) = spawn_with_syncer(config(tmp.path()), Panics).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    sink.emit(event(0)).unwrap();
+    sink.emit(critical(1)).unwrap();
+    assert!(readable_within(
+        sink.failure_event(),
+        Duration::from_secs(10)
+    ));
+    let failure = sink.failure().unwrap();
+    assert_eq!(failure.message, "the audit writer thread panicked");
+    assert_eq!(failure.path, dir.join("events.000001.jsonl"));
+    assert_eq!(failure.seq, 2);
+    assert_eq!(sink.emit(event(2)), Err(EmitError::Failed));
+    let error = writer.close().unwrap_err();
+    assert_eq!(failure_of(&error), Some(&failure));
+    let report = verify_session(&dir).unwrap();
+    assert_eq!(report.last_seq, 2);
+}
+
+/// Holds the writer in its first sync until the test opens the gate, then
+/// fails that sync.
+#[derive(Clone, Default)]
+struct GateThenFail(Gate);
+
+impl Syncer for GateThenFail {
+    fn sync(&self, file: &File) -> io::Result<()> {
+        self.0.sync(file)?;
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    }
+}
+
+#[test]
+fn an_emit_waiting_for_room_is_refused_when_the_writer_fails() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.channel_capacity = 1;
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    let syncer = GateThenFail::default();
+    let (sink, writer) = spawn_with_syncer(cfg, syncer.clone()).unwrap();
+    let _open_on_exit = OpenOnDrop(syncer.0.clone());
+
+    // The writer holds seq 1 in its sync; the channel fills; one more emit
+    // waits for room.
+    sink.emit(critical(0)).unwrap();
+    syncer.0.wait_until_entered();
+    sink.emit(event(1)).unwrap();
+    let (answer, answered) = crossbeam_channel::bounded(1);
+    thread::spawn({
+        let sink = sink.clone();
+        move || answer.send(sink.emit(event(2))).unwrap()
+    });
+    thread::sleep(Duration::from_millis(100));
+    assert!(answered.is_empty(), "the emit waits while the writer syncs");
+
+    syncer.0.open();
+    let refused = answered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the waiting emit returns once the writer fails");
+    // The writer never takes another event after the failed sync, so the
+    // one waiting for room is refused rather than left waiting.
+    assert_eq!(refused, Err(EmitError::Failed));
+    assert_eq!(sink.emit(event(3)), Err(EmitError::Failed));
+    let failure = sink.failure().unwrap();
+    assert_eq!((failure.op, failure.seq), ("sync", 1), "{failure}");
+    assert_eq!(failure.errno, Some(libc::EIO));
+    let error = writer.close().unwrap_err();
+    assert_eq!(failure_of(&error), Some(&failure));
 }
 
 #[test]

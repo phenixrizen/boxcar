@@ -22,9 +22,14 @@
 //! [`FILE_MODE`], whatever the process umask: `PassthroughFs::import` sets
 //! the umask to 0 for the whole process, and the log must not become
 //! writable by others once a share is imported.
+//!
+//! An I/O error while writing is a [`FileError`]: the error, what was being
+//! done, and to which file. After one the writer stops, and
+//! [`SegmentWriter::roll_back`] cuts the segment back to the end of the last
+//! record the log is consistent after, so that what is left verifies.
 
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -42,6 +47,37 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 /// The mode of every file the writer creates.
 pub(crate) const FILE_MODE: u32 = 0o600;
 const WRITE_BUFFER: usize = 256 * 1024;
+
+/// An I/O error on one of the session's files: what was being done
+/// (`write to`, `sync`, `create`, `replace`, `append to`), to which file.
+#[derive(Debug)]
+pub(crate) struct FileError {
+    pub(crate) op: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) error: io::Error,
+}
+
+pub(crate) type FileResult<T> = Result<T, FileError>;
+
+/// Makes an `io::Error` into a [`FileError`] for `op` on `path`.
+pub(crate) fn on<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> FileError + 'a {
+    move |error| FileError {
+        op,
+        path: path.to_owned(),
+        error,
+    }
+}
+
+impl From<FileError> for io::Error {
+    /// For the paths that report plain `io::Error`s, such as opening a
+    /// session: the kind is kept, and the text names the file.
+    fn from(e: FileError) -> Self {
+        io::Error::new(
+            e.error.kind(),
+            format!("cannot {} {}: {}", e.op, e.path.display(), e.error),
+        )
+    }
+}
 
 /// Makes a segment's written bytes durable. The writer calls it for every
 /// segment sync, so a test can observe exactly when the log is synced.
@@ -111,20 +147,25 @@ pub(crate) fn read_meta(dir: &Path) -> io::Result<Meta> {
 
 /// Replaces `meta.json` atomically: a temporary file, synced, renamed over
 /// the old one, then the directory synced.
-fn write_meta(dir: &Path, meta: &Meta) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(meta)?;
+fn write_meta(dir: &Path, meta: &Meta) -> FileResult<()> {
+    let path = dir.join(META_FILE);
+    let replace = on("replace", &path);
+    let mut bytes = serde_json::to_vec(meta).map_err(|e| replace(e.into()))?;
     bytes.push(b'\n');
     let tmp = dir.join(META_TMP);
-    let mut file = OpenOptions::new()
+    let written = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(FILE_MODE)
-        .open(&tmp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&tmp, dir.join(META_FILE))?;
-    sync_dir(dir)
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        });
+    written.map_err(on("replace", &path))?;
+    fs::rename(&tmp, &path).map_err(on("replace", &path))?;
+    sync_dir(dir).map_err(on("sync", dir))
 }
 
 /// Makes the directory's entries (new, renamed or removed names) durable.
@@ -182,15 +223,26 @@ pub(crate) struct Resume {
 /// Appends records to the session's current segment and rotates segments.
 /// It holds an exclusive lock on the session directory for as long as it
 /// lives, so a session has one writer at a time.
+///
+/// Appended lines are buffered here, not in a `BufWriter`, so that after a
+/// failure the buffered bytes can be dropped instead of being written out
+/// when the writer goes away.
 pub struct SegmentWriter<S: Syncer = Fdatasync> {
     dir: PathBuf,
     meta: Meta,
     syncer: S,
     /// The current segment's number.
     number: u32,
-    out: BufWriter<File>,
+    /// The current segment's path.
+    path: PathBuf,
+    file: File,
+    /// Appended lines not yet handed to the kernel.
+    buf: Vec<u8>,
     /// Bytes in the current segment, buffered ones included.
     len: u64,
+    /// Bytes of the current segment known to be in the file, whole lines
+    /// only: the length after the last flush that completed.
+    written: u64,
     /// Whether bytes were appended since the last sync.
     dirty: bool,
     _lock: File,
@@ -413,8 +465,11 @@ impl<S: Syncer> SegmentWriter<S> {
             meta,
             syncer,
             number,
-            out: BufWriter::with_capacity(WRITE_BUFFER, file),
+            path: dir.join(segment_name(number)),
+            file,
+            buf: Vec::with_capacity(WRITE_BUFFER),
             len,
+            written: len,
             dirty: false,
             _lock: lock,
         }
@@ -423,25 +478,38 @@ impl<S: Syncer> SegmentWriter<S> {
     /// Appends one line (newline included) to the current segment and
     /// returns the segment number and the offset the line starts at. The
     /// bytes may stay buffered until [`flush`](Self::flush).
-    pub fn append(&mut self, line: &[u8]) -> io::Result<(u32, u64)> {
+    pub(crate) fn append(&mut self, line: &[u8]) -> FileResult<(u32, u64)> {
+        if !self.buf.is_empty() && self.buf.len() + line.len() > WRITE_BUFFER {
+            self.flush()?;
+        }
         let at = self.len;
-        self.out.write_all(line)?;
+        self.buf.extend_from_slice(line);
         self.len += line.len() as u64;
         self.dirty = true;
         Ok((self.number, at))
     }
 
     /// Hands buffered bytes to the kernel, so readers see them.
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.out.flush()
+    pub(crate) fn flush(&mut self) -> FileResult<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        (&self.file)
+            .write_all(&self.buf)
+            .map_err(on("write to", &self.path))?;
+        self.buf.clear();
+        self.written = self.len;
+        Ok(())
     }
 
     /// Flushes and syncs the current segment, if anything was appended since
     /// the last sync.
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.out.flush()?;
+    pub(crate) fn sync(&mut self) -> FileResult<()> {
+        self.flush()?;
         if self.dirty {
-            self.syncer.sync(self.out.get_ref())?;
+            self.syncer
+                .sync(&self.file)
+                .map_err(on("sync", &self.path))?;
             self.dirty = false;
         }
         Ok(())
@@ -457,30 +525,96 @@ impl<S: Syncer> SegmentWriter<S> {
         self.number
     }
 
+    /// The current segment's path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Syncs the current segment and starts the next one. The caller seals
-    /// the segment with a checkpoint first.
-    pub fn rotate(&mut self) -> io::Result<()> {
+    /// the segment with a checkpoint first. If the next segment cannot be
+    /// listed in `meta.json`, it is removed again, so the log stays as it
+    /// was: ending with the segment just sealed.
+    pub(crate) fn rotate(&mut self) -> FileResult<()> {
         self.sync()?;
         let next = self.number + 1;
         let file = create_segment(&self.dir, next)?;
-        self.meta.segments = next;
-        write_meta(&self.dir, &self.meta)?;
-        self.out = BufWriter::with_capacity(WRITE_BUFFER, file);
+        let meta = Meta {
+            segments: next,
+            ..self.meta.clone()
+        };
+        if let Err(e) = write_meta(&self.dir, &meta) {
+            // A failure after the rename leaves meta.json listing the new
+            // segment, which then belongs to the log.
+            if !read_meta(&self.dir).is_ok_and(|m| m.segments == next) {
+                remove_quietly(&self.dir.join(segment_name(next)));
+            }
+            return Err(e);
+        }
+        self.meta = meta;
+        self.path = self.dir.join(segment_name(next));
+        self.file = file;
+        self.buf.clear();
         self.number = next;
         self.len = 0;
+        self.written = 0;
         Ok(())
+    }
+
+    /// After a failure: drops what is still buffered and cuts the current
+    /// segment back to `keep` bytes, or to the bytes known to be written
+    /// whole if that is less, so that it ends with a complete line. Returns
+    /// the length the segment was cut to. Nothing is written afterwards.
+    /// Best effort: a failure to cut is logged.
+    pub(crate) fn roll_back(&mut self, keep: u64) -> u64 {
+        self.buf.clear();
+        let keep = keep.min(self.written);
+        let cut = self.file.metadata().and_then(|m| {
+            if m.len() > keep {
+                self.file.set_len(keep)?;
+            }
+            Ok(m.len().saturating_sub(keep))
+        });
+        match cut {
+            Ok(0) => {}
+            Ok(bytes) => tracing::warn!(
+                path = %self.path.display(),
+                cut_bytes = bytes,
+                "cut the audit log back to its last consistent record"
+            ),
+            Err(error) => tracing::error!(
+                path = %self.path.display(),
+                "cannot cut the audit log back to its last consistent record: {error}"
+            ),
+        }
+        self.len = keep;
+        self.written = keep;
+        self.dirty = false;
+        keep
     }
 }
 
-/// Creates segment `n`, which must not exist yet, and makes its name durable.
-fn create_segment(dir: &Path, n: u32) -> io::Result<File> {
+/// Creates segment `n`, which must not exist yet, and makes its name
+/// durable. If the name cannot be made durable, the file is removed again.
+fn create_segment(dir: &Path, n: u32) -> FileResult<File> {
+    let path = dir.join(segment_name(n));
     let file = OpenOptions::new()
         .append(true)
         .create_new(true)
         .mode(FILE_MODE)
-        .open(dir.join(segment_name(n)))?;
-    sync_dir(dir)?;
+        .open(&path)
+        .map_err(on("create", &path))?;
+    if let Err(error) = sync_dir(dir) {
+        remove_quietly(&path);
+        return Err(on("create", &path)(error));
+    }
     Ok(file)
+}
+
+/// Removes a file the writer just made, logging a failure.
+fn remove_quietly(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        tracing::error!(path = %path.display(), "cannot remove {}: {error}", path.display());
+    }
 }
 
 #[cfg(test)]
