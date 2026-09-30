@@ -25,3 +25,6 @@ tempfile = { workspace = true }
 # Pin-set canary: it must resolve against the same virtio-queue and vm-memory
 # as fuse-backend-rs, so a pin change that splits those types fails here.
 virtio-vsock = { workspace = true }
+# Same exact pin as [dependencies]; `test-utils` only adds the `mock` module
+# the canary builds its descriptor chain with, and only for test builds.
+virtio-queue = { workspace = true, features = ["test-utils"] }
