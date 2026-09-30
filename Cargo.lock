@@ -194,6 +194,7 @@ dependencies = [
 name = "boxcar-virtio"
 version = "0.1.0"
 dependencies = [
+ "boxcar-virtio",
  "kvm-bindings",
  "kvm-ioctls",
  "thiserror",

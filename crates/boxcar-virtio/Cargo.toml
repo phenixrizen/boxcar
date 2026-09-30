@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes `boxcar_virtio::testing` (a dummy device and transport helpers) to
+# other crates' tests. This crate's own integration tests turn it on through
+# the self dev-dependency below.
+testing = []
+
 [dependencies]
 vm-memory = { workspace = true }
 virtio-queue = { workspace = true }
@@ -16,3 +22,9 @@ kvm-bindings = { workspace = true }
 vm-allocator = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+boxcar-virtio = { path = ".", features = ["testing"] }
+# Same exact pin as [dependencies]; `test-utils` only adds the `mock` module
+# the drain_queue tests build their rings with, and only for test builds.
+virtio-queue = { workspace = true, features = ["test-utils"] }

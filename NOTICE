@@ -10,9 +10,11 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
   Firecracker (https://github.com/firecracker-microvm/firecracker)
     Copyright Amazon.com, Inc. or its affiliates. Apache-2.0.
     Portions Copyright 2017 The Chromium OS Authors. BSD-3-Clause.
+    Portions Copyright © 2020, Oracle and/or its affiliates. Apache-2.0.
     Used for: x86_64 boot setup (memory layout, MP table, page tables, GDT,
-    registers, MSRs), the device bus, the virtio-mmio transport tests, the
-    vsock Unix-socket protocol, and the guest kernel configuration.
+    registers, MSRs), the device bus, the virtio-mmio transport, its IRQ
+    trigger and tests, the vsock Unix-socket protocol, and the guest kernel
+    configuration.
     guest/kernel/base/microvm-kernel-ci-x86_64-6.18.config is copied verbatim
     from resources/guest_configs/microvm-kernel-ci-x86_64-6.18.config at
     commit 21f19ed8109578108568c8a8f3623ddb6f097878 of that repository. Apache-2.0.
@@ -29,6 +31,14 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
       crates/boxcar-vmm/src/arch/x86_64/mod.rs         from mod.rs and src/vmm/src/test_utils/mod.rs
       crates/boxcar-vmm/src/memory.rs                  from mod.rs
     Apache-2.0; the Chromium OS portions BSD-3-Clause.
+    The device bus and virtio-mmio pieces are ported from the same commit,
+    21f19ed8109578108568c8a8f3623ddb6f097878:
+      crates/boxcar-virtio/src/bus.rs      from src/vmm/src/vstate/bus.rs
+      crates/boxcar-virtio/src/mmio.rs     from src/vmm/src/devices/virtio/transport/mmio.rs
+      crates/boxcar-virtio/src/irq.rs      from src/vmm/src/devices/virtio/transport/mmio.rs
+      crates/boxcar-virtio/src/testing.rs  from src/vmm/src/devices/virtio/transport/mmio.rs
+      crates/boxcar-virtio/tests/mmio.rs   from src/vmm/src/devices/virtio/transport/mmio.rs
+    Apache-2.0; the Chromium OS portions BSD-3-Clause.
 
   Cloud Hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor)
     Copyright Intel Corporation and contributors. Apache-2.0.
@@ -40,8 +50,17 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
     portions BSD-3-Clause.
 
   rust-vmm virtio-device (https://github.com/rust-vmm/vm-virtio, tag virtio-queue-v0.17.0)
-    Copyright The Chromium OS Authors and rust-vmm contributors. Apache-2.0 OR MIT.
-    Used for: the virtio device trait and virtio-mmio register map in boxcar-virtio.
+    Copyright 2018 The Chromium OS Authors. Copyright 2020 Amazon.com, Inc. or
+    its affiliates. The source files are marked Apache-2.0 OR BSD-3-Clause (the
+    crate manifest says Apache-2.0 OR MIT); boxcar uses them under Apache-2.0.
+    Used for: the virtio device trait and virtio-mmio register map in
+    boxcar-virtio, ported from virtio-device/src/ at tag virtio-queue-v0.17.0,
+    commit ec17cad1c79e0525647914b33bd9238f6f509471:
+      crates/boxcar-virtio/src/device.rs   from lib.rs
+      crates/boxcar-virtio/src/config.rs   from virtio_config.rs and lib.rs
+      crates/boxcar-virtio/src/mmio.rs     from mmio.rs and lib.rs
+      crates/boxcar-virtio/src/testing.rs  from virtio_config.rs
+      crates/boxcar-virtio/tests/mmio.rs   from mmio.rs and lib.rs
 
   rust-vmm vmm-reference (https://github.com/rust-vmm/vmm-reference)
     Apache-2.0 OR BSD-3-Clause. Used for: structure of the MMIO bus and IRQ wiring.
