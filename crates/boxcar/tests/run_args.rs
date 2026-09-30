@@ -283,3 +283,37 @@ fn an_old_session_workspace_can_be_shared_again() {
         stderr(&output)
     );
 }
+
+/// A session's directory holds its logs: sharing it is refused before a
+/// session starts.
+#[test]
+fn a_session_dir_as_the_workspace_is_refused() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    let audit = scratch.path().join("audit");
+    let old = audit.join("sessions/01a0f42e-4fdf-74e9-95de-4e59c0ac45eb");
+    std::fs::create_dir(&rootfs).unwrap();
+    std::fs::create_dir_all(&old).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["run", "--kernel", "/nonexistent/vmlinux", "--rootfs"])
+        .arg(&rootfs)
+        .arg("--audit-dir")
+        .arg(&audit)
+        .arg("--workspace")
+        .arg(&old)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let (old, audit) = (old.canonicalize().unwrap(), audit.canonicalize().unwrap());
+    assert!(
+        stderr(&output).contains(&format!(
+            "error: share {} would expose audit logs under {}",
+            old.display(),
+            audit.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    let sessions = std::fs::read_dir(audit.join("sessions")).unwrap().count();
+    assert_eq!(sessions, 1, "no session was started");
+}

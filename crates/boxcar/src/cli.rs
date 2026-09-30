@@ -153,7 +153,9 @@ pub struct RunArgs {
     pub debug_boot: bool,
     /// Where audit logs go: DIR/sessions/<session-id>/. Default:
     /// $XDG_DATA_HOME/boxcar, or ~/.local/share/boxcar. It may not be
-    /// inside `--rootfs` or `--workspace`.
+    /// inside `--rootfs` or `--workspace`, nor may either of them be DIR,
+    /// DIR/sessions or a session's directory, which hold the logs; a
+    /// directory deeper in a session, such as its workspace, may be shared.
     #[arg(long, value_name = "DIR")]
     pub audit_dir: Option<PathBuf>,
     /// Write the serial console to PATH instead of stdout. Stdin is then not

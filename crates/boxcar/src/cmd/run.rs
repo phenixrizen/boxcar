@@ -194,12 +194,17 @@ fn default_audit_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) ->
         .or_else(|| absolute(home).map(|home| home.join(".local/share/boxcar")))
 }
 
+/// The directory of the audit dir that holds one directory per session,
+/// `<audit>/sessions/<id>/`, as boxcar-audit's writer lays it out.
+const SESSIONS: &str = "sessions";
+
 /// The audit directory `audit_dir` as an absolute path with every symbolic
-/// link resolved, once it is known to lie outside each of `shares` (real
-/// paths already): the guest writes to its shares, and must not reach the
-/// log that records what it does. A share below the audit directory holds
-/// no log, and an old session's workspace is one, so it may be shared
-/// again.
+/// link resolved, once it is known that no share of `shares` (real paths
+/// already) reaches its logs: the guest writes to its shares, and must not
+/// reach the log that records what it does. So the audit dir may not be
+/// a share or inside one, nor may a share below it hold logs
+/// ([`exposes_logs`]); one deeper in a session, such as an old session's
+/// workspace, holds none and may be shared again.
 fn check_audit_dir(audit_dir: &Path, shares: &[&Path]) -> anyhow::Result<PathBuf> {
     let audit =
         resolve_path(audit_dir).with_context(|| format!("--audit-dir {}", audit_dir.display()))?;
@@ -211,8 +216,27 @@ fn check_audit_dir(audit_dir: &Path, shares: &[&Path]) -> anyhow::Result<PathBuf
                 share.display()
             );
         }
+        if share.strip_prefix(&audit).is_ok_and(exposes_logs) {
+            bail!(
+                "share {} would expose audit logs under {}",
+                share.display(),
+                audit.display()
+            );
+        }
     }
     Ok(audit)
+}
+
+/// Whether a share at `below`, a path relative to the audit dir, holds
+/// session logs: the audit dir itself, `sessions`, and each session's
+/// directory hold them directly. Anything deeper in a session, or beside
+/// `sessions`, holds none.
+fn exposes_logs(below: &Path) -> bool {
+    let parts: Vec<_> = below.components().collect();
+    match parts.as_slice() {
+        [] => true,
+        [first, rest @ ..] => first.as_os_str() == SESSIONS && rest.len() <= 1,
+    }
 }
 
 /// `path` made absolute with every symbolic link resolved, whether or not
@@ -507,6 +531,98 @@ mod tests {
             check_audit_dir(&tree.at("audit"), &[&tree.at("root"), &old]).unwrap(),
             tree.at("audit")
         );
+    }
+
+    /// `check_audit_dir` of `<tree>/audit` with the one share `rel` under
+    /// it.
+    fn check_under_audit(tree: &Tree, rel: &str) -> anyhow::Result<PathBuf> {
+        let share = tree.at("audit").join(rel);
+        check_audit_dir(&tree.at("audit"), &[&share])
+    }
+
+    fn exposes(tree: &Tree, rel: &str) -> String {
+        format!(
+            "share {} would expose audit logs under {}",
+            tree.at("audit").join(rel).display(),
+            tree.at("audit").display()
+        )
+    }
+
+    /// The audit dir itself, `sessions` and a session's directory hold the
+    /// logs directly: none of them may be a share, whether the session is
+    /// there yet or not.
+    #[test]
+    fn a_share_holding_audit_logs_is_refused() {
+        let tree = Tree::new();
+        let id = "01a0f42e-4fdf-74e9-95de-4e59c0ac45eb";
+        fs::create_dir_all(tree.at("audit/sessions").join(id)).unwrap();
+        let error = check_under_audit(&tree, "").unwrap_err();
+        assert!(
+            error.to_string().starts_with("audit dir "),
+            "the audit dir as a share is inside it: {error}"
+        );
+        for rel in [
+            "sessions".to_owned(),
+            format!("sessions/{id}"),
+            "sessions/01a0f42e-0000-7000-8000-000000000000".to_owned(),
+        ] {
+            let error = check_under_audit(&tree, &rel).unwrap_err();
+            assert_eq!(error.to_string(), exposes(&tree, &rel), "{rel}");
+        }
+    }
+
+    /// Below a session's directory, or beside `sessions`, there are no logs.
+    #[test]
+    fn a_share_deeper_in_a_session_or_beside_sessions_is_accepted() {
+        let tree = Tree::new();
+        for rel in [
+            "sessions/01a0f42e-4fdf-74e9-95de-4e59c0ac45eb/workspace",
+            "sessions/01a0f42e-4fdf-74e9-95de-4e59c0ac45eb/workspace/src/deep",
+            "other",
+            "sessions-old",
+            "other/sessions/x",
+        ] {
+            assert_eq!(
+                check_under_audit(&tree, rel).unwrap(),
+                tree.at("audit"),
+                "{rel}"
+            );
+        }
+    }
+
+    /// The audit dir is resolved before the comparison in this direction
+    /// too: named through a link or with `..`, it still may not be shared.
+    #[test]
+    fn a_share_exposing_logs_is_found_through_links_and_dot_dots() {
+        let tree = Tree::new();
+        fs::create_dir_all(tree.at("audit/sessions")).unwrap();
+        std::os::unix::fs::symlink(tree.at("audit"), tree.at("audit-link")).unwrap();
+        let sessions = tree.at("audit/sessions");
+        for audit in [tree.at("audit-link"), tree.at("root/../audit")] {
+            let error = check_audit_dir(&audit, &[&sessions]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                exposes(&tree, "sessions"),
+                "{}",
+                audit.display()
+            );
+        }
+    }
+
+    /// The layout the rule protects is the writer's own: a session's logs go
+    /// in `<audit>/sessions/<id>/`.
+    #[test]
+    fn the_writer_keeps_each_session_where_no_share_may_be() {
+        let tree = Tree::new();
+        let audit = tree.at("audit");
+        let (_sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(&audit, SessionId::new())).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        writer.close().unwrap();
+        let rel = session_dir.strip_prefix(&audit).unwrap();
+        assert!(exposes_logs(rel), "{}", rel.display());
+        assert!(exposes_logs(rel.parent().unwrap()), "{}", rel.display());
+        assert!(!exposes_logs(&rel.join("workspace")));
     }
 
     /// The shares `boxcar run` counts for the command line are the shares it
