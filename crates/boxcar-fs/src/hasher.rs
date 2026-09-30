@@ -25,9 +25,19 @@
 //! `size`), or `error` (anything else, such as a path that now crosses a
 //! symlink or leaves the share).
 //!
-//! The job queue is bounded. When it is full, `release` waits for room: the
-//! close is a never-drop event, and this is the same back-pressure `emit`
-//! applies to the audit channel.
+//! The job queue is bounded, and when it is full `release` waits for room.
+//! That bounded wait on the reply path is deliberate: dropping hashes when
+//! the queue is full would let a guest dodge them by flooding closes, while
+//! waiting slows down only the guest doing the flooding. It is the same
+//! back-pressure `emit` applies to every never-drop event.
+//!
+//! If no worker thread could be started, jobs are hashed inline on the
+//! thread that submits them. That is a degenerate case, logged at error
+//! level, not a mode of operation.
+//!
+//! A worker that panics dies, but the job it held still counts as done, so
+//! [`HashWorker::flush`] cannot wait for it forever; `flush` also returns
+//! once every worker has stopped, leaving any jobs still queued unhashed.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -100,24 +110,45 @@ impl HashOutcome {
     }
 }
 
+/// How a job's file is hashed: [`hash_file`], except in tests.
+pub(crate) type HashFn = fn(&OwnedFd, &CString, Option<FileId>, u64) -> HashOutcome;
+
+/// Jobs and threads, counted under one lock.
+#[derive(Debug, Default)]
+struct Counts {
+    /// Jobs submitted and not yet finished.
+    pending: u64,
+    /// Of those, jobs being hashed on a submitting thread.
+    inline: u64,
+    /// Worker threads still running.
+    alive: usize,
+}
+
 /// What the threads share.
 struct Shared {
     root: OwnedFd,
     max_bytes: u64,
     events: Arc<Events>,
-    /// Jobs submitted and not yet recorded.
-    pending: Mutex<u64>,
-    idle: Condvar,
+    hash: HashFn,
+    counts: Mutex<Counts>,
+    /// Signalled whenever a job finishes or a worker stops.
+    changed: Condvar,
 }
 
 impl Shared {
-    fn pending(&self) -> MutexGuard<'_, u64> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        // Every update leaves the counts consistent.
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Hashes the job's file and records its close.
-    fn run(&self, job: HashJob) {
-        let outcome = hash_file(&self.root, &job.rel_path, job.expected, self.max_bytes);
+    fn run(&self, job: HashJob, inline: bool) {
+        // Counts the job as finished however this ends, a panic included.
+        let _finished = Finished {
+            shared: self,
+            inline,
+        };
+        let outcome = (self.hash)(&self.root, &job.rel_path, job.expected, self.max_bytes);
         let close = FsClose {
             size: outcome.size,
             blake3: outcome.blake3,
@@ -126,11 +157,35 @@ impl Shared {
         };
         self.events
             .record(Some(job.subject), Payload::FsClose(close));
-        let mut pending = self.pending();
-        *pending = pending.saturating_sub(1);
-        if *pending == 0 {
-            self.idle.notify_all();
+    }
+}
+
+/// Counts one job as finished when dropped.
+struct Finished<'a> {
+    shared: &'a Shared,
+    inline: bool,
+}
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        let mut counts = self.shared.counts();
+        counts.pending = counts.pending.saturating_sub(1);
+        if self.inline {
+            counts.inline = counts.inline.saturating_sub(1);
         }
+        self.shared.changed.notify_all();
+    }
+}
+
+/// Counts one worker as stopped when dropped, whether its thread returns
+/// or unwinds.
+struct Alive<'a>(&'a Shared);
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        let mut counts = self.0.counts();
+        counts.alive = counts.alive.saturating_sub(1);
+        self.0.changed.notify_all();
     }
 }
 
@@ -147,23 +202,40 @@ impl HashWorker {
     /// Starts the threads, named `fs-<tag>-hash<N>`. `root` is the share's
     /// host directory; files larger than `max_bytes` are not hashed.
     pub(crate) fn new(tag: &str, root: OwnedFd, max_bytes: u64, events: Arc<Events>) -> Self {
+        Self::with_hash(tag, root, max_bytes, events, hash_file)
+    }
+
+    /// [`new`](Self::new), hashing with `hash`.
+    pub(crate) fn with_hash(
+        tag: &str,
+        root: OwnedFd,
+        max_bytes: u64,
+        events: Arc<Events>,
+        hash: HashFn,
+    ) -> Self {
         let shared = Arc::new(Shared {
             root,
             max_bytes,
             events,
-            pending: Mutex::new(0),
-            idle: Condvar::new(),
+            hash,
+            counts: Mutex::new(Counts::default()),
+            changed: Condvar::new(),
         });
         let (tx, rx) = bounded::<HashJob>(QUEUE);
         let mut threads = Vec::with_capacity(THREADS);
         for n in 0..THREADS {
-            let (shared, rx) = (Arc::clone(&shared), rx.clone());
+            let (worker, rx) = (Arc::clone(&shared), rx.clone());
+            // Counted before it starts, so no flush can see it missing.
+            shared.counts().alive += 1;
             let spawned = thread::Builder::new()
                 .name(format!("fs-{tag}-hash{n}"))
-                .spawn(move || serve(&shared, &rx));
+                .spawn(move || serve(&worker, &rx));
             match spawned {
                 Ok(handle) => threads.push(handle),
-                Err(error) => tracing::error!(tag, "starting a hash thread failed: {error}"),
+                Err(error) => {
+                    shared.counts().alive -= 1;
+                    tracing::error!(tag, "starting a hash thread failed: {error}");
+                }
             }
         }
         if threads.is_empty() {
@@ -177,9 +249,10 @@ impl HashWorker {
         }
     }
 
-    /// Queues a job, waiting while the queue is full.
+    /// Queues a job, waiting while the queue is full (see the module docs).
+    /// With no worker left to take it, the job is hashed on this thread.
     pub fn submit(&self, job: HashJob) {
-        *self.shared.pending() += 1;
+        self.shared.counts().pending += 1;
         let tx = self
             .tx
             .lock()
@@ -188,22 +261,32 @@ impl HashWorker {
         let job = match tx {
             Some(tx) => match tx.send(job) {
                 Ok(()) => return,
+                // Every worker has stopped.
                 Err(returned) => returned.into_inner(),
             },
             None => job,
         };
-        self.shared.run(job);
+        self.shared.counts().inline += 1;
+        self.shared.run(job, true);
     }
 
-    /// Returns once every job submitted so far has been recorded.
+    /// Returns once every job submitted so far has been recorded, or, if
+    /// every worker has stopped, once no job is left that anything will
+    /// finish.
     pub fn flush(&self) {
-        let mut pending = self.shared.pending();
-        while *pending > 0 {
-            pending = self
+        let mut counts = self.shared.counts();
+        while counts.pending > 0 && (counts.alive > 0 || counts.inline > 0) {
+            counts = self
                 .shared
-                .idle
-                .wait(pending)
+                .changed
+                .wait(counts)
                 .unwrap_or_else(PoisonError::into_inner);
+        }
+        if counts.pending > 0 {
+            tracing::error!(
+                jobs = counts.pending,
+                "every hash thread has stopped; queued closes were not recorded"
+            );
         }
     }
 
@@ -233,9 +316,10 @@ impl Drop for HashWorker {
 }
 
 fn serve(shared: &Shared, rx: &Receiver<HashJob>) {
+    let _alive = Alive(shared);
     // Ends when every sender is gone and the queue is empty.
     for job in rx.iter() {
-        shared.run(job);
+        shared.run(job, false);
     }
 }
 
@@ -341,7 +425,10 @@ fn fstat(file: &File) -> io::Result<libc::stat64> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, MetadataExt};
+    use std::time::Duration;
 
+    use boxcar_audit::{spawn, LogReader, WriterConfig, WriterHandle};
+    use boxcar_proto::{Attrib, SessionId};
     use tempfile::TempDir;
 
     use super::*;
@@ -439,5 +526,125 @@ mod tests {
         assert_eq!(outcome, HashOutcome::sized(HashStatus::SkippedSize, 17));
         let outcome = hash_file(&root(&dir), &path("fits"), None, 16);
         assert_eq!(outcome.status, HashStatus::Ok);
+    }
+
+    /// A worker for `dir` hashing with `hash`, and its audit log.
+    fn worker(dir: &TempDir, hash: HashFn) -> (Arc<HashWorker>, WriterHandle) {
+        let (sink, writer) =
+            spawn(WriterConfig::new(dir.path().join("data"), SessionId::new())).unwrap();
+        let events = Arc::new(Events::new(sink, "t".into()));
+        let worker = HashWorker::with_hash("t", root(dir), MAX, events, hash);
+        (Arc::new(worker), writer)
+    }
+
+    fn job(rel_path: &str, fh: u64) -> HashJob {
+        HashJob {
+            rel_path: path(rel_path),
+            expected: None,
+            subject: Subject {
+                pid: 1,
+                uid: 0,
+                gid: 0,
+            },
+            close: FsClose {
+                mount: "t".into(),
+                path: format!("/{rel_path}"),
+                path_at_open: format!("/{rel_path}"),
+                fh,
+                bytes_read: 0,
+                bytes_written: 1,
+                size: None,
+                blake3: None,
+                hash_status: HashStatus::NotHashed,
+                open_seq: None,
+                attrib: Attrib::Caller,
+            },
+        }
+    }
+
+    /// Fails the test instead of hanging it when `flush` does not return.
+    fn flush_within(worker: &Arc<HashWorker>, limit: Duration) {
+        let (done, flushed) = bounded(1);
+        let worker = Arc::clone(worker);
+        thread::spawn(move || {
+            worker.flush();
+            let _ = done.send(());
+        });
+        flushed.recv_timeout(limit).expect("flush returned");
+    }
+
+    /// The close records in the log, as `(fh, hash_status)`.
+    fn closes(writer: WriterHandle) -> Vec<(u64, HashStatus)> {
+        let session = writer.session_dir().to_owned();
+        writer.close().unwrap();
+        LogReader::open(&session)
+            .unwrap()
+            .records()
+            .map(Result::unwrap)
+            .filter_map(|r| match Payload::from_record(&r) {
+                Ok(Payload::FsClose(c)) => Some((c.fh, c.hash_status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn boom_or_hash(
+        root: &OwnedFd,
+        rel_path: &CString,
+        expected: Option<FileId>,
+        max: u64,
+    ) -> HashOutcome {
+        if rel_path.as_bytes() == b"boom" {
+            panic!("hashing boom panicked");
+        }
+        hash_file(root, rel_path, expected, max)
+    }
+
+    #[test]
+    fn a_job_that_panics_still_counts_as_finished() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("fine"), b"x").unwrap();
+        let (worker, writer) = worker(&dir, boom_or_hash);
+        worker.submit(job("boom", 1));
+        flush_within(&worker, Duration::from_secs(10));
+        // The other worker still hashes.
+        worker.submit(job("fine", 2));
+        flush_within(&worker, Duration::from_secs(10));
+        assert_eq!(worker.shared.counts().pending, 0);
+        worker.shutdown();
+        assert_eq!(closes(writer), [(2, HashStatus::Ok)]);
+    }
+
+    static GATE: Mutex<bool> = Mutex::new(false);
+    static GATE_OPENED: Condvar = Condvar::new();
+
+    /// Waits until the gate opens, then panics.
+    fn panic_after_the_gate(_: &OwnedFd, _: &CString, _: Option<FileId>, _: u64) -> HashOutcome {
+        let mut open = GATE.lock().unwrap();
+        while !*open {
+            open = GATE_OPENED.wait(open).unwrap();
+        }
+        drop(open);
+        panic!("hashing panicked");
+    }
+
+    #[test]
+    fn flush_returns_once_every_worker_has_stopped() {
+        let dir = TempDir::new().unwrap();
+        let (worker, writer) = worker(&dir, panic_after_the_gate);
+        // Each worker takes one job and panics on it; the third job is
+        // still queued when the last one dies.
+        for fh in 1..=3 {
+            worker.submit(job("f", fh));
+        }
+        *GATE.lock().unwrap() = true;
+        GATE_OPENED.notify_all();
+        flush_within(&worker, Duration::from_secs(10));
+        {
+            let counts = worker.shared.counts();
+            assert_eq!((counts.pending, counts.alive), (1, 0), "{counts:?}");
+        }
+        worker.shutdown();
+        assert_eq!(closes(writer), []);
     }
 }

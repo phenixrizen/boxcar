@@ -592,6 +592,7 @@ mod tests {
                     offset: 4096,
                     len: 512,
                     result: OpResult::ok(),
+                    attrib: Attrib::Caller,
                 }),
                 json!({
                     "mount": "workspace",
@@ -600,6 +601,7 @@ mod tests {
                     "offset": 4096,
                     "len": 512,
                     "result": {"ok": true},
+                    "attrib": "caller",
                 }),
             ),
             (
@@ -610,6 +612,7 @@ mod tests {
                     offset: 0,
                     len: 3,
                     result: OpResult::errno(28),
+                    attrib: Attrib::Handle,
                 }),
                 json!({
                     "mount": "workspace",
@@ -618,6 +621,7 @@ mod tests {
                     "offset": 0,
                     "len": 3,
                     "result": {"ok": false, "errno": 28, "err": "ENOSPC"},
+                    "attrib": "handle",
                 }),
             ),
             (

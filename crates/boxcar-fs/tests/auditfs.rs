@@ -800,21 +800,28 @@ fn io_without_a_usable_caller_is_attributed_to_the_opener() {
     release_as(&share.fs, &kernel, entry.inode, fh);
 
     let events = share.events();
-    let io: Vec<(&str, u64, Option<u32>)> = events
+    let io: Vec<(&str, u64, Option<u32>, Attrib)> = events
         .iter()
-        .filter_map(|(p, s)| match p {
-            Payload::FsWrite(FsIo { offset, .. }) => Some(("write", *offset, s.map(|s| s.pid))),
-            Payload::FsRead(FsIo { offset, .. }) => Some(("read", *offset, s.map(|s| s.pid))),
-            _ => None,
+        .filter_map(|(p, s)| {
+            let pid = s.map(|s| s.pid);
+            match p {
+                Payload::FsWrite(FsIo { offset, attrib, .. }) => {
+                    Some(("write", *offset, pid, *attrib))
+                }
+                Payload::FsRead(FsIo { offset, attrib, .. }) => {
+                    Some(("read", *offset, pid, *attrib))
+                }
+                _ => None,
+            }
         })
         .collect();
     assert_eq!(
         io,
         [
-            ("write", 0, Some(42)),
-            ("write", 2, Some(42)),
-            ("write", 4, Some(7)),
-            ("read", 0, Some(42)),
+            ("write", 0, Some(42), Attrib::Handle),
+            ("write", 2, Some(42), Attrib::Handle),
+            ("write", 4, Some(7), Attrib::Caller),
+            ("read", 0, Some(42), Attrib::Handle),
         ]
     );
     let (close, subject) = close_of(&events, fh);
@@ -822,6 +829,84 @@ fn io_without_a_usable_caller_is_attributed_to_the_opener() {
     assert_eq!(subject, Some(GUEST_SUBJECT));
     assert_eq!((close.bytes_written, close.bytes_read), (6, 6));
     assert_eq!(close.blake3, Some(b3(b"abcdef")));
+}
+
+/// A file written and never released: the guest's filesystem went away
+/// (unmount, driver unbind, a guest panic, the VM stopping) with it open.
+fn leave_open(share: &Share) -> (u64, u64, u64) {
+    let (entry, fh) = create(&share.fs, &GUEST, ROOT_ID, "unsaved.txt");
+    write(&share.fs, entry.inode, fh, b"unsaved\n");
+    fs::write(share.root.join("ro"), b"r").unwrap();
+    let ro = lookup(&share.fs, ROOT_ID, "ro");
+    let fh_ro = open(&share.fs, ro.inode, libc::O_RDONLY as u32);
+    (entry.inode, fh, fh_ro)
+}
+
+/// The closes of the handles `leave_open` left open.
+fn assert_left_open_closed(events: &[(Payload, Option<Subject>)], fh: u64, fh_ro: u64) {
+    let (close, subject) = close_of(events, fh);
+    assert_eq!(close.path, "/unsaved.txt");
+    assert_eq!(close.bytes_written, 8);
+    assert_eq!(close.hash_status, HashStatus::Ok);
+    assert_eq!(close.blake3, Some(b3(b"unsaved\n")));
+    assert_eq!(close.size, Some(8));
+    assert_eq!(close.attrib, Attrib::Handle, "no request: the opener");
+    assert_eq!(subject, Some(GUEST_SUBJECT));
+    let (close, _) = close_of(events, fh_ro);
+    assert_eq!(close.hash_status, HashStatus::NotHashed);
+    assert_eq!(close.attrib, Attrib::Handle);
+}
+
+/// `destroy` closes and hashes every handle still open before the
+/// passthrough lets go of its files.
+#[test]
+fn destroy_closes_the_handles_left_open() {
+    let share = Share::normal();
+    let (ino, fh, fh_ro) = leave_open(&share);
+    share.fs.destroy();
+    assert_eq!(share.fs.known_inodes(), [ROOT_ID]);
+    // A late release finds nothing left to close.
+    let _ = share
+        .fs
+        .release(&GUEST, ino, RW_CREATE, fh, false, false, None);
+    let events = share.events();
+    assert_left_open_closed(&events, fh, fh_ro);
+}
+
+/// `shutdown` does the same, for a VM stopped with files open.
+#[test]
+fn shutdown_closes_the_handles_left_open() {
+    let share = Share::normal();
+    let (_, fh, fh_ro) = leave_open(&share);
+    share.fs.shutdown();
+    let events = share.events();
+    assert_left_open_closed(&events, fh, fh_ro);
+}
+
+/// And so does dropping the filesystem while the log is still open.
+#[test]
+fn dropping_the_filesystem_closes_the_handles_left_open() {
+    let share = Share::normal();
+    let (_, fh, fh_ro) = leave_open(&share);
+    let Share {
+        dir,
+        root: _,
+        fs,
+        writer,
+    } = share;
+    drop(fs);
+    let session = writer.session_dir().to_owned();
+    writer.close().unwrap();
+    verify_session(&session).unwrap();
+    let events: Vec<(Payload, Option<Subject>)> = LogReader::open(&session)
+        .unwrap()
+        .records()
+        .map(Result::unwrap)
+        .filter(|r| r.kind != "checkpoint")
+        .map(|r| (Payload::from_record(&r).unwrap(), r.subject))
+        .collect();
+    drop(dir);
+    assert_left_open_closed(&events, fh, fh_ro);
 }
 
 /// Symlink, link, mknod, setxattr, removexattr, fallocate and setattr each

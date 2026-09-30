@@ -21,11 +21,12 @@
 //! | `lookup` | `fs.denied` (op `lookup`) on EACCES or EPERM; at Verbose also on ENOENT |
 //! | `open`, `create` | `fs.open`, `fs.create`, failed or not |
 //! | `release` | `fs.close`: hashed if the handle wrote, created or truncated, else `not_hashed` |
+//! | `destroy`, and [`AuditFs::shutdown`] or drop | `fs.close` for every handle still open, attributed to its opener |
 //! | `unlink`, `rmdir`, `rename`, `mkdir`, `mknod`, `symlink`, `link` | the event of that name |
 //! | `setattr`, `fallocate` | `fs.setattr` with the fields set, `fs.fallocate` |
 //! | `setxattr`, `removexattr` | `fs.xattr` (op `set`, `remove`) |
 //! | `access` | `fs.denied` (op `access`) on EACCES |
-//! | `read`, `write`, `readdir`, `readdirplus` | at Verbose only: `fs.read`, `fs.write`, `fs.readdir`, which may be dropped |
+//! | `read`, `write`, `readdir`, `readdirplus` | at Verbose only: `fs.read`, `fs.write` (with `attrib`), `fs.readdir`, which may be dropped |
 //!
 //! `lookup`, `create`, `mkdir`, `mknod`, `symlink`, `link` and each
 //! `readdirplus` entry add to the path map, `forget` and `batch_forget`
@@ -58,10 +59,14 @@ use crate::hasher::{HashJob, HashWorker};
 use crate::path_map::{FileId, PathMap};
 use crate::share::FsShareConfig;
 
-/// `init` options the guest never gets: the write-back cache would let the
-/// guest kernel merge and delay writes (so they reach the host, and the
-/// audit, late and attributed to nobody), and DAX would let it map host
-/// files into its memory, bypassing FUSE reads and writes entirely.
+/// `init` options the guest never gets. The write-back cache would let the
+/// guest kernel merge and delay writes, so they would reach the host, and
+/// the audit, late and attributed to whichever thread flushes them. The DAX
+/// bits are refused so the guest does not negotiate per-file DAX, but that
+/// alone does not prevent DAX: a guest maps host files only through a
+/// shared-memory window the virtio-fs device exposes, and the device must
+/// not expose one (the Task 12 device does not). Through such a window
+/// reads and writes would bypass FUSE, and this audit, entirely.
 const MASKED_OPTIONS: FsOptions = FsOptions::WRITEBACK_CACHE
     .union(FsOptions::MAP_ALIGNMENT)
     .union(FsOptions::PERFILE_DAX);
@@ -144,9 +149,11 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
         self.hasher.flush();
     }
 
-    /// Records the closes still being hashed and stops the hash threads.
-    /// Dropping the filesystem does the same.
+    /// Closes every handle the guest left open (see `destroy`), records
+    /// the closes still being hashed, and stops the hash threads. Dropping
+    /// the filesystem does the same. Call it before closing the audit log.
     pub fn shutdown(&self) {
+        self.close_open_handles();
         self.hasher.shutdown();
     }
 
@@ -191,11 +198,17 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
     }
 
     /// Whom a read or write through `handle` is attributed to: the opener
-    /// when the request has no usable caller of its own, else the caller.
-    fn io_subject(&self, ctx: &Context, opener: Option<Subject>, by_kernel: bool) -> Subject {
+    /// (`Attrib::Handle`) when the request has no usable caller of its own,
+    /// else the caller.
+    fn io_subject(
+        &self,
+        ctx: &Context,
+        opener: Option<Subject>,
+        by_kernel: bool,
+    ) -> (Subject, Attrib) {
         match opener {
-            Some(opener) if by_kernel || ctx.pid == 0 => opener,
-            _ => subject(ctx),
+            Some(opener) if by_kernel || ctx.pid == 0 => (opener, Attrib::Handle),
+            _ => (subject(ctx), Attrib::Caller),
         }
     }
 
@@ -217,13 +230,34 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
         }
     }
 
-    /// Records the close of a released handle, now or once it is hashed.
+    /// Records the close of a handle the guest released, now or once it is
+    /// hashed.
     fn close(&self, ctx: &Context, fh: u64, entry: HandleEntry) {
         let (subject, attrib) = if ctx.pid == 0 {
             (entry.opener, Attrib::Handle)
         } else {
             (subject(ctx), Attrib::Caller)
         };
+        self.record_close(fh, entry, subject, attrib);
+    }
+
+    /// Closes every handle still open, as the guest's filesystem goes away
+    /// (unmount, a driver unbind, a guest panic, the VM stopping) without
+    /// releasing them, and waits for their hashes. At the normal level the
+    /// close is the only record of what was written through a handle, so
+    /// none may be dropped. There is no request, so each close is
+    /// attributed to the handle's opener.
+    fn close_open_handles(&self) {
+        for (fh, entry) in self.handles.drain() {
+            let opener = entry.opener;
+            self.record_close(fh, entry, opener, Attrib::Handle);
+        }
+        self.hasher.flush();
+    }
+
+    /// Records `entry`'s close as `subject`: at once when nothing needs
+    /// hashing, else once the hash worker has hashed the file.
+    fn record_close(&self, fh: u64, entry: HandleEntry, subject: Subject, attrib: Attrib) {
         let (path, rel_path, deleted, expected) = {
             let paths = self.read_paths();
             (
@@ -328,7 +362,7 @@ fn set_attrs(attr: &stat64, valid: SetattrValid, reply: Option<&stat64>) -> SetA
 
 impl<F: FileSystem<Inode = u64, Handle = u64>> Drop for AuditFs<F> {
     fn drop(&mut self) {
-        self.hasher.shutdown();
+        self.shutdown();
     }
 }
 
@@ -397,10 +431,12 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn destroy(&self) {
+        // The guest's filesystem is going away: its open handles are closed
+        // (and hashed) while the paths and the files are still there.
+        self.close_open_handles();
         self.inner.destroy();
-        // The guest unmounted: it holds no inodes and no handles any more.
+        // The guest holds no inodes any more.
         self.write_paths().reset();
-        self.handles.clear();
     }
 
     fn lookup(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
@@ -725,6 +761,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                 Ok(n) => u32::try_from(*n).unwrap_or(u32::MAX),
                 Err(_) => size,
             };
+            let (who, attrib) = self.io_subject(ctx, opener, false);
             let payload = Payload::FsRead(FsIo {
                 mount: self.events.mount(),
                 path: self.path(inode),
@@ -732,8 +769,8 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                 offset,
                 len,
                 result: op_result(&result),
+                attrib,
             });
-            let who = self.io_subject(ctx, opener, false);
             self.events.sample(Some(who), payload);
         }
         result
@@ -775,6 +812,10 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                 Ok(n) => u32::try_from(*n).unwrap_or(u32::MAX),
                 Err(_) => size,
             };
+            // A write-back from the guest's page cache is made by whichever
+            // thread flushes it, not by the process that wrote the data.
+            let cached = delayed_write || fuse_flags & WRITE_CACHE != 0;
+            let (who, attrib) = self.io_subject(ctx, opener, cached);
             let payload = Payload::FsWrite(FsIo {
                 mount: self.events.mount(),
                 path: self.path(inode),
@@ -782,11 +823,8 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                 offset,
                 len,
                 result: op_result(&result),
+                attrib,
             });
-            // A write-back from the guest's page cache is made by whichever
-            // thread flushes it, not by the process that wrote the data.
-            let cached = delayed_write || fuse_flags & WRITE_CACHE != 0;
-            let who = self.io_subject(ctx, opener, cached);
             self.events.sample(Some(who), payload);
         }
         result

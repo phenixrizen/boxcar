@@ -56,6 +56,8 @@ pub(crate) struct Events {
     mount: String,
     /// Whether a refusal from a closed log has been logged yet.
     closed_reported: AtomicBool,
+    /// Whether a refused checkpoint has been logged yet.
+    checkpoint_reported: AtomicBool,
 }
 
 impl Events {
@@ -64,6 +66,7 @@ impl Events {
             sink,
             mount,
             closed_reported: AtomicBool::new(false),
+            checkpoint_reported: AtomicBool::new(false),
         }
     }
 
@@ -84,8 +87,12 @@ impl Events {
                     );
                 }
             }
+            // No filesystem event is a checkpoint, so this is a bug; one
+            // report is enough to find it.
             Err(error @ EmitError::Checkpoint) => {
-                tracing::error!(mount = %self.mount, "audit event refused: {error}");
+                if !self.checkpoint_reported.swap(true, Ordering::Relaxed) {
+                    tracing::error!(mount = %self.mount, "audit event refused: {error}");
+                }
             }
         }
     }

@@ -18,7 +18,9 @@ use boxcar_audit::{
     spawn, spawn_with_syncer, verify_session, EmitError, LogReader, Priority, Submission, Syncer,
     VerifyError, WriterConfig,
 };
-use boxcar_proto::{Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject};
+use boxcar_proto::{
+    Attrib, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -46,6 +48,7 @@ fn event(n: u64) -> Submission {
             offset: n * 4096,
             len: 4096,
             result: OpResult::ok(),
+            attrib: Attrib::Caller,
         }),
         span: None,
         priority: Priority::Normal,

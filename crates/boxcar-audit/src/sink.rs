@@ -156,7 +156,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use boxcar_proto::{FsIo, OpResult};
+    use boxcar_proto::{Attrib, FsIo, OpResult};
     use crossbeam_channel::bounded;
 
     use super::*;
@@ -173,6 +173,7 @@ mod tests {
                 offset: 0,
                 len: 1,
                 result: OpResult::ok(),
+                attrib: Attrib::Caller,
             }),
             span: None,
             priority: Priority::Normal,

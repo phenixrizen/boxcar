@@ -168,6 +168,10 @@ pub struct FsIo {
     pub offset: u64,
     pub len: u32,
     pub result: OpResult,
+    /// Whose identity the record's `subject` is: the caller's, or the
+    /// handle opener's when the request had no usable caller (pid 0, or a
+    /// write-back from the page cache).
+    pub attrib: Attrib,
 }
 
 /// `fs.unlink`, `fs.rmdir`, and `fs.readdir`: an operation on one path.

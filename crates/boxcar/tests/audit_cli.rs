@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use boxcar_audit::{spawn, CloseStats, Priority, Submission, WriterConfig};
-use boxcar_proto::{FsIo, OpResult, Payload, Ring, SessionId};
+use boxcar_proto::{Attrib, FsIo, OpResult, Payload, Ring, SessionId};
 use serde_json::Value;
 
 /// A scratch directory under Cargo's per-target test tmpdir, removed on drop.
@@ -49,6 +49,7 @@ fn write_session(scratch: &Scratch) -> (PathBuf, CloseStats) {
                 offset: 0,
                 len: 1,
                 result: OpResult::ok(),
+                attrib: Attrib::Caller,
             }),
             span: None,
             priority: Priority::Normal,

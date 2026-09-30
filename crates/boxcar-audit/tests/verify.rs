@@ -13,7 +13,8 @@ use boxcar_audit::{
     WriterConfig,
 };
 use boxcar_proto::{
-    genesis_prev, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject,
+    genesis_prev, Attrib, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId,
+    Subject,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -34,6 +35,7 @@ fn event(n: u64) -> Submission {
             offset: 0,
             len: 1,
             result: OpResult::ok(),
+            attrib: Attrib::Caller,
         }),
         span: None,
         priority: Priority::Normal,

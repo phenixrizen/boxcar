@@ -72,9 +72,11 @@ impl HandleTable {
         self.lock().remove(&fh)
     }
 
-    /// Forgets every handle, as after the guest unmounts.
-    pub fn clear(&self) {
-        self.lock().clear();
+    /// Removes every handle and returns them, in handle order.
+    pub fn drain(&self) -> Vec<(u64, HandleEntry)> {
+        let mut all: Vec<(u64, HandleEntry)> = self.lock().drain().collect();
+        all.sort_unstable_by_key(|(fh, _)| *fh);
+        all
     }
 
     pub fn len(&self) -> usize {
@@ -126,7 +128,9 @@ mod tests {
         assert!(taken.changed());
         assert!(table.take(7).is_none());
         table.insert(9, entry());
-        table.clear();
+        table.insert(3, entry());
+        let drained: Vec<u64> = table.drain().into_iter().map(|(fh, _)| fh).collect();
+        assert_eq!(drained, [3, 9]);
         assert_eq!(table.len(), 0);
     }
 
