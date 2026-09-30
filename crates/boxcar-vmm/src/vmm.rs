@@ -35,11 +35,12 @@ use vm_memory::{
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 use crate::arch::x86_64::boot::{configure_system, InitrdConfig};
+pub use crate::arch::x86_64::layout::CMDLINE_MAX_SIZE;
 use crate::arch::x86_64::layout::{CMDLINE_START, HIMEM_START, KVM_TSS_ADDRESS};
 use crate::arch::x86_64::{cpuid, interrupts, msr, regs};
-use crate::cmdline::build_cmdline;
+use crate::cmdline::{build_cmdline, MmioDeviceEntry};
 use crate::devices::legacy::COM1_GSI;
-use crate::devices::{DeviceError, FsDevices, LegacyDevices};
+use crate::devices::{DeviceError, FsDevices, LegacyDevices, FS_TAGS};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
@@ -71,6 +72,48 @@ pub fn base_cmdline(debug_boot: bool) -> String {
     }
 }
 
+/// The size, NUL terminator included, of the kernel command line
+/// [`Vmm::new`] writes for a VM with `debug_boot`, `extra` and `fs_shares`
+/// virtio-fs shares, whether or not it fits in the [`CMDLINE_MAX_SIZE`]
+/// bytes the kernel takes: composed from the same parts in the same order
+/// (the base, `extra`, a `virtio_mmio.device=` entry for each share in its
+/// fixed slot), without building the VM. A caller can refuse a command
+/// line that is too long, with its size, before it starts anything.
+pub fn cmdline_size(
+    debug_boot: bool,
+    extra: &[String],
+    fs_shares: usize,
+) -> Result<usize, VmmError> {
+    let tags = FS_TAGS.get(..fs_shares).ok_or_else(|| {
+        VmmError::Config(format!(
+            "{fs_shares} virtio-fs shares; there are at most {}",
+            FS_TAGS.len()
+        ))
+    })?;
+    let devices = FsDevices::cmdline_entries_for(&mut SlotAllocator::new()?, tags)?;
+    let (base, extras) = cmdline_parts(debug_boot, extra);
+    Ok(crate::cmdline::cmdline_size(&base, &extras, &devices)?)
+}
+
+/// The kernel command line of a VM with `debug_boot`, `extra` and the
+/// virtio-mmio `devices`.
+fn kernel_cmdline(
+    debug_boot: bool,
+    extra: &[String],
+    devices: &[MmioDeviceEntry],
+) -> crate::arch::Result<linux_loader::cmdline::Cmdline> {
+    let (base, extras) = cmdline_parts(debug_boot, extra);
+    build_cmdline(&base, &extras, devices)
+}
+
+/// The base command line and the extra arguments, in order.
+fn cmdline_parts(debug_boot: bool, extra: &[String]) -> (String, Vec<&str>) {
+    (
+        base_cmdline(debug_boot),
+        extra.iter().map(String::as_str).collect(),
+    )
+}
+
 /// Guest memory when not configured.
 pub const DEFAULT_MEM_MIB: u64 = 512;
 /// vCPUs when not configured.
@@ -88,9 +131,15 @@ pub struct VmConfig {
     pub cmdline_extra: Vec<String>,
     /// See [`base_cmdline`].
     pub debug_boot: bool,
-    /// Where the serial console's output goes. With [`ConsoleOut::Stdio`]
-    /// and a TTY on stdin, stdin is forwarded to the guest.
+    /// Where the serial console's output goes. With [`ConsoleOut::Stdio`],
+    /// a TTY on stdin and [`VmConfig::stdin`], stdin is forwarded to the
+    /// guest.
     pub console: ConsoleOut,
+    /// Whether the guest may read the host's stdin: when it is a TTY and the
+    /// console is on stdout, the terminal goes into raw mode and what is
+    /// typed goes to the guest. Off for a run that needs no input, which
+    /// leaves the terminal as it is.
+    pub stdin: bool,
     /// Receives `vmm.start` and `vmm.stop`, and every share's records.
     pub audit: AuditSink,
     /// The directories shared with the guest over virtio-fs, in slot order:
@@ -103,7 +152,7 @@ pub struct VmConfig {
 impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
-    /// boot, the console on stdio, and no shares.
+    /// boot, the console on stdio with stdin, and no shares.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
         VmConfig {
             kernel: kernel.into(),
@@ -113,6 +162,7 @@ impl VmConfig {
             cmdline_extra: Vec::new(),
             debug_boot: false,
             console: ConsoleOut::Stdio,
+            stdin: true,
             audit,
             fs_shares: Vec::new(),
             fs_audit: AuditFsOptions::default(),
@@ -270,9 +320,7 @@ impl Vmm {
             cfg.fs_audit,
         )?;
 
-        let base = base_cmdline(cfg.debug_boot);
-        let extras: Vec<&str> = cfg.cmdline_extra.iter().map(String::as_str).collect();
-        let cmdline = build_cmdline(&base, &extras, fs.cmdline_entries())?;
+        let cmdline = kernel_cmdline(cfg.debug_boot, &cfg.cmdline_extra, fs.cmdline_entries())?;
         load_cmdline(&*mem, GuestAddress(CMDLINE_START), &cmdline).map_err(VmmError::Cmdline)?;
         let cmdline = cmdline
             .as_cstring()
@@ -322,7 +370,7 @@ impl Vmm {
             legacy,
             fs,
             latch,
-            interactive: matches!(cfg.console, ConsoleOut::Stdio) && stdin_is_tty(),
+            interactive: cfg.stdin && matches!(cfg.console, ConsoleOut::Stdio) && stdin_is_tty(),
             audit: cfg.audit,
         })
     }
@@ -593,6 +641,74 @@ mod tests {
              i8042.noaux i8042.nomux i8042.dumbkbd lockdown=integrity random.trust_cpu=on \
              earlyprintk=serial,ttyS0,115200 loglevel=7 rdinit=/init"
         );
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|&a| a.to_owned()).collect()
+    }
+
+    /// The command line of a VM with both shares, as `Vmm::new` builds it:
+    /// the base, the extras, then the two devices in their fixed slots.
+    fn two_share_cmdline(debug_boot: bool, extra: &[&str]) -> String {
+        let devices = [
+            crate::cmdline::MmioDeviceEntry {
+                size: 0x1000,
+                base: 0xc000_0000,
+                gsi: 5,
+            },
+            crate::cmdline::MmioDeviceEntry {
+                size: 0x1000,
+                base: 0xc000_1000,
+                gsi: 6,
+            },
+        ];
+        let cmdline =
+            crate::cmdline::build_cmdline(&base_cmdline(debug_boot), extra, &devices).unwrap();
+        cmdline.as_cstring().unwrap().into_string().unwrap()
+    }
+
+    #[test]
+    fn cmdline_size_is_the_size_of_the_command_line_the_vm_gets() {
+        let extra = ["boxcar.mode=console", "boxcar.uid=1000", "boxcar.gid=1000"];
+        for debug_boot in [false, true] {
+            let text = two_share_cmdline(debug_boot, &extra);
+            assert_eq!(
+                cmdline_size(debug_boot, &strings(&extra), 2).unwrap(),
+                text.len() + 1,
+                "{text}"
+            );
+        }
+        let hello =
+            crate::cmdline::build_cmdline(&base_cmdline(false), &["boxcar.mode=hello"], &[])
+                .unwrap();
+        assert_eq!(
+            cmdline_size(false, &strings(&["boxcar.mode=hello"]), 0).unwrap(),
+            hello.as_cstring().unwrap().as_bytes_with_nul().len()
+        );
+    }
+
+    /// Over the limit, the size is still reported: the caller says by how
+    /// much.
+    #[test]
+    fn cmdline_size_measures_a_command_line_over_the_limit() {
+        let long = "x".repeat(3000);
+        let size = cmdline_size(false, &strings(&[&long]), 2).unwrap();
+        // The extra and the space before it, then the NUL terminator.
+        let without = two_share_cmdline(false, &[]).len();
+        assert_eq!(size, without + 1 + long.len() + 1);
+        assert!(size > CMDLINE_MAX_SIZE);
+    }
+
+    #[test]
+    fn cmdline_size_refuses_what_the_vm_would_refuse() {
+        assert!(matches!(
+            cmdline_size(false, &strings(&["bad\u{7}"]), 0),
+            Err(VmmError::Arch(crate::arch::Error::Cmdline(_)))
+        ));
+        assert!(matches!(
+            cmdline_size(false, &[], 3),
+            Err(VmmError::Config(_))
+        ));
     }
 
     #[test]

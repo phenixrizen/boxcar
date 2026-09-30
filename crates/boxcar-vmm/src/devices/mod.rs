@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use boxcar_audit::AuditSink;
 use boxcar_fs::{AuditFsOptions, FsError, FsShareConfig, VirtioFs};
 use boxcar_virtio::bus::{Bus, BusError};
-use boxcar_virtio::{DeviceContext, MmioTransport, SlotAllocator, SlotError, VirtioDevice};
+use boxcar_virtio::{
+    DeviceContext, MmioSlot, MmioTransport, SlotAllocator, SlotError, VirtioDevice,
+};
 use kvm_ioctls::VmFd;
 use vm_memory::GuestMemoryMmap;
 
@@ -60,6 +62,28 @@ pub enum DeviceError {
     Bus(#[from] BusError),
 }
 
+/// The next slot from `slots`, for the share `tag`, and its command line
+/// entry.
+fn next_slot(
+    slots: &mut SlotAllocator,
+    tag: &str,
+) -> Result<(MmioSlot, MmioDeviceEntry), DeviceError> {
+    let slot = slots.alloc().map_err(|source| DeviceError::Slot {
+        tag: tag.to_owned(),
+        source,
+    })?;
+    let size = u32::try_from(slot.size).map_err(|_| DeviceError::SlotSize {
+        tag: tag.to_owned(),
+        size: slot.size,
+    })?;
+    let entry = MmioDeviceEntry {
+        size,
+        base: slot.base,
+        gsi: slot.gsi,
+    };
+    Ok((slot, entry))
+}
+
 /// A virtio-fs device behind its transport.
 pub type FsTransport = MmioTransport<VirtioFs>;
 
@@ -97,13 +121,7 @@ impl FsDevices {
         for share in shares {
             let tag = || share.tag.clone();
             let wiring = |source| DeviceError::Wiring { tag: tag(), source };
-            let slot = slots
-                .alloc()
-                .map_err(|source| DeviceError::Slot { tag: tag(), source })?;
-            let size = u32::try_from(slot.size).map_err(|_| DeviceError::SlotSize {
-                tag: tag(),
-                size: slot.size,
-            })?;
+            let (slot, entry) = next_slot(slots, &share.tag)?;
             let device = VirtioFs::new(share.clone(), audit.clone(), options)
                 .map_err(|source| DeviceError::Fs { tag: tag(), source })?;
             let ctx = DeviceContext::new(slot, device.num_queues()).map_err(wiring)?;
@@ -117,14 +135,22 @@ impl FsDevices {
                 slot.base,
                 slot.gsi
             );
-            devices.entries.push(MmioDeviceEntry {
-                size,
-                base: slot.base,
-                gsi: slot.gsi,
-            });
+            devices.entries.push(entry);
             devices.devices.push(transport);
         }
         Ok(devices)
+    }
+
+    /// The command line entries [`FsDevices::attach`] announces for shares
+    /// tagged `tags`, in order, from the slots it would take from `slots`,
+    /// without creating a device.
+    pub fn cmdline_entries_for(
+        slots: &mut SlotAllocator,
+        tags: &[&str],
+    ) -> Result<Vec<MmioDeviceEntry>, DeviceError> {
+        tags.iter()
+            .map(|tag| next_slot(slots, tag).map(|(_, entry)| entry))
+            .collect()
     }
 
     /// One `virtio_mmio.device=` entry per device, in slot order.

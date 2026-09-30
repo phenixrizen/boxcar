@@ -30,7 +30,28 @@ pub struct MmioDeviceEntry {
 /// The size to put in `boot_params` is
 /// `cmdline.as_cstring()?.as_bytes_with_nul().len()`.
 pub fn build_cmdline(base: &str, extra: &[&str], devices: &[MmioDeviceEntry]) -> Result<Cmdline> {
-    let mut cmdline = Cmdline::new(CMDLINE_MAX_SIZE).map_err(Error::Cmdline)?;
+    compose(CMDLINE_MAX_SIZE, base, extra, devices)
+}
+
+/// The size, NUL terminator included, of the command line
+/// [`build_cmdline`] builds from the same parts, whether or not it fits in
+/// [`CMDLINE_MAX_SIZE`]: for a caller that refuses one that is too long
+/// and says by how much. Fails as `build_cmdline` does on a part that is
+/// not printable ASCII.
+pub fn cmdline_size(base: &str, extra: &[&str], devices: &[MmioDeviceEntry]) -> Result<usize> {
+    let cmdline = compose(usize::MAX, base, extra, devices)?;
+    let cmdline = cmdline.as_cstring().map_err(Error::Cmdline)?;
+    Ok(cmdline.as_bytes_with_nul().len())
+}
+
+/// The command line of [`build_cmdline`], in at most `capacity` bytes.
+fn compose(
+    capacity: usize,
+    base: &str,
+    extra: &[&str],
+    devices: &[MmioDeviceEntry],
+) -> Result<Cmdline> {
+    let mut cmdline = Cmdline::new(capacity).map_err(Error::Cmdline)?;
     cmdline.insert_str(base).map_err(Error::Cmdline)?;
     for arg in extra {
         cmdline.insert_str(arg).map_err(Error::Cmdline)?;
@@ -128,6 +149,30 @@ mod tests {
         assert!(matches!(
             build_cmdline(&"c".repeat(2020), &[], &[device]),
             Err(Error::Cmdline(linux_loader::cmdline::Error::TooLarge))
+        ));
+    }
+
+    #[test]
+    fn the_size_is_measured_past_the_limit() {
+        let device = MmioDeviceEntry {
+            size: 0x1000,
+            base: 0xc000_0000,
+            gsi: 5,
+        };
+        let fits = build_cmdline("a=1", &["b=2"], &[device]).unwrap();
+        assert_eq!(
+            cmdline_size("a=1", &["b=2"], &[device]).unwrap(),
+            fits.as_cstring().unwrap().as_bytes_with_nul().len()
+        );
+        let long = "c".repeat(2048);
+        assert!(build_cmdline("a=1", &[&long], &[device]).is_err());
+        assert_eq!(
+            cmdline_size("a=1", &[&long], &[device]).unwrap(),
+            "a=1 ".len() + 2048 + " virtio_mmio.device=4K@0xc0000000:5".len() + 1
+        );
+        assert!(matches!(
+            cmdline_size("a=1", &["bad\u{7}"], &[]),
+            Err(Error::Cmdline(_))
         ));
     }
 

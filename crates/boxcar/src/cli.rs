@@ -32,14 +32,16 @@ pub enum Command {
     /// Shares `--rootfs` with the guest as its root filesystem and
     /// `--workspace` at /workspace, both over virtio-fs, and records what
     /// the guest does to them. The guest runs a login shell on its serial
-    /// console as the invoking user's uid and gid. Prints the session id,
-    /// its audit log directory and the workspace on stderr, runs the guest
-    /// with its serial console on stdout (or in `--console-log`), and exits
-    /// when it stops: 0 when the guest reset or shut down, 1 after a
-    /// vCPU error, 130 after SIGINT (Ctrl-C) or the console escape, 143
-    /// after SIGTERM. When stdin is a terminal and the console is on stdout,
-    /// every key goes to the guest, Ctrl-C included; press Ctrl-] twice
-    /// within a second to stop the VM.
+    /// console as the invoking user's uid and gid, or, after `--`, the
+    /// command given. Prints the session id, its audit log directory and
+    /// the workspace on stderr, runs the guest with its serial console on
+    /// stdout (or in `--console-log`), and exits when it stops: 0 when the
+    /// guest reset or shut down (whatever the session's own exit status,
+    /// which the console shows as `boxcar: session exited <code>`), 1 after
+    /// a vCPU error, 130 after SIGINT (Ctrl-C) or the console escape, 143
+    /// after SIGTERM. When stdin is a terminal, the console is on stdout and
+    /// no command is given, every key goes to the guest, Ctrl-C included;
+    /// press Ctrl-] twice within a second to stop the VM.
     Run(RunArgs),
 }
 
@@ -108,19 +110,29 @@ pub struct RunArgs {
     pub audit_level: AuditLevelArg,
     /// An extra kernel command line argument. Repeatable. These follow the
     /// `boxcar.mode`, `boxcar.uid` and `boxcar.gid` keys boxcar sets, so
-    /// they can override them.
+    /// they can override them; `boxcar.cmd` from `-- CMD` comes after them.
+    /// The whole command line may not exceed 2048 bytes.
     #[arg(long, value_name = "STR")]
     pub cmdline_extra: Vec<String>,
     /// Early printk on the serial console and every kernel message.
     #[arg(long)]
     pub debug_boot: bool,
-    /// Where audit logs go: DIR/sessions/<session-id>/.
-    #[arg(long, value_name = "DIR", default_value = "./boxcar-data")]
-    pub audit_dir: PathBuf,
+    /// Where audit logs go: DIR/sessions/<session-id>/. Default:
+    /// $XDG_DATA_HOME/boxcar, or ~/.local/share/boxcar. It may not be
+    /// inside `--rootfs` or `--workspace`, nor either of them inside it.
+    #[arg(long, value_name = "DIR")]
+    pub audit_dir: Option<PathBuf>,
     /// Write the serial console to PATH instead of stdout. Stdin is then not
     /// forwarded to the guest.
     #[arg(long, value_name = "PATH")]
     pub console_log: Option<PathBuf>,
+    /// The command the guest runs instead of a login shell, and its
+    /// arguments, after `--`: an argv, run without a shell, with CMD looked
+    /// up in the guest's PATH unless it holds a `/`. The run is not
+    /// interactive: stdin is not forwarded and the terminal is left as it
+    /// is.
+    #[arg(last = true, value_name = "CMD", conflicts_with = "no_fs")]
+    pub command: Vec<String>,
 }
 
 /// `--audit-level`.
