@@ -14,20 +14,32 @@ use vm_memory::GuestMemoryMmap;
 /// re-enabled before returning. Re-enabling re-checks the available ring, and
 /// if the driver added a chain in between (and so may not have notified),
 /// the drain starts over; a chain offered at any point before this returns
-/// is processed by this call.
+/// is processed by this call. When `VIRTIO_RING_F_EVENT_IDX` is enabled on
+/// `queue`, the result honours the driver's `used_event`; without it the
+/// result is always `true`.
 ///
-/// An error from `f` aborts the drain and is returned: the chain `f` failed
-/// on is not added to the used ring, and notifications stay disabled, so the
-/// caller should treat the queue as broken. Errors from the queue itself
-/// (writing the used ring or the notification fields) are returned as well.
-/// When `VIRTIO_RING_F_EVENT_IDX` is enabled on `queue`, the result honours
-/// the driver's `used_event`; without it the result is always `true`.
+/// # The callback's contract
 ///
-/// If the available ring keeps announcing chains that cannot be popped (the
-/// driver wrote an available index more than a queue's worth ahead, or the
-/// ring is not readable), the drain fails with
-/// [`virtio_queue::Error::InvalidAvailRingIndex`] instead of spinning. The
-/// queue must be ready and inside guest memory ([`QueueT::is_valid`]); a
+/// `f` handles per-request failures itself: a malformed or failed request is
+/// logged and completed with `Ok(0)`, or answered with an error reply to the
+/// guest and completed with `Ok(len)` for that reply. An `Err` from `f` means
+/// the device cannot go on: the drain completes the chain `f` failed on with
+/// length 0 (best effort, so the guest request does not hang), stops, and
+/// returns the error. The device's worker must then call
+/// [`IrqTrigger::signal_needs_reset`](crate::IrqTrigger::signal_needs_reset)
+/// and stop serving the queue until the driver resets the device.
+///
+/// # Errors
+///
+/// Besides `f`'s error: errors from the queue itself (writing the used ring
+/// or the notification fields) are returned as they occur. If the available
+/// ring keeps announcing chains that cannot be popped (the driver wrote an
+/// available index more than a queue's worth ahead, or the ring is not
+/// readable), the drain fails with
+/// [`virtio_queue::Error::InvalidAvailRingIndex`] instead of spinning. All of
+/// these are fatal in the same way as an `Err` from `f`.
+///
+/// The queue must be ready and inside guest memory ([`QueueT::is_valid`]); a
 /// device checks that once, at activation.
 pub fn drain_queue<F, E>(queue: &mut Queue, mem: &GuestMemoryMmap, mut f: F) -> Result<bool, E>
 where
@@ -44,7 +56,15 @@ where
         let mut used_any = false;
         while let Some(chain) = queue.pop_descriptor_chain(mem) {
             let head = chain.head_index();
-            let len = f(chain)?;
+            let len = match f(chain) {
+                Ok(len) => len,
+                Err(err) => {
+                    // Hand the buffer back empty so the guest request does
+                    // not hang; the callback's error is the one that matters.
+                    let _ = queue.add_used(mem, head, 0);
+                    return Err(err);
+                }
+            };
             queue.add_used(mem, head, len)?;
             used_any = true;
         }

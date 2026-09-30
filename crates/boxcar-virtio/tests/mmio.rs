@@ -543,6 +543,44 @@ fn interrupt_ack_clears_only_the_acked_bits() {
     );
 }
 
+// A device asking for a reset.
+
+#[test]
+fn a_device_worker_can_request_a_reset() {
+    let mut t = transport();
+    activate(&mut t, VERSION_1 | EVENT_IDX);
+    let irq = t
+        .device()
+        .activation
+        .as_ref()
+        .expect("activated")
+        .irq
+        .clone();
+
+    // What a worker does after a fatal drain_queue error.
+    irq.signal_needs_reset().expect("signal the reset request");
+    assert!(irq.needs_reset.load(Ordering::SeqCst));
+    assert_eq!(status(&mut t), ALL_OK | DEVICE_NEEDS_RESET);
+    assert_eq!(read(&mut t, 0x070) & 64, 64);
+    assert_eq!(read(&mut t, 0x060) & 0x2, 0x2, "config change interrupt");
+    assert_eq!(irq.evt.read().expect("interrupt raised"), 1);
+
+    // While the device needs a reset the driver cannot write its config.
+    t.write(0x100, &[0xaa]);
+    assert!(t.device().config_writes.is_empty());
+
+    // The driver resets: the request is cleared and Status reads 0.
+    set_status(&mut t, 0);
+    assert!(!irq.needs_reset.load(Ordering::SeqCst));
+    assert_eq!(read(&mut t, 0x070), 0);
+    assert_eq!(read(&mut t, 0x060), 0);
+    assert_eq!(t.device().reset_calls, 1);
+
+    // And the device comes back up normally.
+    activate(&mut t, VERSION_1 | EVENT_IDX);
+    assert_eq!(status(&mut t), ALL_OK);
+}
+
 // (g) Device configuration space.
 
 #[test]
@@ -802,7 +840,7 @@ fn drain_queue_on_an_empty_queue_calls_nothing() {
 }
 
 #[test]
-fn drain_queue_stops_at_the_first_callback_error() {
+fn drain_queue_completes_the_failed_chain_and_stops() {
     let mem = queue_memory();
     let mock = MockSplitQueue::new(&mem, QUEUE_LEN);
     offer_chains(&mock, 0, 3);
@@ -815,18 +853,22 @@ fn drain_queue_stops_at_the_first_callback_error() {
         if head == 1 {
             Err(DrainError::Rejected(head))
         } else {
-            Ok(0)
+            Ok(0x40)
         }
     })
     .expect_err("the callback failed");
 
     assert!(matches!(err, DrainError::Rejected(1)), "{err:?}");
-    assert_eq!(seen, [0, 1]);
-    assert_eq!(
-        used_idx(&mem),
-        1,
-        "only the chain before the failure is used"
-    );
+    assert_eq!(seen, [0, 1], "the drain stops at the failure");
+    // Both chains the callback saw went back to the driver, the failed one
+    // with nothing written, so no guest request is left hanging.
+    assert_eq!(used_idx(&mem), 2);
+    let first = used_elem(&mem, 0);
+    assert_eq!((first.id(), first.len()), (0, 0x40));
+    let failed = used_elem(&mem, 1);
+    assert_eq!((failed.id(), failed.len()), (1, 0));
+    // The third chain is still available.
+    assert_eq!(queue.next_avail(), 2);
 }
 
 #[test]

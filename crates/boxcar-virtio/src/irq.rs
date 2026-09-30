@@ -13,13 +13,13 @@
 // commit 21f19ed8109578108568c8a8f3623ddb6f097878. The BSD-3-Clause text
 // referred to above is in LICENSE-BSD-3-Clause. Adapted: the status is the
 // `AtomicU8` the transport's InterruptStatus register reads, the two interrupt
-// kinds are two methods instead of an `IrqType`, errors are `io::Error`, and
-// there are no metrics.
+// kinds are two methods instead of an `IrqType`, errors are `io::Error`,
+// there are no metrics, and a device can flag DEVICE_NEEDS_RESET through it.
 
 //! The interrupt a virtio-mmio device raises towards the guest.
 
 use std::io;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use virtio_bindings::virtio_mmio::{VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
@@ -33,14 +33,18 @@ pub const INT_CONFIG: u8 = VIRTIO_MMIO_INT_CONFIG as u8;
 /// Raises a device's interrupt: sets the reason in the InterruptStatus bits
 /// and writes the eventfd that KVM's irqfd turns into the guest interrupt.
 ///
-/// `status` is shared with the transport, which reads it through
-/// InterruptStatus and clears acknowledged bits through InterruptACK.
+/// `status` and `needs_reset` are shared with the transport: it reads
+/// `status` through InterruptStatus and clears acknowledged bits through
+/// InterruptACK, and shows `needs_reset` as DEVICE_NEEDS_RESET in the Status
+/// register until the driver resets the device.
 #[derive(Debug)]
 pub struct IrqTrigger {
     /// Registered with KVM as the irqfd for the device's GSI.
     pub evt: EventFd,
     /// The InterruptStatus bits.
     pub status: Arc<AtomicU8>,
+    /// Set by [`IrqTrigger::signal_needs_reset`]; cleared by a device reset.
+    pub needs_reset: Arc<AtomicBool>,
 }
 
 impl IrqTrigger {
@@ -49,6 +53,7 @@ impl IrqTrigger {
         Ok(Self {
             evt: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
             status: Arc::new(AtomicU8::new(0)),
+            needs_reset: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -59,6 +64,17 @@ impl IrqTrigger {
 
     /// Tells the guest the device configuration changed.
     pub fn signal_config_change(&self) -> io::Result<()> {
+        self.signal(INT_CONFIG)
+    }
+
+    /// Tells the guest the device hit an error it cannot recover from: the
+    /// Status register shows DEVICE_NEEDS_RESET until the driver resets the
+    /// device, and the driver gets a configuration change interrupt (virtio
+    /// 1.2 section 2.1.2). A device worker calls this after a fatal error,
+    /// such as an `Err` from [`drain_queue`](crate::drain_queue)'s callback.
+    /// The request is recorded even if the interrupt cannot be sent.
+    pub fn signal_needs_reset(&self) -> io::Result<()> {
+        self.needs_reset.store(true, Ordering::SeqCst);
         self.signal(INT_CONFIG)
     }
 
@@ -104,6 +120,23 @@ mod tests {
         irq.evt.write(u64::MAX - 1).unwrap();
         irq.signal_config_change().unwrap_err();
         irq.signal_used_queue().unwrap_err();
+    }
+
+    #[test]
+    fn signal_needs_reset_raises_a_config_change() {
+        let irq = IrqTrigger::new().unwrap();
+        assert!(!irq.needs_reset.load(Ordering::SeqCst));
+
+        irq.signal_needs_reset().unwrap();
+        assert!(irq.needs_reset.load(Ordering::SeqCst));
+        assert_eq!(irq.status.load(Ordering::SeqCst), INT_CONFIG);
+        assert_eq!(irq.evt.read().unwrap(), 1);
+
+        // The request stays set even when the interrupt cannot be sent.
+        irq.needs_reset.store(false, Ordering::SeqCst);
+        irq.evt.write(u64::MAX - 1).unwrap();
+        irq.signal_needs_reset().unwrap_err();
+        assert!(irq.needs_reset.load(Ordering::SeqCst));
     }
 
     #[test]

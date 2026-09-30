@@ -31,7 +31,8 @@
 // queues and features in a `VirtioConfig`, activation hands the device copies
 // of the configured queues with their eventfds, FEATURES_OK is refused for
 // unoffered features (rust-vmm), QueueNum is bounded by the queue maximum,
-// InterruptACK is honoured in any state, and the address registers read back.
+// InterruptACK is honoured in any state, the address registers read back, and
+// a device's reset request (`IrqTrigger::signal_needs_reset`) shows in Status.
 
 //! The virtio-mmio transport (virtio 1.2 section 4.2.2, version 2): the
 //! register map the guest's `virtio_mmio` driver talks to, in front of one
@@ -185,7 +186,13 @@ impl<D: VirtioDevice> MmioTransport<D> {
             );
         }
 
-        let cfg = VirtioConfig::new(features, queues, queue_evts, irq.status.clone());
+        let cfg = VirtioConfig::new(
+            features,
+            queues,
+            queue_evts,
+            irq.status.clone(),
+            irq.needs_reset.clone(),
+        );
         Self {
             device,
             mem,
@@ -216,8 +223,18 @@ impl<D: VirtioDevice> MmioTransport<D> {
         &self.kill_evt
     }
 
+    /// Device Status as the driver sees it: DEVICE_NEEDS_RESET is also set
+    /// while the device's reset request is pending.
+    fn device_status(&self) -> u8 {
+        if self.cfg.needs_reset.load(Ordering::SeqCst) {
+            self.cfg.device_status | status::DEVICE_NEEDS_RESET
+        } else {
+            self.cfg.device_status
+        }
+    }
+
     fn check_status(&self, set: u8, clear: u8) -> bool {
-        self.cfg.device_status & (set | clear) == set
+        self.device_status() & (set | clear) == set
     }
 
     fn read_register(&self, offset: u64) -> Option<u32> {
@@ -236,7 +253,7 @@ impl<D: VirtioDevice> MmioTransport<D> {
             regs::QUEUE_NUM => queue.map_or(0, |q| u32::from(q.size())),
             regs::QUEUE_READY => queue.map_or(0, |q| u32::from(q.ready())),
             regs::INTERRUPT_STATUS => u32::from(self.cfg.interrupt_status.load(Ordering::SeqCst)),
-            regs::STATUS => u32::from(self.cfg.device_status),
+            regs::STATUS => u32::from(self.device_status()),
             // Write-only in the spec; the stored halves are returned.
             regs::QUEUE_DESC_LOW => queue.map_or(0, |q| low(q.desc_table())),
             regs::QUEUE_DESC_HIGH => queue.map_or(0, |q| high(q.desc_table())),

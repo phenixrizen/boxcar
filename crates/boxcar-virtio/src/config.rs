@@ -22,7 +22,7 @@
 //! Transport-side virtio state: negotiated features, selectors, device
 //! status, interrupt status, and the queues as the driver configured them.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use virtio_queue::{Queue, QueueT};
@@ -64,6 +64,9 @@ pub struct VirtioConfig {
     pub device_status: u8,
     /// The InterruptStatus bits, shared with the device's `IrqTrigger`.
     pub interrupt_status: Arc<AtomicU8>,
+    /// Set when the device asked for a reset through its `IrqTrigger`
+    /// (shared with it); the Status register then shows DEVICE_NEEDS_RESET.
+    pub needs_reset: Arc<AtomicBool>,
     /// ConfigGeneration. It is never reset, so it only moves forward.
     pub config_generation: u32,
     /// The queues as the driver configured them. At activation the device
@@ -82,6 +85,7 @@ impl VirtioConfig {
         queues: Vec<Queue>,
         queue_evts: Vec<EventFd>,
         interrupt_status: Arc<AtomicU8>,
+        needs_reset: Arc<AtomicBool>,
     ) -> Self {
         VirtioConfig {
             device_features,
@@ -91,6 +95,7 @@ impl VirtioConfig {
             queue_select: 0,
             device_status: 0,
             interrupt_status,
+            needs_reset,
             config_generation: 0,
             queues,
             queue_evts,
@@ -133,8 +138,9 @@ impl VirtioConfig {
     }
 
     /// Back to the state after [`VirtioConfig::new`]: features, selectors,
-    /// status, interrupt status and every queue cleared, not activated. The
-    /// offered features, the queue eventfds and ConfigGeneration are kept.
+    /// status, interrupt status, the reset request and every queue cleared,
+    /// not activated. The offered features, the queue eventfds and
+    /// ConfigGeneration are kept.
     pub fn reset(&mut self) {
         self.driver_features = 0;
         self.device_features_select = 0;
@@ -142,6 +148,7 @@ impl VirtioConfig {
         self.queue_select = 0;
         self.device_status = 0;
         self.interrupt_status.store(0, Ordering::SeqCst);
+        self.needs_reset.store(false, Ordering::SeqCst);
         self.queues.iter_mut().for_each(QueueT::reset);
         self.activated = false;
     }
@@ -158,6 +165,7 @@ mod tests {
             queues,
             Vec::new(),
             Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -202,6 +210,7 @@ mod tests {
         c.queue_select = 1;
         c.device_status = status::ACKNOWLEDGE | status::DRIVER;
         c.interrupt_status.store(3, Ordering::SeqCst);
+        c.needs_reset.store(true, Ordering::SeqCst);
         c.config_generation = 4;
         c.queues[0].set_size(32);
         c.queues[0].set_ready(true);
@@ -216,6 +225,7 @@ mod tests {
         assert_eq!(c.queue_select, 0);
         assert_eq!(c.device_status, 0);
         assert_eq!(c.interrupt_status.load(Ordering::SeqCst), 0);
+        assert!(!c.needs_reset.load(Ordering::SeqCst));
         assert_eq!(c.config_generation, 4);
         assert_eq!(c.queues[0].size(), 256);
         assert!(!c.queues[0].ready());
