@@ -1161,6 +1161,7 @@ dependencies = [
  "clap",
  "cpio",
  "hex",
+ "serde_json",
 ]
 
 [[package]]

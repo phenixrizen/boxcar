@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 mod initramfs;
 mod kernel;
+mod rootfs;
 
 /// Build tasks for boxcar.
 #[derive(Parser)]
@@ -22,11 +23,14 @@ enum Command {
     Kernel(kernel::KernelArgs),
     /// Build the guest init and pack target/guest/initramfs.cpio.
     Initramfs,
+    /// Download, verify and unpack a guest root filesystem into target/guest.
+    Rootfs(rootfs::RootfsArgs),
 }
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Kernel(args) => kernel::run(&args),
         Command::Initramfs => initramfs::run(),
+        Command::Rootfs(args) => rootfs::run(&args),
     }
 }
