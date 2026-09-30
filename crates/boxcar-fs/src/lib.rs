@@ -2,6 +2,30 @@
 // Copyright 2026 The boxcar Authors
 
 //! Audited virtio-fs: `AuditFs` over the fuse-backend-rs passthrough filesystem.
+//!
+//! - [`share`]: a share's configuration and its passthrough `Config`.
+//! - [`audit_fs`]: [`AuditFs`], the `FileSystem` decorator that records.
+//! - [`path_map`]: inode to path, without syscalls.
+//! - [`handles`]: open handles and what went through them.
+//! - [`hasher`]: content hashes for `fs.close`, off the reply path.
+//! - `events` and `forward`: building submissions, and the `forward!` macro
+//!   that delegates every trait method.
+
+#[macro_use]
+mod forward;
+
+pub mod audit_fs;
+mod events;
+pub mod handles;
+pub mod hasher;
+pub mod path_map;
+pub mod share;
+
+pub use audit_fs::{AuditFs, AuditFsOptions, AuditLevel};
+pub use handles::{HandleEntry, HandleTable};
+pub use hasher::{HashJob, HashWorker};
+pub use path_map::{FileId, PathMap, ROOT_INO};
+pub use share::{passthrough_config, CachePolicyKind, FsShareConfig};
 
 #[cfg(test)]
 mod dep_check {

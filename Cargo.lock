@@ -157,6 +157,7 @@ dependencies = [
  "boxcar-audit",
  "boxcar-proto",
  "boxcar-virtio",
+ "crossbeam-channel",
  "fuse-backend-rs",
  "libc",
  "tempfile",
