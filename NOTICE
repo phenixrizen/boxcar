@@ -16,11 +16,28 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
     guest/kernel/base/microvm-kernel-ci-x86_64-6.18.config is copied verbatim
     from resources/guest_configs/microvm-kernel-ci-x86_64-6.18.config at
     commit 21f19ed8109578108568c8a8f3623ddb6f097878 of that repository. Apache-2.0.
+    The x86_64 boot setup is ported from src/vmm/src/arch/x86_64/ at the same
+    commit, 21f19ed8109578108568c8a8f3623ddb6f097878:
+      crates/boxcar-vmm/src/arch/x86_64/layout.rs      from layout.rs
+      crates/boxcar-vmm/src/arch/x86_64/gdt.rs         from gdt.rs
+      crates/boxcar-vmm/src/arch/x86_64/mptable.rs     from mptable.rs
+      crates/boxcar-vmm/src/arch/x86_64/mpspec.rs      from generated/mpspec.rs
+      crates/boxcar-vmm/src/arch/x86_64/regs.rs        from regs.rs
+      crates/boxcar-vmm/src/arch/x86_64/msr.rs         from msr.rs and generated/msr_index.rs
+      crates/boxcar-vmm/src/arch/x86_64/interrupts.rs  from interrupts.rs
+      crates/boxcar-vmm/src/arch/x86_64/boot.rs        from mod.rs
+      crates/boxcar-vmm/src/arch/x86_64/mod.rs         from mod.rs and src/vmm/src/test_utils/mod.rs
+      crates/boxcar-vmm/src/memory.rs                  from mod.rs
+    Apache-2.0; the Chromium OS portions BSD-3-Clause.
 
   Cloud Hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor)
     Copyright Intel Corporation and contributors. Apache-2.0.
     Portions Copyright 2017 The Chromium OS Authors. BSD-3-Clause.
     Used for: the vsock connection state machine and Unix muxer, CPUID patching.
+    crates/boxcar-vmm/src/arch/x86_64/cpuid.rs is derived from
+    arch/src/x86_64/mod.rs (configure_vcpu, update_cpuid_topology) at commit
+    853c440425ebe23bcf5fb43d9058bd1d8a0abe2a. Apache-2.0; the Chromium OS
+    portions BSD-3-Clause.
 
   rust-vmm virtio-device (https://github.com/rust-vmm/vm-virtio, tag virtio-queue-v0.17.0)
     Copyright The Chromium OS Authors and rust-vmm contributors. Apache-2.0 OR MIT.
