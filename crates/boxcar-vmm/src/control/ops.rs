@@ -22,6 +22,12 @@ pub trait Ops: Send + Sync {
     /// `status`.
     fn status(&self) -> Status;
     /// `stop`, with its parameters. The result is the response's `result`.
+    ///
+    /// It must return promptly: start the stop and return, never wait on
+    /// the guest or on the stop sequence. The connection calls it holding
+    /// its outbox lock (so the response comes before the `stopping` the
+    /// stop causes), and the stop sequence's `notify_state` takes that
+    /// lock: a `stop` that waited for the VM to stop would deadlock it.
     fn stop(&self, params: StopParams) -> Result<Value, ErrorBody>;
     /// Any op other than `status` and `stop`: `unknown_op` for one it does
     /// not serve. An op that turns the connection into a raw byte stream

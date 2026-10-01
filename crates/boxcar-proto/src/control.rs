@@ -75,7 +75,8 @@ impl Request {
 pub struct Response {
     pub v: u32,
     /// The request's `id`, or 0 when the request had none that could be
-    /// read.
+    /// read, or was a long line dropped unread for being over the rate
+    /// limit.
     pub id: u64,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

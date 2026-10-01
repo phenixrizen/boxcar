@@ -37,7 +37,7 @@ use boxcar_proto::control::{
 use boxcar_proto::{ControlStop, Payload, Ring};
 use serde::Serialize;
 use serde_json::Value;
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use super::ops::{ConnCtx, Ops, RawUpgrade};
 
@@ -50,6 +50,10 @@ pub(crate) const BURST: f64 = 100.0;
 pub(crate) const OUTBOX_MAX: usize = 2 * (MAX_LINE + 1);
 /// How much is read from the socket at a time.
 const READ_CHUNK: usize = 64 * 1024;
+/// The longest line over the rate budget whose id is still read for its
+/// `rate_limited` response: any ordinary request, and nothing that costs
+/// a real parse.
+const RATE_LIMITED_ID_MAX: usize = 4096;
 /// How long a connection the server closes (a line over the cap) gets to
 /// take what it was sent, such as the error that says why.
 const LINGER: Duration = Duration::from_secs(1);
@@ -82,15 +86,23 @@ impl Outbox {
 }
 
 impl Conn {
-    /// Takes `stream` and makes it non-blocking.
-    pub(crate) fn new(stream: UnixStream) -> io::Result<Conn> {
+    /// Takes `stream`, makes it non-blocking, and queues `hello` as its
+    /// first line, before the connection is published to the server or
+    /// its thread starts, so nothing the server sends can come before it.
+    pub(crate) fn new(stream: UnixStream, hello: &Hello) -> io::Result<Conn> {
         stream.set_nonblocking(true)?;
-        Ok(Conn {
+        let conn = Conn {
             stream,
-            wake: EventFd::new(EFD_NONBLOCK)?,
+            wake: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
             out: Mutex::new(Outbox::default()),
             closing: AtomicBool::new(false),
-        })
+        };
+        {
+            let mut out = conn.lock();
+            conn.queue(&mut out, hello);
+            conn.flush(&mut out);
+        }
+        Ok(conn)
     }
 
     fn lock(&self) -> MutexGuard<'_, Outbox> {
@@ -174,6 +186,11 @@ impl Conn {
             out.buf.drain(..out.sent);
             out.sent = 0;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wake_fd(&self) -> RawFd {
+        self.wake.as_raw_fd()
     }
 
     fn wake(&self) {
@@ -320,8 +337,6 @@ pub(crate) struct Session {
     pub(crate) ctx: ConnCtx,
     pub(crate) ops: Arc<dyn Ops>,
     pub(crate) audit: AuditSink,
-    /// Sent before anything is read.
-    pub(crate) hello: Hello,
 }
 
 impl Session {
@@ -331,7 +346,8 @@ impl Session {
         let mut reader = LineReader::new();
         let mut limit = RateLimit::new(Instant::now());
         let mut chunk = vec![0u8; READ_CHUNK];
-        self.conn.send(&self.hello);
+        // The hello is in the outbox already (`Conn::new`): the first pass
+        // polls for output and sends what the socket did not take then.
         let flow = loop {
             if self.conn.is_closing() {
                 break Flow::Continue;
@@ -413,25 +429,32 @@ impl Session {
     }
 
     /// Handles one line: a request within the budget is served, anything
-    /// else answered with an error. Blank lines are skipped.
+    /// else answered with an error. Blank lines are skipped. The budget is
+    /// checked before the line is parsed, so a flood of long lines costs no
+    /// parsing; a line over it is answered `rate_limited` with its id when
+    /// it is short enough to read cheaply ([`RATE_LIMITED_ID_MAX`]), 0
+    /// otherwise.
     fn line(&mut self, line: &[u8], limit: &mut RateLimit) -> Flow {
         if line.iter().all(u8::is_ascii_whitespace) {
             return Flow::Continue;
         }
-        let parsed = parse_request(line);
         if !limit.allow(Instant::now()) {
-            let id = match &parsed {
-                Ok(request) => request.id,
-                Err(error) => error.id.unwrap_or(0),
+            let id = if line.len() <= RATE_LIMITED_ID_MAX {
+                match parse_request(line) {
+                    Ok(request) => request.id,
+                    Err(error) => error.id.unwrap_or(0),
+                }
+            } else {
+                0
             };
             let error = ErrorBody::new(
                 ErrorCode::RateLimited,
-                "over 100 requests a second; the request was dropped",
+                format!("over {RATE_PER_SEC} requests a second; the request was dropped"),
             );
             self.conn.send(&Response::failure(id, error));
             return Flow::Continue;
         }
-        let request = match parsed {
+        let request = match parse_request(line) {
             Ok(request) => request,
             Err(error) => {
                 self.conn.send(&error.into_response());
@@ -617,7 +640,110 @@ impl LineReader {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+
+    use serde_json::json;
+
     use super::*;
+
+    /// The lines a client reads from `stream` until the server closes it.
+    fn lines(stream: UnixStream) -> Vec<Value> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        BufReader::new(stream)
+            .lines()
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// The hello is queued when the connection is made, before the server
+    /// can reach it, so a state event sent before the connection's thread
+    /// runs, or the server closing it then, still comes after the hello.
+    #[test]
+    fn the_hello_comes_before_an_event_sent_before_serve_runs() {
+        let hello = Hello::new("boxcar/test", "s", Vec::new());
+        let (server, client) = UnixStream::pair().unwrap();
+        let conn = Conn::new(server, &hello).unwrap();
+        conn.send_state(VmState::Stopping);
+        conn.send_state(VmState::Stopped);
+        conn.close();
+        let got = lines(client);
+        assert_eq!(
+            got,
+            [
+                serde_json::to_value(&hello).unwrap(),
+                json!({"v": 1, "event": "state", "state": "stopping"}),
+                json!({"v": 1, "event": "state", "state": "stopped"}),
+            ]
+        );
+    }
+
+    /// Ops for a session whose requests never get past the rate limit.
+    struct Unreached;
+
+    impl Ops for Unreached {
+        fn status(&self) -> boxcar_proto::control::Status {
+            unreachable!("over the budget")
+        }
+
+        fn stop(&self, _: StopParams) -> Result<Value, ErrorBody> {
+            unreachable!("over the budget")
+        }
+
+        fn dispatch(&self, _: &mut ConnCtx, _: &Request) -> Result<Value, ErrorBody> {
+            unreachable!("over the budget")
+        }
+    }
+
+    /// Over the budget, a line is answered before it is parsed: a long one
+    /// with id 0, since reading its id would mean parsing it, a short one
+    /// with its own id. Neither reaches the ops.
+    #[test]
+    fn a_line_over_the_budget_is_refused_before_it_is_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = crate::lifecycle::test_handle(tmp.path());
+        let (server, client) = UnixStream::pair().unwrap();
+        let hello = Hello::new("boxcar/test", "s", Vec::new());
+        let mut session = Session {
+            conn: Arc::new(Conn::new(server, &hello).unwrap()),
+            ctx: ConnCtx {
+                peer_pid: 1,
+                peer_uid: 0,
+                raw_upgrade: None,
+            },
+            ops: Arc::new(Unreached),
+            audit: handle.audit().clone(),
+        };
+        // No tokens, and none coming: `last` is in the future.
+        let mut spent = RateLimit {
+            tokens: 0.0,
+            last: Instant::now() + Duration::from_secs(3600),
+        };
+        let pad = "x".repeat(RATE_LIMITED_ID_MAX);
+        let long =
+            serde_json::to_vec(&json!({"v": 1, "id": 500, "op": "status", "p": pad})).unwrap();
+        let short = br#"{"v":1,"id":501,"op":"status"}"#;
+        assert!(matches!(session.line(&long, &mut spent), Flow::Continue));
+        assert!(matches!(session.line(short, &mut spent), Flow::Continue));
+        session.conn.close();
+
+        let got = lines(client);
+        assert_eq!(got[0]["event"], "hello");
+        let refused: Vec<(u64, &Value)> = got[1..]
+            .iter()
+            .map(|r| (r["id"].as_u64().unwrap(), &r["error"]["code"]))
+            .collect();
+        assert_eq!(
+            refused,
+            [(0, &json!("rate_limited")), (501, &json!("rate_limited"))]
+        );
+        assert_eq!(
+            got[2]["error"]["message"],
+            "over 100 requests a second; the request was dropped"
+        );
+        writer.close().unwrap();
+    }
 
     #[test]
     fn the_budget_is_a_burst_of_100_then_100_a_second() {

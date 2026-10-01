@@ -226,13 +226,15 @@ fn a_session_is_found_by_a_unique_prefix_of_its_id() {
     let other = "01999b00-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
     let _other_server = fake_server(&runtime.socket(other));
 
-    // Two sessions run: one must be named.
-    let none = boxcar(runtime.path(), &["status"]);
-    assert_eq!(none.status.code(), Some(1), "{}", stderr(&none));
+    // Two sessions run: one must be named, and the error names both.
+    let two = boxcar(runtime.path(), &["status"]);
+    assert_eq!(two.status.code(), Some(1), "{}", stderr(&two));
     assert!(
-        stderr(&none).contains("no session found; pass --control or a session id"),
+        stderr(&two).contains(&format!(
+            "2 sessions are running ({SESSION}, {other}); pass --control or a session id"
+        )),
         "{}",
-        stderr(&none)
+        stderr(&two)
     );
     let ambiguous = boxcar(runtime.path(), &["status", "01999"]);
     assert_eq!(ambiguous.status.code(), Some(1));

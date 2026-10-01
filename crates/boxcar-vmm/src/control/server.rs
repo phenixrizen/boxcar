@@ -37,7 +37,7 @@ use std::time::Duration;
 use boxcar_audit::AuditSink;
 use boxcar_proto::control::{Hello, VmState, SOCKET_NAME};
 use boxcar_proto::{ControlConnect, Payload, Verdict};
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use super::conn::{poll_two, record, Conn, Session};
 use super::ops::{ConnCtx, Ops};
@@ -142,7 +142,7 @@ impl ControlServer {
         }
         let shared = Arc::new(Shared {
             closing: AtomicBool::new(false),
-            wake: EventFd::new(EFD_NONBLOCK)?,
+            wake: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
             conns: Mutex::new(Vec::new()),
         });
         let server = format!("boxcar/{}", env!("CARGO_PKG_VERSION"));
@@ -292,7 +292,9 @@ impl Accept {
             &self.audit,
             Payload::ControlConnect(ControlConnect { pid, uid, verdict }),
         );
-        let conn = match Conn::new(stream) {
+        // The hello is queued here, before the connection is in
+        // `shared.conns` where `notify_state` and `close` reach it.
+        let conn = match Conn::new(stream, &self.hello) {
             Ok(conn) => Arc::new(conn),
             Err(error) => {
                 tracing::warn!("control: cannot set up a connection: {error}");
@@ -308,7 +310,6 @@ impl Accept {
             },
             ops: self.ops.clone(),
             audit: self.audit.clone(),
-            hello: self.hello.clone(),
         };
         let thread = thread::Builder::new()
             .name("control-conn".into())
@@ -855,6 +856,24 @@ mod tests {
             mode(fixture.state_dir.parent().unwrap().parent().unwrap()),
             0o700
         );
+    }
+
+    fn close_on_exec(fd: std::os::fd::RawFd) -> bool {
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fcntl: {}", io::Error::last_os_error());
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    /// No descriptor of the server leaks into a process the VMM starts.
+    #[test]
+    fn the_wake_eventfds_are_close_on_exec() {
+        let fixture = Fixture::new(Options::default());
+        assert!(close_on_exec(fixture.server().shared.wake.as_raw_fd()));
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let hello = Hello::new("boxcar/test", "s", Vec::new());
+        let conn = Conn::new(stream, &hello).unwrap();
+        assert!(close_on_exec(conn.wake_fd()));
     }
 
     /// A state directory others can enter is refused.

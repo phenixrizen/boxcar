@@ -170,16 +170,30 @@ pub fn connect(control: Option<&Path>, session_id: Option<&str>) -> anyhow::Resu
         };
     }
     // A socket left by a VMM that is gone refuses the connection.
-    let mut live: Vec<(&Session, UnixStream)> = sessions
+    let live: Vec<(String, (&Path, UnixStream))> = sessions
         .iter()
-        .filter_map(|session| Some((session, UnixStream::connect(&session.socket).ok()?)))
+        .filter_map(|session| {
+            let stream = UnixStream::connect(&session.socket).ok()?;
+            Some((session.id.clone(), (session.socket.as_path(), stream)))
+        })
         .collect();
+    let (socket, stream) = only_one(live)?;
+    Client::from_stream(stream, socket)
+}
+
+/// The one running session of `live`, by id: an error when there is none,
+/// and one that names them all when there are several.
+fn only_one<T>(mut live: Vec<(String, T)>) -> anyhow::Result<T> {
     match live.len() {
-        1 => {
-            let (session, stream) = live.remove(0);
-            Client::from_stream(stream, &session.socket)
-        }
-        _ => bail!("no session found; pass --control or a session id"),
+        0 => bail!("no session found; pass --control or a session id"),
+        1 => Ok(live.remove(0).1),
+        n => bail!(
+            "{n} sessions are running ({}); pass --control or a session id",
+            live.iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -360,6 +374,21 @@ mod tests {
         );
         let over = format!("{fits}d");
         assert_eq!(sessions_root_for(os(&over), 1000, yes), fallback);
+    }
+
+    #[test]
+    fn without_an_id_exactly_one_running_session_is_chosen() {
+        let none: Vec<(String, u8)> = Vec::new();
+        assert_eq!(
+            only_one(none).unwrap_err().to_string(),
+            "no session found; pass --control or a session id"
+        );
+        assert_eq!(only_one(vec![("a".to_owned(), 7)]).unwrap(), 7);
+        let two = vec![("01aa".to_owned(), 1), ("01bb".to_owned(), 2)];
+        assert_eq!(
+            only_one(two).unwrap_err().to_string(),
+            "2 sessions are running (01aa, 01bb); pass --control or a session id"
+        );
     }
 
     #[test]
