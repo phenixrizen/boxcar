@@ -44,13 +44,16 @@ pub(crate) const FLAG_RD: u16 = 0x0100;
 pub(crate) const FLAG_RA: u16 = 0x0080;
 pub(crate) const FLAG_RCODE: u16 = 0x000f;
 
-/// A query's question, as the policy and the audit log see it.
+/// A query's question, as the policy and the audit log see it, and as an
+/// answer must repeat it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Question {
     /// Lowercase, labels joined with dots, no trailing dot; `.` for the
     /// root.
     pub name: String,
     pub qtype: u16,
+    /// The class: 1 is IN, 3 is CH.
+    pub qclass: u16,
 }
 
 /// Why a message was not read.
@@ -287,6 +290,7 @@ impl RawQuestion {
         Ok(Question {
             name: name_text(&self.name).ok_or(DnsError::Name)?,
             qtype: self.qtype,
+            qclass: self.qclass,
         })
     }
 }
@@ -750,7 +754,8 @@ mod tests {
                 0xbeef,
                 Question {
                     name: "www.example.com".into(),
-                    qtype: TYPE_A
+                    qtype: TYPE_A,
+                    qclass: CLASS_IN,
                 }
             ))
         );
@@ -758,6 +763,14 @@ mod tests {
             parse_query(&query("", TYPE_A)).map(|(_, q)| q.name),
             Ok(".".into()),
             "the root"
+        );
+        // The class is read too: CH for version.bind.
+        let mut chaos = query("version.bind", 16);
+        let at = chaos.len() - 2;
+        chaos[at..].copy_from_slice(&3u16.to_be_bytes());
+        assert_eq!(
+            parse_query(&chaos).map(|(_, q)| (q.qtype, q.qclass)),
+            Ok((16, 3))
         );
     }
 
@@ -921,7 +934,8 @@ mod tests {
                 0x4321,
                 Question {
                     name: "www.example.com".into(),
-                    qtype: TYPE_A
+                    qtype: TYPE_A,
+                    qclass: CLASS_IN,
                 }
             ))
         );

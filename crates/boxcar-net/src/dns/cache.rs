@@ -9,8 +9,11 @@
 //! address, the name it was the answer for and every name on the CNAME
 //! chain to it, so a connection to a CDN's address carries the name the
 //! guest asked for. An entry lives for its TTL, held to between a minute
-//! and a day. At most [`CACHE_CAP`] entries are kept; past that the one
-//! least recently answered goes first.
+//! and a day. An address keeps at most [`NAMES_PER_IP`] names, and the
+//! cache at most [`CACHE_CAP`] entries in all; past either, the one least
+//! recently answered goes first. The per-address bound keeps the names a
+//! record lists for one connection short, even when many names share an
+//! address (wildcard DNS, a CDN).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
@@ -19,6 +22,8 @@ use std::time::{Duration, Instant};
 
 /// The most (address, name) entries the cache holds.
 pub const CACHE_CAP: usize = 4096;
+/// The most names one address keeps.
+pub const NAMES_PER_IP: usize = 16;
 /// The shortest an entry lives, in seconds, whatever its TTL: answers with
 /// a TTL of seconds are common, and a connection may start a little after.
 pub const TTL_FLOOR: u32 = 60;
@@ -84,7 +89,9 @@ impl DnsCache {
     /// Records that `name` resolved to `ip` for `ttl` seconds (held to
     /// [`TTL_FLOOR`]..=[`TTL_CAP`]) at `now`. An entry already there is
     /// renewed, its expiry the new one, and becomes the most recent. Past
-    /// the cap, the least recently answered entry is evicted.
+    /// [`NAMES_PER_IP`] for the address, its least recently answered name
+    /// is evicted; past the cache's cap, the least recently answered entry
+    /// of any address.
     pub fn insert_at(&mut self, ip: Ipv4Addr, name: &str, ttl: u32, now: Instant) {
         if self.cap == 0 {
             return;
@@ -97,6 +104,16 @@ impl DnsCache {
         let names = self.by_ip.entry(ip).or_default();
         if let Some(old) = names.insert(name.clone(), Entry { expires, stamp }) {
             self.order.remove(&old.stamp);
+        }
+        if names.len() > NAMES_PER_IP {
+            let oldest = names
+                .iter()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(name, entry)| (name.clone(), entry.stamp));
+            if let Some((oldest, oldest_stamp)) = oldest {
+                names.remove(&oldest);
+                self.order.remove(&oldest_stamp);
+            }
         }
         self.order.insert(stamp, (ip, name));
         while self.order.len() > self.cap {
@@ -184,6 +201,30 @@ mod tests {
             ["a-week.test", "five-minutes.test"]
         );
         assert_eq!(cache.names_for_at(IP, at(160)), ["five-minutes.test"]);
+    }
+
+    #[test]
+    fn an_address_keeps_its_16_most_recent_names() {
+        let t0 = Instant::now();
+        let mut cache = DnsCache::new();
+        for i in 0..100 {
+            cache.insert_at(IP, &format!("n{i}.example"), 300, t0);
+        }
+        let newest: Vec<String> = (84..100).rev().map(|i| format!("n{i}.example")).collect();
+        assert_eq!(cache.names_for_at(IP, t0), newest);
+        assert_eq!(cache.len(), NAMES_PER_IP, "evicted names leave the cache");
+
+        // A name already there is renewed, not added twice, and evicts
+        // nothing.
+        cache.insert_at(IP, "n84.example", 300, t0);
+        let names = cache.names_for_at(IP, t0);
+        assert_eq!(names.len(), NAMES_PER_IP);
+        assert_eq!(names[0], "n84.example");
+        assert_eq!(names[NAMES_PER_IP - 1], "n85.example");
+        // Other addresses are not touched.
+        cache.insert_at(Ipv4Addr::new(192, 0, 2, 2), "other.example", 300, t0);
+        assert_eq!(cache.names_for_at(IP, t0).len(), NAMES_PER_IP);
+        assert_eq!(cache.len(), NAMES_PER_IP + 1);
     }
 
     #[test]

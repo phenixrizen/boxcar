@@ -894,6 +894,110 @@ fn a_query_is_recorded_even_when_the_guest_queue_refuses_its_answer() {
     );
 }
 
+/// An answer must repeat the query's class as well as its name and type:
+/// a CH query is not answered by an IN reply, which is counted as bogus.
+#[test]
+fn a_reply_must_repeat_the_question_class() {
+    const TXT: u16 = 16;
+    const CH: u16 = 3;
+    let mut h = harness();
+    let mut q = query(0x5555, "version.bind", TXT);
+    let class_at = q.len() - 2;
+    q[class_at..].copy_from_slice(&CH.to_be_bytes());
+    h.stack.push_guest_frame(&dns_frame(&q));
+    let (sent, from) = forwarded(&h);
+    assert_eq!(sent[2..], q[2..]);
+
+    let mut txt = vec![9];
+    txt.extend(b"boxcar 1");
+    let answer = |class: u16| {
+        let mut m = reply(&sent, 0, &[], &[]);
+        m[7] = 1; // one answer
+        m[class_at..class_at + 2].copy_from_slice(&class.to_be_bytes());
+        m.extend(pointer(QNAME_AT));
+        m.extend(TXT.to_be_bytes());
+        m.extend(class.to_be_bytes());
+        m.extend(60u32.to_be_bytes());
+        m.extend((txt.len() as u16).to_be_bytes());
+        m.extend(&txt);
+        m
+    };
+    let wrong_class = answer(IN);
+    let right = answer(CH);
+    h.upstream.send_to(&wrong_class, from).unwrap();
+    h.upstream.send_to(&right, from).unwrap();
+    let frames = answered(&mut h);
+    assert_eq!(frames.len(), 1);
+    let got = dns_payload(&frames[0]);
+    assert_eq!(got[..2], 0x5555_u16.to_be_bytes());
+    assert_eq!(got[2..], right[2..], "the CH answer");
+
+    assert_eq!(
+        h.events(),
+        [
+            Payload::NetDrop(NetDrop {
+                reason: "dns_bogus".into(),
+                count: 1,
+            }),
+            record(0x5555, "version.bind", TXT, 0, &[], Verdict::Allow, None),
+        ]
+    );
+}
+
+/// A rule's port does not stop a name resolving if the rule allows: a
+/// port-qualified allow under default deny gets the name forwarded, and so
+/// does a name whose only deny is on another port.
+#[test]
+fn a_port_qualified_allow_lets_the_name_resolve() {
+    let mut h = harness_with(policy(&[
+        "default deny",
+        "allow api.example.com:443",
+        "deny example.com:80",
+        "allow example.com",
+    ]));
+    for (id, name, rule, ip) in [
+        (
+            0x0301,
+            "api.example.com",
+            "allow api.example.com:443",
+            [192, 0, 2, 31],
+        ),
+        (0x0302, "example.com", "allow example.com", [192, 0, 2, 32]),
+    ] {
+        h.stack.push_guest_frame(&dns_frame(&query(id, name, A)));
+        assert!(h.drain().is_empty(), "{name}: forwarded, not refused");
+        let (sent, from) = forwarded(&h);
+        let answer = reply(&sent, 0, &[a(pointer(QNAME_AT), ip, 60)], &[]);
+        h.upstream.send_to(&answer, from).unwrap();
+        let m = read_message(&dns_payload(&answered(&mut h)[0]));
+        assert_eq!((m.id, m.flags), (id, 0x8180), "{name}: {rule}");
+        assert_eq!(h.stack.dns_names(Ipv4Addr::from(ip)), [name]);
+    }
+    assert_eq!(
+        h.events(),
+        [
+            record(
+                0x0301,
+                "api.example.com",
+                A,
+                0,
+                &["192.0.2.31"],
+                Verdict::Allow,
+                Some("allow api.example.com:443"),
+            ),
+            record(
+                0x0302,
+                "example.com",
+                A,
+                0,
+                &["192.0.2.32"],
+                Verdict::Allow,
+                Some("allow example.com"),
+            ),
+        ]
+    );
+}
+
 /// A record an upstream might send: owned by the question's name or some
 /// other, of a common type with data of its shape or of any type with any
 /// data.

@@ -15,12 +15,23 @@
 //! allow 198.51.100.7:22     # a bare address is a /32
 //! ```
 //!
-//! [`Policy::egress`] decides a connection: the guest's own network is
-//! always denied; then the six [built-in private ranges](PRIVATE_RANGES)
-//! are denied unless an `allow` rule names that exact range; then the rules
-//! in file order, the first that matches deciding; then the default.
-//! [`Policy::dns`] decides a name: the first domain rule that matches it,
-//! whatever its port, else the default.
+//! [`Policy::egress`] decides a connection:
+//!
+//! 1. Denied whatever the rules say: the guest's own network
+//!    ([`GUEST_NET`], `builtin:guest-net`), "this network" `0.0.0.0/8`
+//!    ([`THIS_NET`], `builtin:this-net`: a host connect to `0.0.0.0` reaches
+//!    the host's own loopback), and multicast and the reserved range,
+//!    broadcast included ([`RESERVED_RANGES`], `builtin:reserved`).
+//! 2. The six [built-in private ranges](PRIVATE_RANGES) are denied
+//!    (`builtin:private`) unless an `allow` rule names that exact range.
+//! 3. The rules in file order, the first that matches deciding.
+//! 4. The default.
+//!
+//! [`Policy::dns`] decides a name: walking the rules in order, the first
+//! domain rule that matches the name and either allows (on any port) or
+//! denies on every port decides; a deny on one port is
+//! [`egress`](Policy::egress)'s business and does not stop the name
+//! resolving. Else the default.
 //!
 //! The stack shares one policy through an `Arc<arc_swap::ArcSwap<Policy>>`
 //! and loads it for every decision, so a swapped policy decides the next
@@ -36,6 +47,23 @@ pub use boxcar_proto::audit::Verdict;
 pub const BUILTIN_GUEST_NET: &str = "builtin:guest-net";
 /// The rule text records give for a destination in a built-in private range.
 pub const BUILTIN_PRIVATE: &str = "builtin:private";
+/// The rule text records give for a destination in "this network",
+/// `0.0.0.0/8`.
+pub const BUILTIN_THIS_NET: &str = "builtin:this-net";
+/// The rule text records give for a multicast or reserved destination.
+pub const BUILTIN_RESERVED: &str = "builtin:reserved";
+
+/// "This network" (RFC 1122 §3.2.1.3), never a destination: a host
+/// connect to `0.0.0.0` reaches the host's own loopback, past the
+/// `127.0.0.0/8` denial. Denied whatever the rules say.
+pub const THIS_NET: Ipv4Net = Ipv4Net::masked(Ipv4Addr::new(0, 0, 0, 0), 8);
+
+/// Multicast, and the reserved range with the limited broadcast address
+/// in it: no relay connects there. Denied whatever the rules say.
+pub const RESERVED_RANGES: [Ipv4Net; 2] = [
+    Ipv4Net::masked(Ipv4Addr::new(224, 0, 0, 0), 4),
+    Ipv4Net::masked(Ipv4Addr::new(240, 0, 0, 0), 4),
+];
 
 /// The ranges denied unless a rule allows exactly one of them: loopback,
 /// the three RFC 1918 networks, shared address space (RFC 6598), and link
@@ -194,6 +222,8 @@ pub enum PolicyErrorKind {
     Target(&'static str),
     #[error("{0:?} is not a port from 1 to 65535")]
     Port(String),
+    #[error("{0:?} looks like an address but is not an IPv4 address")]
+    Address(String),
     #[error(
         "{0:?} is not a host name or *.name: labels of a-z, 0-9 and -, 1 to 63 long, 253 in all"
     )]
@@ -267,18 +297,21 @@ impl Policy {
     /// `names` (those the DNS cache holds for its address), and the text of
     /// the rule that decided, or `None` for the default.
     ///
-    /// In order: the guest's own network ([`GUEST_NET`]) is denied as
-    /// `builtin:guest-net`; an address in a [built-in private
-    /// range](PRIVATE_RANGES) is denied as `builtin:private` unless an
-    /// `allow` rule names exactly that range (the same address and prefix,
-    /// and, if the rule has a port, this port); then the first rule that
-    /// matches decides, a domain rule matching when any of `names` matches
-    /// it, a network rule when it holds the address, either only on its
-    /// port if it has one; then the default.
+    /// In order: the guest's own network ([`GUEST_NET`]), "this network"
+    /// ([`THIS_NET`]) and multicast and reserved addresses
+    /// ([`RESERVED_RANGES`]) are denied as `builtin:guest-net`,
+    /// `builtin:this-net` and `builtin:reserved`, and no rule lifts that;
+    /// an address in a [built-in private range](PRIVATE_RANGES) is denied
+    /// as `builtin:private` unless an `allow` rule names exactly that range
+    /// (the same address and prefix, and, if the rule has a port, this
+    /// port); then the first rule that matches decides, a domain rule
+    /// matching when any of `names` matches it, a network rule when it
+    /// holds the address, either only on its port if it has one; then the
+    /// default.
     pub fn egress(&self, dst: SocketAddrV4, names: &[String]) -> (Verdict, Option<String>) {
         let (ip, port) = (*dst.ip(), dst.port());
-        if GUEST_NET.contains(ip) {
-            return (Verdict::Deny, Some(BUILTIN_GUEST_NET.to_owned()));
+        if let Some(builtin) = never_reachable(ip) {
+            return (Verdict::Deny, Some(builtin.to_owned()));
         }
         if let Some(range) = PRIVATE_RANGES.iter().find(|range| range.contains(ip)) {
             let lifted = self.rules.iter().any(|rule| {
@@ -303,6 +336,12 @@ impl Policy {
     }
 
     /// The verdict on resolving `qname`: a denied name gets NXDOMAIN.
+    ///
+    /// Walking the rules in order, the first domain rule that matches the
+    /// name decides if it allows, with a port or without, or if it denies
+    /// without a port. A matching deny with a port is passed over: it
+    /// denies connections on that port, which [`egress`](Self::egress)
+    /// judges, not the name. With no deciding rule, the default.
     pub fn dns(&self, qname: &str) -> Verdict {
         self.dns_rule(qname).0
     }
@@ -311,13 +350,31 @@ impl Policy {
     /// `None` for the default.
     pub fn dns_rule(&self, qname: &str) -> (Verdict, Option<String>) {
         let decided = self.rules.iter().find(|rule| match &rule.target {
-            Target::Domain { pattern, .. } => name_matches(pattern, qname),
+            // An allow on any port lets the name resolve; only a deny on
+            // every port refuses it.
+            Target::Domain { pattern, port } => {
+                name_matches(pattern, qname) && (rule.verdict == Verdict::Allow || port.is_none())
+            }
             Target::Cidr { .. } => false,
         });
         match decided {
             Some(rule) => (rule.verdict, Some(rule.text.clone())),
             None => (self.default, None),
         }
+    }
+}
+
+/// The built-in rule text for an address no rule may open: on the guest's
+/// own network, in "this network", or multicast or reserved.
+fn never_reachable(ip: Ipv4Addr) -> Option<&'static str> {
+    if GUEST_NET.contains(ip) {
+        Some(BUILTIN_GUEST_NET)
+    } else if THIS_NET.contains(ip) {
+        Some(BUILTIN_THIS_NET)
+    } else if RESERVED_RANGES.iter().any(|range| range.contains(ip)) {
+        Some(BUILTIN_RESERVED)
+    } else {
+        None
     }
 }
 
@@ -348,21 +405,27 @@ fn name_matches(pattern: &str, name: &str) -> bool {
 }
 
 /// A rule's target: a name or `*.name`, an address, or a network, each
-/// with an optional `:port`.
+/// with an optional `:port`. A target that looks numeric (one with a `/`,
+/// or of digits and dots only) must be an address or a network: a typo
+/// such as `192.168.1.300` or `10.0.0.1.` is refused rather than taken for
+/// a name that never matches.
 fn parse_target(target: &str) -> Result<Target, PolicyErrorKind> {
     let (host, port) = match target.rsplit_once(':') {
         Some((host, port)) => (host, Some(parse_port(port)?)),
         None => (target, None),
     };
-    if let Ok(addr) = host.parse::<Ipv4Addr>() {
-        return Ok(Target::Cidr {
-            net: Ipv4Net::masked(addr, 32),
-            port,
-        });
-    }
     if host.contains('/') {
         return Ok(Target::Cidr {
             net: host.parse()?,
+            port,
+        });
+    }
+    if !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        let addr = host
+            .parse::<Ipv4Addr>()
+            .map_err(|_| PolicyErrorKind::Address(host.to_owned()))?;
+        return Ok(Target::Cidr {
+            net: Ipv4Net::masked(addr, 32),
             port,
         });
     }
@@ -653,13 +716,118 @@ mod tests {
         );
         assert_eq!(p.egress(at([198, 51, 100, 8], 1234), &[]), DEFAULT_DENY);
 
-        // A name's port does not matter to DNS: the first domain rule that
-        // matches the name decides, here a port-qualified deny.
+        // For DNS, an allow on any port lets the name resolve, and a deny
+        // on one port is passed over: it is egress's to judge.
         assert_eq!(
             p.dns_rule("api.example.com"),
             allow("allow api.example.com:443")
         );
-        assert_eq!(p.dns_rule("example.com"), deny("deny example.com:80"));
+        assert_eq!(p.dns_rule("example.com"), allow("allow example.com"));
+    }
+
+    #[test]
+    fn a_deny_on_one_port_does_not_stop_a_name_resolving() {
+        let ruling = |lines: &[&str], name| parse(lines).dns_rule(name);
+        // Port-qualified denies are passed over, whatever the default.
+        assert_eq!(
+            ruling(&["deny example.com:80", "allow example.com"], "example.com"),
+            allow("allow example.com")
+        );
+        assert_eq!(
+            ruling(&["deny example.com:80"], "example.com"),
+            DEFAULT_DENY
+        );
+        assert_eq!(
+            ruling(&["default allow", "deny example.com:80"], "example.com"),
+            DEFAULT_ALLOW
+        );
+        assert_eq!(
+            ruling(
+                &["deny *.example.com:443", "allow *.example.com"],
+                "www.example.com"
+            ),
+            allow("allow *.example.com")
+        );
+        // A port-qualified allow lets the name resolve under default deny.
+        assert_eq!(
+            ruling(
+                &["default deny", "allow api.example.com:443"],
+                "api.example.com"
+            ),
+            allow("allow api.example.com:443")
+        );
+        // A deny on every port decides, whatever allows come after.
+        assert_eq!(
+            ruling(
+                &[
+                    "deny example.com",
+                    "allow example.com:443",
+                    "allow example.com"
+                ],
+                "example.com"
+            ),
+            deny("deny example.com")
+        );
+        assert_eq!(
+            ruling(&["default allow", "deny *.example.com"], "a.example.com"),
+            deny("deny *.example.com")
+        );
+        // Egress still applies the port-qualified deny.
+        let p = parse(&["deny example.com:80", "allow example.com"]);
+        let known = names(&["example.com"]);
+        assert_eq!(
+            p.egress(at([93, 184, 215, 14], 80), &known),
+            deny("deny example.com:80")
+        );
+        assert_eq!(
+            p.egress(at([93, 184, 215, 14], 443), &known),
+            allow("allow example.com")
+        );
+    }
+
+    /// "This network", multicast and the reserved range are denied before
+    /// any rule is read: neither the default, an exact allow, an allow of
+    /// everything, nor a name lifts them.
+    #[test]
+    fn unspecified_multicast_and_reserved_destinations_are_never_reachable() {
+        let cases = [
+            ([0, 0, 0, 0], BUILTIN_THIS_NET),
+            ([0, 1, 2, 3], BUILTIN_THIS_NET),
+            ([0, 255, 255, 255], BUILTIN_THIS_NET),
+            ([224, 0, 0, 1], BUILTIN_RESERVED),
+            ([239, 255, 255, 250], BUILTIN_RESERVED),
+            ([240, 0, 0, 1], BUILTIN_RESERVED),
+            ([255, 255, 255, 255], BUILTIN_RESERVED),
+        ];
+        let everything = parse(&[
+            "default allow",
+            "allow 0.0.0.0/8",
+            "allow 0.0.0.0",
+            "allow 0.1.2.3",
+            "allow 224.0.0.0/4",
+            "allow 224.0.0.1:443",
+            "allow 240.0.0.0/4",
+            "allow 255.255.255.255",
+            "allow 0.0.0.0/0",
+            "allow example.com",
+        ]);
+        let known = names(&["example.com"]);
+        for (ip, builtin) in cases {
+            for (policy, which) in [(&Policy::allow_all(), "allow_all"), (&everything, "allows")] {
+                assert_eq!(
+                    policy.egress(at(ip, 443), &known),
+                    deny(builtin),
+                    "{ip:?} under {which}"
+                );
+            }
+        }
+        // Their neighbors are ordinary addresses.
+        for ip in [[1, 0, 0, 0], [223, 255, 255, 255]] {
+            assert_eq!(Policy::allow_all().egress(at(ip, 443), &[]), DEFAULT_ALLOW);
+        }
+        assert_eq!(THIS_NET.to_string(), "0.0.0.0/8");
+        let reserved: Vec<String> = RESERVED_RANGES.iter().map(|n| n.to_string()).collect();
+        assert_eq!(reserved, ["224.0.0.0/4", "240.0.0.0/4"]);
     }
 
     #[test]
@@ -772,6 +940,24 @@ mod tests {
             (vec![&long_label], 1, K::Pattern(long_label[6..].into())),
             (vec![&long_name], 1, K::Pattern(long_name[6..].into())),
             (vec!["allow [::1]:443"], 1, K::Pattern("[::1]".into())),
+            // What looks numeric must be an address.
+            (
+                vec!["allow 192.168.1.300"],
+                1,
+                K::Address("192.168.1.300".into()),
+            ),
+            (
+                vec!["# c", "allow 10.0.0.1."],
+                2,
+                K::Address("10.0.0.1.".into()),
+            ),
+            (vec!["allow 10.0.0"], 1, K::Address("10.0.0".into())),
+            (
+                vec!["deny 10.0.0.1.:443"],
+                1,
+                K::Address("10.0.0.1.".into()),
+            ),
+            (vec!["allow 1.2.3.4.5"], 1, K::Address("1.2.3.4.5".into())),
         ];
         for (lines, line, kind) in cases {
             let error = refused(&lines);
@@ -780,7 +966,17 @@ mod tests {
                 .to_string()
                 .starts_with(&format!("policy line {line}: ")));
         }
+        // A name with a letter is a name.
+        assert_eq!(
+            parse(&["allow 1e100.net"]).rules[0].target,
+            Target::Domain {
+                pattern: "1e100.net".into(),
+                port: None
+            }
+        );
         for (text, why) in [
+            ("allow 10.0.0.0/33", "prefix"),
+            ("allow 10.0.0.1./8", "address"),
             ("allow 10.1.2.3/8", "host bits"),
             ("allow 10.0.0.0/33", "prefix"),
             ("allow 10.0.0/8", "address"),

@@ -4,10 +4,12 @@
 //! [`Forwarder`]: one non-blocking UDP socket connected to the upstream
 //! resolver, and the guest queries waiting on it.
 //!
-//! Each query goes upstream under an id the forwarder picks, random and
-//! unique among those in flight, and an answer is taken only when it
+//! Each query goes upstream under an id the forwarder picks, unique among
+//! those in flight and not predictable from the ones before it (SipHash,
+//! keyed at random for the process, over a counter), and an answer is
+//! taken only when it
 //! carries an id in flight *and* repeats that query's question (the name in
-//! any case, and the type) *and* reads as a whole. Anything else that
+//! any case, the type and the class) *and* reads as a whole. Anything else that
 //! arrives is bogus and ignored, and the query it might have been for
 //! waits on. At most [`MAX_IN_FLIGHT`] queries wait at once, and a query
 //! unanswered after [`DNS_TIMEOUT`] is given up.
@@ -33,6 +35,10 @@ pub const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_IN_FLIGHT: usize = 256;
 /// The largest UDP datagram.
 const MAX_DATAGRAM: usize = 65_535;
+/// How many ids [`Forwarder::forward`] draws before it gives up on finding
+/// one not in flight. With at most 256 of 65536 taken, each draw collides
+/// with odds of 1 in 256 at worst, so this is never reached in practice.
+const ID_DRAWS: usize = 64;
 /// How many socket errors one [`Forwarder::receive`] takes before it stops
 /// reading. Each ICMP error for an earlier datagram is reported once, so a
 /// few are normal; more mean something else is wrong.
@@ -97,8 +103,11 @@ pub struct Forwarder {
     /// How long a query waits; [`DNS_TIMEOUT`] unless a test shortens it.
     timeout: Duration,
     cap: usize,
-    /// xorshift64 state for the ids, never zero.
-    rng: u64,
+    /// The id generator's key: std's SipHash with a key drawn at random
+    /// for the process.
+    id_key: RandomState,
+    /// How many ids have been drawn: what the key hashes into the next.
+    id_counter: u64,
     seq: u64,
     buf: Vec<u8>,
 }
@@ -112,14 +121,14 @@ impl Forwarder {
         for &upstream in upstreams {
             match socket_to(upstream) {
                 Ok(socket) => {
-                    let seed = RandomState::new().hash_one((upstream, socket.local_addr().ok()));
                     return Ok(Forwarder {
                         socket,
                         upstream,
                         in_flight: HashMap::new(),
                         timeout: DNS_TIMEOUT,
                         cap: MAX_IN_FLIGHT,
-                        rng: seed | 1,
+                        id_key: RandomState::new(),
+                        id_counter: 0,
                         seq: 0,
                         buf: vec![0; MAX_DATAGRAM],
                     });
@@ -254,7 +263,8 @@ impl Forwarder {
     }
 
     /// The answer `datagram` gives, if it is one: a response with an id in
-    /// flight, that query's question, and records that read.
+    /// flight, that query's question (name in any case, type and class),
+    /// and records that read.
     fn accept(&mut self, datagram: &[u8]) -> Option<Answer> {
         let (id, question) = parse::parse_reply(datagram).ok()?;
         if self.in_flight.get(&id)?.pending.question != question {
@@ -273,29 +283,23 @@ impl Forwarder {
         })
     }
 
-    /// An id no query in flight has: random, or failing that the first free
-    /// one after a random start.
+    /// An id no query in flight has, drawn again while it collides.
     fn fresh_id(&mut self) -> Option<u16> {
-        for _ in 0..16 {
-            let id = self.random();
+        for _ in 0..ID_DRAWS {
+            let id = self.next_id();
             if !self.in_flight.contains_key(&id) {
                 return Some(id);
             }
         }
-        let start = self.random();
-        (0..=u16::MAX)
-            .map(|i| start.wrapping_add(i))
-            .find(|id| !self.in_flight.contains_key(id))
+        None
     }
 
-    fn random(&mut self) -> u16 {
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        // The high bits are the better mixed.
-        (x >> 48) as u16
+    /// The next id: the keyed hash of the next counter value. Without the
+    /// key, the ids already seen say nothing about the next one.
+    fn next_id(&mut self) -> u16 {
+        self.id_counter = self.id_counter.wrapping_add(1);
+        // 16 of SipHash's 64 output bits.
+        (self.id_key.hash_one(self.id_counter) >> 48) as u16
     }
 
     /// Sends one datagram. A connected UDP socket reports the ICMP error
@@ -344,6 +348,7 @@ mod tests {
             question: Question {
                 name: name.to_owned(),
                 qtype: 1,
+                qclass: 1,
             },
             query: query(name),
             verdict: Verdict::Allow,
@@ -402,6 +407,25 @@ mod tests {
         upstream.send_to(&empty_answer(b_query), from).unwrap();
         assert_eq!(forwarder.receive(), [Received::Bogus]);
         assert!(forwarder.receive().is_empty(), "nothing left to read");
+    }
+
+    /// Ids are spread over the whole space and are not a simple step from
+    /// one to the next; two forwarders draw different ids.
+    #[test]
+    fn ids_are_keyed_hashes_of_a_counter() {
+        let (mut a, _ua) = local();
+        let (mut b, _ub) = local();
+        let ids: Vec<u16> = (0..4096).map(|_| a.next_id()).collect();
+        let distinct: std::collections::HashSet<u16> = ids.iter().copied().collect();
+        // 4096 draws from 65536 values: about 3970 distinct expected.
+        assert!(distinct.len() > 3800, "{}", distinct.len());
+        let steps: std::collections::HashSet<u16> =
+            ids.windows(2).map(|w| w[1].wrapping_sub(w[0])).collect();
+        assert!(steps.len() > 3800, "no fixed stride: {}", steps.len());
+        let high = ids.iter().filter(|id| **id >= 0x8000).count();
+        assert!((1700..2400).contains(&high), "top bit balanced: {high}");
+        let other: Vec<u16> = (0..64).map(|_| b.next_id()).collect();
+        assert_ne!(ids[..64], other[..], "a key of its own");
     }
 
     #[test]
