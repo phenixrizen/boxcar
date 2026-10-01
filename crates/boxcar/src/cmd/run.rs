@@ -25,8 +25,9 @@ use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
+use boxcar_vmm::lifecycle::SignalFd;
 use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
-use boxcar_vmm::pty_relay::{self, RelayHandle, RelayInput, RelayOutput};
+use boxcar_vmm::pty_relay::{self, RelayHandle, RelayInput, RelayOutput, RelayWait};
 use boxcar_vmm::stdin::RawModeGuard;
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
@@ -234,9 +235,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             let outcome = vmm.run();
             // What the session printed last may still be on its way to a
             // slow stdout: it is written before boxcar exits, for as long as
-            // stdout keeps taking it.
+            // stdout keeps taking it (see `finish_relay`).
             if let Some(relay) = relay {
-                relay.wait(RELAY_IDLE);
+                if let Some(line) = finish_relay(&relay) {
+                    tell(&line);
+                }
             }
             outcome
         }
@@ -661,6 +664,42 @@ fn check_cmdline_size(
 /// nothing more before it exits without the rest of the session's output.
 const RELAY_IDLE: Duration = Duration::from_secs(2);
 
+/// How long, once the VM has stopped, boxcar waits for the session's output
+/// at most, however steadily stdout takes it.
+const RELAY_CAP: Duration = Duration::from_secs(30);
+
+/// Waits, once the VM has stopped, for the relay to write out the session's
+/// output: while stdout keeps taking bytes ([`RELAY_IDLE`]), for at most
+/// [`RELAY_CAP`], and not past another stop signal (`SIGINT`, `SIGTERM`,
+/// `SIGHUP`, `SIGQUIT`, still blocked and now read from a signalfd of its
+/// own). Returns the line to say when output was left behind.
+fn finish_relay(relay: &RelayHandle) -> Option<String> {
+    let signals = SignalFd::new().ok();
+    let ended = relay.wait_with(RELAY_IDLE, RELAY_CAP, || {
+        signals
+            .as_ref()
+            .is_some_and(|signals| matches!(signals.read(), Ok(Some(_))))
+    });
+    undelivered_line(ended, relay.undelivered())
+}
+
+/// The line `boxcar run` says when the relay's wait ended (`ended`) with
+/// `bytes` of the session's output not written: none when it is all out.
+fn undelivered_line(ended: RelayWait, bytes: u64) -> Option<String> {
+    let why = match ended {
+        RelayWait::Done => return None,
+        RelayWait::Stalled => "stdout stalled",
+        RelayWait::Capped => "stdout still not done after 30 s",
+        RelayWait::Stopped => "stopped by a signal",
+    };
+    if bytes == 0 {
+        return None;
+    }
+    Some(format!(
+        "boxcar: {bytes} bytes of session output not delivered: {why}"
+    ))
+}
+
 /// Registers the transitional PTY relay (until Task 12's hub) on `vmm`:
 /// the session's terminal to stdout and, for an interactive run, stdin to
 /// the session, with the terminal in raw mode when stdin is one, restored
@@ -970,6 +1009,31 @@ mod tests {
         assert_eq!(cfg.argv, ["/bin/sh", "-l"]);
         assert!(cfg.env.contains(&("HOME".to_owned(), "/root".to_owned())));
         assert_eq!(cfg.cwd, "/");
+    }
+
+    /// What is said when the relay's wait leaves output behind: one line
+    /// with the count and why; nothing when it is all out.
+    #[test]
+    fn output_left_behind_is_said_with_its_count() {
+        assert_eq!(undelivered_line(RelayWait::Done, 0), None);
+        assert_eq!(
+            undelivered_line(RelayWait::Stalled, 113_000).as_deref(),
+            Some("boxcar: 113000 bytes of session output not delivered: stdout stalled")
+        );
+        assert_eq!(
+            undelivered_line(RelayWait::Capped, 5).as_deref(),
+            Some(
+                "boxcar: 5 bytes of session output not delivered: stdout still not done after 30 s"
+            )
+        );
+        assert_eq!(
+            undelivered_line(RelayWait::Stopped, 7).as_deref(),
+            Some("boxcar: 7 bytes of session output not delivered: stopped by a signal")
+        );
+        // Given up with nothing left (it finished meanwhile): nothing to say.
+        assert_eq!(undelivered_line(RelayWait::Stalled, 0), None);
+        assert_eq!(RELAY_CAP, Duration::from_secs(30));
+        assert_eq!(RELAY_IDLE, Duration::from_secs(2));
     }
 
     #[test]

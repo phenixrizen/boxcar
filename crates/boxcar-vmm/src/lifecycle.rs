@@ -480,11 +480,12 @@ pub fn block_stop_signals() -> io::Result<()> {
     Ok(())
 }
 
-/// A non-blocking signalfd for the [`STOP_SIGNALS`].
-pub(crate) struct SignalFd(OwnedFd);
+/// A non-blocking signalfd for the [`STOP_SIGNALS`]: with them blocked
+/// ([`block_stop_signals`]), how they are seen.
+pub struct SignalFd(OwnedFd);
 
 impl SignalFd {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         let set = stop_sigset()?;
         // SAFETY: `set` is a valid sigset; the result is checked.
         let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
@@ -497,7 +498,7 @@ impl SignalFd {
 
     /// The number of the next pending stop signal, or `None` when there is
     /// none.
-    pub(crate) fn read(&self) -> io::Result<Option<i32>> {
+    pub fn read(&self) -> io::Result<Option<i32>> {
         // SAFETY: signalfd_siginfo is plain data; all zeroes is valid.
         let mut info: libc::signalfd_siginfo = unsafe { mem::zeroed() };
         let size = mem::size_of::<libc::signalfd_siginfo>();

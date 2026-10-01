@@ -29,8 +29,13 @@
 //! reads nothing more from the stream, so the guest's side fills and init
 //! stops reading the session's PTY. Only an output that fails for good (its
 //! reader is gone) is given up on; the rest of the stream is then read and
-//! dropped, so the guest never blocks on it. [`RelayHandle::wait`] lets
-//! `boxcar run` finish writing what the relay holds before it exits.
+//! dropped, so the guest never blocks on it. [`RelayHandle::wait_with`]
+//! lets `boxcar run` finish writing what the relay holds before it exits,
+//! for as long as stdout keeps taking bytes: a write of at most
+//! [`WRITE_PIECE`] bytes at a time, and the bytes stdout's reader takes from
+//! its queue (`FIONREAD` on a pipe or socket, `TIOCOUTQ` on a terminal),
+//! both count, so a consumer however slow is seen; when the wait gives up,
+//! the handle says how many bytes were not delivered.
 //!
 //! Input ([`RelayInput`]), when there is any, goes to the session as it is
 //! read. From a terminal (which `boxcar run` puts in raw mode, as M1's
@@ -44,7 +49,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -73,6 +78,14 @@ const WOULD_BLOCK_RETRY: Duration = Duration::from_millis(2);
 /// The longest single wait for the output to take more; the wait goes on
 /// after it.
 const POLL_STEP: Duration = Duration::from_millis(500);
+
+/// The most bytes given to one `write`: `PIPE_BUF`. A blocking pipe takes a
+/// write whole or waits, so a smaller write shows progress sooner to
+/// [`RelayHandle`].
+pub const WRITE_PIECE: usize = 4096;
+
+/// How often [`RelayHandle::wait_with`] looks at the relay's progress.
+const WAIT_STEP: Duration = Duration::from_millis(10);
 
 /// What the relay forwards to the session.
 pub struct RelayInput {
@@ -128,12 +141,13 @@ impl RelayOutput {
         Ok(RelayOutput::file(File::from(fd)))
     }
 
-    /// Writes all of `bytes`, waiting while the output cannot take them, and
-    /// counts each byte taken in `written`. Fails only when the output fails
-    /// for good.
+    /// Writes all of `bytes`, at most [`WRITE_PIECE`] at a time, waiting
+    /// while the output cannot take them, and counts each byte taken in
+    /// `written`. Fails only when the output fails for good.
     fn write_all(&mut self, mut bytes: &[u8], written: &AtomicU64) -> io::Result<()> {
         while !bytes.is_empty() {
-            match self.writer.write(bytes) {
+            let piece = &bytes[..bytes.len().min(WRITE_PIECE)];
+            match self.writer.write(piece) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => {
                     bytes = &bytes[n..];
@@ -176,10 +190,58 @@ impl RelayOutput {
 struct Progress {
     /// The guest's terminal was taken.
     connected: AtomicBool,
+    /// Bytes read from the guest's stream (and written, or being written).
+    received: AtomicU64,
     /// Bytes the output took.
     written: AtomicU64,
     /// The stream ended and everything is written (or the output failed).
     done: AtomicBool,
+    /// A copy of the relay's end of the stream, to count what it has not
+    /// read yet (`FIONREAD`, which is `SIOCINQ` on a socket).
+    stream: Mutex<Option<UnixStream>>,
+    /// A copy of the output's descriptor, to see its reader take bytes.
+    /// Both copies are let go once the relay is done: a pipe's reader sees
+    /// its end only when every writer has closed.
+    output: Mutex<Option<OwnedFd>>,
+}
+
+/// How [`RelayHandle::wait_with`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayWait {
+    /// Everything the guest sent is written (or the guest never connected).
+    Done,
+    /// The output took nothing for the idle time.
+    Stalled,
+    /// The wait reached its cap.
+    Capped,
+    /// The caller asked it to stop (a second stop signal).
+    Stopped,
+}
+
+/// What the wait does at `now`: it started at `start` and the output last
+/// took a byte at `progress`; it goes on (until the time returned, at the
+/// latest) while `idle` has not passed since `progress` and `cap` has not
+/// passed since `start`.
+pub fn wait_step(
+    now: Instant,
+    start: Instant,
+    progress: Instant,
+    idle: Duration,
+    cap: Duration,
+) -> Result<Instant, RelayWait> {
+    let stall = progress.max(start).checked_add(idle);
+    let end = start.checked_add(cap);
+    if end.is_some_and(|end| now >= end) {
+        Err(RelayWait::Capped)
+    } else if stall.is_some_and(|stall| now >= stall) {
+        Err(RelayWait::Stalled)
+    } else {
+        Ok(match (stall, end) {
+            (Some(stall), Some(end)) => stall.min(end),
+            (Some(at), None) | (None, Some(at)) => at,
+            (None, None) => now + WAIT_STEP,
+        })
+    }
 }
 
 /// Lets the caller wait for the relay to have written out what it holds.
@@ -189,36 +251,113 @@ pub struct RelayHandle {
 }
 
 impl RelayHandle {
+    /// [`RelayHandle::wait_with`] with no cap and nothing to stop it:
+    /// whether the relay is done.
+    pub fn wait(&self, idle: Duration) -> bool {
+        self.wait_with(idle, Duration::MAX, || false) == RelayWait::Done
+    }
+
     /// Waits until the relay has written everything the guest sent, for as
     /// long as the output keeps taking bytes: it gives up once `idle` passes
-    /// with none taken. Returns at once when the guest never connected, and
-    /// returns whether the relay is done. `boxcar run` calls it once the VM
-    /// has stopped, before it exits.
-    pub fn wait(&self, idle: Duration) -> bool {
+    /// with none taken (written to it, or taken by its reader from its
+    /// queue), once `cap` has passed, or as soon as `stop` says so (asked
+    /// every few milliseconds). Returns at once when the guest never
+    /// connected. `boxcar run` calls it once the VM has stopped, before it
+    /// exits; [`RelayHandle::undelivered`] then says what is lost.
+    pub fn wait_with(
+        &self,
+        idle: Duration,
+        cap: Duration,
+        mut stop: impl FnMut() -> bool,
+    ) -> RelayWait {
         let progress = &self.progress;
         if !progress.connected.load(Ordering::Acquire) {
-            return true;
+            return RelayWait::Done;
         }
+        let start = Instant::now();
+        let mut last = start;
         let mut written = progress.written.load(Ordering::Relaxed);
-        let mut deadline = Instant::now() + idle;
+        let mut queued = self.output_queue();
         loop {
             if progress.done.load(Ordering::Acquire) {
-                return true;
+                return RelayWait::Done;
+            }
+            if stop() {
+                return RelayWait::Stopped;
             }
             let now = Instant::now();
             let seen = progress.written.load(Ordering::Relaxed);
-            if seen != written {
-                written = seen;
-                deadline = now + idle;
-            } else if now >= deadline {
-                return false;
+            let queue = self.output_queue();
+            // A byte written, or one the reader took from the queue.
+            let drained = matches!((queued, queue), (Some(before), Some(after)) if after < before);
+            if seen != written || drained {
+                last = now;
             }
-            thread::sleep(
-                deadline
-                    .saturating_duration_since(now)
-                    .min(Duration::from_millis(10)),
-            );
+            written = seen;
+            queued = queue;
+            match wait_step(now, start, last, idle, cap) {
+                Ok(until) => thread::sleep(until.saturating_duration_since(now).min(WAIT_STEP)),
+                Err(ended) => return ended,
+            }
         }
+    }
+
+    /// Bytes the output has taken so far.
+    pub fn written(&self) -> u64 {
+        self.progress.written.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the session's output the relay has not written: what it has
+    /// read and holds, and what waits unread in its stream. 0 once it is
+    /// done.
+    pub fn undelivered(&self) -> u64 {
+        let progress = &self.progress;
+        if progress.done.load(Ordering::Acquire) {
+            return 0;
+        }
+        let held = progress
+            .received
+            .load(Ordering::Relaxed)
+            .saturating_sub(progress.written.load(Ordering::Relaxed));
+        let unread = progress
+            .stream
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|stream| queue_len(stream.as_raw_fd(), libc::FIONREAD))
+            .unwrap_or(0);
+        held + unread
+    }
+
+    /// The bytes waiting in the output for its reader, when it says.
+    fn output_queue(&self) -> Option<u64> {
+        let output = self
+            .progress
+            .output
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let fd = output.as_ref()?.as_raw_fd();
+        // SAFETY: isatty has no preconditions.
+        let request = if unsafe { libc::isatty(fd) } == 1 {
+            libc::TIOCOUTQ
+        } else {
+            libc::FIONREAD
+        };
+        queue_len(fd, request)
+    }
+}
+
+/// The byte count `request` (`FIONREAD`, which is `SIOCINQ` on a socket, or
+/// `TIOCOUTQ`) gives for `fd`, or `None` when it gives none.
+fn queue_len(fd: RawFd, request: libc::Ioctl) -> Option<u64> {
+    let mut len: libc::c_int = 0;
+    // SAFETY: both requests store one int through the pointer, which points
+    // at `len`, alive for the call.
+    let rc = unsafe { libc::ioctl(fd, request, &mut len) };
+    if rc == 0 {
+        u64::try_from(len).ok()
+    } else {
+        None
     }
 }
 
@@ -265,6 +404,7 @@ impl Relay {
             Deny::NoService
         };
         let (ours, theirs) = pair().map_err(refused)?;
+        let watch = theirs.try_clone().map_err(refused)?;
         // The thread takes the parts once it runs: a thread that cannot be
         // started leaves them for the next connection.
         let parts = Arc::clone(&self.parts);
@@ -276,10 +416,24 @@ impl Relay {
                 if let Some(parts) = taken {
                     relay(theirs, parts, &progress);
                 }
+                // Done: the copies go, so the output's reader sees its end.
+                *progress
+                    .stream
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                *progress
+                    .output
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
                 progress.done.store(true, Ordering::Release);
             })
             .map_err(refused)?;
         self.taken.store(true, Ordering::Release);
+        *self
+            .progress
+            .stream
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(watch);
         self.progress.connected.store(true, Ordering::Release);
         Ok(ours)
     }
@@ -294,7 +448,18 @@ pub fn register(
     input: Option<RelayInput>,
     handle: VmmHandle,
 ) -> Result<RelayHandle, RegisterError> {
-    let progress = Arc::new(Progress::default());
+    // A copy of the output's descriptor, only to look at its queue.
+    let output = out.fd.and_then(|fd| {
+        // SAFETY: `fd` is the descriptor `out` owns, open until it is
+        // dropped; it is only duplicated here.
+        unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .ok()
+    });
+    let progress = Arc::new(Progress {
+        output: Mutex::new(output),
+        ..Progress::default()
+    });
     let relay = Relay {
         parts: Arc::new(Mutex::new(Some(Parts { out, input, handle }))),
         taken: AtomicBool::new(false),
@@ -334,6 +499,9 @@ fn relay(mut stream: UnixStream, parts: Parts, progress: &Progress) {
             }
         }
     }
+    progress
+        .received
+        .fetch_add(rest.len() as u64, Ordering::Relaxed);
     let mut writing = write_out(&mut out, &rest, progress);
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -341,7 +509,10 @@ fn relay(mut stream: UnixStream, parts: Parts, progress: &Progress) {
         // read: the guest's side fills, and the session blocks on its tty.
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) if writing => writing = write_out(&mut out, &buf[..n], progress),
+            Ok(n) if writing => {
+                progress.received.fetch_add(n as u64, Ordering::Relaxed);
+                writing = write_out(&mut out, &buf[..n], progress);
+            }
             // An output that failed for good: the rest is read and dropped,
             // so the guest never blocks on it.
             Ok(_) => {}
@@ -456,6 +627,8 @@ mod tests {
     use boxcar_vsock::{ConnMeta, Deny, InternalServices};
 
     use super::*;
+    use std::os::fd::AsRawFd;
+
     use crate::lifecycle::{test_handle, VmState};
     use crate::services::ServiceRegistry;
 
@@ -743,5 +916,121 @@ mod tests {
         );
         drop(stream);
         writer.close().unwrap();
+    }
+
+    /// A pipe of one page, blocking.
+    fn small_pipe() -> (File, File) {
+        let (read, write) = small_non_blocking_pipe();
+        // SAFETY: fcntl with integer arguments only.
+        unsafe {
+            let fd = write.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK), 0);
+        }
+        (read, write)
+    }
+
+    const HEADER: &[u8] = b"{\"v\":1,\"session\":\"main\",\"rows\":24,\"cols\":80}\n";
+
+    /// The re-review's probe as a test: a steady consumer of 5 KiB/s on a
+    /// plain (blocking) pipe. A whole write takes it a long time, but every
+    /// byte it takes from the pipe counts: the wait follows it to the end,
+    /// and it gets everything.
+    #[test]
+    fn a_slow_steady_reader_keeps_the_wait_going_to_the_end() {
+        const PAYLOAD: usize = 6 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        let registry = ServiceRegistry::new();
+        let (mut read_end, write_end) = small_pipe();
+        let relay = register(&registry, RelayOutput::file(write_end), None, handle).unwrap();
+        let mut stream = guest(&registry);
+        stream.write_all(HEADER).unwrap();
+        stream.write_all(&[b'z'; PAYLOAD]).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        // 256 bytes every 50 ms: 5 KiB/s, about 1.2 s in all.
+        let reader = std::thread::spawn(move || {
+            let mut got = 0;
+            let mut buf = [0u8; 256];
+            loop {
+                match read_end.read(&mut buf) {
+                    Ok(0) => return got,
+                    Ok(n) => got += n,
+                    Err(e) => panic!("{e}"),
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        // An idle limit far below a whole write's time at this pace (0.8 s
+        // for a page).
+        let ended = relay.wait_with(Duration::from_millis(300), LIMIT, || false);
+        assert_eq!(ended, RelayWait::Done);
+        assert_eq!(relay.undelivered(), 0);
+        assert_eq!(relay.written(), PAYLOAD as u64);
+        assert_eq!(reader.join().unwrap(), PAYLOAD);
+        writer.close().unwrap();
+    }
+
+    /// A reader that stops: the wait gives up after the idle time, and the
+    /// handle counts what is left, written and not; a stop request ends the
+    /// wait at once.
+    #[test]
+    fn a_reader_that_stops_leaves_the_wait_stalled_with_the_count() {
+        const PAYLOAD: usize = 20 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        let registry = ServiceRegistry::new();
+        let (read_end, write_end) = small_pipe();
+        let relay = register(&registry, RelayOutput::file(write_end), None, handle).unwrap();
+        let mut stream = guest(&registry);
+        let mut sent = HEADER.to_vec();
+        sent.extend_from_slice(&[b'z'; PAYLOAD]);
+        stream.write_all(&sent).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+        assert_eq!(relay.wait_with(LIMIT, LIMIT, || true), RelayWait::Stopped);
+        let started = Instant::now();
+        let ended = relay.wait_with(Duration::from_millis(200), LIMIT, || false);
+        assert_eq!(ended, RelayWait::Stalled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // What the pipe took (at most its one page: a write of a whole page
+        // waits for it to empty); the rest is held or unread, every byte
+        // counted.
+        let written = relay.written();
+        assert!(written > 0 && written <= 4096, "{written}");
+        assert_eq!(relay.undelivered(), PAYLOAD as u64 - written);
+        // Its reader gone, the relay drops the rest and ends.
+        drop(read_end);
+        assert!(relay.wait(LIMIT));
+        assert_eq!(relay.undelivered(), 0);
+        writer.close().unwrap();
+    }
+
+    /// The wait's ends, in time: the idle limit counts from the last
+    /// progress (or the start), the cap from the start, whichever is first.
+    #[test]
+    fn the_wait_ends_at_the_idle_limit_or_the_cap() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let (idle, cap) = (Duration::from_millis(2000), Duration::from_millis(30_000));
+        assert_eq!(wait_step(ms(0), t0, t0, idle, cap), Ok(ms(2000)));
+        assert_eq!(wait_step(ms(1999), t0, t0, idle, cap), Ok(ms(2000)));
+        assert_eq!(
+            wait_step(ms(2000), t0, t0, idle, cap),
+            Err(RelayWait::Stalled)
+        );
+        // Progress moves the idle limit on.
+        assert_eq!(wait_step(ms(2500), t0, ms(1500), idle, cap), Ok(ms(3500)));
+        // But never past the cap, however steady the progress.
+        assert_eq!(
+            wait_step(ms(29_000), t0, ms(28_900), idle, cap),
+            Ok(ms(30_000))
+        );
+        assert_eq!(
+            wait_step(ms(30_000), t0, ms(29_999), idle, cap),
+            Err(RelayWait::Capped)
+        );
+        // No cap: the idle limit alone.
+        assert_eq!(wait_step(ms(10), t0, t0, idle, Duration::MAX), Ok(ms(2000)));
     }
 }
