@@ -12,6 +12,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{env, fs, io};
 
 use anyhow::{bail, Context};
@@ -26,7 +27,7 @@ use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
 use boxcar_vmm::guest_ctl::check_session;
 use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
-use boxcar_vmm::pty_relay::{self, RelayInput};
+use boxcar_vmm::pty_relay::{self, RelayHandle, RelayInput, RelayOutput};
 use boxcar_vmm::stdin::RawModeGuard;
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
@@ -217,17 +218,28 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                     ready.announce(path, &session_id);
                 }
             }
+            let mut relay = None;
             if relayed {
-                if let Err(error) = relay_session(&mut vmm, interactive) {
-                    // The VM was built, and its stop records vmm.stop: run
-                    // it to a stop at once rather than leave the log
-                    // without one.
-                    tell(&format!("error: {error:#}"));
-                    vmm.handle()
-                        .request_stop(boxcar_vmm::vmm::StopReason::Requested);
+                match relay_session(&mut vmm, interactive) {
+                    Ok(handle) => relay = Some(handle),
+                    Err(error) => {
+                        // The VM was built, and its stop records vmm.stop:
+                        // run it to a stop at once rather than leave the
+                        // log without one.
+                        tell(&format!("error: {error:#}"));
+                        vmm.handle()
+                            .request_stop(boxcar_vmm::vmm::StopReason::Requested);
+                    }
                 }
             }
-            vmm.run()
+            let outcome = vmm.run();
+            // What the session printed last may still be on its way to a
+            // slow stdout: it is written before boxcar exits, for as long as
+            // stdout keeps taking it.
+            if let Some(relay) = relay {
+                relay.wait(RELAY_IDLE);
+            }
+            outcome
         }
         Err(error) => {
             // No guest ran: the empty console file and the state directory
@@ -646,26 +658,30 @@ fn check_cmdline_size(
     Ok(())
 }
 
+/// How long, once the VM has stopped, boxcar waits for a stdout that takes
+/// nothing more before it exits without the rest of the session's output.
+const RELAY_IDLE: Duration = Duration::from_secs(2);
+
 /// Registers the transitional PTY relay (until Task 12's hub) on `vmm`:
 /// the session's terminal to stdout and, for an interactive run, stdin to
 /// the session, with the terminal in raw mode when stdin is one, restored
 /// by the VM's stop sequence.
-fn relay_session(vmm: &mut Vmm, interactive: bool) -> anyhow::Result<()> {
+fn relay_session(vmm: &mut Vmm, interactive: bool) -> anyhow::Result<RelayHandle> {
     let input = if interactive {
         Some(RelayInput::stdin().context("cannot read stdin")?)
     } else {
         None
     };
     let tty = input.as_ref().is_some_and(|input| input.tty);
-    let out = pty_relay::stdout().context("cannot write to stdout")?;
-    pty_relay::register(&vmm.handle().services(), out, input, vmm.handle())
+    let out = RelayOutput::stdout().context("cannot write to stdout")?;
+    let relay = pty_relay::register(&vmm.handle().services(), out, input, vmm.handle())
         .context("cannot serve the session's terminal")?;
     if tty {
         if let Some(guard) = RawModeGuard::enter().context("cannot put the terminal in raw mode")? {
             vmm.restore_terminal_on_stop(guard);
         }
     }
-    Ok(())
+    Ok(relay)
 }
 
 /// The name of the serial console's file in the state directory, in vsock

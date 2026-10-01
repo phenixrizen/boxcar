@@ -171,7 +171,13 @@ fn run(
     };
     let vmm = Vmm::new(cfg).unwrap();
     let out = File::create(dir.path().join("session.out")).unwrap();
-    pty_relay::register(&vmm.handle().services(), Box::new(out), None, vmm.handle()).unwrap();
+    let relay = pty_relay::register(
+        &vmm.handle().services(),
+        pty_relay::RelayOutput::file(out),
+        None,
+        vmm.handle(),
+    )
+    .unwrap();
     let control = vmm.control_path().unwrap().to_owned();
 
     let handle = vmm.handle();
@@ -188,6 +194,7 @@ fn run(
     let started = Instant::now();
     let exit = vmm.run().unwrap();
     let stopped_at = Instant::now();
+    assert!(relay.wait(Duration::from_secs(2)), "the relay did not finish");
     let elapsed = started.elapsed();
     drop(done);
     watchdog.join().unwrap();
