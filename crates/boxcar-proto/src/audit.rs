@@ -953,12 +953,14 @@ mod tests {
             (
                 Payload::NetTls(NetTls {
                     flow: 7,
+                    kind: "tls".into(),
                     sni: Some("example.com".into()),
                     alpn: vec!["h2".into(), "http/1.1".into()],
                     verdict: Verdict::Allow,
                 }),
                 json!({
                     "flow": 7,
+                    "kind": "tls",
                     "sni": "example.com",
                     "alpn": ["h2", "http/1.1"],
                     "verdict": "allow",
@@ -1144,13 +1146,15 @@ mod tests {
                 }),
             ),
             (
+                // A plain HTTP request with no Host to read.
                 Payload::NetTls(NetTls {
                     flow: 9,
+                    kind: "http".into(),
                     sni: None,
                     alpn: Vec::new(),
                     verdict: Verdict::Deny,
                 }),
-                json!({"flow": 9, "sni": null, "alpn": [], "verdict": "deny"}),
+                json!({"flow": 9, "kind": "http", "sni": null, "alpn": [], "verdict": "deny"}),
             ),
         ]
     }

@@ -413,15 +413,24 @@ pub struct NetConnect {
     pub rule: Option<String>,
 }
 
-/// `net.tls`: what a flow's TLS ClientHello asked for, and whether the flow
-/// was let through on it.
+/// `net.tls`: the gate's reading of a flow's first bytes, the name they
+/// asked for, and whether the flow was let through on it. The gate reads
+/// the flows a domain rule allowed: a TLS ClientHello's server name, or a
+/// plain HTTP request's `Host`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetTls {
     /// The `flow` of the flow's `net.connect`.
     pub flow: u64,
-    /// The server name the ClientHello named; `null` when it named none.
+    /// What the first bytes were read as: `tls` (a ClientHello, bytes that
+    /// began like one, or none at all) or `http` (anything else, read as a
+    /// plain HTTP request).
+    pub kind: String,
+    /// The name asked for: for `tls`, the server name the ClientHello named;
+    /// for `http`, the request's `Host` (lowercase, without its port).
+    /// `null` when there was none to read.
     pub sni: Option<String>,
-    /// The ALPN protocols the ClientHello offered, in its order.
+    /// The ALPN protocols the ClientHello offered, in its order; empty for
+    /// `http`.
     pub alpn: Vec<String>,
     pub verdict: Verdict,
 }
