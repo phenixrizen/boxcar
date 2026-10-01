@@ -4,6 +4,7 @@
 //! Audit record schema and wire types shared by the host and the guest.
 //!
 //! - [`audit`]: the record envelope, its hash chain, and the typed payloads.
+//! - [`control`]: the control protocol, v1: requests, responses, events.
 //! - [`guestcmd`]: the session command on the kernel command line.
 //! - [`ids`]: session identifiers.
 //! - [`limits`]: size limits for record fields, and the cut that enforces them.
@@ -18,6 +19,7 @@
 //! way.
 
 pub mod audit;
+pub mod control;
 pub mod guestcmd;
 pub mod ids;
 pub mod limits;
@@ -26,10 +28,10 @@ pub mod redact;
 #[cfg(feature = "hash")]
 pub use audit::genesis_prev;
 pub use audit::{
-    ArtifactRef, Attrib, Checkpoint, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
-    FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hash,
-    HashStatus, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, ShareRef, Source,
-    SpanRef, Subject, VmmStart, VmmStop, SCHEMA_VERSION,
+    ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
+    FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
+    FsSymlink, FsXattr, Hash, HashStatus, OpResult, ParseHashError, Payload, Record, Ring, SetAttr,
+    ShareRef, Source, SpanRef, Subject, Verdict, VmmStart, VmmStop, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

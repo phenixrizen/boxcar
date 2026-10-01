@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::errno::name as errno_name;
 use super::Hash;
+use crate::control::StopMode;
 
 /// How one operation ended. Present on every filesystem event that performs
 /// an operation, so readers can filter failures without knowing the event.
@@ -315,4 +316,31 @@ pub struct Checkpoint {
     /// blake3 over the raw hashes of the records since the previous
     /// checkpoint.
     pub root_hash: Hash,
+}
+
+/// Whether something was let through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Allow,
+    Deny,
+}
+
+/// `control.connect`: a process connected to the control socket. It is
+/// served (`allow`) only when its uid is the VMM's; otherwise the
+/// connection is closed before the hello (`deny`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ControlConnect {
+    /// The peer's process id and user id, from `SO_PEERCRED`.
+    pub pid: u32,
+    pub uid: u32,
+    pub verdict: Verdict,
+}
+
+/// `control.stop`: a control client asked the VM to stop.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ControlStop {
+    /// The client's process id.
+    pub by_pid: u32,
+    pub mode: StopMode,
 }

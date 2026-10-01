@@ -41,9 +41,9 @@ mod errno;
 mod payloads;
 
 pub use payloads::{
-    ArtifactRef, Attrib, Checkpoint, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
-    FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
-    HashStatus, OpResult, SetAttr, ShareRef, VmmStart, VmmStop,
+    ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
+    FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
+    FsSymlink, FsXattr, HashStatus, OpResult, SetAttr, ShareRef, Verdict, VmmStart, VmmStop,
 };
 
 /// The value of a record's `v` field.
@@ -98,12 +98,15 @@ pub enum Source {
 impl Source {
     /// The source of an event kind this crate defines a payload for:
     /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
-    /// device. `None` for every other kind; later milestones add theirs.
+    /// device, `control.*` from the control socket. `None` for every other
+    /// kind; later milestones add theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
         if kind == "checkpoint" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
         } else if kind.starts_with("fs.") {
             Some(Source::Fs)
+        } else if kind.starts_with("control.") {
+            Some(Source::Control)
         } else {
             None
         }
@@ -350,6 +353,10 @@ pub enum Payload {
     FsReaddir(FsPathOp),
     #[serde(rename = "checkpoint")]
     Checkpoint(Checkpoint),
+    #[serde(rename = "control.connect")]
+    ControlConnect(ControlConnect),
+    #[serde(rename = "control.stop")]
+    ControlStop(ControlStop),
 }
 
 impl Payload {
@@ -378,12 +385,14 @@ impl Payload {
             Payload::FsDenied(_) => "fs.denied",
             Payload::FsReaddir(_) => "fs.readdir",
             Payload::Checkpoint(_) => "checkpoint",
+            Payload::ControlConnect(_) => "control.connect",
+            Payload::ControlStop(_) => "control.stop",
         }
     }
 
     /// The source of the record that carries this payload: the VMM for
-    /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, as
-    /// [`Source::from_kind`] says. A new variant does not compile until it
+    /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, the
+    /// control socket for `control.*`, as [`Source::from_kind`] says. A new variant does not compile until it
     /// is given one.
     pub fn source(&self) -> Source {
         match self {
@@ -406,6 +415,7 @@ impl Payload {
             | Payload::FsXattr(_)
             | Payload::FsDenied(_)
             | Payload::FsReaddir(_) => Source::Fs,
+            Payload::ControlConnect(_) | Payload::ControlStop(_) => Source::Control,
         }
     }
 
@@ -432,12 +442,13 @@ impl Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::StopMode;
     use serde_json::json;
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 21 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 21] = [
+    /// The 23 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 23] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -459,6 +470,8 @@ mod tests {
         "fs.denied",
         "fs.readdir",
         "checkpoint",
+        "control.connect",
+        "control.stop",
     ];
 
     fn session() -> SessionId {
@@ -827,7 +840,44 @@ mod tests {
                 }),
                 json!({"records_since": 1024, "dropped": 0, "root_hash": b3(0x33)}),
             ),
+            (
+                Payload::ControlConnect(ControlConnect {
+                    pid: 4242,
+                    uid: 1000,
+                    verdict: Verdict::Allow,
+                }),
+                json!({"pid": 4242, "uid": 1000, "verdict": "allow"}),
+            ),
+            (
+                Payload::ControlStop(ControlStop {
+                    by_pid: 4242,
+                    mode: StopMode::Graceful,
+                }),
+                json!({"by_pid": 4242, "mode": "graceful"}),
+            ),
         ]
+    }
+
+    /// The other values of the control payloads' enums.
+    #[test]
+    fn control_payloads_spell_deny_and_force() {
+        let deny = Payload::ControlConnect(ControlConnect {
+            pid: 1,
+            uid: 1001,
+            verdict: Verdict::Deny,
+        });
+        assert_eq!(
+            deny.into_parts(),
+            (
+                "control.connect".to_owned(),
+                json!({"pid": 1, "uid": 1001, "verdict": "deny"})
+            )
+        );
+        let force = Payload::ControlStop(ControlStop {
+            by_pid: 1,
+            mode: StopMode::Force,
+        });
+        assert_eq!(force.into_parts().1, json!({"by_pid": 1, "mode": "force"}));
     }
 
     /// Payloads whose optional fields are unset. `Option`s that the schema
@@ -971,6 +1021,8 @@ mod tests {
         for (payload, _) in cases() {
             let expected = if payload.kind().starts_with("fs.") {
                 Source::Fs
+            } else if payload.kind().starts_with("control.") {
+                Source::Control
             } else {
                 Source::Vmm
             };
@@ -980,6 +1032,7 @@ mod tests {
         assert_eq!(Source::from_kind("vmm.start"), Some(Source::Vmm));
         assert_eq!(Source::from_kind("fs.open"), Some(Source::Fs));
         assert_eq!(Source::from_kind("checkpoint"), Some(Source::Vmm));
+        assert_eq!(Source::from_kind("control.stop"), Some(Source::Control));
         for other in [
             "net.connect",
             "vsock.open",
@@ -990,6 +1043,8 @@ mod tests {
             "fs",
             "fsx.open",
             "checkpoints",
+            "control",
+            "controls.stop",
         ] {
             assert_eq!(Source::from_kind(other), None, "{other:?}");
         }
