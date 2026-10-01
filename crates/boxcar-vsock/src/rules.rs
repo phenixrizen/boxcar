@@ -150,6 +150,23 @@ impl Rules {
     /// the module docs.
     pub(crate) fn decide(&mut self, port: u32, src_port: u32) -> Decision {
         if crate::services::is_internal(port) {
+            // boxcar: why a guest source port below 1024 is trusted to be
+            // init's. The guest kernel enforces it: in `net/vmw_vsock/
+            // af_vsock.c` (`__vsock_bind_connectible`, Linux 6.18) an explicit
+            // bind to a port at or below `LAST_RESERVED_PORT` (1023) fails
+            // with `EACCES` unless the caller is `capable(CAP_NET_BIND_SERVICE)`
+            // (checked before the port-in-use test, and against the initial
+            // user namespace, so a capability gained inside a user namespace
+            // does not count), and an automatic bind (a `connect` without a
+            // bind) only hands out ports above 1023. In the guest only PID 1
+            // holds that capability: the session runs with empty capability
+            // sets, even as uid 0, under `NO_NEW_PRIVS`. A connection from a
+            // port below 1024 therefore comes from init; Task 11's review
+            // confirmed it from a session as uid 1000 and as uid 0 (`EACCES`
+            // on every bind below 1024, also inside a user namespace, and an
+            // unprivileged connect to 1024 or 1025 reset and recorded here as
+            // `unprivileged`). The first-connection rule below and the
+            // services' one connection a VMM life are further layers.
             if src_port >= PRIVILEGED_PORT_LIMIT {
                 return Decision::Deny(Peer::Internal, Refusal::Unprivileged);
             }

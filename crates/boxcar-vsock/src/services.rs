@@ -7,9 +7,11 @@
 //! `boxcar.ctl` (the guest control channel), 1025 `boxcar.pty` (the agent's
 //! terminal) and 1026 `boxcar.sensor` (reserved). A guest connection to one
 //! of them is served by [`InternalServices::connect`], and only when it
-//! comes from a guest source port below [`PRIVILEGED_PORT_LIMIT`] (which
-//! only root can bind, so an unprivileged process in the guest cannot pose
-//! as init) and is the first to that port since the device was activated.
+//! comes from a guest source port below [`PRIVILEGED_PORT_LIMIT`] (which the
+//! guest kernel lets only a process with `CAP_NET_BIND_SERVICE` in its
+//! initial user namespace bind: init, never the session, which has no
+//! capability even as uid 0, so nothing in the guest but init can pose as
+//! it) and is the first to that port since the device was activated.
 //! Any other guest connection to them is reset and recorded as refused
 //! (see the muxer).
 //!

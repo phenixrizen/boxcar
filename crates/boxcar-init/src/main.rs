@@ -134,7 +134,8 @@ fn run_session(args: &BTreeMap<String, String>) -> Result<Ended, Failed> {
 /// session: a console line, and the reboot.
 fn vsock_mode(args: &BTreeMap<String, String>) -> ! {
     match run_vsock_session(args) {
-        Ok(ended) => shutdown::finish(ended),
+        Ok(Some(ended)) => shutdown::finish(ended),
+        Ok(None) => shutdown::finish_unended(),
         Err(VsockFailure::NoConfig(failed)) => {
             let _ = write_console(format!("boxcar-init: ctl: {failed}\n").as_bytes());
             shutdown::finish(Ended::Exited(1))
@@ -158,8 +159,8 @@ impl From<Failed> for VsockFailure {
 }
 
 /// The steps of `vsock` mode after the early mounts, up to the session's
-/// end, its report and the sweep.
-fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Ended, VsockFailure> {
+/// end (`None`: it outlived `SIGKILL`), its report and the sweep.
+fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Option<Ended>, VsockFailure> {
     mounts::mount_shares()?;
     let mounted = mounts::mount_api()?;
     mounts::switch_root()?;
@@ -176,12 +177,27 @@ fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Ended, VsockFail
     let config = ctl
         .receive_config(Instant::now() + ctl::CONFIG_DEADLINE)
         .map_err(VsockFailure::NoConfig)?;
-    ctl::check_config(&config)?;
+    // From here the host hears why init stops (its stderr shows it), not
+    // only the console.
+    run_configured(&mut ctl, &config, join_cgroup).map_err(|failed| {
+        ctl.tell_host(&failed);
+        VsockFailure::Failed(failed)
+    })
+}
+
+/// `vsock` mode with the session's `config`: the session, run to its end
+/// and reported.
+fn run_configured(
+    ctl: &mut ctl::Ctl,
+    config: &boxcar_proto::guest::SessionConfig,
+    join_cgroup: bool,
+) -> Result<Option<Ended>, Failed> {
+    ctl::check_config(config)?;
     sethostname(&config.hostname).step(&format!("sethostname {}", config.hostname))?;
     sysctl::apply_config(&config.sysctls);
 
     // Everything the child needs, before the fork.
-    let env = pty::session_env(&config);
+    let env = pty::session_env(config);
     let path = pty::search_path(&env).to_owned();
     let exec = Exec::with_env(&config.argv, env, &path)?;
     let cwd = CString::new(config.cwd.as_str()).step("config cwd")?;
@@ -224,8 +240,8 @@ fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Ended, VsockFail
         pid: u32::try_from(pid.as_raw()).unwrap_or(0),
     });
     let mut relay = pty::Relay::new(master, stream);
-    let how = ctl::supervise(&mut ctl, &mut relay, &reaper, pid)?;
-    Ok(ctl::finish(&mut ctl, &mut relay, &reaper, pid, how)?)
+    let how = ctl::supervise(ctl, &mut relay, &reaper, pid)?;
+    ctl::finish(ctl, &mut relay, &reaper, pid, how)
 }
 
 /// Sends a panic to `/dev/kmsg` and `/dev/console`, then aborts.

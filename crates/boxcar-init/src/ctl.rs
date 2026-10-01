@@ -10,18 +10,23 @@
 //! Once the session runs, init reports `session.started`, and the poll loop
 //! relays the terminal and serves the host: `resize` sets the PTY's size,
 //! `signal` signals the session's process group, `ping` gets a `pong`, and
-//! `shutdown` ends the session (`SIGTERM` to its process group, then
-//! `SIGKILL` after the grace, at most [`MAX_GRACE`]). A channel the host
-//! closes while the session runs is taken as `shutdown` with
-//! [`LOST_HOST_GRACE`].
+//! `shutdown` ends the session: `SIGHUP` then `SIGTERM` to its process group
+//! (as a terminal hangup would: an interactive shell ignores `SIGTERM`
+//! alone), then `SIGKILL` after the grace, at most [`MAX_GRACE`], and at
+//! most [`KILL_REAP_LIMIT`] more for the session to be gone (one stuck in
+//! the kernel does not hold PID 1 up). A channel the host closes while the
+//! session runs is taken as `shutdown` with [`LOST_HOST_GRACE`].
 //!
 //! When the session has ended, [`finish`] drains its terminal to the
 //! stream and closes it, reports `session.exited`, sweeps the processes left
-//! (as M1 does), and waits, at most [`ACK_DEADLINE`], for the host to close
-//! its side of both streams: the VMM closes the control channel once the
-//! report is recorded, the relay the terminal once it has written it all.
-//! Only then does init reboot, so the report and the last output are not
-//! lost to the reset.
+//! (as M1 does), and waits for the host to close its side of both streams:
+//! the VMM closes the control channel once the report is recorded, the
+//! relay the terminal once it has written it all. Only then does init
+//! reboot, so the report and the last output are not lost to the reset.
+//! Every wait on the host there counts from the last byte the host took
+//! ([`pty::HostDeadline`]): a slow host gets everything, and one that takes
+//! nothing for [`ACK_DEADLINE`] is taken as gone; the session's output init
+//! could not send then is counted on the console and in a `log` line.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -30,20 +35,25 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use boxcar_proto::guest::{decode, encode, GuestMsg, HostMsg, LineBuf, SessionConfig, MAX_LINE};
+use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
-use crate::console::{Failed, Step};
-use crate::pty::{self, poll, pollfd, Relay, DRAIN_LIMIT};
+use crate::console::{warn, Failed, Step};
+use crate::pty::{self, poll, pollfd, HostDeadline, Relay, DRAIN_LIMIT};
 use crate::reaper::{Ended, Reaper};
 use crate::vsock::{self, set_nonblocking, CTL_PORT, CTL_SOURCE_PORT};
 
 /// How long init waits for the session's config after `hello`.
 pub const CONFIG_DEADLINE: Duration = Duration::from_secs(10);
 
-/// How long init waits, before it reboots, for the host to close its side
-/// of the streams: the sign that it took the report and the output.
+/// How long init waits, before it reboots, for a host that takes nothing to
+/// close its side of the streams (the sign that it took the report and the
+/// output), counted from the last byte it took.
 pub const ACK_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long, after `SIGKILL`, init waits for the session to be gone.
+pub const KILL_REAP_LIMIT: Duration = Duration::from_secs(2);
 
 /// The longest grace a `shutdown` gets.
 pub const MAX_GRACE: Duration = Duration::from_secs(60);
@@ -98,33 +108,12 @@ pub fn shutdown_grace(grace_ms: u64) -> Duration {
     Duration::from_millis(grace_ms).min(MAX_GRACE)
 }
 
-/// Refuses a config init cannot run: no command, the all-ones uid or gid
-/// (which `setresuid` and `setresgid` read as "leave this id alone": the
-/// session would stay root), a hostname the kernel refuses (empty, over 64
-/// bytes or holding a NUL), a working directory that is not absolute.
+/// Refuses a config init cannot run, as the VMM did before it booted
+/// ([`SessionConfig::validate`]): a command, usable ids, a hostname the
+/// kernel takes, an absolute working directory, names and values that can
+/// be passed.
 pub fn check_config(config: &SessionConfig) -> Result<(), Failed> {
-    if config.argv.is_empty() {
-        return Err(Failed::new("config", "argv is empty"));
-    }
-    for (what, id) in [("uid", config.uid), ("gid", config.gid)] {
-        if id == u32::MAX {
-            return Err(Failed::new("config", format!("{what} {id} is not usable")));
-        }
-    }
-    let host = config.hostname.as_bytes();
-    if host.is_empty() || host.len() > 64 || host.contains(&0) {
-        return Err(Failed::new(
-            "config",
-            format!("hostname {:?} is not one", config.hostname),
-        ));
-    }
-    if !config.cwd.starts_with('/') || config.cwd.contains('\0') {
-        return Err(Failed::new(
-            "config",
-            format!("cwd {:?} is not an absolute path", config.cwd),
-        ));
-    }
-    Ok(())
+    config.validate().step("config")
 }
 
 /// Lines waiting for the host.
@@ -144,7 +133,9 @@ impl Outbox {
     /// Queues `msg`'s line, unless it would take the outbox past its cap:
     /// then it is dropped whole. Returns whether it was queued.
     pub fn push(&mut self, msg: &GuestMsg) -> bool {
-        let line = encode(msg);
+        let Ok(line) = encode(msg) else {
+            return false;
+        };
         if self.buf.len() + line.len() > self.cap {
             return false;
         }
@@ -153,9 +144,12 @@ impl Outbox {
     }
 
     /// Queues a report (`session.started`, `session.exited`), whatever the
-    /// cap: there are two in init's life.
+    /// cap: there are two in init's life. (They are a few dozen bytes: the
+    /// line limit never refuses one.)
     pub fn push_report(&mut self, msg: &GuestMsg) {
-        self.buf.extend_from_slice(&encode(msg));
+        if let Ok(line) = encode(msg) {
+            self.buf.extend_from_slice(&line);
+        }
     }
 
     /// Writes what is queued to `to` until it is all written or `to` would
@@ -180,6 +174,11 @@ impl Outbox {
 
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+
+    /// Bytes queued.
+    pub fn len(&self) -> usize {
+        self.buf.len()
     }
 }
 
@@ -272,14 +271,29 @@ impl Ctl {
         self.flush();
     }
 
-    /// Sends what waits, without blocking.
-    fn flush(&mut self) {
+    /// Sends what waits, without blocking; returns whether the host took
+    /// any of it.
+    fn flush(&mut self) -> bool {
         if self.broken {
-            return;
+            return false;
         }
+        let before = self.out.len();
         if self.out.write_to(&mut self.stream).is_err() {
             self.broken = true;
+            return false;
         }
+        self.out.len() < before
+    }
+
+    /// Tells the host why init stops before the session ends (a `log` at
+    /// level `error`, which the VMM logs), waiting for a host that takes it
+    /// as in [`finish`].
+    pub fn tell_host(&mut self, failed: &Failed) {
+        self.send(&GuestMsg::Log {
+            level: boxcar_proto::guest::LogLevel::Error,
+            msg: format!("boxcar-init: {failed}"),
+        });
+        self.flush_until(&mut HostDeadline::new(Instant::now(), ACK_DEADLINE));
     }
 
     /// What the host sent, as far as it is here; marks the end of the
@@ -309,19 +323,22 @@ impl Ctl {
         msgs
     }
 
-    /// Sends what waits, waiting until `deadline` for the host to take it.
-    fn flush_until(&mut self, deadline: Instant) {
+    /// Sends what waits, for as long as the host takes it: until `host`
+    /// passes, which each byte it takes moves on.
+    fn flush_until(&mut self, host: &mut HostDeadline) {
         loop {
-            self.flush();
+            if self.flush() {
+                host.progress(Instant::now());
+            }
             if self.out.is_empty() || self.broken {
                 return;
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            let now = Instant::now();
+            if host.passed(now) {
                 return;
             }
             let mut fds = [pollfd(self.stream.as_raw_fd(), libc::POLLOUT)];
-            if poll(&mut fds, Some(left)).is_err() {
+            if poll(&mut fds, Some(host.left(now))).is_err() {
                 return;
             }
         }
@@ -332,54 +349,96 @@ impl Ctl {
 struct Ending {
     /// When the session's process group gets `SIGKILL`.
     kill_at: Instant,
-    killed: bool,
+    /// When it got it.
+    killed_at: Option<Instant>,
+}
+
+impl Ending {
+    /// What is next at `now`: `SIGKILL` once the grace is over, giving up
+    /// on the session once [`KILL_REAP_LIMIT`] has passed after it, else
+    /// waiting until the returned time.
+    fn next(&self, now: Instant) -> EndingStep {
+        match self.killed_at {
+            None if now >= self.kill_at => EndingStep::Kill,
+            None => EndingStep::WaitUntil(self.kill_at),
+            Some(at) if now >= at + KILL_REAP_LIMIT => EndingStep::GiveUp,
+            Some(at) => EndingStep::WaitUntil(at + KILL_REAP_LIMIT),
+        }
+    }
+}
+
+/// What a `shutdown` under way does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndingStep {
+    Kill,
+    WaitUntil(Instant),
+    GiveUp,
 }
 
 /// Signals the session's process group (`session`, its leader's pid).
-/// One that is gone is fine.
+/// Right after the fork the session may not lead a group yet (it has not
+/// reached `setsid`): then the leader alone gets it. One that is gone is
+/// fine.
 fn signal_group(session: Pid, signal: Signal) {
-    let _ = kill(Pid::from_raw(-session.as_raw()), signal);
+    if kill(Pid::from_raw(-session.as_raw()), signal) == Err(Errno::ESRCH) {
+        let _ = kill(session, signal);
+    }
 }
 
-/// Starts ending the session: `SIGTERM` to its process group now,
+/// The signals a `shutdown` starts with, in order: a hangup, as the
+/// terminal going away would send (an interactive shell ends on it, and
+/// ignores `SIGTERM`), then `SIGTERM`.
+pub const ENDING_SIGNALS: [Signal; 2] = [Signal::SIGHUP, Signal::SIGTERM];
+
+/// Starts ending the session: [`ENDING_SIGNALS`] to its process group now,
 /// `SIGKILL` after the grace.
 fn begin_ending(session: Pid, grace_ms: u64) -> Ending {
-    signal_group(session, Signal::SIGTERM);
+    for signal in ENDING_SIGNALS {
+        signal_group(session, signal);
+    }
     Ending {
         kill_at: Instant::now() + shutdown_grace(grace_ms),
-        killed: false,
+        killed_at: None,
     }
 }
 
 /// PID 1's loop while the session runs: relays its terminal, serves the
-/// host's requests, reaps every child, and returns how the session ended.
+/// host's requests, reaps every child, and returns how the session ended,
+/// or `None` when it outlived `SIGKILL` by [`KILL_REAP_LIMIT`].
 pub fn supervise(
     ctl: &mut Ctl,
     relay: &mut Relay,
     reaper: &Reaper,
     session: Pid,
-) -> Result<Ended, Failed> {
+) -> Result<Option<Ended>, Failed> {
     let mut ended = None;
     let mut ending: Option<Ending> = None;
     loop {
         reaper.reap(session, &mut ended)?;
-        if let Some(how) = ended {
-            return Ok(how);
+        if ended.is_some() {
+            return Ok(ended);
         }
         if ctl.eof && ending.is_none() {
             ending = Some(begin_ending(session, LOST_HOST_GRACE));
         }
+        let mut until = None;
         if let Some(end) = &mut ending {
-            if !end.killed && Instant::now() >= end.kill_at {
-                signal_group(session, Signal::SIGKILL);
-                end.killed = true;
+            let now = Instant::now();
+            match end.next(now) {
+                EndingStep::Kill => {
+                    signal_group(session, Signal::SIGKILL);
+                    end.killed_at = Some(now);
+                    until = Some(now + KILL_REAP_LIMIT);
+                }
+                EndingStep::WaitUntil(at) => until = Some(at),
+                EndingStep::GiveUp => {
+                    warn("the session outlived SIGKILL; going on without it");
+                    return Ok(None);
+                }
             }
         }
         let timeout = if ctl.pending.is_empty() {
-            ending
-                .as_ref()
-                .filter(|end| !end.killed)
-                .map(|end| end.kill_at.saturating_duration_since(Instant::now()))
+            until.map(|at| at.saturating_duration_since(Instant::now()))
         } else {
             // Messages that came with the config are served at once.
             Some(Duration::ZERO)
@@ -435,30 +494,46 @@ fn log_warn(msg: String) -> GuestMsg {
     }
 }
 
-/// Once the session has ended (`how`): its terminal drained to the stream
-/// and closed, the report, the sweep, then the wait for the host to close
-/// its side of both streams. See the module docs.
+/// The console line, and the host's `log`, for session output init could
+/// not send.
+pub fn undelivered_line(bytes: usize) -> String {
+    format!(
+        "pty: at least {bytes} bytes of the session's last output were not delivered: the host \
+         took none for {} s",
+        DRAIN_LIMIT.as_secs()
+    )
+}
+
+/// Once the session has ended (`how`, or `None` when it outlived
+/// `SIGKILL`): its terminal drained to the stream and closed, the report,
+/// the sweep, then the wait for the host to close its side of both streams.
+/// See the module docs.
 pub fn finish(
     ctl: &mut Ctl,
     relay: &mut Relay,
     reaper: &Reaper,
     session: Pid,
-    how: Ended,
-) -> Result<Ended, Failed> {
-    relay.drain(Instant::now() + DRAIN_LIMIT);
+    how: Option<Ended>,
+) -> Result<Option<Ended>, Failed> {
+    let drained = relay.drain(DRAIN_LIMIT);
     relay.close_stream_output();
-    ctl.report(&exit_report(Some(how)));
-    ctl.flush_until(Instant::now() + ACK_DEADLINE);
-    let started = Instant::now();
+    if drained.undelivered > 0 {
+        let line = undelivered_line(drained.undelivered);
+        warn(&line);
+        ctl.send(&log_warn(line));
+    }
+    let mut host = HostDeadline::new(drained.last_progress, ACK_DEADLINE);
+    ctl.report(&exit_report(how));
+    ctl.flush_until(&mut host);
     let how = reaper.sweep(session, how)?;
-    wait_for_host(ctl, relay, started + ACK_DEADLINE);
+    wait_for_host(ctl, relay, host);
     Ok(how)
 }
 
-/// Waits until `deadline` for the host to close its side of the control
-/// channel and of the terminal stream, reading and dropping what it still
-/// sends.
-fn wait_for_host(ctl: &mut Ctl, relay: &mut Relay, deadline: Instant) {
+/// Waits for the host to close its side of the control channel and of the
+/// terminal stream, reading and dropping what it still sends, until `host`
+/// passes: [`ACK_DEADLINE`] after the last byte it took.
+fn wait_for_host(ctl: &mut Ctl, relay: &mut Relay, host: HostDeadline) {
     loop {
         let _ = ctl.read();
         let ctl_done = ctl.eof || ctl.broken;
@@ -466,7 +541,7 @@ fn wait_for_host(ctl: &mut Ctl, relay: &mut Relay, deadline: Instant) {
         if ctl_done && pty_done {
             return;
         }
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = host.left(Instant::now());
         if left.is_zero() {
             return;
         }
@@ -567,6 +642,17 @@ mod tests {
             let failed = check_config(&cfg).unwrap_err();
             assert!(failed.to_string().contains(what), "{what}: {failed}");
         }
+        // The VMM's check, word for word: a 65-byte hostname.
+        let mut long = config();
+        long.hostname = "x".repeat(65);
+        assert!(
+            check_config(&long)
+                .unwrap_err()
+                .to_string()
+                .starts_with("config: the session's hostname: "),
+            "{:?}",
+            check_config(&long)
+        );
     }
 
     /// Lines wait in the outbox for the socket, which may take part of
@@ -627,13 +713,16 @@ mod tests {
         let (ours, mut host) = std::os::unix::net::UnixStream::pair().unwrap();
         ours.set_nonblocking(true).unwrap();
         let mut ctl = Ctl::over(OwnedFd::from(ours));
-        let mut lines = encode(&HostMsg::Ping { id: 1 });
-        lines.extend(encode(&HostMsg::Config(config())));
-        lines.extend(encode(&HostMsg::Resize {
-            rows: 40,
-            cols: 120,
-        }));
-        lines.extend(encode(&HostMsg::Ping { id: 2 }));
+        let mut lines = encode(&HostMsg::Ping { id: 1 }).unwrap();
+        lines.extend(encode(&HostMsg::Config(config())).unwrap());
+        lines.extend(
+            encode(&HostMsg::Resize {
+                rows: 40,
+                cols: 120,
+            })
+            .unwrap(),
+        );
+        lines.extend(encode(&HostMsg::Ping { id: 2 }).unwrap());
         host.write_all(&lines).unwrap();
         let got = ctl
             .receive_config(Instant::now() + Duration::from_secs(5))
@@ -653,6 +742,43 @@ mod tests {
         drop(host);
         assert!(ctl.read().is_empty());
         assert!(ctl.eof);
+    }
+
+    /// A shutdown starts as a terminal hangup does, then asks politely:
+    /// SIGHUP, then SIGTERM.
+    #[test]
+    fn a_shutdown_hangs_up_then_terminates() {
+        assert_eq!(ENDING_SIGNALS, [Signal::SIGHUP, Signal::SIGTERM]);
+    }
+
+    /// SIGKILL once the grace is over, then at most KILL_REAP_LIMIT for the
+    /// session to be gone: one stuck in the kernel does not hold PID 1.
+    #[test]
+    fn after_sigkill_the_wait_for_the_session_is_bounded() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut end = Ending {
+            kill_at: ms(1000),
+            killed_at: None,
+        };
+        assert_eq!(end.next(ms(0)), EndingStep::WaitUntil(ms(1000)));
+        assert_eq!(end.next(ms(999)), EndingStep::WaitUntil(ms(1000)));
+        assert_eq!(end.next(ms(1000)), EndingStep::Kill);
+        end.killed_at = Some(ms(1000));
+        assert_eq!(end.next(ms(1500)), EndingStep::WaitUntil(ms(3000)));
+        assert_eq!(end.next(ms(2999)), EndingStep::WaitUntil(ms(3000)));
+        assert_eq!(end.next(ms(3000)), EndingStep::GiveUp);
+        assert_eq!(KILL_REAP_LIMIT, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn undelivered_output_is_counted_in_words() {
+        assert_eq!(
+            undelivered_line(4096),
+            "pty: at least 4096 bytes of the session's last output were not delivered: the \
+             host took none for 2 s"
+        );
     }
 
     /// The deadline init gives a shutdown: the host's grace, at most a

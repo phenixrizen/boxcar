@@ -196,7 +196,8 @@ fn a_command_over_the_control_channels_limit_is_refused_before_a_session_starts(
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let text = stderr(&output);
     assert!(
-        text.contains("error: the session's config is ") && text.contains("65536"),
+        text.contains("error: the session's config: ")
+            && text.contains("over the control channel's limit of 65536"),
         "{text}"
     );
     assert!(!audit.exists(), "no session was started");

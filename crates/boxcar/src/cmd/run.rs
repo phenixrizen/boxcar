@@ -25,7 +25,6 @@ use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
-use boxcar_vmm::guest_ctl::check_session;
 use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
 use boxcar_vmm::pty_relay::{self, RelayHandle, RelayInput, RelayOutput};
 use boxcar_vmm::stdin::RawModeGuard;
@@ -124,7 +123,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         terminal_size(stdin_terminal_size()),
     );
     if mode == GuestMode::Vsock {
-        check_session(&session).map_err(anyhow::Error::msg)?;
+        session.validate()?;
     }
     if net {
         // Every relayed connection is a host socket.

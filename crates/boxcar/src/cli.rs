@@ -79,7 +79,8 @@ pub enum Command {
     /// `--console-log` and `--console-stdout`). The run exits with the
     /// session's own exit code, 128 plus the signal that killed it (137
     /// for SIGKILL), or 0 after `boxcar stop`, which asks the guest to end
-    /// the session first (SIGTERM, then SIGKILL after its timeout).
+    /// the session first (a hangup and SIGTERM, then SIGKILL after its
+    /// timeout).
     ///
     /// With `--no-vsock`, M1's console session: the session runs on the
     /// serial console, which goes to stdout (or `--console-log`), and the

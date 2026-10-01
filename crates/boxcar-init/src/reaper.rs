@@ -67,15 +67,18 @@ impl Reaper {
     /// init takes the foreground of `terminal` back, before it writes a
     /// line of its own.
     pub fn wait(&self, session: Pid, terminal: &Terminal) -> Result<Ended, Failed> {
-        self.wait_from(session, None, || terminal.take_foreground())
+        let ended = self.wait_from(session, None, false, || terminal.take_foreground())?;
+        ended.ok_or_else(|| Failed::new("waitpid", "the session was not seen to end"))
     }
 
-    /// The sweep after a session init saw end (`ended`) in its own loop
-    /// (`vsock` mode): the processes it left behind get `SIGTERM`, then
-    /// `SIGKILL`, as in [`Reaper::wait`], until none is left or init gives
-    /// up on them.
-    pub fn sweep(&self, session: Pid, ended: Ended) -> Result<Ended, Failed> {
-        self.wait_from(session, Some(ended), || {})
+    /// The sweep once init's own loop is done with the session (`vsock`
+    /// mode): the processes left get `SIGTERM`, then `SIGKILL`, as in
+    /// [`Reaper::wait`], until none is left or init gives up on them.
+    /// `ended` is how the session ended, or `None` when it outlived
+    /// `SIGKILL` (stuck in the kernel): the sweep starts all the same, and
+    /// returns how the session ended if it did meanwhile.
+    pub fn sweep(&self, session: Pid, ended: Option<Ended>) -> Result<Option<Ended>, Failed> {
+        self.wait_from(session, ended, true, || {})
     }
 
     /// The signalfd, for a poll loop of init's own; [`Reaper::drain`] it
@@ -104,13 +107,15 @@ impl Reaper {
     }
 
     /// [`Reaper::wait`] from `ended`, with `on_end` run once, as soon as the
-    /// session is seen ended.
+    /// session is seen ended. The sweep starts once the session has ended,
+    /// or at once with `sweep_now`; without it, `None` is never returned.
     fn wait_from(
         &self,
         session: Pid,
         mut ended: Option<Ended>,
+        sweep_now: bool,
         on_end: impl FnOnce(),
-    ) -> Result<Ended, Failed> {
+    ) -> Result<Option<Ended>, Failed> {
         let mut on_end = Some(on_end);
         let mut phase = Phase::Session;
         loop {
@@ -123,11 +128,15 @@ impl Reaper {
                 }
             }
             if left == Left::None {
-                return ended.ok_or_else(|| {
-                    Failed::new("waitpid", "no child is left and the session was not seen")
-                });
+                if ended.is_none() && !sweep_now {
+                    return Err(Failed::new(
+                        "waitpid",
+                        "no child is left and the session was not seen",
+                    ));
+                }
+                return Ok(ended);
             }
-            if let Some(how) = ended {
+            if ended.is_some() || sweep_now {
                 let (next, action) = phase.after_session(Instant::now());
                 phase = next;
                 match action {
@@ -135,7 +144,7 @@ impl Reaper {
                     Action::Signal(signal) => signal_all(signal),
                     Action::GiveUp => {
                         let _ = write_console(GAVE_UP);
-                        return Ok(how);
+                        return Ok(ended);
                     }
                 }
             }

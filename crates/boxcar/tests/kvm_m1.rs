@@ -454,6 +454,84 @@ fn the_last_line_reaches_stdout_through_the_relay() {
     assert!(lost.is_empty(), "lost in runs {lost:?}");
 }
 
+/// The reviewer's stdout probe as a test: stdout is a non-blocking pipe
+/// (`EAGAIN` once full) whose reader stalls a second while the session
+/// prints 300,000 bytes, then reads slowly. Every byte arrives, in order,
+/// and the run exits 0: the relay waits out `EAGAIN`, backpressure holds
+/// the session, init's drain counts from the last byte the host took, and
+/// `boxcar run` writes out what the relay holds before it exits.
+#[test]
+fn a_slow_non_blocking_stdout_gets_all_of_the_session() {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let Some(guest) = guest_or_skip("kvm_m1 slow stdout") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two descriptors into `fds`.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both are new descriptors that nothing else owns.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: fcntl with integer arguments only.
+    unsafe {
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0
+        );
+    }
+    let script = "head -c 300000 /dev/zero | tr '\\0' x; echo; echo END_OF_OUTPUT";
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .args(["--", "/bin/sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write_end))
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    let mut reader = File::from(read_end);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("{e}"),
+        }
+        thread::sleep(Duration::from_millis(5));
+        assert!(start.elapsed() < LIMIT, "no end within {LIMIT:?}");
+    }
+    let status = child.wait().unwrap();
+    let stderr = read_lossy(&scratch.path("stderr.log"));
+    let xs = got.iter().filter(|&&b| b == b'x').count();
+    eprintln!(
+        "kvm_m1 slow stdout: {status} after {:?}, {} bytes, {xs} x",
+        start.elapsed(),
+        got.len()
+    );
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(xs, 300_000, "{stderr}");
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.ends_with("x\r\nEND_OF_OUTPUT\r\n"), "{stderr}");
+}
+
 /// A loop of 200 file writes in the workspace, then `AFTER`.
 const WRITE_LOOP: [&str; 3] = [
     "/bin/sh",

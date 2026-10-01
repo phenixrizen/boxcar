@@ -65,42 +65,15 @@ const READ_CHUNK: usize = 8192;
 /// The most of a guest log line the host logs, in bytes.
 const LOG_MAX: usize = 1024;
 
-/// Whether `session` can be sent and run: a command, ids other than the
-/// all-ones one (which `setresuid` reads as "leave alone"), an absolute
-/// working directory, and a config line within the channel's limit. The
-/// error says what is wrong, as a user should see it.
-pub fn check_session(session: &SessionConfig) -> Result<(), String> {
-    if session.argv.is_empty() {
-        return Err("the session has no command".into());
-    }
-    if session.uid == u32::MAX || session.gid == u32::MAX {
-        return Err(format!(
-            "the session's uid {} and gid {}: 4294967295 is not a usable id",
-            session.uid, session.gid
-        ));
-    }
-    if !session.cwd.starts_with('/') {
-        return Err(format!(
-            "the session's working directory {:?} is not absolute",
-            session.cwd
-        ));
-    }
-    let len = encode(&HostMsg::Config(session.clone())).len() - 1;
-    if len > MAX_LINE {
-        return Err(format!(
-            "the session's config is {len} bytes, over the control channel's limit of \
-             {MAX_LINE}: the command or its environment is too long"
-        ));
-    }
-    Ok(())
-}
-
 /// Why a message was not sent.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SendError {
     /// Init is not connected, or the channel has closed.
     #[error("the guest control channel is not connected")]
     NotConnected,
+    /// The message is over the channel's 64 KiB.
+    #[error("the message is over the guest control channel's limit")]
+    TooLong,
     /// The writer has its 64 lines waiting: init is not reading.
     #[error("the guest control channel is full")]
     Full,
@@ -339,8 +312,9 @@ impl GuestCtl {
         }
         let version: String = init_version.chars().take(64).collect();
         tracing::debug!("guest control channel: init {version:?} is ready");
+        // The VMM validated the config, its size included, before it booted.
         let config = encode(&HostMsg::Config(self.session.clone()));
-        if self.queue(config).is_err() {
+        if config.map(|line| self.queue(line)).is_err() {
             boxcar_virtio::limited!(warn, "guest control channel: cannot send the config");
         }
     }
@@ -456,7 +430,18 @@ fn log_guest(level: LogLevel, msg: &str) {
     while !msg.is_char_boundary(end) {
         end -= 1;
     }
-    let msg = msg[..end].escape_debug();
+    // Control characters escaped, so a line cannot forge others.
+    let msg: String = msg[..end]
+        .chars()
+        .flat_map(|c| {
+            let escaped: Vec<char> = if c.is_control() {
+                c.escape_default().collect()
+            } else {
+                vec![c]
+            };
+            escaped
+        })
+        .collect();
     match level {
         LogLevel::Error => boxcar_virtio::limited!(error, "guest: {msg}"),
         LogLevel::Warn => boxcar_virtio::limited!(warn, "guest: {msg}"),
@@ -476,7 +461,8 @@ impl GuestCtlHandle {
     /// Queues `msg` for init without waiting; fails when init is not
     /// connected or is not reading.
     pub fn send(&self, msg: HostMsg) -> Result<(), SendError> {
-        self.ctl.queue(encode(&msg))
+        let line = encode(&msg).map_err(|_| SendError::TooLong)?;
+        self.ctl.queue(line)
     }
 
     /// Sends a ping and returns its id; the matching pong clears it (see
@@ -541,7 +527,7 @@ mod tests {
         }
 
         fn send(&mut self, msg: &GuestMsg) {
-            self.out.write_all(&encode(msg)).unwrap();
+            self.out.write_all(&encode(msg).unwrap()).unwrap();
         }
 
         fn recv(&mut self) -> HostMsg {
@@ -763,20 +749,22 @@ mod tests {
         writer.close().unwrap();
     }
 
-    /// The config line must fit the channel's limit; the CLI checks it
-    /// before a session starts.
+    /// Nothing over the channel's limit is queued.
     #[test]
-    fn a_config_over_64_kib_is_refused() {
-        assert!(check_session(&session()).is_ok());
+    fn a_message_over_64_kib_is_not_sent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(tmp.path(), SessionId::new())).unwrap();
+        let ctl = GuestCtl::new(session(), sink);
+        let _init = FakeInit::connect(&ctl);
         let mut big = session();
         big.argv.push("y".repeat(MAX_LINE));
-        let error = check_session(&big).unwrap_err();
-        assert!(error.contains("65536"), "{error}");
-        let mut empty = session();
-        empty.argv.clear();
-        assert!(check_session(&empty).is_err());
-        let mut root = session();
-        root.uid = u32::MAX;
-        assert!(check_session(&root).is_err());
+        assert!(big.validate().is_err());
+        assert_eq!(
+            ctl.handle().send(HostMsg::Config(big)),
+            Err(SendError::TooLong)
+        );
+        assert_eq!(ctl.handle().send(HostMsg::Ping { id: 1 }), Ok(()));
+        writer.close().unwrap();
     }
 }

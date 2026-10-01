@@ -95,8 +95,8 @@ impl Ops for VmmOps {
     }
 
     /// `graceful` (the default), while a session runs: init is asked to
-    /// end it, with `timeout_ms` (5000 by default) between `SIGTERM` and
-    /// `SIGKILL`, and the VM stops when the guest resets, or
+    /// end it, with `timeout_ms` (5000 by default) between `SIGHUP` and
+    /// `SIGTERM` and `SIGKILL`, and the VM stops when the guest resets, or
     /// [`GRACEFUL_STOP_MARGIN`] after that at the latest (see
     /// [`VmmHandle::request_graceful_stop`]). `force`, or no session to end:
     /// the VM stops at once. Either way the run exits 0.

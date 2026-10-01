@@ -5,11 +5,13 @@
 //! guest ports.
 //!
 //! The VMM serves its internal ports (1024 the control channel, 1025 the
-//! session's terminal) only from a guest source port below 1024, which only
-//! root may bind (`CAP_NET_BIND_SERVICE`, which init holds: the session's
-//! drop happens in its own child), so no other process in the guest can
-//! pose as init. Init binds 1023 for the control channel and 1022 for the
-//! terminal before it connects.
+//! session's terminal) only from a guest source port below 1024, which the
+//! kernel lets only a process with `CAP_NET_BIND_SERVICE` in the initial
+//! user namespace bind (`af_vsock.c` refuses ports up to 1023 with
+//! `EACCES` otherwise). Init holds it; the session has no capability at
+//! all, even as uid 0 (its drop happens in its own child), so no other
+//! process in the guest can pose as init. Init binds 1023 for the control
+//! channel and 1022 for the terminal before it connects.
 //!
 //! Through libc: nix's `socket` feature would bring a second `memoffset`
 //! into the build.

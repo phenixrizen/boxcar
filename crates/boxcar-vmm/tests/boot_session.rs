@@ -14,8 +14,21 @@
 //!   by a signal as 128 plus it (137), and the log has `session.start`
 //!   (argv, pid) and `session.exit` (code or signal);
 //! - a graceful stop through the control socket (`boxcar stop`) asks init
-//!   to end the session: `SIGTERM`, `session.exit{signal:15}`, and the VM
-//!   ends within the grace plus 3 s, exiting 0 as a requested stop.
+//!   to end the session: `SIGHUP` then `SIGTERM` to its process group, so
+//!   `sleep` dies of the hangup (`session.exit{signal:1}`) and so does an
+//!   interactive login shell, which ignores `SIGTERM`; the VM ends well
+//!   within the grace, exiting 0 as a requested stop;
+//! - the host's `resize` reaches the session (`stty size` changes, and the
+//!   session gets `SIGWINCH`), and its `signal` interrupts it (`SIGINT`:
+//!   130).
+//!
+//! What it does not prove: that an unprivileged guest process is refused at
+//! 1024 and 1025. The Alpine rootfs has no tool that speaks `AF_VSOCK`;
+//! the rule is covered by `boxcar-vsock`'s muxer tests (a request from a
+//! guest port of 1024 or more is reset and recorded `unprivileged`), and the
+//! guest kernel's part (no bind below 1024 without `CAP_NET_BIND_SERVICE`)
+//! was probed in Task 11's review and is documented on the rule
+//! (`boxcar_vsock::rules`).
 //!
 //! Skips with a printed reason unless `BOXCAR_TEST_KERNEL`,
 //! `BOXCAR_TEST_INITRAMFS` and `BOXCAR_TEST_ROOTFS` are set and `/dev/kvm`
@@ -35,12 +48,13 @@ use std::time::{Duration, Instant};
 
 use boxcar_audit::{verify_session, LogReader, WriterConfig};
 use boxcar_fs::{CachePolicyKind, FsShareConfig};
+use boxcar_proto::guest::HostMsg;
 use boxcar_proto::{Record, SessionId};
 use boxcar_vmm::guest_ctl::SessionConfig;
 use boxcar_vmm::kvm::kvm_available;
 use boxcar_vmm::lifecycle::exit_code_for;
 use boxcar_vmm::pty_relay;
-use boxcar_vmm::vmm::{ConsoleOut, ControlConfig, StopReason, VmConfig, VmExit, Vmm};
+use boxcar_vmm::vmm::{ConsoleOut, ControlConfig, StopReason, VmConfig, VmExit, Vmm, VmmHandle};
 use boxcar_vsock::VsockConfig;
 
 const TEST: &str = "boot_session";
@@ -132,14 +146,48 @@ impl Run {
     }
 }
 
+/// What runs beside the VM gets.
+struct Beside {
+    handle: VmmHandle,
+    /// The control socket.
+    control: PathBuf,
+    /// The relay's output: the session's terminal.
+    out: PathBuf,
+}
+
+impl Beside {
+    /// Waits until the session has started.
+    fn session_started(&self) -> bool {
+        let deadline = Instant::now() + LIMIT;
+        while self.handle.status().guest.session_pid.is_none() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// Waits until the session's terminal shows `text`.
+    fn shows(&self, text: &str) -> bool {
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let out = fs::read(&self.out).unwrap_or_default();
+            if String::from_utf8_lossy(&out).contains(text) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 /// Boots `argv` as the session in vsock mode, with the relay writing to
 /// `session.out` and the control socket in `state/`; `during` runs beside
-/// the VM with its handle and the control socket's path. A watchdog stops
-/// a VM that does not end within [`LIMIT`].
-fn run(
-    argv: &[&str],
-    during: impl FnOnce(boxcar_vmm::vmm::VmmHandle, PathBuf) + Send + 'static,
-) -> Option<Run> {
+/// the VM. A watchdog stops a VM that does not end within [`LIMIT`].
+fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Run> {
     let (kernel, initramfs, rootfs) = guest_or_skip(TEST)?;
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -188,13 +236,20 @@ fn run(
         }
     });
     let beside = {
-        let handle = vmm.handle();
-        thread::spawn(move || during(handle, control))
+        let beside = Beside {
+            handle: vmm.handle(),
+            control,
+            out: dir.path().join("session.out"),
+        };
+        thread::spawn(move || during(beside))
     };
     let started = Instant::now();
     let exit = vmm.run().unwrap();
     let stopped_at = Instant::now();
-    assert!(relay.wait(Duration::from_secs(2)), "the relay did not finish");
+    assert!(
+        relay.wait(Duration::from_secs(2)),
+        "the relay did not finish"
+    );
     let elapsed = started.elapsed();
     drop(done);
     watchdog.join().unwrap();
@@ -218,7 +273,7 @@ fn of_kind<'a>(records: &'a [Record], kind: &str) -> Vec<&'a Record> {
 
 #[test]
 fn the_session_exit_code_and_output_come_back() {
-    let Some(run) = run(&["/bin/sh", "-c", "echo SESSION_HI; exit 7"], |_, _| {}) else {
+    let Some(run) = run(&["/bin/sh", "-c", "echo SESSION_HI; exit 7"], |_| {}) else {
         return;
     };
     assert!(
@@ -287,7 +342,7 @@ fn the_session_exit_code_and_output_come_back() {
 
 #[test]
 fn a_session_killed_by_a_signal_exits_128_plus_it() {
-    let Some(run) = run(&["/bin/sh", "-c", "kill -9 $$"], |_, _| {}) else {
+    let Some(run) = run(&["/bin/sh", "-c", "kill -9 $$"], |_| {}) else {
         return;
     };
     assert_eq!(exit_code_for(&run.exit), 137, "{}", run.describe());
@@ -299,19 +354,11 @@ fn a_session_killed_by_a_signal_exits_128_plus_it() {
 
 /// Speaks the control protocol: waits for the session to start, asks for a
 /// graceful stop, and returns when it was asked.
-fn graceful_stop(
-    handle: boxcar_vmm::vmm::VmmHandle,
-    control: PathBuf,
-    asked: mpsc::Sender<Instant>,
-) {
-    let deadline = Instant::now() + LIMIT;
-    while handle.status().guest.session_pid.is_none() {
-        if Instant::now() > deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
+fn graceful_stop(beside: Beside, asked: mpsc::Sender<Instant>) {
+    if !beside.session_started() {
+        return;
     }
-    let stream = UnixStream::connect(&control).unwrap();
+    let stream = UnixStream::connect(&beside.control).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -329,11 +376,12 @@ fn graceful_stop(
     assert!(response.contains("\"ok\":true"), "{response}");
 }
 
+/// `sleep` dies of the hangup, the first of the two signals.
 #[test]
-fn a_graceful_stop_ends_the_session_with_sigterm() {
+fn a_graceful_stop_ends_the_session_with_a_hangup() {
     let (asked_tx, asked) = mpsc::channel();
-    let Some(run) = run(&["sleep", "100"], move |handle, control| {
-        graceful_stop(handle, control, asked_tx)
+    let Some(run) = run(&["sleep", "100"], move |beside| {
+        graceful_stop(beside, asked_tx)
     }) else {
         return;
     };
@@ -355,12 +403,94 @@ fn a_graceful_stop_ends_the_session_with_sigterm() {
     let records = run.records();
     let exit = of_kind(&records, "session.exit");
     assert_eq!(exit.len(), 1, "{}", run.describe());
-    assert_eq!(
-        exit[0].data,
-        serde_json::json!({"code": null, "signal": 15})
-    );
+    assert_eq!(exit[0].data, serde_json::json!({"code": null, "signal": 1}));
     assert_eq!(of_kind(&records, "control.stop").len(), 1);
     let stop = of_kind(&records, "vmm.stop");
     assert_eq!(stop[0].data["reason"], "stop_requested", "{stop:?}");
     assert_eq!(stop[0].data["exit_code"], 0, "{stop:?}");
+}
+
+/// The default session, an interactive login shell, ignores `SIGTERM`; the
+/// hangup ends it at once, far within the grace (it used to take the whole
+/// grace and `SIGKILL`).
+#[test]
+fn a_graceful_stop_ends_an_interactive_login_shell_at_once() {
+    let (asked_tx, asked) = mpsc::channel();
+    let Some(run) = run(&["/bin/sh", "-l"], move |beside| {
+        graceful_stop(beside, asked_tx)
+    }) else {
+        return;
+    };
+    let asked = asked.recv().expect("the stop was never asked for");
+    let took = run.stopped_at.saturating_duration_since(asked);
+    eprintln!("{TEST}: the login shell's VM stopped {took:?} after the stop was asked for");
+    assert_eq!(
+        run.exit,
+        VmExit::StopRequested(StopReason::Requested),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        took < Duration::from_secs(2),
+        "{took:?}; {}",
+        run.describe()
+    );
+    let records = run.records();
+    let exit = of_kind(&records, "session.exit");
+    assert_eq!(exit.len(), 1, "{}", run.describe());
+    let data = &exit[0].data;
+    assert!(
+        data["signal"] == 1 || data["code"].is_number(),
+        "not ended by the hangup: {data}"
+    );
+    assert_ne!(data["signal"], 9, "it took SIGKILL: {data}");
+}
+
+/// `resize` through the control channel: the PTY takes the new size, and the
+/// session gets `SIGWINCH`.
+#[test]
+fn a_resize_reaches_the_session() {
+    let script = "stty size; trap 'stty size; exit 0' WINCH; echo READY; \
+                  while :; do sleep 0.1; done";
+    let Some(run) = run(&["/bin/sh", "-c", script], |beside| {
+        if beside.shows("READY") {
+            beside
+                .handle
+                .guest_ctl()
+                .send(HostMsg::Resize {
+                    rows: 40,
+                    cols: 120,
+                })
+                .unwrap();
+        }
+    }) else {
+        return;
+    };
+    assert_eq!(exit_code_for(&run.exit), 0, "{}", run.describe());
+    let out = run.text("session.out");
+    let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+    assert_eq!(lines, ["24 80", "READY", "40 120"], "{}", run.describe());
+}
+
+/// `signal` through the control channel: `SIGINT` to the session's process
+/// group interrupts `sleep`, and the run exits 130.
+#[test]
+fn a_signal_from_the_host_interrupts_the_session() {
+    let script = "echo READY; exec sleep 100";
+    let Some(run) = run(&["/bin/sh", "-c", script], |beside| {
+        if beside.shows("READY") {
+            beside
+                .handle
+                .guest_ctl()
+                .send(HostMsg::Signal { sig: 2 })
+                .unwrap();
+        }
+    }) else {
+        return;
+    };
+    assert_eq!(exit_code_for(&run.exit), 130, "{}", run.describe());
+    let records = run.records();
+    let exit = of_kind(&records, "session.exit");
+    assert_eq!(exit.len(), 1, "{exit:?}");
+    assert_eq!(exit[0].data, serde_json::json!({"code": null, "signal": 2}));
 }

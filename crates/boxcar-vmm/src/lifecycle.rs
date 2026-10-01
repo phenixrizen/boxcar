@@ -250,6 +250,12 @@ impl StopLatch {
         !self.graceful.swap(true, Ordering::AcqRel)
     }
 
+    /// Takes back a graceful stop that could not be asked for: the caller
+    /// stops the VM at once instead.
+    pub(crate) fn cancel_graceful(&self) {
+        self.graceful.store(false, Ordering::Release);
+    }
+
     /// Whether a graceful stop is under way.
     pub(crate) fn graceful(&self) -> bool {
         self.graceful.load(Ordering::Acquire)
@@ -349,7 +355,8 @@ impl VmmHandle {
     }
 
     /// Asks the guest's init to end the session, giving it `grace_ms`
-    /// between `SIGTERM` and `SIGKILL`, when a session runs: see the module
+    /// between `SIGHUP` and `SIGTERM` and `SIGKILL`, when a session runs
+    /// (the stop is marked before init is told): see the module
     /// docs. Returns at once, with whether it did; when it did not (no
     /// session runs, or init cannot be told), the caller stops the VM with
     /// [`VmmHandle::request_stop`]. The VM is `Stopping` from here; when it
@@ -364,11 +371,14 @@ impl VmmHandle {
         if !guest.session_running() {
             return false;
         }
-        if guest.handle().send(HostMsg::Shutdown { grace_ms }).is_err() {
-            return false;
-        }
+        // Marked first: a reset that comes as soon as init has the message
+        // is the stop that was asked for, never the session's own end.
         if !self.latch.begin_graceful() {
             return true;
+        }
+        if guest.handle().send(HostMsg::Shutdown { grace_ms }).is_err() {
+            self.latch.cancel_graceful();
+            return false;
         }
         let wait = Duration::from_millis(grace_ms).saturating_add(margin);
         let latch = Arc::clone(&self.latch);
@@ -971,13 +981,13 @@ mod tests {
             guest_mono_ns: 0,
             guest_real_ns: 0,
         };
-        stream.write_all(&encode(&hello)).unwrap();
+        stream.write_all(&encode(&hello).unwrap()).unwrap();
         let mut lines = std::io::BufReader::new(stream.try_clone().unwrap());
         let mut line = Vec::new();
         lines.read_until(b'\n', &mut line).unwrap();
         assert!(matches!(decode(&line).unwrap(), HostMsg::Config(_)));
         stream
-            .write_all(&encode(&GuestMsg::SessionStarted { pid: 9 }))
+            .write_all(&encode(&GuestMsg::SessionStarted { pid: 9 }).unwrap())
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while handle.status().guest.session_pid.is_none() {

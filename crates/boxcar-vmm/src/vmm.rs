@@ -57,7 +57,7 @@ use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
 use crate::devices::{DeviceError, FsDevices, LegacyDevices, NetDevice, VsockDevice};
-use crate::guest_ctl::{check_session, GuestCtl, SessionConfig, CLOSE_DEADLINE};
+use crate::guest_ctl::{GuestCtl, SessionConfig, CLOSE_DEADLINE};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
@@ -373,6 +373,13 @@ impl Vmm {
     /// docs, and records `vmm.start`.
     pub fn new(cfg: VmConfig) -> Result<Vmm, VmmError> {
         let built = Instant::now();
+        // Before anything is built: a session init would refuse is refused
+        // here, with why, instead of ending in a reset with no report.
+        if cfg.vsock.is_some() {
+            cfg.session
+                .validate()
+                .map_err(|error| VmmError::Config(error.to_string()))?;
+        }
         if cfg.vcpus == 0 {
             return Err(VmmError::Config("a VM needs at least one vCPU".into()));
         }
@@ -424,9 +431,6 @@ impl Vmm {
                 .map_err(kvm_ioctl("register_irqfd"))?;
         }
         let set = DeviceSet::from_config(&cfg);
-        if cfg.vsock.is_some() {
-            check_session(&cfg.session).map_err(VmmError::Config)?;
-        }
         let mut mmio = Bus::new();
         let mut slots = SlotAllocator::new()?;
         let fs = FsDevices::attach(
@@ -1102,6 +1106,30 @@ mod tests {
             format!("ip={GUEST_IP}::{GATEWAY_IP}:{mask}:{HOSTNAME}:eth0:off:{GATEWAY_IP}")
         );
         assert_eq!(NET_CMDLINE[1], "boxcar.net=1");
+    }
+
+    /// A session init would refuse is refused before anything is built
+    /// (no KVM needed to see it): a hostname of 65 bytes.
+    #[test]
+    fn a_session_init_would_refuse_is_refused_before_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            tmp.path(),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let mut cfg = VmConfig::new(tmp.path().join("no-such-vmlinux"), sink);
+        cfg.vsock = Some(VsockConfig::new(tmp.path().join("state/vsock.sock")));
+        cfg.session.hostname = "x".repeat(65);
+        match Vmm::new(cfg) {
+            Err(VmmError::Config(message)) => {
+                assert!(message.starts_with("the session's hostname: "), "{message}")
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a 65-byte hostname was accepted"),
+        }
+        assert!(!tmp.path().join("state").exists());
+        writer.close().unwrap();
     }
 
     #[test]

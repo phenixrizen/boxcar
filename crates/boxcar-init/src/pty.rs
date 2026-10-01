@@ -14,8 +14,13 @@
 //! while the master takes no more, the stream is not read. When the stream
 //! is gone the session's output is read and dropped, so the session never
 //! blocks on a host that left. Once the session has ended,
-//! [`Relay::drain`] reads the master until `EIO` (no slave left open) or
-//! [`DRAIN_LIMIT`], and sends it all.
+//! [`Relay::drain`] reads the master until `EIO` (no slave left open) and
+//! sends it all, for as long as the host keeps taking bytes: it gives up
+//! only when the host has taken none for [`DRAIN_LIMIT`] ([`HostDeadline`]),
+//! so a slow host gets everything and a dead one holds init up for 2 s.
+//! The master is read for at most [`DRAIN_LIMIT`] of waiting on it alone
+//! and [`DRAIN_READ_MAX`] bytes, which bounds a process the session left
+//! behind that holds the slave and keeps writing.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -35,9 +40,15 @@ use crate::vsock::{close_output, set_nonblocking};
 /// The bytes each way may hold while the other side is not taking them.
 pub const PIPE_CAP: usize = 64 * 1024;
 
-/// How long, once the session has ended, init reads what is left on the
-/// master.
+/// How long, once the session has ended, init waits for a host that takes
+/// none of the session's last output, and for a master that has none to
+/// give and is not at its end.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(2);
+
+/// The most bytes init reads from the master once the session has ended:
+/// far more than the session can have left there (its writes wait for
+/// room), so only processes it left behind are cut short.
+pub const DRAIN_READ_MAX: usize = 1 << 20;
 
 /// A terminal's size when none is given.
 const DEFAULT_SIZE: (u16, u16) = (24, 80);
@@ -47,7 +58,8 @@ const TTY_GID: libc::gid_t = 5;
 
 /// The terminal stream's header line for a terminal of `rows` by `cols`.
 pub fn header_line(rows: u16, cols: u16) -> Vec<u8> {
-    encode(&PtyHeader::main(rows, cols))
+    // Some 45 bytes: never over the line limit.
+    encode(&PtyHeader::main(rows, cols)).unwrap_or_default()
 }
 
 /// The window size of `rows` by `cols`, or 24 by 80 when either is 0.
@@ -90,12 +102,12 @@ pub fn session_env(config: &SessionConfig) -> Vec<CString> {
     env
 }
 
-/// The `PATH` of `env`, which the command is looked for on; init's own
-/// when `env` has none.
+/// The `PATH` of `env` (the first, which is what the session sees), which
+/// the command is looked for on; init's own when `env` has none.
 pub fn search_path(env: &[CString]) -> &str {
+    // The first, as the session's `getenv("PATH")` finds it.
     let path = env
         .iter()
-        .rev()
         .find_map(|var| var.to_str().ok()?.strip_prefix("PATH="));
     match path {
         Some(path) => path,
@@ -175,6 +187,11 @@ impl Pipe {
         self.buf.is_empty()
     }
 
+    /// Bytes it holds.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Drops what it holds.
     pub fn clear(&mut self) {
         self.buf.clear();
@@ -224,6 +241,54 @@ impl Pipe {
         self.buf.drain(..sent);
         result
     }
+}
+
+/// A deadline that moves with the host: it passes `limit` after the last
+/// time the host took a byte, so a host that keeps taking them, however
+/// slowly, never meets it, and one that takes none meets it `limit` after
+/// it stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDeadline {
+    last: Instant,
+    limit: Duration,
+}
+
+impl HostDeadline {
+    /// A deadline `limit` after `now`.
+    pub fn new(now: Instant, limit: Duration) -> HostDeadline {
+        HostDeadline { last: now, limit }
+    }
+
+    /// The host took a byte at `now`.
+    pub fn progress(&mut self, now: Instant) {
+        self.last = self.last.max(now);
+    }
+
+    /// When the host last took a byte.
+    pub fn last(&self) -> Instant {
+        self.last
+    }
+
+    /// Whether it has passed at `now`.
+    pub fn passed(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last) >= self.limit
+    }
+
+    /// How long until it passes, from `now`.
+    pub fn left(&self, now: Instant) -> Duration {
+        (self.last + self.limit).saturating_duration_since(now)
+    }
+}
+
+/// How [`Relay::drain`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Drained {
+    /// Bytes of the session's output init held and could not send: the
+    /// host took none for [`DRAIN_LIMIT`], or it is gone. (What was still
+    /// on the master then is not counted.)
+    pub undelivered: usize,
+    /// When the host last took a byte.
+    pub last_progress: Instant,
 }
 
 /// The relay between the PTY's master and the terminal stream: see the
@@ -321,19 +386,25 @@ impl Relay {
         }
     }
 
-    fn read_master(&mut self) {
+    /// Reads what the master has and the stream's pipe has room for;
+    /// returns the bytes read.
+    fn read_master(&mut self) -> usize {
         if !self.wants_master_input() {
-            return;
+            return 0;
         }
-        match self.to_stream.fill_from(&mut self.master) {
-            Ok(Some(_)) => {}
+        let read = match self.to_stream.fill_from(&mut self.master) {
+            Ok(Some(n)) => n,
             // EIO: no slave is left open; anything else ends the reads too.
-            Ok(None) | Err(_) => self.master_eof = true,
-        }
+            Ok(None) | Err(_) => {
+                self.master_eof = true;
+                0
+            }
+        };
         if self.stream_broken {
             // Nowhere to go: dropped, so the session never blocks on it.
             self.to_stream.clear();
         }
+        read
     }
 
     fn write_master(&mut self) {
@@ -362,19 +433,23 @@ impl Relay {
         }
     }
 
-    fn write_stream(&mut self) {
+    /// Sends what the stream takes; returns the bytes it took.
+    fn write_stream(&mut self) -> usize {
         let Some(stream) = &mut self.stream else {
             self.to_stream.clear();
-            return;
+            return 0;
         };
         if self.stream_broken {
             self.to_stream.clear();
-            return;
+            return 0;
         }
+        let before = self.to_stream.len();
         if self.to_stream.drain_to(stream).is_err() {
             self.stream_broken = true;
             self.to_stream.clear();
+            return 0;
         }
+        before - self.to_stream.len()
     }
 
     /// Sets the terminal's size; the kernel tells the session (`SIGWINCH`).
@@ -388,28 +463,67 @@ impl Relay {
         Ok(())
     }
 
-    /// Once the session has ended: reads the master until `EIO` or
-    /// `deadline`, sending everything to the stream; returns once all of it
-    /// is sent, the stream is gone, or the deadline has passed.
-    pub fn drain(&mut self, deadline: Instant) {
+    /// Once the session has ended: reads the master until `EIO` and sends
+    /// everything to the stream, giving up only when the host has taken no
+    /// byte for `limit`; reads the master for at most `limit` of waiting
+    /// on it alone and [`DRAIN_READ_MAX`] bytes. See the module docs.
+    pub fn drain(&mut self, limit: Duration) -> Drained {
+        let mut host = HostDeadline::new(Instant::now(), limit);
+        let mut read_wait = Duration::ZERO;
+        let mut read_total = 0usize;
         loop {
-            self.read_master();
-            self.write_stream();
-            let done = self.master_eof && self.to_stream.is_empty();
-            if done || self.stream_broken {
-                return;
+            let reading = !self.master_eof && read_wait < limit && read_total < DRAIN_READ_MAX;
+            if reading {
+                read_total += self.read_master();
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return;
+            let sent = self.write_stream();
+            let now = Instant::now();
+            if sent > 0 {
+                host.progress(now);
             }
-            let (master, mut master_events) = self.master_poll();
-            master_events &= libc::POLLIN;
-            let (stream, mut stream_events) = self.stream_poll();
-            stream_events &= libc::POLLOUT;
-            let mut fds = [pollfd(master, master_events), pollfd(stream, stream_events)];
-            if poll(&mut fds, Some(left)).is_err() {
-                return;
+            let reading = !self.master_eof && read_wait < limit && read_total < DRAIN_READ_MAX;
+            if self.to_stream.is_empty() && (!reading || self.stream_broken) {
+                return Drained {
+                    undelivered: 0,
+                    last_progress: host.last(),
+                };
+            }
+            if !self.to_stream.is_empty() && host.passed(now) {
+                return Drained {
+                    undelivered: self.to_stream.len(),
+                    last_progress: host.last(),
+                };
+            }
+            let master_events = if reading && self.to_stream.room() > 0 {
+                libc::POLLIN
+            } else {
+                0
+            };
+            let stream_events = if self.to_stream.is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            };
+            // Waiting on the master alone counts against its budget;
+            // waiting on the host does not.
+            let on_master_alone = self.to_stream.is_empty();
+            let timeout = if on_master_alone {
+                limit.saturating_sub(read_wait)
+            } else {
+                host.left(now)
+            };
+            let mut fds = [
+                pollfd(self.master.as_raw_fd(), master_events),
+                pollfd(self.stream_fd(), stream_events),
+            ];
+            if poll(&mut fds, Some(timeout)).is_err() {
+                return Drained {
+                    undelivered: self.to_stream.len(),
+                    last_progress: host.last(),
+                };
+            }
+            if on_master_alone {
+                read_wait += now.elapsed();
             }
         }
     }
@@ -555,6 +669,9 @@ mod tests {
     fn the_search_path_is_the_environments() {
         let env = session_env(&config(&[("PATH", "/opt/bin:/bin")]));
         assert_eq!(search_path(&env), "/opt/bin:/bin");
+        // Two PATHs: the first, which the session's getenv finds.
+        let env = session_env(&config(&[("PATH", "/first"), ("PATH", "/second")]));
+        assert_eq!(search_path(&env), "/first");
         let env = session_env(&config(&[]));
         assert_eq!(search_path(&env), crate::session::session_path());
     }
@@ -599,7 +716,8 @@ mod tests {
         drop(pty.slave);
         let mut relay = Relay::new(pty.master, Some(OwnedFd::from(ours)));
         let started = Instant::now();
-        relay.drain(Instant::now() + Duration::from_secs(2));
+        let drained = relay.drain(DRAIN_LIMIT);
+        assert_eq!(drained.undelivered, 0);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "{:?}",
@@ -625,5 +743,117 @@ mod tests {
             .fill_from(&mut &vec![b'x'; PIPE_CAP][..])
             .unwrap();
         assert!(!relay.wants_master_input());
+    }
+
+    /// The host's deadline moves with each byte it takes.
+    #[test]
+    fn the_host_deadline_counts_from_the_last_byte_taken() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut host = HostDeadline::new(t0, Duration::from_millis(2000));
+        assert!(!host.passed(ms(1999)));
+        assert_eq!(host.left(ms(500)), Duration::from_millis(1500));
+        host.progress(ms(1500));
+        assert!(!host.passed(ms(3000)));
+        assert!(!host.passed(ms(3499)));
+        assert!(host.passed(ms(3500)));
+        assert_eq!(host.last(), ms(1500));
+        // A progress older than the last one changes nothing.
+        host.progress(ms(100));
+        assert_eq!(host.last(), ms(1500));
+        assert_eq!(host.left(ms(9000)), Duration::ZERO);
+    }
+
+    /// A small send buffer on `stream`, so that the drain is paced by the
+    /// host's reads.
+    fn small_send_buffer(stream: &UnixStream) {
+        use std::os::fd::AsRawFd;
+        let size: libc::c_int = 4096;
+        // SAFETY: setsockopt reads one int of the size given.
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+    }
+
+    /// A host that reads slowly but steadily gets everything, though the
+    /// drain takes several times its limit: the limit counts from the last
+    /// byte it took.
+    #[test]
+    fn a_slow_host_gets_all_of_the_drain() {
+        const TOTAL: usize = 96 * 1024;
+        let limit = Duration::from_millis(200);
+        let pty = nix::pty::openpty(&winsize(24, 80), None).unwrap();
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        small_send_buffer(&ours);
+        let slave = pty.slave;
+        let writer = std::thread::spawn(move || {
+            let data = vec![b'x'; TOTAL];
+            let mut sent = 0;
+            while sent < TOTAL {
+                sent += nix::unistd::write(&slave, &data[sent..]).unwrap();
+            }
+            // The session's end: no slave left.
+        });
+        // 4 KiB every 30 ms: about 0.7 s for it all, against 200 ms.
+        let reader = std::thread::spawn(move || {
+            let mut got = 0;
+            let mut buf = [0u8; 4096];
+            loop {
+                match theirs.read(&mut buf) {
+                    Ok(0) => return got,
+                    Ok(n) => got += n,
+                    Err(e) => panic!("{e}"),
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let mut relay = Relay::new(pty.master, Some(OwnedFd::from(ours)));
+        let started = Instant::now();
+        let drained = relay.drain(limit);
+        let took = started.elapsed();
+        writer.join().unwrap();
+        relay.close_stream_output();
+        drop(relay);
+        let got = reader.join().unwrap();
+        assert_eq!(drained.undelivered, 0, "after {took:?}");
+        assert!(
+            took > limit * 2,
+            "the drain was not paced by the host: {took:?}"
+        );
+        assert_eq!(got, TOTAL);
+    }
+
+    /// A host that takes nothing holds the drain up for its limit, and what
+    /// init could not send is counted.
+    #[test]
+    fn a_host_that_takes_nothing_ends_the_drain_at_its_limit() {
+        let limit = Duration::from_millis(200);
+        let pty = nix::pty::openpty(&winsize(24, 80), None).unwrap();
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        small_send_buffer(&ours);
+        let slave = pty.slave;
+        let writer = std::thread::spawn(move || {
+            let data = vec![b'x'; 64 * 1024];
+            // Blocks once the PTY and the pipe are full: fine, the master
+            // goes away under it.
+            let _ = nix::unistd::write(&slave, &data);
+            let _ = nix::unistd::write(&slave, &data);
+        });
+        let mut relay = Relay::new(pty.master, Some(OwnedFd::from(ours)));
+        let started = Instant::now();
+        let drained = relay.drain(limit);
+        let took = started.elapsed();
+        assert!(drained.undelivered > 0, "{drained:?}");
+        assert!(took >= limit, "{took:?}");
+        assert!(took < limit * 5, "{took:?}");
+        drop(relay);
+        writer.join().unwrap();
     }
 }
