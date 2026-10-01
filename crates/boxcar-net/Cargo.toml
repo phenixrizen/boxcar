@@ -13,6 +13,9 @@ boxcar-audit = { workspace = true }
 # one a second.
 boxcar-virtio = { workspace = true }
 smoltcp = { workspace = true }
+socket2 = { workspace = true }
+# getifaddrs, for the host's own addresses, and the connect errno.
+libc = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }
 

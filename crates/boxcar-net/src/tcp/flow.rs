@@ -1,0 +1,456 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The boxcar Authors
+
+//! The relay's tables: the flows it carries and the host connects under
+//! way, by id and by the guest's (source, destination) pair, each bounded.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::net::{SocketAddrV4, TcpStream};
+use std::time::{Duration, Instant};
+
+use smoltcp::iface::SocketHandle;
+
+use super::FLOW_TOKEN_BASE;
+use crate::stack::Interest;
+
+/// A flow's id: unique within a stack, counted from 1 in the order SYNs
+/// are decided. A flow's records carry it, and its host socket's
+/// [`FdChange`](crate::FdChange) token is derived from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FlowId(pub u64);
+
+impl FlowId {
+    /// The token of this flow's host socket.
+    pub fn token(self) -> u64 {
+        FLOW_TOKEN_BASE.saturating_add(self.0)
+    }
+
+    /// The flow a host socket's token is for, if it is a flow's.
+    pub fn from_token(token: u64) -> Option<FlowId> {
+        token.checked_sub(FLOW_TOKEN_BASE).map(FlowId)
+    }
+}
+
+impl fmt::Display for FlowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Where a flow is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowState {
+    /// Holding the guest's first bytes, unforwarded, until the gate
+    /// decides on the name they show.
+    Gating,
+    /// Moving bytes both ways.
+    Relaying,
+    /// Over, for this `net.close` reason (already recorded): its smoltcp
+    /// socket is sending the guest a reset, and then the flow goes.
+    Ending(&'static str),
+}
+
+/// What a gated flow must show, and by when.
+#[derive(Debug)]
+pub struct GateBuf {
+    /// The pattern of the domain rule that allowed the flow: the server
+    /// name or `Host` must match it.
+    pub pattern: String,
+    /// When a flow that has shown no name is denied.
+    pub deadline: Instant,
+    /// The guest's first bytes as last looked at. They are copied: the
+    /// smoltcp socket keeps them until the gate opens, and then they are
+    /// forwarded like any others.
+    pub seen: Vec<u8>,
+}
+
+/// A connection the guest made, carried by a host socket.
+pub struct Flow {
+    pub id: FlowId,
+    /// The guest's address and port.
+    pub guest: SocketAddrV4,
+    /// Where the guest connected to.
+    pub dst: SocketAddrV4,
+    /// The names the DNS cache gave `dst` when the SYN came.
+    pub names: Vec<String>,
+    /// The host socket; `None` once the flow is ending.
+    pub host: Option<TcpStream>,
+    pub state: FlowState,
+    /// Bytes the guest sent that went to the host.
+    pub tx: u64,
+    /// Bytes the host sent that went to the guest.
+    pub rx: u64,
+    /// When the guest's SYN was decided.
+    pub opened: Instant,
+    /// What the gate waits for, while the flow is [`FlowState::Gating`].
+    pub gate: Option<GateBuf>,
+    /// The smoltcp socket that is the guest's far end.
+    pub(crate) socket: SocketHandle,
+    /// When the last byte moved, either way.
+    pub(crate) last_active: Instant,
+    /// What the net thread watches the host socket for.
+    pub(crate) watched: Interest,
+    /// The host socket may have bytes to read: it was reported readable
+    /// and has not refused a read since.
+    pub(crate) host_readable: bool,
+    /// The host socket may take bytes: it has not refused a write since
+    /// it was last reported writable.
+    pub(crate) host_writable: bool,
+    /// The host sent its FIN (a read gave 0), which went on to the guest.
+    pub(crate) host_eof: bool,
+    /// The guest's FIN went on to the host (`shutdown(Write)`).
+    pub(crate) host_shut: bool,
+    /// The guest sent its FIN.
+    pub(crate) guest_fin: bool,
+}
+
+impl Flow {
+    /// A flow for the connect `pending` made, carried by `socket`.
+    pub(crate) fn new(
+        pending: Pending,
+        socket: SocketHandle,
+        now: Instant,
+        gate_timeout: Duration,
+    ) -> Flow {
+        let gate = pending.gate.map(|pattern| GateBuf {
+            pattern,
+            deadline: now + gate_timeout,
+            seen: Vec::new(),
+        });
+        Flow {
+            id: pending.id,
+            guest: pending.guest,
+            dst: pending.dst,
+            names: pending.names,
+            host: Some(pending.host),
+            state: if gate.is_some() {
+                FlowState::Gating
+            } else {
+                FlowState::Relaying
+            },
+            tx: 0,
+            rx: 0,
+            opened: pending.opened,
+            gate,
+            socket,
+            last_active: now,
+            watched: pending.watched,
+            host_readable: true,
+            host_writable: true,
+            host_eof: false,
+            host_shut: false,
+            guest_fin: false,
+        }
+    }
+
+    pub(crate) fn ending(&self) -> bool {
+        matches!(self.state, FlowState::Ending(_))
+    }
+}
+
+impl fmt::Debug for Flow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Flow")
+            .field("id", &self.id)
+            .field("guest", &self.guest)
+            .field("dst", &self.dst)
+            .field("state", &self.state)
+            .field("tx", &self.tx)
+            .field("rx", &self.rx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A guest SYN waiting on its host connect.
+pub struct Pending {
+    pub id: FlowId,
+    pub guest: SocketAddrV4,
+    pub dst: SocketAddrV4,
+    pub names: Vec<String>,
+    /// The host socket, connecting.
+    pub host: TcpStream,
+    /// The guest's SYN frame, fed to smoltcp when the connect succeeds and
+    /// answered with a reset when it fails.
+    pub syn: Vec<u8>,
+    /// When the SYN was decided.
+    pub opened: Instant,
+    /// The pattern of the domain rule that allowed it, if one did: the
+    /// flow will be gated on it.
+    pub gate: Option<String>,
+    /// What the net thread watches the host socket for.
+    pub(crate) watched: Interest,
+}
+
+impl fmt::Debug for Pending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pending")
+            .field("id", &self.id)
+            .field("guest", &self.guest)
+            .field("dst", &self.dst)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The flows and the connects under way, each table bounded, with the
+/// guest's (source, destination) pairs they hold.
+#[derive(Debug)]
+pub struct FlowTable {
+    flows: HashMap<FlowId, Flow>,
+    pending: BTreeMap<FlowId, Pending>,
+    by_pair: HashMap<(SocketAddrV4, SocketAddrV4), FlowId>,
+    flow_cap: usize,
+    pending_cap: usize,
+}
+
+impl FlowTable {
+    /// Tables of at most `flow_cap` flows and `pending_cap` connects.
+    pub fn new(flow_cap: usize, pending_cap: usize) -> FlowTable {
+        FlowTable {
+            flows: HashMap::new(),
+            pending: BTreeMap::new(),
+            by_pair: HashMap::new(),
+            flow_cap,
+            pending_cap,
+        }
+    }
+
+    /// Flows held, ending ones included.
+    pub fn len(&self) -> usize {
+        self.flows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.flows.is_empty()
+    }
+
+    /// Connects under way.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether a flow or a connect holds the guest's `guest` → `dst`.
+    pub fn knows(&self, guest: SocketAddrV4, dst: SocketAddrV4) -> bool {
+        self.by_pair.contains_key(&(guest, dst))
+    }
+
+    /// Whether a new flow needs another evicted first.
+    pub fn is_full(&self) -> bool {
+        self.flows.len() >= self.flow_cap
+    }
+
+    /// Whether a new connect must wait.
+    pub fn pending_full(&self) -> bool {
+        self.pending.len() >= self.pending_cap
+    }
+
+    /// Holds a connect, or gives it back if the table is full.
+    pub fn add_pending(&mut self, pending: Pending) -> Result<(), Pending> {
+        if self.pending_full() {
+            return Err(pending);
+        }
+        self.by_pair
+            .insert((pending.guest, pending.dst), pending.id);
+        self.pending.insert(pending.id, pending);
+        Ok(())
+    }
+
+    pub fn pending(&self, id: FlowId) -> Option<&Pending> {
+        self.pending.get(&id)
+    }
+
+    /// Takes a connect out, forgetting its pair.
+    pub fn take_pending(&mut self, id: FlowId) -> Option<Pending> {
+        let pending = self.pending.remove(&id)?;
+        self.by_pair.remove(&(pending.guest, pending.dst));
+        Some(pending)
+    }
+
+    /// The connects started `timeout` or longer before `now`, oldest first.
+    pub fn timed_out(&self, now: Instant, timeout: Duration) -> Vec<FlowId> {
+        self.pending
+            .values()
+            .filter(|p| now.saturating_duration_since(p.opened) >= timeout)
+            .map(|p| p.id)
+            .collect()
+    }
+
+    /// When the next connect times out, if one is under way.
+    pub fn next_timeout(&self, timeout: Duration) -> Option<Instant> {
+        self.pending
+            .values()
+            .filter_map(|p| p.opened.checked_add(timeout))
+            .min()
+    }
+
+    /// Holds a flow, or gives it back if the table is full: evict one
+    /// first.
+    pub fn insert(&mut self, flow: Flow) -> Result<(), Box<Flow>> {
+        if self.is_full() {
+            return Err(Box::new(flow));
+        }
+        self.by_pair.insert((flow.guest, flow.dst), flow.id);
+        self.flows.insert(flow.id, flow);
+        Ok(())
+    }
+
+    pub fn get(&self, id: FlowId) -> Option<&Flow> {
+        self.flows.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: FlowId) -> Option<&mut Flow> {
+        self.flows.get_mut(&id)
+    }
+
+    /// Takes a flow out, forgetting its pair.
+    pub fn remove(&mut self, id: FlowId) -> Option<Flow> {
+        let flow = self.flows.remove(&id)?;
+        self.by_pair.remove(&(flow.guest, flow.dst));
+        Some(flow)
+    }
+
+    /// Every flow.
+    pub fn flows_mut(&mut self) -> impl Iterator<Item = &mut Flow> {
+        self.flows.values_mut()
+    }
+
+    /// The flow to evict for a new one: one already ending if there is
+    /// one, else the one whose last byte moved longest ago (the oldest of
+    /// those that tie).
+    pub fn victim(&self) -> Option<FlowId> {
+        self.flows
+            .values()
+            .min_by_key(|flow| (!flow.ending(), flow.last_active, flow.id))
+            .map(|flow| flow.id)
+    }
+
+    /// Takes everything out, in id order: the connects, then the flows.
+    pub fn drain(&mut self) -> (Vec<Pending>, Vec<Flow>) {
+        self.by_pair.clear();
+        let pending = std::mem::take(&mut self.pending).into_values().collect();
+        let mut flows: Vec<Flow> = self.flows.drain().map(|(_, flow)| flow).collect();
+        flows.sort_by_key(|flow| flow.id);
+        (pending, flows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpListener};
+
+    fn addr(port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), port)
+    }
+
+    fn far() -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443)
+    }
+
+    /// A connected loopback stream, to stand for a host socket.
+    fn stream() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        TcpStream::connect(listener.local_addr().unwrap()).unwrap()
+    }
+
+    fn pending(id: u64, port: u16, opened: Instant) -> Pending {
+        Pending {
+            id: FlowId(id),
+            guest: addr(port),
+            dst: far(),
+            names: Vec::new(),
+            host: stream(),
+            syn: Vec::new(),
+            opened,
+            gate: None,
+            watched: Interest::default(),
+        }
+    }
+
+    fn flow(id: u64, port: u16, last_active: Instant) -> Flow {
+        let mut flow = Flow::new(
+            pending(id, port, last_active),
+            SocketHandle::default(),
+            last_active,
+            Duration::from_secs(5),
+        );
+        flow.host = None;
+        flow
+    }
+
+    #[test]
+    fn tokens_map_to_flows() {
+        assert_eq!(FlowId(1).token(), (1 << 32) + 1);
+        assert_eq!(FlowId::from_token((1 << 32) + 7), Some(FlowId(7)));
+        assert_eq!(FlowId::from_token(1), None, "the DNS socket's");
+        assert_eq!(FlowId(u64::MAX).token(), u64::MAX);
+    }
+
+    #[test]
+    fn both_tables_are_bounded_and_know_their_pairs() {
+        let now = Instant::now();
+        let mut table = FlowTable::new(2, 2);
+        table.add_pending(pending(1, 1, now)).unwrap();
+        table.add_pending(pending(2, 2, now)).unwrap();
+        assert!(table.pending_full());
+        let refused = table.add_pending(pending(3, 3, now)).unwrap_err();
+        assert_eq!(refused.id, FlowId(3));
+        assert!(table.knows(addr(1), far()) && table.knows(addr(2), far()));
+        assert!(!table.knows(addr(3), far()));
+        assert!(!table.knows(addr(1), SocketAddrV4::new(*far().ip(), 80)));
+
+        let first = table.take_pending(FlowId(1)).unwrap();
+        assert!(!table.knows(addr(1), far()), "forgotten while it moves");
+        table
+            .insert(Flow::new(
+                first,
+                SocketHandle::default(),
+                now,
+                Duration::ZERO,
+            ))
+            .unwrap();
+        assert!(table.knows(addr(1), far()));
+        table.insert(flow(4, 4, now)).unwrap();
+        assert!(table.is_full());
+        assert!(table.insert(flow(5, 5, now)).is_err());
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.pending_len(), 1);
+
+        table.remove(FlowId(4)).unwrap();
+        assert!(!table.knows(addr(4), far()));
+        let (pending, flows) = table.drain();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(flows.len(), 1);
+        assert!(!table.knows(addr(1), far()) && !table.knows(addr(2), far()));
+    }
+
+    #[test]
+    fn the_victim_is_an_ending_flow_or_the_idlest() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut table = FlowTable::new(8, 8);
+        assert_eq!(table.victim(), None);
+        table.insert(flow(1, 1, at(30))).unwrap();
+        table.insert(flow(2, 2, at(10))).unwrap();
+        table.insert(flow(3, 3, at(10))).unwrap();
+        table.insert(flow(4, 4, at(20))).unwrap();
+        assert_eq!(table.victim(), Some(FlowId(2)), "idlest, then oldest");
+        table.get_mut(FlowId(1)).unwrap().state = FlowState::Ending("gate");
+        assert_eq!(table.victim(), Some(FlowId(1)), "an ending flow first");
+    }
+
+    #[test]
+    fn connects_time_out_in_order() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut table = FlowTable::new(8, 8);
+        let timeout = Duration::from_secs(10);
+        assert_eq!(table.next_timeout(timeout), None);
+        table.add_pending(pending(1, 1, at(0))).unwrap();
+        table.add_pending(pending(2, 2, at(3))).unwrap();
+        assert_eq!(table.next_timeout(timeout), Some(at(10)));
+        assert!(table.timed_out(at(9), timeout).is_empty());
+        assert_eq!(table.timed_out(at(10), timeout), [FlowId(1)]);
+        assert_eq!(table.timed_out(at(13), timeout), [FlowId(1), FlowId(2)]);
+    }
+}

@@ -23,6 +23,18 @@ pub fn emit(sink: &AuditSink, payload: Payload) -> Result<(), EmitError> {
     sink.emit(submission(payload))
 }
 
+/// Records an event that must not be dropped, waiting for room in the
+/// log. A log that is closed (the session is ending) or has failed (the
+/// VMM stops on that) records nothing more.
+pub(crate) fn record(sink: &AuditSink, payload: Payload) {
+    match emit(sink, payload) {
+        Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
+        Err(error @ EmitError::Checkpoint) => {
+            boxcar_virtio::limited!(error, "net: audit record refused: {error}");
+        }
+    }
+}
+
 /// Records `payload` if the log's channel has room, and says whether it
 /// did. The log counts what it drops and reports the count at its next
 /// checkpoint.
@@ -63,13 +75,16 @@ pub enum DropReason {
     UdpUnimplemented,
     /// A queue between the guest and the stack was full.
     QueueFull,
+    /// A guest SYN the policy allowed while the most host connects were
+    /// under way: the guest sends it again, and it is decided then.
+    TcpPendingFull,
     /// Anything else: an unknown protocol, or a malformed frame.
     Other,
 }
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 8] = [
+    pub const ALL: [DropReason; 9] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
@@ -77,6 +92,7 @@ impl DropReason {
         DropReason::DnsBogus,
         DropReason::UdpUnimplemented,
         DropReason::QueueFull,
+        DropReason::TcpPendingFull,
         DropReason::Other,
     ];
 
@@ -90,6 +106,7 @@ impl DropReason {
             DropReason::DnsBogus => "dns_bogus",
             DropReason::UdpUnimplemented => "udp_unimplemented",
             DropReason::QueueFull => "queue_full",
+            DropReason::TcpPendingFull => "tcp_pending_full",
             DropReason::Other => "other",
         }
     }
@@ -302,6 +319,7 @@ mod tests {
                 "dns_bogus",
                 "udp_unimplemented",
                 "queue_full",
+                "tcp_pending_full",
                 "other"
             ]
         );

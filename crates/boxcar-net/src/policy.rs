@@ -309,18 +309,44 @@ impl Policy {
     /// holds the address, either only on its port if it has one; then the
     /// default.
     pub fn egress(&self, dst: SocketAddrV4, names: &[String]) -> (Verdict, Option<String>) {
+        match self.decide(dst, names) {
+            Decided::Builtin(builtin) => (Verdict::Deny, Some(builtin.to_owned())),
+            Decided::Rule(rule) => (rule.verdict, Some(rule.text.clone())),
+            Decided::Default => (self.default, None),
+        }
+    }
+
+    /// The rule that decides [`egress`](Self::egress) for `dst` and
+    /// `names`, or `None` when a built-in denial or the default does. The
+    /// TCP relay gates a flow a domain rule allowed on the name its first
+    /// bytes ask for, which must match that rule.
+    pub fn egress_rule(&self, dst: SocketAddrV4, names: &[String]) -> Option<&Rule> {
+        match self.decide(dst, names) {
+            Decided::Rule(rule) => Some(rule),
+            Decided::Builtin(_) | Decided::Default => None,
+        }
+    }
+
+    /// Whether an `allow` rule names exactly `net` (the same address and
+    /// prefix) on `port`: on that port, or on every port. This is what
+    /// lifts a built-in denial that rules may lift.
+    pub fn allows_exactly(&self, net: Ipv4Net, port: u16) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.verdict == Verdict::Allow
+                && matches!(rule.target, Target::Cidr { net: named, port: on }
+                    if named == net && on_port(on, port))
+        })
+    }
+
+    /// What decides [`egress`](Self::egress), in its order.
+    fn decide(&self, dst: SocketAddrV4, names: &[String]) -> Decided<'_> {
         let (ip, port) = (*dst.ip(), dst.port());
         if let Some(builtin) = never_reachable(ip) {
-            return (Verdict::Deny, Some(builtin.to_owned()));
+            return Decided::Builtin(builtin);
         }
         if let Some(range) = PRIVATE_RANGES.iter().find(|range| range.contains(ip)) {
-            let lifted = self.rules.iter().any(|rule| {
-                rule.verdict == Verdict::Allow
-                    && matches!(rule.target, Target::Cidr { net, port: on }
-                        if net == *range && on_port(on, port))
-            });
-            if !lifted {
-                return (Verdict::Deny, Some(BUILTIN_PRIVATE.to_owned()));
+            if !self.allows_exactly(*range, port) {
+                return Decided::Builtin(BUILTIN_PRIVATE);
             }
         }
         let decided = self.rules.iter().find(|rule| match &rule.target {
@@ -329,10 +355,7 @@ impl Policy {
             }
             Target::Cidr { net, port: on } => on_port(*on, port) && net.contains(ip),
         });
-        match decided {
-            Some(rule) => (rule.verdict, Some(rule.text.clone())),
-            None => (self.default, None),
-        }
+        decided.map_or(Decided::Default, Decided::Rule)
     }
 
     /// The verdict on resolving `qname`: a denied name gets NXDOMAIN.
@@ -364,6 +387,14 @@ impl Policy {
     }
 }
 
+/// What decided a connection's verdict.
+enum Decided<'a> {
+    /// A built-in denial, by its rule text.
+    Builtin(&'static str),
+    Rule(&'a Rule),
+    Default,
+}
+
 /// The built-in rule text for an address no rule may open: on the guest's
 /// own network, in "this network", or multicast or reserved.
 fn never_reachable(ip: Ipv4Addr) -> Option<&'static str> {
@@ -385,8 +416,10 @@ fn on_port(on: Option<u16>, port: u16) -> bool {
 
 /// Whether `name` matches a domain pattern: the name itself, or for
 /// `*.suffix` any name under the suffix but not the suffix itself. Case
-/// and one trailing dot on `name` do not matter.
-fn name_matches(pattern: &str, name: &str) -> bool {
+/// and one trailing dot on `name` do not matter. Domain rules match names
+/// this way for [`Policy::egress`] and [`Policy::dns`], and the TCP
+/// relay's gate matches a flow's server name or `Host` with it.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name);
     let Some(suffix) = pattern.strip_prefix("*.") else {
         return name.eq_ignore_ascii_case(pattern);
@@ -1039,5 +1072,57 @@ mod tests {
                 "169.254.0.0/16"
             ]
         );
+    }
+
+    #[test]
+    fn egress_rule_is_the_rule_that_decided() {
+        let p = parse(&[
+            "deny evil.example",
+            "allow example.com:443",
+            "allow 127.0.0.0/8",
+            "allow 203.0.113.0/24",
+            "default allow",
+        ]);
+        let named = names(&["example.com"]);
+        let rule = p.egress_rule(at([93, 184, 215, 14], 443), &named).unwrap();
+        assert_eq!(rule.text, "allow example.com:443");
+        assert!(matches!(rule.target, Target::Domain { .. }));
+        // The same address on another port: the default decides.
+        assert!(p.egress_rule(at([93, 184, 215, 14], 80), &named).is_none());
+        // A deny decides too.
+        let rule = p
+            .egress_rule(at([1, 2, 3, 4], 80), &names(&["evil.example"]))
+            .unwrap();
+        assert_eq!(rule.verdict, Verdict::Deny);
+        // A network rule.
+        let rule = p.egress_rule(at([203, 0, 113, 9], 22), &[]).unwrap();
+        assert_eq!(rule.text, "allow 203.0.113.0/24");
+        // Built-in denials are no rule's.
+        assert!(p.egress_rule(at([10, 0, 2, 2], 53), &named).is_none());
+        assert!(p.egress_rule(at([192, 168, 1, 1], 80), &named).is_none());
+        // The lift is not the decision: the first matching rule is.
+        let rule = p.egress_rule(at([127, 0, 0, 1], 80), &named).unwrap();
+        assert_eq!(rule.text, "allow 127.0.0.0/8");
+    }
+
+    #[test]
+    fn allows_exactly_needs_the_same_network_and_port() {
+        let p = parse(&[
+            "allow 192.0.2.7:443",
+            "allow 198.51.100.7",
+            "allow 10.0.0.0/8",
+            "deny 203.0.113.7",
+        ]);
+        let host = |ip: [u8; 4]| Ipv4Net::masked(Ipv4Addr::from(ip), 32);
+        assert!(p.allows_exactly(host([192, 0, 2, 7]), 443));
+        assert!(!p.allows_exactly(host([192, 0, 2, 7]), 80), "another port");
+        assert!(p.allows_exactly(host([198, 51, 100, 7]), 1));
+        assert!(p.allows_exactly(host([198, 51, 100, 7]), 65_535));
+        assert!(
+            !p.allows_exactly(host([10, 1, 2, 3]), 80),
+            "inside, not exact"
+        );
+        assert!(p.allows_exactly(Ipv4Net::masked(Ipv4Addr::new(10, 0, 0, 0), 8), 80));
+        assert!(!p.allows_exactly(host([203, 0, 113, 7]), 80), "a deny");
     }
 }

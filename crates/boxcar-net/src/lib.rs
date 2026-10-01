@@ -17,14 +17,18 @@
 //! - [`dns`]: the gateway's DNS, forwarded to the host's resolver, and the
 //!   names each answer gave its addresses.
 //! - [`policy`]: what the guest may reach and resolve.
-//! - [`stack`]: the queues, smoltcp's interface (which takes TCP), and the
-//!   counted drops.
+//! - [`tcp`]: the TCP relay, which decides each connection before
+//!   answering it, carries it over a host socket, and gates the ones a
+//!   domain rule allowed on the name they ask for ([`sni`],
+//!   [`http_host`]); [`upstream`]: its host connects, and the host's own
+//!   addresses, which the guest may not reach.
+//! - [`stack`]: the queues, smoltcp's interface (the far end of the
+//!   relayed connections), and the counted drops.
 //! - [`audit`]: the `net.*` records.
-//! - [`config`]: the addressing and the DNS upstreams.
+//! - [`config`]: the addressing, the DNS upstreams, and the relay's bounds.
 //!
 //! IPv6 is dropped. UDP other than DHCP and DNS is dropped and counted
-//! until its relay lands; TCP reaches smoltcp, which has no sockets yet and
-//! resets every connection.
+//! until its relay lands.
 
 pub mod arp;
 pub mod audit;
@@ -32,12 +36,17 @@ pub mod config;
 pub mod dhcp;
 pub mod dns;
 pub mod frame;
+pub mod http_host;
 pub mod icmp;
 pub mod policy;
+pub mod sni;
 pub mod stack;
+pub mod tcp;
+pub mod upstream;
 
 pub use audit::DropReason;
 pub use config::{ConfigError, NetConfig};
 pub use frame::Dispatch;
 pub use policy::{Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};
+pub use tcp::{TcpLimits, FLOW_TOKEN_BASE};

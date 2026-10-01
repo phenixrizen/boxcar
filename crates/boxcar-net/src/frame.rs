@@ -17,8 +17,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr,
-    Icmpv4Packet, IpProtocol, Ipv4Packet, Ipv4Repr, TcpPacket, UdpPacket, UdpRepr,
-    DHCP_SERVER_PORT,
+    Icmpv4Packet, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    UdpPacket, UdpRepr, DHCP_SERVER_PORT,
 };
 
 /// The DNS port.
@@ -180,6 +180,64 @@ pub(crate) fn udp_frame(
             &(*dst.ip()).into(),
             payload.len(),
             |body| body.copy_from_slice(payload),
+            &ChecksumCapabilities::default(),
+        )
+    }))
+}
+
+/// The RST+ACK that refuses a guest's TCP segment `segment` (a SYN, for
+/// the relay): from the address and port it was sent to, with the
+/// sequence number of its acknowledgement (zero, for a SYN, which has
+/// none) and acknowledging all it occupied, and a zero window (RFC 9293
+/// §3.10.7.1). `None` for a frame that is not an IPv4 TCP segment.
+pub(crate) fn tcp_reset(
+    segment: &[u8],
+    eth_src: EthernetAddress,
+    eth_dst: EthernetAddress,
+) -> Option<Vec<u8>> {
+    let eth = EthernetFrame::new_checked(segment).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let packet = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if packet.next_header() != IpProtocol::Tcp {
+        return None;
+    }
+    let (src, dst) = (packet.src_addr(), packet.dst_addr());
+    let tcp = TcpPacket::new_checked(packet.payload()).ok()?;
+    let seq_number = if tcp.ack() {
+        tcp.ack_number()
+    } else {
+        TcpSeqNumber(0)
+    };
+    // A segment fits a 16-bit IPv4 length, so this always converts.
+    let occupied = i32::try_from(tcp.segment_len()).ok()?;
+    let reply = TcpRepr {
+        src_port: tcp.dst_port(),
+        dst_port: tcp.src_port(),
+        control: TcpControl::Rst,
+        seq_number,
+        ack_number: Some(TcpSeqNumber(tcp.seq_number().0.wrapping_add(occupied))),
+        window_len: 0,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let ip = Ipv4Repr {
+        src_addr: dst,
+        dst_addr: src,
+        next_header: IpProtocol::Tcp,
+        payload_len: reply.buffer_len(),
+        hop_limit: TTL,
+    };
+    Some(ipv4_frame(eth_src, eth_dst, &ip, |datagram| {
+        reply.emit(
+            &mut TcpPacket::new_unchecked(datagram),
+            &dst.into(),
+            &src.into(),
             &ChecksumCapabilities::default(),
         )
     }))

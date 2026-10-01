@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! The guest network's addressing and the DNS upstreams the stack is built
-//! with. The egress policy is in [`policy`](crate::policy).
+//! The guest network's addressing, the DNS upstreams, and the TCP relay's
+//! bounds the stack is built with. The egress policy is in
+//! [`policy`](crate::policy).
 //!
 //! The addressing is fixed: the guest is `10.0.2.15/24` at
 //! `02:62:6f:78:00:01`, and `10.0.2.2` at `02:62:6f:78:00:02` is its
@@ -11,6 +12,8 @@
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use crate::tcp::TcpLimits;
 
 /// The guest's address.
 pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -44,6 +47,8 @@ pub struct NetConfig {
     pub hostname: String,
     /// Where guest DNS queries are forwarded, in order of preference.
     pub dns_upstreams: Vec<SocketAddr>,
+    /// The TCP relay's bounds.
+    pub tcp: TcpLimits,
 }
 
 /// The fixed addressing, with [`FALLBACK_DNS`] as the only upstream.
@@ -58,6 +63,7 @@ impl Default for NetConfig {
             gateway_mac: GATEWAY_MAC,
             hostname: HOSTNAME.to_owned(),
             dns_upstreams: vec![FALLBACK_DNS],
+            tcp: TcpLimits::default(),
         }
     }
 }
@@ -139,6 +145,7 @@ impl NetConfig {
         if self.dns_upstreams.is_empty() {
             return Err(ConfigError::NoDnsUpstream);
         }
+        self.tcp.check().map_err(ConfigError::TcpLimits)?;
         Ok(())
     }
 }
@@ -170,6 +177,8 @@ pub enum ConfigError {
     NoDnsUpstream,
     #[error("no DNS upstream could be given a socket: {0}")]
     DnsUpstream(String),
+    #[error("{0}")]
+    TcpLimits(&'static str),
 }
 
 fn mac_text(mac: [u8; 6]) -> String {
@@ -282,6 +291,10 @@ mod tests {
             with(|c| c.dns_upstreams.clear()),
             Err(ConfigError::NoDnsUpstream)
         );
+        assert!(matches!(
+            with(|c| c.tcp.flow_cap = 0),
+            Err(ConfigError::TcpLimits(_))
+        ));
         for bad in ["", "box car", "boxcar.local", &"x".repeat(64)] {
             let cfg = NetConfig {
                 hostname: bad.to_owned(),

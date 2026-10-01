@@ -6,16 +6,24 @@
 //!
 //! Every guest frame goes through the dispatcher first ([`classify`]):
 //! ARP, DHCP and ICMP are answered here, deterministically, DNS to the
-//! gateway goes to the [forwarder](crate::dns), and what is not carried is
-//! dropped and counted. Only TCP, and what smoltcp must learn from ARP,
-//! reaches smoltcp. smoltcp's interface owns the gateway's MAC and address,
-//! with any-IP on and a default route through itself, so it takes TCP for
-//! every destination.
+//! gateway goes to the [forwarder](crate::dns), a TCP SYN to the
+//! [relay](crate::tcp), which decides it before anything answers it, and
+//! what is not carried is dropped and counted. Only the rest of TCP, and
+//! what smoltcp must learn from ARP, reaches smoltcp. smoltcp's interface
+//! owns the gateway's MAC and address, with any-IP on and a default route
+//! through itself, so its sockets can be any destination; the relay makes
+//! one for each connection it lets through.
 //!
-//! The forwarder's upstream socket is the one host fd the stack has so
-//! far: the first [`poll`](NetStack::poll) asks the net thread to watch it
-//! (token [`DNS_TOKEN`]), and [`on_host_fd_event`](NetStack::on_host_fd_event)
-//! reads the answers.
+//! The stack's host fds are the forwarder's upstream socket (token
+//! [`DNS_TOKEN`], asked for by the first [`poll`](NetStack::poll)) and one
+//! socket for each relayed connection (tokens from
+//! [`FLOW_TOKEN_BASE`](crate::FLOW_TOKEN_BASE)). The stack asks the net
+//! thread to start, change and stop watching them through the
+//! [`FdChange`]s each poll returns, and
+//! [`on_host_fd_event`](NetStack::on_host_fd_event) handles their
+//! readiness; the net thread polls again after handing events over. An fd
+//! the stack is done with stays open until the poll after the one whose
+//! outcome asked for it to be unwatched.
 //!
 //! Frames move through two queues, each holding at most [`QUEUE_CAP`]:
 //! guest to stack, which smoltcp reads at the next
@@ -35,7 +43,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use boxcar_audit::{AuditSink, EmitError};
+use boxcar_audit::AuditSink;
 use boxcar_proto::{NetDns, Payload};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
@@ -49,6 +57,8 @@ use crate::dns::forwarder::{self, ForwardError, Forwarder, Pending, Received};
 use crate::dns::{self as dns, parse};
 use crate::frame::{self, classify, Dispatch, DNS_PORT};
 use crate::policy::{Policy, Verdict};
+use crate::tcp::relay::{Ctx, Relay};
+use crate::upstream::HostAddrs;
 use crate::{arp, dhcp, icmp};
 
 /// The link's IP MTU, the guest's default for virtio-net.
@@ -101,6 +111,8 @@ pub struct NetStack {
     dns_cache: DnsCache,
     /// Whether the net thread has been asked to watch the DNS socket.
     dns_watched: bool,
+    /// The TCP relay: the guest's connections and their host sockets.
+    tcp: Relay,
     /// smoltcp's time zero.
     epoch: Instant,
 }
@@ -142,6 +154,7 @@ impl NetStack {
             .add_default_ipv4_route(cfg.gateway)
             .map_err(|_| ConfigError::Interface("the default route"))?;
         iface.set_any_ip(true);
+        let tcp = Relay::new(cfg.tcp.clone(), HostAddrs::system());
         Ok(NetStack {
             cfg,
             sink,
@@ -153,6 +166,7 @@ impl NetStack {
             dns,
             dns_cache: DnsCache::new(),
             dns_watched: false,
+            tcp,
             epoch,
         })
     }
@@ -168,6 +182,19 @@ impl NetStack {
     /// for comes before the CNAMEs that led to the address.
     pub fn dns_names(&self, ip: Ipv4Addr) -> Vec<String> {
         self.dns_cache.names_for(ip)
+    }
+
+    /// Replaces where the stack reads the host's own addresses, which the
+    /// guest may not reach unless a rule names one exactly (by default,
+    /// [`HostAddrs::system`]).
+    pub fn set_host_addrs(&mut self, addrs: HostAddrs) {
+        self.tcp.set_host_addrs(addrs);
+    }
+
+    /// The TCP connections the stack holds: those relayed or ending, and
+    /// those waiting on their host connect.
+    pub fn open_flows(&self) -> usize {
+        self.tcp.open_flows()
     }
 
     /// Takes one Ethernet frame the guest sent.
@@ -203,11 +230,9 @@ impl NetStack {
                 }
                 None => self.drop_frame(DropReason::Icmp, now),
             },
-            // smoltcp has no sockets yet, so it resets every connection;
-            // the relay and its policy gate (M2 Task 7) come in front.
-            Dispatch::TcpSyn { .. } | Dispatch::Tcp { .. } => {
-                self.send_to_smoltcp(frame.to_vec(), now)
-            }
+            Dispatch::TcpSyn { src, dst } => self.tcp_syn(frame, src, dst, now),
+            // Segments of the relay's connections; smoltcp resets any other.
+            Dispatch::Tcp { .. } => self.send_to_smoltcp(frame.to_vec(), now),
             Dispatch::Ipv6 => self.drop_frame(DropReason::Ipv6, now),
             Dispatch::Other => self.drop_frame(DropReason::Other, now),
         }
@@ -218,23 +243,36 @@ impl NetStack {
         self.pipe.to_guest.pop_front()
     }
 
-    /// Lets smoltcp take the frames queued for it and send what it has, and
-    /// records the dropped-frame counts that have fallen due. `now` must
-    /// come from the same clock as [`Instant::now`].
+    /// Lets smoltcp take the frames queued for it, moves the relayed
+    /// connections' bytes, sends what all that queued, and records the
+    /// dropped-frame counts that have fallen due. `now` must come from the
+    /// same clock as [`Instant::now`].
     ///
     /// smoltcp takes nothing while the guest's queue is full: what waits for
     /// it is taken at the first poll after the guest has drained some, so
-    /// the device polls again once it has popped frames.
+    /// the device polls again once it has popped frames. The net thread
+    /// also polls after handing host fd events over.
     ///
-    /// DNS queries whose time is up get SERVFAIL here, so `next_deadline`
-    /// counts the next of those too. The first poll asks for the DNS
-    /// socket to be watched.
+    /// DNS queries whose time is up get SERVFAIL here, host connects whose
+    /// time is up reset the guest, and gated connections whose time is up
+    /// are denied, so `next_deadline` counts the next of each too. The
+    /// first poll asks for the DNS socket to be watched. Host sockets the
+    /// last outcome asked to be unwatched are closed first.
     pub fn poll(&mut self, now: Instant) -> PollOutcome {
+        self.tcp.bury();
         for pending in self.dns.expire(now) {
             self.refuse(pending, dns::SERVFAIL, now);
         }
-        let stamp = self.smoltcp_time(now);
+        let stamp = smoltcp_time(self.epoch, now);
+        {
+            let (tcp, mut cx) = self.split(now);
+            tcp.expire(&mut cx);
+        }
         self.iface.poll(stamp, &mut self.pipe, &mut self.sockets);
+        {
+            let (tcp, mut cx) = self.split(now);
+            tcp.relay(&mut cx);
+        }
         let refused = std::mem::take(&mut self.pipe.refused);
         if let Some(counted) = self.drops.count_many(DropReason::QueueFull, refused, now) {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
@@ -242,14 +280,6 @@ impl NetStack {
         for counted in self.drops.flush(now) {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
         }
-        let smoltcp_due = self
-            .iface
-            .poll_delay(stamp, &self.sockets)
-            .and_then(|delay| now.checked_add(delay.into()));
-        let next_deadline = [smoltcp_due, self.drops.next_due(), self.dns.next_deadline()]
-            .into_iter()
-            .flatten()
-            .min();
         let mut fd_changes = Vec::new();
         if !self.dns_watched {
             self.dns_watched = true;
@@ -262,20 +292,43 @@ impl NetStack {
                 },
             });
         }
+        fd_changes.extend(self.tcp.take_fd_changes());
+        let smoltcp_due = self
+            .iface
+            .poll_delay(stamp, &self.sockets)
+            .and_then(|delay| now.checked_add(delay.into()));
+        let next_deadline = [
+            smoltcp_due,
+            self.drops.next_due(),
+            self.dns.next_deadline(),
+            self.tcp.next_deadline(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         PollOutcome {
             next_deadline,
             fd_changes,
         }
     }
 
-    /// A host fd the stack asked to watch through [`FdChange`] is ready.
-    /// For the DNS socket ([`DNS_TOKEN`]), every answer waiting on it goes
-    /// to the guest, and what answers nothing is counted as `dns_bogus`.
-    pub fn on_host_fd_event(&mut self, token: u64, readable: bool, _writable: bool) {
-        if token != DNS_TOKEN || !readable {
+    /// A host fd the stack asked to watch through [`FdChange`] is ready (an
+    /// error or hang-up counts as both readable and writable). For the DNS
+    /// socket ([`DNS_TOKEN`]), every answer waiting on it goes to the
+    /// guest, and what answers nothing is counted as `dns_bogus`. For a
+    /// relayed connection's socket, its connect completes or fails, or
+    /// bytes move; what that queues for the guest goes at the next
+    /// [`poll`](Self::poll), as do the watch changes it makes. Events for
+    /// tokens the stack no longer uses are ignored.
+    pub fn on_host_fd_event(&mut self, token: u64, readable: bool, writable: bool) {
+        let now = Instant::now();
+        if token != DNS_TOKEN {
+            let (tcp, mut cx) = self.split(now);
+            return tcp.host_event(&mut cx, token, readable, writable);
+        }
+        if !readable {
             return;
         }
-        let now = Instant::now();
         for received in self.dns.receive() {
             match received {
                 Received::Answer(answer) => self.deliver(answer, now),
@@ -285,16 +338,48 @@ impl NetStack {
     }
 
     /// Records the DNS queries still waiting for the upstream as
-    /// unanswered (SERVFAIL), and every dropped-frame count still held, due
-    /// or not, so the stack's last second is not lost. The net thread (M2
-    /// Task 9) calls it as it stops, before the audit log closes.
+    /// unanswered (SERVFAIL), ends every TCP connection (`net.close` with
+    /// reason `shutdown`; the guest's side is reset), and records every
+    /// dropped-frame count still held, due or not, so the stack's last
+    /// second is not lost. The net thread (M2 Task 9) calls it as it stops,
+    /// before the audit log closes, and then drops the stack, which closes
+    /// the host sockets.
     pub fn shutdown(&mut self) {
+        let now = Instant::now();
         for pending in self.dns.abandon() {
             self.record(dns_record(pending, dns::SERVFAIL, Vec::new()));
         }
-        for counted in self.drops.flush_all(Instant::now()) {
+        {
+            let (tcp, mut cx) = self.split(now);
+            tcp.shutdown(&mut cx);
+        }
+        for counted in self.drops.flush_all(now) {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
         }
+    }
+
+    /// A guest SYN from `guest` to `dst`: the relay decides it on the
+    /// policy and the names the DNS cache has for `dst`.
+    fn tcp_syn(&mut self, frame: &[u8], guest: SocketAddrV4, dst: SocketAddrV4, now: Instant) {
+        let names = self.dns_cache.names_for_at(*dst.ip(), now);
+        let policy = self.policy.load();
+        let (tcp, mut cx) = self.split(now);
+        tcp.syn(&mut cx, frame, guest, dst, &policy, names);
+    }
+
+    /// The relay, and what it borrows from the rest of the stack.
+    fn split(&mut self, now: Instant) -> (&mut Relay, Ctx<'_>) {
+        let cx = Ctx {
+            cfg: &self.cfg,
+            sink: &self.sink,
+            iface: &mut self.iface,
+            pipe: &mut self.pipe,
+            sockets: &mut self.sockets,
+            drops: &mut self.drops,
+            now,
+            stamp: smoltcp_time(self.epoch, now),
+        };
+        (&mut self.tcp, cx)
     }
 
     /// A guest DNS message to the gateway, from `guest`. One shorter than a
@@ -413,22 +498,15 @@ impl NetStack {
         }
     }
 
-    /// `now` on smoltcp's clock: microseconds since the stack was made.
-    fn smoltcp_time(&self, now: Instant) -> SmolInstant {
-        let since = now.saturating_duration_since(self.epoch).as_micros();
-        SmolInstant::from_micros(i64::try_from(since).unwrap_or(i64::MAX))
-    }
-
     /// Queues `frame` for the guest, and says whether it was: a full queue
     /// drops it as `queue_full`.
     fn send_to_guest(&mut self, frame: Vec<u8>, now: Instant) -> bool {
-        if self.pipe.to_guest.len() >= QUEUE_CAP {
+        if self.pipe.queue_for_guest(frame) {
+            true
+        } else {
             boxcar_virtio::limited!(warn, "net: the guest is not taking frames; dropping");
             self.drop_frame(DropReason::QueueFull, now);
             false
-        } else {
-            self.pipe.to_guest.push_back(frame);
-            true
         }
     }
 
@@ -441,16 +519,9 @@ impl NetStack {
         }
     }
 
-    /// Records an event that must not be dropped, waiting for room in the
-    /// log. A log that is closed (the session is ending) or has failed (the
-    /// VMM stops on that) records nothing more.
+    /// Records an event that must not be dropped (see [`audit::record`]).
     fn record(&self, payload: Payload) {
-        match audit::emit(&self.sink, payload) {
-            Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
-            Err(error @ EmitError::Checkpoint) => {
-                boxcar_virtio::limited!(error, "net: audit record refused: {error}");
-            }
-        }
+        audit::record(&self.sink, payload);
     }
 
     fn drop_frame(&mut self, reason: DropReason, now: Instant) {
@@ -477,9 +548,17 @@ fn dns_record(pending: Pending, rcode: u16, answers: Vec<String>) -> Payload {
     })
 }
 
-/// smoltcp's device: two frame queues, one each way.
+/// `now` on smoltcp's clock: microseconds since `epoch`, the stack's time
+/// zero.
+fn smoltcp_time(epoch: Instant, now: Instant) -> SmolInstant {
+    let since = now.saturating_duration_since(epoch).as_micros();
+    SmolInstant::from_micros(i64::try_from(since).unwrap_or(i64::MAX))
+}
+
+/// smoltcp's device: two frame queues, one each way, and the relay's slot
+/// for a parked SYN.
 #[derive(Default)]
-struct Pipe {
+pub(crate) struct Pipe {
     /// Guest frames for smoltcp.
     to_stack: VecDeque<Vec<u8>>,
     /// Frames for the guest, from the dispatcher and from smoltcp.
@@ -487,16 +566,52 @@ struct Pipe {
     /// Frames smoltcp made that the full guest queue refused, since the
     /// stack last counted them.
     refused: u64,
+    /// A guest SYN the relay hands smoltcp ahead of the queue.
+    injected: Option<Vec<u8>>,
+}
+
+impl Pipe {
+    /// Queues `frame` for the guest, unless its queue is full; says which.
+    pub(crate) fn queue_for_guest(&mut self, frame: Vec<u8>) -> bool {
+        if self.to_guest.len() >= QUEUE_CAP {
+            return false;
+        }
+        self.to_guest.push_back(frame);
+        true
+    }
+
+    /// Makes `frame` the next frame smoltcp receives, ahead of the queue
+    /// and even while the guest's queue is full (a SYN to a listening
+    /// socket gets no answer through its token; the SYN-ACK waits for
+    /// egress).
+    pub(crate) fn inject(&mut self, frame: Vec<u8>) {
+        self.injected = Some(frame);
+    }
+
+    /// Forgets an injected frame smoltcp did not take.
+    pub(crate) fn clear_injected(&mut self) {
+        self.injected = None;
+    }
 }
 
 impl phy::Device for Pipe {
     type RxToken<'a> = RxToken;
     type TxToken<'a> = TxToken<'a>;
 
-    /// Nothing while the guest's queue is full: smoltcp answers a frame
-    /// through the token that comes with it, and the guest has no room for
-    /// the answer. The frame waits in its queue.
+    /// An injected frame first. Otherwise nothing while the guest's queue
+    /// is full: smoltcp answers a frame through the token that comes with
+    /// it, and the guest has no room for the answer. The frame waits in
+    /// its queue.
     fn receive(&mut self, _now: SmolInstant) -> Option<(RxToken, TxToken<'_>)> {
+        if let Some(frame) = self.injected.take() {
+            return Some((
+                RxToken(frame),
+                TxToken {
+                    queue: &mut self.to_guest,
+                    refused: &mut self.refused,
+                },
+            ));
+        }
         if self.to_guest.len() >= QUEUE_CAP {
             return None;
         }
@@ -531,7 +646,7 @@ impl phy::Device for Pipe {
     }
 }
 
-struct RxToken(Vec<u8>);
+pub(crate) struct RxToken(Vec<u8>);
 
 impl phy::RxToken for RxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -539,7 +654,7 @@ impl phy::RxToken for RxToken {
     }
 }
 
-struct TxToken<'a> {
+pub(crate) struct TxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
     refused: &'a mut u64,
 }

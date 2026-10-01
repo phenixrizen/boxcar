@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 
 use boxcar_net::frame::{classify, Dispatch};
 use boxcar_net::stack::QUEUE_CAP;
-use boxcar_net::NetStack;
+use boxcar_net::{NetStack, Policy};
 use boxcar_proto::{NetDhcp, NetDrop, Payload};
-use common::{drops, ethernet, harness, ipv4, udp, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC};
+use common::{
+    drops, ethernet, harness, harness_with, ipv4, udp, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC,
+};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -319,6 +321,40 @@ fn tcp_syn(src: SocketAddrV4, dst: SocketAddrV4, seq: i32) -> Vec<u8> {
         window_len: 64240,
         window_scale: None,
         max_seg_size: Some(1460),
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    ipv4(
+        GATEWAY_MAC,
+        *src.ip(),
+        *dst.ip(),
+        IpProtocol::Tcp,
+        repr.buffer_len(),
+        |buf| {
+            repr.emit(
+                &mut TcpPacket::new_unchecked(buf),
+                &(*src.ip()).into(),
+                &(*dst.ip()).into(),
+                &ChecksumCapabilities::default(),
+            )
+        },
+    )
+}
+
+/// A bare ACK from the guest for a connection nobody has: smoltcp resets
+/// it (sequence number `ack`, no ACK of its own).
+fn tcp_ack(src: SocketAddrV4, dst: SocketAddrV4, seq: i32, ack: i32) -> Vec<u8> {
+    let repr = TcpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+        control: TcpControl::None,
+        seq_number: TcpSeqNumber(seq),
+        ack_number: Some(TcpSeqNumber(ack)),
+        window_len: 64240,
+        window_scale: None,
+        max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
@@ -763,13 +799,13 @@ fn drops_are_coalesced_per_reason() {
     }
 }
 
-/// TCP goes to smoltcp, which takes any destination (any-IP with a default
-/// route through itself). It has no sockets yet, so it resets the SYN. That
-/// it answers at once, rather than asking who has the guest's address,
-/// shows it learned the guest's MAC from an ARP the guest sent for some
-/// other address.
+/// TCP other than a SYN goes to smoltcp, which takes any destination
+/// (any-IP with a default route through itself). A segment for no
+/// connection it has is reset. That it answers at once, rather than asking
+/// who has the guest's address, shows it learned the guest's MAC from an
+/// ARP the guest sent for some other address.
 #[test]
-fn a_tcp_syn_reaches_smoltcp_which_knows_the_guest_mac_from_its_arp() {
+fn a_tcp_segment_reaches_smoltcp_which_knows_the_guest_mac_from_its_arp() {
     let mut h = harness();
     h.stack
         .push_guest_frame(&arp_request(GUEST, Ipv4Addr::new(10, 0, 2, 77)));
@@ -777,7 +813,8 @@ fn a_tcp_syn_reaches_smoltcp_which_knows_the_guest_mac_from_its_arp() {
 
     let guest = SocketAddrV4::new(GUEST, 40000);
     let remote = SocketAddrV4::new(Ipv4Addr::new(93, 184, 215, 14), 80);
-    h.stack.push_guest_frame(&tcp_syn(guest, remote, 1000));
+    h.stack
+        .push_guest_frame(&tcp_ack(guest, remote, 1000, 5000));
     h.stack.poll(Instant::now());
     let replies = h.drain();
     assert_eq!(replies.len(), 1, "one RST");
@@ -802,14 +839,15 @@ fn a_tcp_syn_reaches_smoltcp_which_knows_the_guest_mac_from_its_arp() {
     .unwrap();
     assert_eq!((tcp.src_port, tcp.dst_port), (80, 40000));
     assert_eq!(tcp.control, TcpControl::Rst);
-    assert_eq!(tcp.ack_number, Some(TcpSeqNumber(1001)));
-    assert!(h.events().is_empty());
+    assert_eq!(tcp.seq_number, TcpSeqNumber(5000));
+    assert_eq!(tcp.ack_number, None);
+    assert!(h.events().is_empty(), "no flow: nothing is recorded");
 }
 
 /// smoltcp learns only the guest's own binding. ARP from more made-up
 /// senders than its neighbor cache holds does not evict the guest, and a
-/// made-up MAC for the guest's address does not redirect its replies: a SYN
-/// afterwards is reset at once, to the guest's MAC.
+/// made-up MAC for the guest's address does not redirect its replies: a
+/// stray segment afterwards is reset at once, to the guest's MAC.
 #[test]
 fn spoofed_arp_neither_evicts_nor_poisons_the_guest_in_smoltcp() {
     let mut h = harness();
@@ -832,7 +870,8 @@ fn spoofed_arp_neither_evicts_nor_poisons_the_guest_in_smoltcp() {
 
     let guest = SocketAddrV4::new(GUEST, 40000);
     let remote = SocketAddrV4::new(Ipv4Addr::new(93, 184, 215, 14), 80);
-    h.stack.push_guest_frame(&tcp_syn(guest, remote, 1000));
+    h.stack
+        .push_guest_frame(&tcp_ack(guest, remote, 1000, 5000));
     h.stack.poll(Instant::now());
     let replies = h.drain();
     assert_eq!(replies.len(), 1, "one RST");
@@ -855,10 +894,10 @@ fn reset_port(frame: &[u8]) -> u16 {
 }
 
 /// A guest that sends and never takes frames cannot grow either queue past
-/// its cap. smoltcp answers each SYN with a reset until the guest's queue
-/// is full, then takes no more; SYNs wait for it until theirs is full too,
-/// and after that are dropped as `queue_full`. Nothing that waited is lost:
-/// smoltcp takes it once the guest drains its queue.
+/// its cap. smoltcp answers each stray segment with a reset until the
+/// guest's queue is full, then takes no more; segments wait for it until
+/// theirs is full too, and after that are dropped as `queue_full`. Nothing
+/// that waited is lost: smoltcp takes it once the guest drains its queue.
 #[test]
 fn queues_are_capped_and_smoltcp_waits_for_the_guest() {
     let mut h = harness();
@@ -874,7 +913,7 @@ fn queues_are_capped_and_smoltcp_waits_for_the_guest() {
     for _ in 0..3 {
         for _ in 0..QUEUE_CAP {
             h.stack
-                .push_guest_frame(&tcp_syn(SocketAddrV4::new(GUEST, port), remote, 1));
+                .push_guest_frame(&tcp_ack(SocketAddrV4::new(GUEST, port), remote, 1, 1));
             port += 1;
         }
         h.stack.poll(Instant::now());
@@ -1122,10 +1161,13 @@ proptest! {
 }
 
 /// The whole stack, not just the dispatcher, takes anything the guest
-/// sends without panicking.
+/// sends without panicking. (The shaped frames' TCP goes to 192.0.2.1,
+/// which the policy denies, so no fuzzed SYN makes a host connect.)
 #[test]
 fn the_stack_never_panics_on_arbitrary_frames() {
-    let h = RefCell::new(harness());
+    let h = RefCell::new(harness_with(
+        Policy::parse(&["deny 192.0.2.0/24", "default allow"]).unwrap(),
+    ));
     TestRunner::default()
         .run(&frames(), |frame| {
             let mut h = h.borrow_mut();
