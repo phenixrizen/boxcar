@@ -8,24 +8,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 //
-// The input flow control follows Firecracker
+// The input flow control began as Firecracker's
 // (https://github.com/firecracker-microvm/firecracker),
 // src/vmm/src/devices/legacy/serial.rs (the MutEventSubscriber impl of
-// SerialWrapper: read up to the FIFO's free space, drop stdin interest when
-// the FIFO is full, take it back on the buffer-ready event, detach on EOF) at
-// commit 21f19ed8109578108568c8a8f3623ddb6f097878. The BSD-3-Clause text
-// referred to above is in LICENSE-BSD-3-Clause. Adapted: the subscriber is
-// separate from the device, which it reaches through an Arc<Mutex>; the
-// caller registers its descriptors; the Ctrl-] escape and the raw-mode
-// terminal guard are boxcar's.
+// SerialWrapper: queue stdin for the FIFO, take the buffer-ready event when
+// the guest has read it empty, detach on EOF) at commit
+// 21f19ed8109578108568c8a8f3623ddb6f097878. The BSD-3-Clause text referred to
+// above is in LICENSE-BSD-3-Clause. Adapted: the subscriber is separate from
+// the device, which it reaches through an Arc<Mutex>; the caller registers
+// its descriptors; stdin is never unwatched, so that what does not fit the
+// FIFO waits in a holding buffer instead of stopping the reads; the Ctrl-]
+// escape and the raw-mode terminal guard are boxcar's.
 
 //! Host stdin to the guest's serial console, and the host terminal.
 //!
 //! When stdin is a TTY and the console goes to stdout, the VMM puts the
 //! terminal in raw mode ([`RawModeGuard`]) and forwards what is typed to
 //! COM1 ([`StdinSubscriber`]). Ctrl-C then reaches the guest; pressing
-//! Ctrl-] twice within a second stops the VM instead.
+//! Ctrl-] twice within a second stops the VM instead, whatever the guest is
+//! doing: the escape is detected on every byte read, before the serial
+//! FIFO is looked at, so a guest that has stopped reading its console
+//! cannot take the escape away.
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic;
@@ -150,18 +155,31 @@ impl Drop for RawModeGuard {
 /// Bytes read from stdin at a time: the whole 16550A receive FIFO.
 const READ_CHUNK: usize = 64;
 
-/// Forwards stdin to COM1 on the main loop. Reads no more than the FIFO has
-/// room for; when it is full, stops watching stdin until the guest has read
-/// the FIFO empty (the serial's buffer-ready event).
+/// How much input waits for room in the receive FIFO.
+const HOLD_CAP: usize = 4096;
+
+/// Forwards stdin to COM1 on the main loop.
+///
+/// Every byte read is first run through the [`EscapeDetector`]; a double
+/// Ctrl-] stops the VM and the chunk is dropped. Only then is the input
+/// queued for the guest: what the receive FIFO has room for goes in, the
+/// rest waits in a [`HOLD_CAP`]-byte holding buffer that the serial's
+/// buffer-ready event (the guest has read the FIFO empty) drains. Stdin
+/// stays watched throughout: a guest that has stopped reading, so that the
+/// FIFO is full, must not make Ctrl-] Ctrl-] stop working, which is how a
+/// wedged guest is stopped. When the holding buffer is full too, the oldest
+/// held bytes are dropped (and counted) for the newest.
 pub(crate) struct StdinSubscriber {
     serial: Arc<Mutex<SerialDevice>>,
     buffer_ready: EventFd,
-    /// Whether stdin is in the epoll set.
-    watching: bool,
     /// Stdin reached EOF or failed; it is never watched again.
     closed: bool,
     escape: EscapeDetector,
     handle: VmmHandle,
+    /// Input the FIFO had no room for, oldest first.
+    held: VecDeque<u8>,
+    /// Input bytes dropped from `held` so far.
+    dropped_input: u64,
 }
 
 impl StdinSubscriber {
@@ -170,10 +188,11 @@ impl StdinSubscriber {
         Ok(StdinSubscriber {
             serial,
             buffer_ready,
-            watching: true,
             closed: false,
             escape: EscapeDetector::default(),
             handle,
+            held: VecDeque::with_capacity(HOLD_CAP),
+            dropped_input: 0,
         })
     }
 
@@ -182,49 +201,79 @@ impl StdinSubscriber {
         [libc::STDIN_FILENO, self.buffer_ready.as_raw_fd()]
     }
 
-    fn unwatch(&mut self, ops: &mut EventOps) {
-        if self.watching {
-            self.watching = false;
+    fn close(&mut self, ops: &mut EventOps) {
+        if !self.closed {
+            self.closed = true;
             if let Err(error) = ops.remove(Events::new_raw(libc::STDIN_FILENO, EventSet::IN)) {
                 tracing::warn!("cannot stop watching stdin: {error}");
             }
         }
     }
 
-    fn watch(&mut self, ops: &mut EventOps) {
-        if self.watching || self.closed {
+    /// What was typed at `now`: the escape detector sees it before anything
+    /// else does; then it goes to the guest, or waits for room.
+    fn on_input(&mut self, bytes: &[u8], now: Instant) {
+        if self.escape.feed(bytes, now) {
+            self.handle.request_stop(StopReason::ConsoleEscape);
             return;
         }
-        match ops.add(Events::new_raw(libc::STDIN_FILENO, EventSet::IN)) {
-            Ok(()) | Err(event_manager::Error::FdAlreadyRegistered) => self.watching = true,
-            Err(error) => {
-                tracing::warn!("cannot watch stdin again: {error}");
-                self.closed = true;
+        let taken = {
+            let mut serial = lock(&self.serial);
+            // Older input first: new input goes in only behind an empty
+            // holding buffer.
+            drain_held(&mut self.held, &mut serial);
+            if self.held.is_empty() {
+                serial.enqueue(bytes)
+            } else {
+                0
             }
-        }
+        };
+        self.hold(&bytes[taken..]);
     }
 
-    fn close(&mut self, ops: &mut EventOps) {
-        self.unwatch(ops);
-        self.closed = true;
+    /// The guest has read the receive FIFO empty: the held input goes in.
+    fn on_buffer_ready(&mut self) {
+        drain_held(&mut self.held, &mut lock(&self.serial));
+    }
+
+    /// Appends `bytes` to the holding buffer, dropping the oldest held
+    /// bytes (or the front of `bytes`) beyond [`HOLD_CAP`].
+    fn hold(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let keep = bytes.len().min(HOLD_CAP);
+        let from_bytes = bytes.len() - keep;
+        let from_held = (self.held.len() + keep).saturating_sub(HOLD_CAP);
+        self.held.drain(..from_held);
+        self.held.extend(&bytes[from_bytes..]);
+        let dropped = from_bytes + from_held;
+        if dropped > 0 {
+            if self.dropped_input == 0 {
+                tracing::warn!(
+                    "the guest is not reading its console input; dropping the oldest of what \
+                     is typed (Ctrl-] Ctrl-] still stops the VM)"
+                );
+            }
+            self.dropped_input = self
+                .dropped_input
+                .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        }
     }
 
     fn on_stdin(&mut self, ops: &mut EventOps) {
-        let room = lock(&self.serial).fifo_capacity().min(READ_CHUNK);
-        if room == 0 {
-            self.unwatch(ops);
+        if self.closed {
             return;
         }
         let mut buf = [0u8; READ_CHUNK];
-        // SAFETY: reads at most `room` bytes into `buf`, which holds more.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), room) };
-        let count = match usize::try_from(n) {
+        // SAFETY: reads at most `buf.len()` bytes into `buf`.
+        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        match usize::try_from(n) {
             Ok(0) => {
                 tracing::debug!("stdin reached EOF; no more console input");
                 self.close(ops);
-                return;
             }
-            Ok(count) => count,
+            Ok(count) => self.on_input(&buf[..count], Instant::now()),
             Err(_) => {
                 let error = io::Error::last_os_error();
                 if !matches!(
@@ -234,20 +283,7 @@ impl StdinSubscriber {
                     tracing::warn!("cannot read stdin, no more console input: {error}");
                     self.close(ops);
                 }
-                return;
             }
-        };
-        let bytes = &buf[..count];
-        if self.escape.feed(bytes, Instant::now()) {
-            self.handle.request_stop(StopReason::ConsoleEscape);
-        }
-        let full = {
-            let mut serial = lock(&self.serial);
-            serial.enqueue(bytes);
-            serial.fifo_capacity() == 0
-        };
-        if full {
-            self.unwatch(ops);
         }
     }
 }
@@ -256,7 +292,7 @@ impl MutEventSubscriber for StdinSubscriber {
     fn process(&mut self, events: Events, ops: &mut EventOps) {
         if events.fd() == self.buffer_ready.as_raw_fd() {
             let _ = self.buffer_ready.read();
-            self.watch(ops);
+            self.on_buffer_ready();
         } else if events.fd() == libc::STDIN_FILENO {
             self.on_stdin(ops);
         }
@@ -264,6 +300,22 @@ impl MutEventSubscriber for StdinSubscriber {
 
     /// Registration happens in the caller; see [`StdinSubscriber::fds`].
     fn init(&mut self, _ops: &mut EventOps) {}
+}
+
+/// Moves as much of `held` into the FIFO as fits, oldest first.
+fn drain_held(held: &mut VecDeque<u8>, serial: &mut SerialDevice) {
+    while !held.is_empty() {
+        let room = serial.fifo_capacity();
+        if room == 0 {
+            return;
+        }
+        let (front, _) = held.as_slices();
+        let taken = serial.enqueue(&front[..front.len().min(room)]);
+        if taken == 0 {
+            return;
+        }
+        held.drain(..taken);
+    }
 }
 
 fn lock(serial: &Mutex<SerialDevice>) -> std::sync::MutexGuard<'_, SerialDevice> {
@@ -319,5 +371,169 @@ mod tests {
         assert!(!detector.feed(b"x", t0 + 100 * MS));
         assert!(!detector.feed(&[ESCAPE_BYTE], t0 + 200 * MS));
         assert!(!detector.feed(b"ls\r", t0 + 300 * MS));
+    }
+
+    use boxcar_virtio::bus::BusDevice;
+
+    use crate::console::ConsoleWriter;
+    use crate::lifecycle::{test_handle, VmState};
+
+    /// A subscriber on a UART whose console goes nowhere, with no real stdin.
+    struct Rig {
+        subscriber: StdinSubscriber,
+        serial: Arc<Mutex<SerialDevice>>,
+        handle: VmmHandle,
+        _audit: boxcar_audit::WriterHandle,
+        _dir: tempfile::TempDir,
+    }
+
+    fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, audit) = test_handle(dir.path());
+        let (sink, _writer) = ConsoleWriter::spawn_with(std::io::sink()).unwrap();
+        let serial = Arc::new(Mutex::new(SerialDevice::new(sink).unwrap()));
+        let subscriber = StdinSubscriber::new(serial.clone(), handle.clone()).unwrap();
+        Rig {
+            subscriber,
+            serial,
+            handle,
+            _audit: audit,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        /// Fills the receive FIFO, as a guest that has stopped reading does.
+        fn fill_fifo(&self) {
+            let mut serial = lock(&self.serial);
+            let room = serial.fifo_capacity();
+            assert_eq!(serial.enqueue(&vec![b'.'; room]), room);
+            assert_eq!(serial.fifo_capacity(), 0);
+        }
+
+        /// The guest reads `count` bytes of the receive FIFO.
+        fn guest_reads(&self, count: usize) -> Vec<u8> {
+            let mut serial = lock(&self.serial);
+            (0..count)
+                .map(|_| {
+                    let mut byte = [0u8];
+                    serial.read(0, &mut byte);
+                    byte[0]
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn escape_is_detected_while_the_fifo_is_full() {
+        // Two Ctrl-] in separate reads, 200 ms apart.
+        let mut rig = rig();
+        rig.fill_fifo();
+        let t0 = Instant::now();
+        rig.subscriber.on_input(&[ESCAPE_BYTE], t0);
+        assert_eq!(rig.handle.state(), VmState::Booting);
+        rig.subscriber.on_input(&[ESCAPE_BYTE], t0 + 200 * MS);
+        assert_eq!(rig.handle.state(), VmState::Stopping);
+
+        // Both in one read.
+        let mut rig = rig_with_full_fifo();
+        rig.subscriber.on_input(&[ESCAPE_BYTE, ESCAPE_BYTE], t0);
+        assert_eq!(rig.handle.state(), VmState::Stopping);
+    }
+
+    fn rig_with_full_fifo() -> Rig {
+        let rig = rig();
+        rig.fill_fifo();
+        rig
+    }
+
+    #[test]
+    fn escape_is_detected_while_the_holding_buffer_is_full_and_dropping() {
+        let mut rig = rig_with_full_fifo();
+        let t0 = Instant::now();
+        // Far more than the FIFO and the holding buffer hold.
+        for _ in 0..(HOLD_CAP / READ_CHUNK) * 3 {
+            rig.subscriber.on_input(&[b'x'; READ_CHUNK], t0);
+        }
+        assert!(rig.subscriber.dropped_input > 0);
+        assert_eq!(rig.handle.state(), VmState::Booting);
+        rig.subscriber.on_input(&[ESCAPE_BYTE], t0 + 10 * MS);
+        rig.subscriber.on_input(&[ESCAPE_BYTE], t0 + 20 * MS);
+        assert_eq!(rig.handle.state(), VmState::Stopping);
+    }
+
+    #[test]
+    fn the_chunk_that_completes_the_escape_is_not_forwarded() {
+        let mut rig = rig();
+        let t0 = Instant::now();
+        rig.subscriber.on_input(&[ESCAPE_BYTE], t0);
+        rig.subscriber.on_input(b"a\x1d\x1db", t0 + 10 * MS);
+        assert_eq!(rig.handle.state(), VmState::Stopping);
+        // The first press went to the guest like any key; the second chunk,
+        // which fired the detector, did not.
+        assert_eq!(rig.guest_reads(1), [ESCAPE_BYTE]);
+        assert_eq!(lock(&rig.serial).fifo_capacity(), 64);
+    }
+
+    #[test]
+    fn bytes_the_fifo_cannot_take_wait_in_order_for_the_guest_to_read() {
+        let mut rig = rig();
+        let t0 = Instant::now();
+        // 60 bytes fit; of 10 more, 4 go in and 6 are held.
+        rig.subscriber.on_input(&[b'a'; 60], t0);
+        rig.subscriber.on_input(b"0123456789", t0);
+        assert_eq!(lock(&rig.serial).fifo_capacity(), 0);
+        assert_eq!(rig.subscriber.held.len(), 6);
+        // Later input queues behind them.
+        rig.subscriber.on_input(b"XY", t0);
+        assert_eq!(rig.subscriber.held.len(), 8);
+
+        // The guest reads the FIFO empty; the buffer-ready event drains the
+        // holding buffer, in order.
+        assert_eq!(rig.guest_reads(64), [&[b'a'; 60][..], b"0123"].concat());
+        let event = lock(&rig.serial).buffer_ready_evt().try_clone().unwrap();
+        assert!(event.read().is_ok());
+        rig.subscriber.on_buffer_ready();
+        assert!(rig.subscriber.held.is_empty());
+        assert_eq!(rig.guest_reads(8), b"456789XY");
+        assert_eq!(rig.subscriber.dropped_input, 0);
+    }
+
+    #[test]
+    fn held_bytes_go_in_ahead_of_new_input_once_the_fifo_has_room() {
+        let mut rig = rig();
+        let t0 = Instant::now();
+        rig.subscriber.on_input(&[b'a'; 60], t0);
+        rig.subscriber.on_input(b"0123456789", t0);
+        assert_eq!(rig.subscriber.held.len(), 6);
+
+        // The guest reads some, but not all: no buffer-ready event yet.
+        assert_eq!(rig.guest_reads(10), [b'a'; 10]);
+        rig.subscriber.on_input(b"XY", t0);
+        assert!(rig.subscriber.held.is_empty());
+        assert_eq!(rig.guest_reads(54), [&[b'a'; 50][..], b"0123"].concat());
+        assert_eq!(rig.guest_reads(8), b"456789XY");
+    }
+
+    #[test]
+    fn the_holding_buffer_drops_its_oldest_bytes_and_counts_them() {
+        let mut rig = rig_with_full_fifo();
+        let t0 = Instant::now();
+        let input: Vec<u8> = (0..HOLD_CAP + 100).map(|i| (i % 200) as u8 + 1).collect();
+        for chunk in input.chunks(READ_CHUNK) {
+            rig.subscriber.on_input(chunk, t0);
+        }
+        assert_eq!(rig.subscriber.held.len(), HOLD_CAP);
+        assert_eq!(rig.subscriber.dropped_input, 100);
+        // What is kept is the newest input.
+        let kept: Vec<u8> = rig.subscriber.held.iter().copied().collect();
+        assert_eq!(kept, input[100..]);
+
+        // The guest reads the FIFO empty and gets the held bytes after the
+        // 64 that filled it.
+        let _ = rig.guest_reads(64);
+        rig.subscriber.on_buffer_ready();
+        assert_eq!(rig.guest_reads(64), input[100..164]);
+        assert_eq!(rig.subscriber.held.len(), HOLD_CAP - 64);
     }
 }

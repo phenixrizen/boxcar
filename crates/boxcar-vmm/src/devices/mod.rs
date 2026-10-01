@@ -23,7 +23,8 @@ use vm_memory::GuestMemoryMmap;
 
 use self::slots::{slot, SlotId};
 
-pub use legacy::{ConsoleOut, EventFdTrigger, LegacyDevices, SerialDevice, I8042};
+pub use crate::console::ConsoleOut;
+pub use legacy::{EventFdTrigger, LegacyDevices, SerialDevice, I8042};
 
 /// The tags of the virtio-fs shares, in slot order: slot 0 (`0xC000_0000`,
 /// GSI 5) is the root filesystem, slot 1 (`0xC000_1000`, GSI 6) the

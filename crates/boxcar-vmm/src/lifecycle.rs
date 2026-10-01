@@ -15,14 +15,16 @@
 //! The stop sequence, run on the main thread: tell the control clients the
 //! VM is `stopping`, kick and join every vCPU, close the devices (reset
 //! every virtio-fs device through its transport, which joins its workers
-//! and records the close of every file the guest left open, then flush the
-//! console), mark the VM `stopped` and shut the control server down (each
-//! client hears `stopped` and is disconnected, with no wait on any of
-//! them), emit `vmm.stop` through the audit sink, restore the terminal,
-//! and return the `VmExit`. The caller (`boxcar run`) then closes the audit
-//! writer, which drains, checkpoints and syncs the log, so every record the
-//! devices made is in it. After an audit failure the sequence is the same;
-//! the records it makes are refused, and each refusal is logged.
+//! and records the close of every file the guest left open), let the
+//! console writer drain what it can for at most [`CONSOLE_DEADLINE`]
+//! (it counts what it could not deliver), mark the VM `stopped` and shut
+//! the control server down (each client hears `stopped` and is
+//! disconnected, with no wait on any of them), emit `vmm.stop` through the
+//! audit sink with that count as `console_dropped_bytes`, restore the
+//! terminal, and return the `VmExit`. The caller (`boxcar run`) then closes
+//! the audit writer, which drains, checkpoints and syncs the log, so every
+//! record the devices made is in it. After an audit failure the sequence is
+//! the same; the records it makes are refused, and each refusal is logged.
 
 use std::fmt;
 use std::io;
@@ -32,7 +34,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, Priority, Submission};
 use boxcar_proto::control::{AuditStatus, GuestStatus, Status};
@@ -41,8 +43,9 @@ use event_manager::{EventManager, EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 use vmm_sys_util::signal::create_sigset;
 
+use crate::console::ConsoleWriter;
 use crate::control::ControlServer;
-use crate::devices::{FsDevices, LegacyDevices};
+use crate::devices::FsDevices;
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
 
@@ -50,6 +53,11 @@ pub use boxcar_proto::control::{SessionOutcome, VmState};
 
 /// The exit code of a run whose audit log failed.
 pub const AUDIT_FAILED_EXIT: i32 = 3;
+
+/// How long the stop sequence waits for the console writer to drain what
+/// the guest printed last. A host stdout that has stalled (a paused pipe
+/// reader) must not hold the stop up longer.
+pub const CONSOLE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Why the VMM was asked to stop the VM.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,7 +504,7 @@ pub(crate) fn wait_for_stop(
 pub(crate) struct Teardown<'a> {
     pub(crate) vcpus: VcpuSet,
     pub(crate) fs: &'a FsDevices,
-    pub(crate) devices: &'a LegacyDevices,
+    pub(crate) console: ConsoleWriter,
     pub(crate) control: Option<ControlServer>,
     pub(crate) latch: &'a StopLatch,
     pub(crate) audit: &'a AuditSink,
@@ -512,7 +520,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     let Teardown {
         vcpus,
         fs,
-        devices,
+        console,
         control,
         latch,
         audit,
@@ -523,17 +531,23 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     }
     vcpus.stop_and_join();
     fs.close();
-    devices.close();
+    let console = console.flush_and_join(CONSOLE_DEADLINE);
     latch.mark_stopped();
     if let Some(control) = control {
         control.shutdown();
     }
-    record_stop(audit, reason, exit_code);
+    record_stop(audit, reason, exit_code, console.dropped_bytes);
     drop(terminal);
 }
 
-/// Emits `vmm.stop`, synced as soon as it is written.
-pub(crate) fn record_stop(audit: &AuditSink, reason: &str, exit_code: i32) {
+/// Emits `vmm.stop`, synced as soon as it is written. `console_dropped_bytes`
+/// is what the console writer reports (see [`ConsoleWriter::flush_and_join`]).
+pub(crate) fn record_stop(
+    audit: &AuditSink,
+    reason: &str,
+    exit_code: i32,
+    console_dropped_bytes: u64,
+) {
     let record = Submission {
         ring: Ring::Host,
         ts_guest_ns: None,
@@ -541,6 +555,7 @@ pub(crate) fn record_stop(audit: &AuditSink, reason: &str, exit_code: i32) {
         payload: Payload::VmmStop(VmmStop {
             reason: reason.to_owned(),
             exit_code: Some(exit_code),
+            console_dropped_bytes,
         }),
         span: None,
         priority: Priority::Critical,
@@ -778,7 +793,7 @@ mod tests {
         }
 
         // A critical record is synced at once, and the sync fails.
-        record_stop(&sink, "test", 0);
+        record_stop(&sink, "test", 0, 0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let exit = loop {
             if let Some(exit) = latch.outcome() {

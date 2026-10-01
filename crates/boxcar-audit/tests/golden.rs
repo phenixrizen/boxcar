@@ -150,6 +150,7 @@ fn golden_records() -> Vec<Record> {
         Payload::VmmStop(VmmStop {
             reason: "guest_reset".into(),
             exit_code: Some(0),
+            console_dropped_bytes: 0,
         }),
         None,
         None,

@@ -43,6 +43,7 @@ pub use crate::arch::x86_64::layout::CMDLINE_MAX_SIZE;
 use crate::arch::x86_64::layout::{CMDLINE_START, HIMEM_START, KVM_TSS_ADDRESS};
 use crate::arch::x86_64::{cpuid, interrupts, msr, regs};
 use crate::cmdline::{build_cmdline, MmioDeviceEntry};
+use crate::console::ConsoleWriter;
 use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
@@ -51,7 +52,7 @@ use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
     block_stop_signals, exit_code_for, record_stop, stop, wait_for_stop, ControlSubscriber,
-    MainLoop, SignalFd, StopLatch, Teardown, VmInfo,
+    MainLoop, SignalFd, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
@@ -283,6 +284,10 @@ pub struct Vmm {
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
     legacy: LegacyDevices,
+    /// The thread that writes the guest's console output; drained and
+    /// joined by the stop sequence, after the devices close and before
+    /// `vmm.stop`.
+    console: ConsoleWriter,
     fs: FsDevices,
     latch: Arc<StopLatch>,
     info: Arc<VmInfo>,
@@ -339,8 +344,9 @@ impl Vmm {
             None => None,
         };
 
-        let console = cfg.console.open().map_err(VmmError::Console)?;
-        let legacy = LegacyDevices::new(console).map_err(setup("legacy devices"))?;
+        let (sink, console) =
+            ConsoleWriter::spawn(cfg.console.clone()).map_err(VmmError::Console)?;
+        let legacy = LegacyDevices::new(sink).map_err(setup("legacy devices"))?;
         let mut pio = Bus::new();
         legacy.attach(&mut pio)?;
         {
@@ -427,7 +433,9 @@ impl Vmm {
                 match ControlServer::bind(&control.state_dir, handle, ops) {
                     Ok((server, path)) => (Some(server), Some(path)),
                     Err(source) => {
-                        record_stop(&cfg.audit, "vmm_error", 1);
+                        // The guest has not run: nothing was dropped.
+                        let console = console.flush_and_join(CONSOLE_DEADLINE);
+                        record_stop(&cfg.audit, "vmm_error", 1, console.dropped_bytes);
                         return Err(VmmError::Control {
                             state_dir: control.state_dir.clone(),
                             source,
@@ -445,6 +453,7 @@ impl Vmm {
             pio: Arc::new(pio),
             mmio: Arc::new(mmio),
             legacy,
+            console,
             fs,
             latch,
             info,
@@ -479,11 +488,12 @@ impl Vmm {
             Ok(started) => started,
             Err(error) => {
                 self.fs.close();
+                let console = self.console.flush_and_join(CONSOLE_DEADLINE);
                 self.latch.mark_stopped();
                 if let Some(control) = self.control.take() {
                     control.shutdown();
                 }
-                record_stop(&self.audit, "vmm_error", 1);
+                record_stop(&self.audit, "vmm_error", 1, console.dropped_bytes);
                 return Err(error);
             }
         };
@@ -495,7 +505,7 @@ impl Vmm {
         let teardown = Teardown {
             vcpus,
             fs: &self.fs,
-            devices: &self.legacy,
+            console: self.console,
             control: self.control.take(),
             latch: &self.latch,
             audit: &self.audit,

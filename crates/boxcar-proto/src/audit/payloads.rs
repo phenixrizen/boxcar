@@ -84,6 +84,14 @@ pub struct VmmStart {
 pub struct VmmStop {
     pub reason: String,
     pub exit_code: Option<i32>,
+    /// Console bytes the guest wrote that the host never wrote out: the
+    /// oldest bytes the console's ring dropped when the host's stdout (or
+    /// the console file) fell behind, bytes a failed write lost, and what
+    /// was still undelivered when the stop sequence gave up waiting for a
+    /// stalled writer. 0 when the console kept up. Absent in logs written
+    /// before it existed, and read as 0.
+    #[serde(default)]
+    pub console_dropped_bytes: u64,
 }
 
 /// `fs.mount`: a virtio-fs share was attached.
