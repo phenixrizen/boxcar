@@ -133,6 +133,61 @@ fn classify_ipv4(payload: &[u8], gateway: Ipv4Addr) -> Dispatch {
     }
 }
 
+/// The UDP payload of a guest frame [`classify`] sorted as UDP (DHCP, DNS,
+/// or other); `None` for any other frame.
+pub(crate) fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Udp {
+        return None;
+    }
+    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
+    Some(udp.payload())
+}
+
+/// An Ethernet frame carrying `payload` in a UDP datagram from `src` to
+/// `dst`, with both checksums filled in; `None` for a payload too long for
+/// one datagram.
+pub(crate) fn udp_frame(
+    eth_src: EthernetAddress,
+    eth_dst: EthernetAddress,
+    src: SocketAddrV4,
+    dst: SocketAddrV4,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let ports = UdpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+    };
+    let ip = Ipv4Repr {
+        src_addr: *src.ip(),
+        dst_addr: *dst.ip(),
+        next_header: IpProtocol::Udp,
+        payload_len: ports.header_len() + payload.len(),
+        hop_limit: TTL,
+    };
+    // The IPv4 total length is 16 bits.
+    if ip.buffer_len() + ip.payload_len > usize::from(u16::MAX) {
+        return None;
+    }
+    Some(ipv4_frame(eth_src, eth_dst, &ip, |datagram| {
+        ports.emit(
+            &mut UdpPacket::new_unchecked(datagram),
+            &(*src.ip()).into(),
+            &(*dst.ip()).into(),
+            payload.len(),
+            |body| body.copy_from_slice(payload),
+            &ChecksumCapabilities::default(),
+        )
+    }))
+}
+
+/// The hop limit of the replies the stack makes.
+const TTL: u8 = 64;
+
 /// An Ethernet frame carrying the IPv4 packet `ip` describes, with its
 /// header checksum filled in; `fill` writes the `ip.payload_len` bytes of
 /// payload. For the replies the dispatcher makes itself.

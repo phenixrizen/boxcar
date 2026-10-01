@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! The guest network's addressing, the DNS upstreams, and the egress policy
-//! the stack is built with.
+//! The guest network's addressing and the DNS upstreams the stack is built
+//! with. The egress policy is in [`policy`](crate::policy).
 //!
 //! The addressing is fixed: the guest is `10.0.2.15/24` at
 //! `02:62:6f:78:00:01`, and `10.0.2.2` at `02:62:6f:78:00:02` is its
@@ -11,8 +11,6 @@
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-use boxcar_proto::Verdict;
 
 /// The guest's address.
 pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -96,8 +94,8 @@ impl NetConfig {
     }
 
     /// Checks what the stack depends on: a network with room for a guest
-    /// and a gateway, both on it, distinct, and unicast at both layers, and
-    /// a host name a DHCP lease can carry.
+    /// and a gateway, both on it, distinct, and unicast at both layers, a
+    /// host name a DHCP lease can carry, and a DNS upstream.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !(1..=30).contains(&self.netmask) {
             return Err(ConfigError::Netmask(self.netmask));
@@ -138,6 +136,9 @@ impl NetConfig {
         {
             return Err(ConfigError::Hostname(self.hostname.clone()));
         }
+        if self.dns_upstreams.is_empty() {
+            return Err(ConfigError::NoDnsUpstream);
+        }
         Ok(())
     }
 }
@@ -165,6 +166,10 @@ pub enum ConfigError {
     Hostname(String),
     #[error("the network interface has no room for {0}")]
     Interface(&'static str),
+    #[error("no DNS upstream to forward the guest's queries to")]
+    NoDnsUpstream,
+    #[error("no DNS upstream could be given a socket: {0}")]
+    DnsUpstream(String),
 }
 
 fn mac_text(mac: [u8; 6]) -> String {
@@ -187,27 +192,6 @@ pub fn nameservers(resolv_conf: &str) -> Vec<SocketAddr> {
         })
         .map(|ip| SocketAddr::new(ip, 53))
         .collect()
-}
-
-/// What the stack lets the guest reach.
-///
-/// For now this holds only the default verdict, and the stack consults
-/// nothing but the gateway; the rule-based policy that replaces it is
-/// shared and hot-swapped the same way, through an
-/// `Arc<arc_swap::ArcSwap<Policy>>`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Policy {
-    /// The verdict for a destination no rule names.
-    pub default: Verdict,
-}
-
-impl Policy {
-    /// A policy that lets everything through.
-    pub fn allow_all() -> Self {
-        Policy {
-            default: Verdict::Allow,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -294,6 +278,10 @@ mod tests {
             with(|c| c.guest_mac = c.gateway_mac),
             Err(ConfigError::SameMac(_))
         ));
+        assert_eq!(
+            with(|c| c.dns_upstreams.clear()),
+            Err(ConfigError::NoDnsUpstream)
+        );
         for bad in ["", "box car", "boxcar.local", &"x".repeat(64)] {
             let cfg = NetConfig {
                 hostname: bad.to_owned(),

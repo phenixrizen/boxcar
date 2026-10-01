@@ -5,11 +5,17 @@
 //! machine over Ethernet frames.
 //!
 //! Every guest frame goes through the dispatcher first ([`classify`]):
-//! ARP, DHCP and ICMP are answered here, deterministically, and what is not
-//! carried is dropped and counted. Only TCP, and what smoltcp must learn
-//! from ARP, reaches smoltcp. smoltcp's interface owns the gateway's MAC
-//! and address, with any-IP on and a default route through itself, so it
-//! takes TCP for every destination.
+//! ARP, DHCP and ICMP are answered here, deterministically, DNS to the
+//! gateway goes to the [forwarder](crate::dns), and what is not carried is
+//! dropped and counted. Only TCP, and what smoltcp must learn from ARP,
+//! reaches smoltcp. smoltcp's interface owns the gateway's MAC and address,
+//! with any-IP on and a default route through itself, so it takes TCP for
+//! every destination.
+//!
+//! The forwarder's upstream socket is the one host fd the stack has so
+//! far: the first [`poll`](NetStack::poll) asks the net thread to watch it
+//! (token [`DNS_TOKEN`]), and [`on_host_fd_event`](NetStack::on_host_fd_event)
+//! reads the answers.
 //!
 //! Frames move through two queues, each holding at most [`QUEUE_CAP`]:
 //! guest to stack, which smoltcp reads at the next
@@ -23,25 +29,32 @@
 use std::collections::hash_map::RandomState;
 use std::collections::VecDeque;
 use std::hash::BuildHasher;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError};
-use boxcar_proto::Payload;
+use boxcar_proto::{NetDns, Payload};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, ETHERNET_HEADER_LEN};
 
 use crate::audit::{self, DropReason, Drops};
-use crate::config::{ConfigError, NetConfig, Policy};
-use crate::frame::{classify, Dispatch};
+use crate::config::{ConfigError, NetConfig};
+use crate::dns::cache::DnsCache;
+use crate::dns::forwarder::{self, ForwardError, Forwarder, Pending, Received};
+use crate::dns::{self as dns, parse};
+use crate::frame::{self, classify, Dispatch, DNS_PORT};
+use crate::policy::{Policy, Verdict};
 use crate::{arp, dhcp, icmp};
 
 /// The link's IP MTU, the guest's default for virtio-net.
 pub const IP_MTU: usize = 1500;
+/// The token of the DNS forwarder's upstream socket in [`FdChange`].
+pub const DNS_TOKEN: u64 = 1;
 /// Frames each queue holds before it refuses more: the guest-to-stack queue
 /// between polls, the stack-to-guest queue until the device drains it.
 pub const QUEUE_CAP: usize = 1024;
@@ -82,20 +95,30 @@ pub struct NetStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     drops: Drops,
+    /// The DNS upstream's socket, and the guest queries waiting on it.
+    dns: Forwarder,
+    /// The names DNS answers gave each address.
+    dns_cache: DnsCache,
+    /// Whether the net thread has been asked to watch the DNS socket.
+    dns_watched: bool,
     /// smoltcp's time zero.
     epoch: Instant,
 }
 
 impl NetStack {
     /// A stack for `cfg`, recording into `sink`, with `policy` deciding
-    /// what the guest may reach. Fails when `cfg` does not
-    /// [validate](NetConfig::validate).
+    /// what the guest may reach and resolve; the stack reads it at every
+    /// decision, so whoever holds the handle may swap it. Fails when `cfg`
+    /// does not [validate](NetConfig::validate), or when no DNS upstream
+    /// can be given a socket.
     pub fn new(
         cfg: NetConfig,
         sink: AuditSink,
         policy: Arc<ArcSwap<Policy>>,
     ) -> Result<NetStack, ConfigError> {
         cfg.validate()?;
+        let dns = Forwarder::connect(&cfg.dns_upstreams)
+            .map_err(|error| ConfigError::DnsUpstream(error.to_string()))?;
         let epoch = Instant::now();
         let mut pipe = Pipe::default();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(cfg.gateway_mac)));
@@ -127,13 +150,24 @@ impl NetStack {
             iface,
             sockets: SocketSet::new(Vec::new()),
             drops: Drops::new(),
+            dns,
+            dns_cache: DnsCache::new(),
+            dns_watched: false,
             epoch,
         })
     }
 
-    /// The policy in force now.
-    pub fn policy(&self) -> Arc<Policy> {
-        self.policy.load_full()
+    /// The handle the stack reads its policy through; storing a new
+    /// policy in it decides the next query or connection.
+    pub fn policy(&self) -> Arc<ArcSwap<Policy>> {
+        Arc::clone(&self.policy)
+    }
+
+    /// The names DNS answers to the guest gave `ip` that have not expired,
+    /// the most recently answered first: for each answer, the name asked
+    /// for comes before the CNAMEs that led to the address.
+    pub fn dns_names(&self, ip: Ipv4Addr) -> Vec<String> {
+        self.dns_cache.names_for(ip)
     }
 
     /// Takes one Ethernet frame the guest sent.
@@ -159,10 +193,9 @@ impl NetStack {
                 dhcp::Answer::NotForUs => {}
                 dhcp::Answer::Unanswered => self.drop_frame(DropReason::Dhcp, now),
             },
-            // The DNS forwarder (M2 Task 6) answers these. Until it lands
-            // they are dropped, and the guest's resolver times out.
-            Dispatch::Dns { .. } => self.drop_frame(DropReason::DnsUnimplemented, now),
-            // Likewise the UDP relay (M2 Task 8), under the egress policy.
+            Dispatch::Dns { src, .. } => self.dns_query(frame, src, now),
+            // The UDP relay (M2 Task 8) carries these, under the egress
+            // policy. Until it lands they are dropped.
             Dispatch::Udp { .. } => self.drop_frame(DropReason::UdpUnimplemented, now),
             Dispatch::Icmp { .. } => match icmp::reply(&self.cfg, frame) {
                 Some(reply) => {
@@ -192,7 +225,14 @@ impl NetStack {
     /// smoltcp takes nothing while the guest's queue is full: what waits for
     /// it is taken at the first poll after the guest has drained some, so
     /// the device polls again once it has popped frames.
+    ///
+    /// DNS queries whose time is up get SERVFAIL here, so `next_deadline`
+    /// counts the next of those too. The first poll asks for the DNS
+    /// socket to be watched.
     pub fn poll(&mut self, now: Instant) -> PollOutcome {
+        for pending in self.dns.expire(now) {
+            self.refuse(pending, dns::SERVFAIL, now);
+        }
         let stamp = self.smoltcp_time(now);
         self.iface.poll(stamp, &mut self.pipe, &mut self.sockets);
         let refused = std::mem::take(&mut self.pipe.refused);
@@ -206,26 +246,170 @@ impl NetStack {
             .iface
             .poll_delay(stamp, &self.sockets)
             .and_then(|delay| now.checked_add(delay.into()));
-        let next_deadline = match (smoltcp_due, self.drops.next_due()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let next_deadline = [smoltcp_due, self.drops.next_due(), self.dns.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let mut fd_changes = Vec::new();
+        if !self.dns_watched {
+            self.dns_watched = true;
+            fd_changes.push(FdChange {
+                token: DNS_TOKEN,
+                fd: self.dns.fd(),
+                interest: Interest {
+                    readable: true,
+                    writable: false,
+                },
+            });
+        }
         PollOutcome {
             next_deadline,
-            fd_changes: Vec::new(),
+            fd_changes,
         }
     }
 
     /// A host fd the stack asked to watch through [`FdChange`] is ready.
-    /// The stack watches none yet, so there is nothing to do.
-    pub fn on_host_fd_event(&mut self, _token: u64, _readable: bool, _writable: bool) {}
+    /// For the DNS socket ([`DNS_TOKEN`]), every answer waiting on it goes
+    /// to the guest, and what answers nothing is counted as `dns_bogus`.
+    pub fn on_host_fd_event(&mut self, token: u64, readable: bool, _writable: bool) {
+        if token != DNS_TOKEN || !readable {
+            return;
+        }
+        let now = Instant::now();
+        for received in self.dns.receive() {
+            match received {
+                Received::Answer(answer) => self.deliver(answer, now),
+                Received::Bogus => self.drop_frame(DropReason::DnsBogus, now),
+            }
+        }
+    }
 
-    /// Records every dropped-frame count still held, due or not, so the
-    /// drops of the stack's last second are not lost. The net thread (M2
+    /// Records the DNS queries still waiting for the upstream as
+    /// unanswered (SERVFAIL), and every dropped-frame count still held, due
+    /// or not, so the stack's last second is not lost. The net thread (M2
     /// Task 9) calls it as it stops, before the audit log closes.
     pub fn shutdown(&mut self) {
+        for pending in self.dns.abandon() {
+            self.record(dns_record(pending, dns::SERVFAIL, Vec::new()));
+        }
         for counted in self.drops.flush_all(Instant::now()) {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
+        }
+    }
+
+    /// A guest DNS message to the gateway, from `guest`. One shorter than a
+    /// header is dropped as `dns`. Every other gets exactly one answer and
+    /// one `net.dns`: FORMERR if it is not one plain query, NXDOMAIN if the
+    /// policy denies the name, else the upstream's answer, or SERVFAIL if
+    /// the query cannot be sent or waits too long.
+    fn dns_query(&mut self, frame: &[u8], guest: SocketAddrV4, now: Instant) {
+        let Some(message) = frame::udp_payload(frame) else {
+            return self.drop_frame(DropReason::Other, now);
+        };
+        let Ok(header) = parse::Header::parse(message) else {
+            return self.drop_frame(DropReason::Dns, now);
+        };
+        let (txid, question) = match parse::parse_query(message) {
+            Ok(query) => query,
+            Err(_) => {
+                // Named in the record as well as it reads.
+                let (qname, qtype) = match parse::read_question(message) {
+                    Ok(q) if header.counts[0] == 1 => (parse::name_display(&q.name), q.qtype),
+                    _ => (String::new(), 0),
+                };
+                let (verdict, rule) = self.policy.load().dns_rule(&qname);
+                if let Some(reply) = dns::error_reply(message, dns::FORMERR) {
+                    self.send_dns(guest, &reply, now);
+                }
+                return self.record(Payload::NetDns(NetDns {
+                    txid: header.id,
+                    qname,
+                    qtype,
+                    rcode: dns::FORMERR,
+                    answers: Vec::new(),
+                    verdict,
+                    rule,
+                }));
+            }
+        };
+        let (verdict, rule) = self.policy.load().dns_rule(&question.name);
+        let pending = Pending {
+            txid,
+            guest,
+            question,
+            query: message.to_vec(),
+            verdict,
+            rule,
+        };
+        if verdict == Verdict::Deny {
+            return self.refuse(pending, dns::NXDOMAIN, now);
+        }
+        if let Err((pending, error)) = self.dns.forward(pending, now) {
+            if let ForwardError::Send(error) = &error {
+                boxcar_virtio::limited!(warn, "net: dns: {error}");
+            }
+            self.refuse(pending, dns::SERVFAIL, now);
+        }
+    }
+
+    /// Answers a query with `rcode` and no records, and records it.
+    fn refuse(&mut self, pending: Pending, rcode: u16, now: Instant) {
+        if let Some(reply) = dns::error_reply(&pending.query, rcode) {
+            self.send_dns(pending.guest, &reply, now);
+        }
+        self.record(dns_record(pending, rcode, Vec::new()));
+    }
+
+    /// Gives the guest the upstream's answer, without its AAAA answers and
+    /// cut down if the link cannot carry it whole, caches the addresses it
+    /// gives, and records it. An answer cut down gives the guest no
+    /// address, so none is cached or recorded.
+    fn deliver(&mut self, answer: forwarder::Answer, now: Instant) {
+        let forwarder::Answer {
+            pending,
+            reply,
+            answers,
+        } = answer;
+        let stripped = parse::strip_aaaa(&reply);
+        let (message, whole) = if stripped.len() <= dns::MAX_MESSAGE {
+            (Some(stripped), true)
+        } else {
+            (dns::truncated(&stripped), false)
+        };
+        let Some(message) = message else {
+            // Unreachable: the forwarder takes only answers that read.
+            return self.drop_frame(DropReason::DnsBogus, now);
+        };
+        let rcode = dns::rcode(&message).unwrap_or(dns::SERVFAIL);
+        let mut addresses: Vec<Ipv4Addr> = Vec::new();
+        if whole {
+            for (name, ip, ttl) in &answers {
+                self.dns_cache.insert_at(*ip, name, *ttl, now);
+                if !addresses.contains(ip) {
+                    addresses.push(*ip);
+                }
+            }
+        }
+        self.send_dns(pending.guest, &message, now);
+        let addresses = addresses.iter().map(Ipv4Addr::to_string).collect();
+        self.record(dns_record(pending, rcode, addresses));
+    }
+
+    /// Sends `message` to the guest's resolver at `guest` (by the guest's
+    /// MAC), from the gateway's port 53.
+    fn send_dns(&mut self, guest: SocketAddrV4, message: &[u8], now: Instant) {
+        let server = SocketAddrV4::new(self.cfg.gateway, DNS_PORT);
+        let built = frame::udp_frame(
+            EthernetAddress(self.cfg.gateway_mac),
+            EthernetAddress(self.cfg.guest_mac),
+            server,
+            guest,
+            message,
+        );
+        // Every message here fits the link: built from a query that came
+        // over it, or held to `dns::MAX_MESSAGE`.
+        if let Some(built) = built {
+            self.send_to_guest(built, now);
         }
     }
 
@@ -274,6 +458,23 @@ impl NetStack {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
         }
     }
+}
+
+/// The `net.dns` for a query answered with `rcode`, giving `answers`.
+///
+/// It is made whether or not the guest's queue takes the answer (one it
+/// refuses is counted as `queue_full`): the query was asked and decided,
+/// and may have gone upstream, which the log must show either way.
+fn dns_record(pending: Pending, rcode: u16, answers: Vec<String>) -> Payload {
+    Payload::NetDns(NetDns {
+        txid: pending.txid,
+        qname: pending.question.name,
+        qtype: pending.question.qtype,
+        rcode,
+        answers,
+        verdict: pending.verdict,
+        rule: pending.rule,
+    })
 }
 
 /// smoltcp's device: two frame queues, one each way.

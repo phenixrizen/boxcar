@@ -14,24 +14,30 @@
 //! - [`arp`]: proxy ARP for the whole network but the guest's own address.
 //! - [`dhcp`]: a static lease.
 //! - [`icmp`]: echo replies from the gateway; all other ICMP is dropped.
+//! - [`dns`]: the gateway's DNS, forwarded to the host's resolver, and the
+//!   names each answer gave its addresses.
+//! - [`policy`]: what the guest may reach and resolve.
 //! - [`stack`]: the queues, smoltcp's interface (which takes TCP), and the
 //!   counted drops.
 //! - [`audit`]: the `net.*` records.
-//! - [`config`]: the addressing and the egress policy.
+//! - [`config`]: the addressing and the DNS upstreams.
 //!
-//! IPv6 is dropped. DNS and other UDP are dropped and counted until their
-//! handlers land; TCP reaches smoltcp, which has no sockets yet and resets
-//! every connection.
+//! IPv6 is dropped. UDP other than DHCP and DNS is dropped and counted
+//! until its relay lands; TCP reaches smoltcp, which has no sockets yet and
+//! resets every connection.
 
 pub mod arp;
 pub mod audit;
 pub mod config;
 pub mod dhcp;
+pub mod dns;
 pub mod frame;
 pub mod icmp;
+pub mod policy;
 pub mod stack;
 
 pub use audit::DropReason;
-pub use config::{ConfigError, NetConfig, Policy};
+pub use config::{ConfigError, NetConfig};
 pub use frame::Dispatch;
-pub use stack::{FdChange, Interest, NetStack, PollOutcome};
+pub use policy::{Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
+pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};

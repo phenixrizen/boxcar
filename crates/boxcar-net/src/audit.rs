@@ -4,11 +4,11 @@
 //! The network stack's way into the audit log, and the coalescing that
 //! keeps a guest that floods it with junk from flooding the log.
 //!
-//! [`emit`] is for records that must not be lost (leases, verdicts);
-//! [`try_emit`] for records the log may drop when it is busy, which it
-//! counts (`net.drop`). Dropped frames are recorded through [`Drops`]: at
-//! most one `net.drop` a second for each [`DropReason`], counting every
-//! frame since the last.
+//! [`emit`] is for records that must not be lost (leases, DNS queries,
+//! verdicts); [`try_emit`] for records the log may drop when it is busy,
+//! which it counts (`net.drop`). Dropped frames are recorded through
+//! [`Drops`]: at most one `net.drop` a second for each [`DropReason`],
+//! counting every frame since the last.
 
 use std::time::{Duration, Instant};
 
@@ -51,8 +51,14 @@ pub enum DropReason {
     /// UDP to the DHCP port that gets no lease: a message other than a
     /// DISCOVER or a REQUEST, or a malformed one.
     Dhcp,
-    /// DNS to the gateway, before the forwarder answers it.
-    DnsUnimplemented,
+    /// UDP to the gateway's DNS port too short to hold a DNS header, which
+    /// gets no answer. (Longer messages that are not plain queries get
+    /// FORMERR, and a `net.dns`.)
+    Dns,
+    /// A datagram from the DNS upstream that answers no query in flight:
+    /// its id is not in flight, its question is not that query's, or it
+    /// does not read.
+    DnsBogus,
     /// UDP other than DHCP and DNS, before the relay carries it.
     UdpUnimplemented,
     /// A queue between the guest and the stack was full.
@@ -63,11 +69,12 @@ pub enum DropReason {
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 7] = [
+    pub const ALL: [DropReason; 8] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
-        DropReason::DnsUnimplemented,
+        DropReason::Dns,
+        DropReason::DnsBogus,
         DropReason::UdpUnimplemented,
         DropReason::QueueFull,
         DropReason::Other,
@@ -79,7 +86,8 @@ impl DropReason {
             DropReason::Ipv6 => "ipv6",
             DropReason::Icmp => "icmp",
             DropReason::Dhcp => "dhcp",
-            DropReason::DnsUnimplemented => "dns_unimplemented",
+            DropReason::Dns => "dns",
+            DropReason::DnsBogus => "dns_bogus",
             DropReason::UdpUnimplemented => "udp_unimplemented",
             DropReason::QueueFull => "queue_full",
             DropReason::Other => "other",
@@ -290,7 +298,8 @@ mod tests {
                 "ipv6",
                 "icmp",
                 "dhcp",
-                "dns_unimplemented",
+                "dns",
+                "dns_bogus",
                 "udp_unimplemented",
                 "queue_full",
                 "other"
