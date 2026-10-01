@@ -15,6 +15,7 @@ boxcar-audit = { workspace = true }
 boxcar-virtio = { workspace = true }
 boxcar-fs = { workspace = true }
 boxcar-net = { workspace = true }
+boxcar-vsock = { workspace = true }
 arc-swap = { workspace = true }
 kvm-ioctls = { workspace = true }
 kvm-bindings = { workspace = true }

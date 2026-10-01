@@ -20,6 +20,7 @@ boxcar-virtio = { path = "crates/boxcar-virtio" }
 boxcar-fs = { path = "crates/boxcar-fs" }
 boxcar-vmm = { path = "crates/boxcar-vmm" }
 boxcar-net = { path = "crates/boxcar-net" }
+boxcar-vsock = { path = "crates/boxcar-vsock" }
 
 # rust-vmm and fuse-backend-rs: exact pins, one coherent vm-memory 0.17 set.
 # crates.io only: no git dependencies and no [patch] sections.

@@ -3,15 +3,18 @@
 
 //! The devices the VMM puts on its buses. The legacy PIO devices live in
 //! [`legacy`]; the virtio-mmio devices come from `boxcar-virtio`, the
-//! virtio-fs shares, [`FsDevices`], from `boxcar-fs`, and the network card,
-//! [`NetDevice`], from `boxcar-net`. Where each virtio device sits is fixed
-//! by the table in [`slots`].
+//! virtio-fs shares, [`FsDevices`], from `boxcar-fs`, the network card,
+//! [`NetDevice`], from `boxcar-net`, and the vsock device, [`VsockDevice`],
+//! from `boxcar-vsock`. Where each virtio device sits is fixed by the table
+//! in [`slots`].
 
 pub mod legacy;
 pub mod net;
 pub mod slots;
+pub mod vsock;
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_audit::AuditSink;
@@ -28,11 +31,12 @@ use self::slots::{slot, SlotId};
 pub use crate::console::ConsoleOut;
 pub use legacy::{EventFdTrigger, LegacyDevices, SerialDevice, I8042};
 pub use net::NetDevice;
+pub use vsock::VsockDevice;
 
 /// The tags of the virtio-fs shares, in slot order: slot 0 (`0xC000_0000`,
 /// GSI 5) is the root filesystem, slot 1 (`0xC000_1000`, GSI 6) the
-/// workspace. Slot 2 is the network card's ([`NetDevice`]), slot 3 is kept
-/// for vsock.
+/// workspace. Slot 2 is the network card's ([`NetDevice`]), slot 3 the
+/// vsock device's ([`VsockDevice`]).
 pub const FS_TAGS: [&str; 2] = ["root", "workspace"];
 
 /// The slot of each of the [`FS_TAGS`], in the same order.
@@ -78,6 +82,23 @@ pub enum DeviceError {
     /// KVM.
     #[error("cannot wire the virtio-net device into KVM")]
     NetWiring(#[source] io::Error),
+    /// The directory of the vsock socket could not be created.
+    #[error("cannot create the directory of the vsock socket {}", path.display())]
+    VsockDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The vsock device, or its host socket, could not be created.
+    #[error("cannot create the virtio-vsock device")]
+    Vsock(#[source] boxcar_vsock::device::VsockDeviceError),
+    /// The vsock device's fixed slot or GSI could not be reserved.
+    #[error("cannot reserve the virtio-mmio slot of the virtio-vsock device")]
+    VsockSlot(#[source] SlotError),
+    /// The vsock device's eventfds could not be created or registered with
+    /// KVM.
+    #[error("cannot wire the virtio-vsock device into KVM")]
+    VsockWiring(#[source] io::Error),
     #[error("cannot place a virtio-mmio device on the bus")]
     Bus(#[from] BusError),
 }

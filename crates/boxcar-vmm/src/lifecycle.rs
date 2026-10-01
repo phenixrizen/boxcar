@@ -15,9 +15,11 @@
 //! The stop sequence, run on the main thread: tell the control clients the
 //! VM is `stopping`, kick and join every vCPU, close the devices (reset
 //! every virtio-fs device through its transport, which joins its workers
-//! and records the close of every file the guest left open, and the
-//! network card, whose net thread records the end of every flow before it
-//! is joined), let the
+//! and records the close of every file the guest left open, the network
+//! card, whose net thread records the end of every flow before it is
+//! joined, and the vsock device, whose vsock thread records the end of
+//! every connection before it is joined, and whose host socket is then
+//! unlinked), let the
 //! console writer drain what it can for at most [`CONSOLE_DEADLINE`]
 //! (it counts what it could not deliver), mark the VM `stopped` and shut
 //! the control server down (each client hears `stopped` and is
@@ -54,7 +56,8 @@ use vmm_sys_util::signal::create_sigset;
 
 use crate::console::ConsoleWriter;
 use crate::control::ControlServer;
-use crate::devices::{FsDevices, NetDevice};
+use crate::devices::{FsDevices, NetDevice, VsockDevice};
+use crate::services::ServiceRegistry;
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
 
@@ -253,6 +256,8 @@ pub(crate) struct VmInfo {
     /// The virtio devices present, by slot name in slot order.
     pub(crate) devices: Vec<String>,
     pub(crate) audit: AuditSink,
+    /// The services on the internal vsock ports.
+    pub(crate) services: Arc<ServiceRegistry>,
 }
 
 /// Stops a VM from another thread, and reports its status. Cheap to clone.
@@ -312,6 +317,14 @@ impl VmmHandle {
     /// The sink of the session's audit log.
     pub(crate) fn audit(&self) -> &AuditSink {
         &self.info.audit
+    }
+
+    /// The services on the internal vsock ports, where the guest control
+    /// channel and the PTY hub register theirs. Empty until they do; the
+    /// vsock device, if the VM has one, asks it for every guest connection
+    /// to an internal port that its rules let through.
+    pub fn services(&self) -> Arc<ServiceRegistry> {
+        Arc::clone(&self.info.services)
     }
 }
 
@@ -514,6 +527,7 @@ pub(crate) struct Teardown<'a> {
     pub(crate) vcpus: VcpuSet,
     pub(crate) fs: &'a FsDevices,
     pub(crate) net: &'a NetDevice,
+    pub(crate) vsock: &'a VsockDevice,
     pub(crate) console: ConsoleWriter,
     /// Console input bytes the stdin subscriber dropped, read once the main
     /// loop is done.
@@ -534,6 +548,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
         vcpus,
         fs,
         net,
+        vsock,
         console,
         stdin_dropped_bytes,
         control,
@@ -547,6 +562,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     vcpus.stop_and_join();
     fs.close();
     net.close();
+    vsock.close();
     let console = console.flush_and_join(CONSOLE_DEADLINE);
     latch.mark_stopped();
     if let Some(control) = control {
@@ -619,6 +635,7 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         mem_mib: 256,
         devices: vec!["fs:root".into(), "fs:workspace".into()],
         audit: sink,
+        services: Arc::new(ServiceRegistry::new()),
     };
     let latch = Arc::new(StopLatch::new().expect("stop latch"));
     (VmmHandle::new(latch, Arc::new(info)), writer)

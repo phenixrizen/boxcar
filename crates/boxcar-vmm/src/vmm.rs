@@ -7,8 +7,10 @@
 //! Boot order in `Vmm::new`: open KVM and check its capabilities, raise
 //! `RLIMIT_NOFILE`, create the VM with its TSS, in-kernel irqchip and PIT,
 //! map guest memory, load the kernel and the initramfs, create the devices
-//! (the legacy PIO devices, then one virtio-fs device per share and the
-//! network card, each in its fixed slot of [`crate::devices::slots`]), write
+//! (the legacy PIO devices, then one virtio-fs device per share, the network
+//! card and the vsock device, each in its fixed slot of
+//! [`crate::devices::slots`], the vsock device with the VMM's
+//! [`ServiceRegistry`], empty, behind its internal ports), write
 //! the command line with the network's arguments ([`NET_CMDLINE`]) when
 //! there is a network card and a `virtio_mmio.device=` entry for each slot
 //! of the [`DeviceSet`], write the zero page and MP table, create and set up
@@ -33,6 +35,7 @@ use boxcar_net::{NetConfig, Policy};
 use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
+use boxcar_vsock::VsockConfig;
 use event_manager::{EventManager, EventSet, Events, MutEventSubscriber, SubscriberOps};
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::{VcpuFd, VmFd};
@@ -52,7 +55,7 @@ use crate::console::ConsoleWriter;
 use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
-use crate::devices::{DeviceError, FsDevices, LegacyDevices, NetDevice};
+use crate::devices::{DeviceError, FsDevices, LegacyDevices, NetDevice, VsockDevice};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
@@ -60,6 +63,7 @@ use crate::lifecycle::{
     MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
+use crate::services::ServiceRegistry;
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
 use crate::vcpu::VcpuSet;
 
@@ -194,6 +198,11 @@ pub struct VmConfig {
     /// decision; storing a new policy in it (the control server's
     /// `policy.update`) decides the next query or connection.
     pub policy: Arc<ArcSwap<Policy>>,
+    /// The vsock device, if the VM has one (slot 3): the guest's CID, the
+    /// host socket (`boxcar run` puts it in the session's state directory,
+    /// beside the control socket), and the host ports a guest connection
+    /// may reach besides the internal ones. See `boxcar_vsock`.
+    pub vsock: Option<VsockConfig>,
     /// The control socket, if any: see [`ControlConfig`].
     pub control: Option<ControlConfig>,
 }
@@ -213,7 +222,8 @@ impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
     /// boot, the console on stdio with stdin, no shares, no network card (and
-    /// a policy that denies everything), and no control socket.
+    /// a policy that denies everything), no vsock device, and no control
+    /// socket.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
         VmConfig {
             kernel: kernel.into(),
@@ -229,6 +239,7 @@ impl VmConfig {
             fs_audit: AuditFsOptions::default(),
             net: None,
             policy: Arc::new(ArcSwap::from_pointee(Policy::default())),
+            vsock: None,
             control: None,
         }
     }
@@ -326,6 +337,7 @@ pub struct Vmm {
     stdin_dropped: Arc<AtomicU64>,
     fs: FsDevices,
     net: NetDevice,
+    vsock: VsockDevice,
     /// What the guest may reach: the network card's stack reads it.
     policy: Arc<ArcSwap<Policy>>,
     latch: Arc<StopLatch>,
@@ -414,10 +426,21 @@ impl Vmm {
             &cfg.audit,
             &cfg.policy,
         )?;
+        // Empty: the guest control channel and the PTY hub register theirs.
+        let services = Arc::new(ServiceRegistry::new());
+        let vsock = VsockDevice::attach(
+            &vm,
+            &mem,
+            &mut mmio,
+            &mut slots,
+            cfg.vsock.as_ref(),
+            &cfg.audit,
+            &services,
+        )?;
         // What was attached is what the command line and `status` say.
         debug_assert_eq!(
             set,
-            DeviceSet::new(fs.len(), net.is_attached(), false),
+            DeviceSet::new(fs.len(), net.is_attached(), vsock.is_attached()),
             "the devices attached are not DeviceSet::from_config's"
         );
 
@@ -453,6 +476,7 @@ impl Vmm {
                 .map(|slot| slot.id.name().to_owned())
                 .collect(),
             audit: cfg.audit.clone(),
+            services,
         });
 
         let start = VmmStart {
@@ -515,6 +539,7 @@ impl Vmm {
             stdin_dropped: Arc::new(AtomicU64::new(0)),
             fs,
             net,
+            vsock,
             policy: cfg.policy,
             latch,
             info,
@@ -556,6 +581,7 @@ impl Vmm {
             Err(error) => {
                 self.fs.close();
                 self.net.close();
+                self.vsock.close();
                 let console = self.console.flush_and_join(CONSOLE_DEADLINE);
                 self.latch.mark_stopped();
                 if let Some(control) = self.control.take() {
@@ -578,6 +604,7 @@ impl Vmm {
             vcpus,
             fs: &self.fs,
             net: &self.net,
+            vsock: &self.vsock,
             console: self.console,
             // The main loop is done: this is the final count.
             stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),

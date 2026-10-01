@@ -86,6 +86,12 @@ pub enum Command {
     /// `--allow`; everything else is denied), and every DNS query and
     /// connection is in the audit log. A policy rule that does not parse
     /// exits 2.
+    ///
+    /// With shares the guest also gets a vsock device (see `--vsock`),
+    /// whose host socket is `vsock.sock` beside the control socket: host
+    /// processes reach a guest port by connecting to it and sending
+    /// `CONNECT <port>`, and the guest reaches host ports listed with
+    /// `--vsock-allow`. Every vsock connection is in the audit log.
     // Boxed: the run's arguments are most of the enum's size.
     Run(Box<RunArgs>),
     /// Show a running VM's status.
@@ -271,6 +277,50 @@ pub struct RunArgs {
         conflicts_with = "no_net"
     )]
     pub dns: Vec<SocketAddr>,
+    /// Give the guest a vsock device (CID 3): the VMM's own channels to the
+    /// guest, and connections between guest and host ports. Its host
+    /// socket is `vsock.sock` in the session's state directory, mode 0600:
+    /// a host process reaches guest port P by connecting to it and sending
+    /// `CONNECT P` and a newline; once the guest accepts, it reads `OK
+    /// <port>` and a newline (the port the guest sees the connection come
+    /// from), and the socket carries the connection. Default: on with
+    /// shares, off with `--no-fs`. The last of `--vsock` and `--no-vsock`
+    /// wins.
+    #[arg(long, overrides_with = "no_vsock")]
+    pub vsock: bool,
+    /// No vsock device.
+    #[arg(long, overrides_with = "vsock")]
+    pub no_vsock: bool,
+    /// Let the guest connect to host vsock port PORT, which reaches the
+    /// Unix socket `vsock.sock_PORT` beside the vsock socket. PORT is 1027
+    /// or more: 1024 to 1026 are the VMM's own, and below 1024 is
+    /// reserved. A connection to a port not listed is refused and recorded.
+    /// Repeatable.
+    #[arg(
+        long,
+        value_name = "PORT",
+        value_parser = parse_vsock_port,
+        conflicts_with = "no_vsock"
+    )]
+    pub vsock_allow: Vec<u32>,
+}
+
+/// A host vsock port for `--vsock-allow`: a number from 1027 up, not an
+/// internal port (1024 to 1026), which the VMM keeps for itself, nor below
+/// 1024.
+pub fn parse_vsock_port(text: &str) -> Result<u32, String> {
+    let port: u32 = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a port number"))?;
+    if boxcar_vsock::services::is_internal(port) {
+        return Err(format!(
+            "{port} is an internal port (1024 to 1026), the VMM's own"
+        ));
+    }
+    if port < boxcar_vsock::services::PRIVILEGED_PORT_LIMIT {
+        return Err(format!("{port} is below 1024"));
+    }
+    Ok(port)
 }
 
 /// A DNS upstream for `--dns`: `ip`, on port 53, or `ip:port` (an IPv6
@@ -404,6 +454,65 @@ mod tests {
         for bad in ["dns.example", "9.9.9.9:0", "9.9.9.9:x", ""] {
             assert!(parse_upstream(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// `--vsock` and `--no-vsock`: the last one given wins; neither leaves
+    /// the default to `boxcar run`.
+    #[test]
+    fn vsock_and_no_vsock_override_each_other() {
+        let cli = run(&[]).unwrap();
+        assert_eq!(
+            (run_args(&cli).vsock, run_args(&cli).no_vsock),
+            (false, false)
+        );
+        let cli = run(&["--vsock", "--no-vsock"]).unwrap();
+        assert_eq!(
+            (run_args(&cli).vsock, run_args(&cli).no_vsock),
+            (false, true)
+        );
+        let cli = run(&["--no-vsock", "--vsock"]).unwrap();
+        assert_eq!(
+            (run_args(&cli).vsock, run_args(&cli).no_vsock),
+            (true, false)
+        );
+    }
+
+    /// `--vsock-allow` repeats; a port below 1024, an internal port (1024
+    /// to 1026) or no number at all is a usage error.
+    #[test]
+    fn vsock_allow_takes_ports_above_the_internal_ones() {
+        let cli = run(&["--vsock-allow", "5000", "--vsock-allow", "1027"]).unwrap();
+        assert_eq!(run_args(&cli).vsock_allow, [5000, 1027]);
+        let cli = run(&["--vsock-allow", "4294967295"]).unwrap();
+        assert_eq!(run_args(&cli).vsock_allow, [u32::MAX]);
+        for bad in [
+            "1023",
+            "1024",
+            "1025",
+            "1026",
+            "0",
+            "-1",
+            "x",
+            "4294967296",
+            "",
+        ] {
+            let error = run(&["--vsock-allow", bad]).err().unwrap();
+            assert_eq!(error.exit_code(), 2, "{bad:?}");
+        }
+        let error = run(&["--no-vsock", "--vsock-allow", "5000"]).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn a_vsock_port_is_above_1023_and_not_internal() {
+        assert_eq!(parse_vsock_port("5000"), Ok(5000));
+        assert_eq!(parse_vsock_port("1027"), Ok(1027));
+        for internal in ["1024", "1025", "1026"] {
+            let error = parse_vsock_port(internal).unwrap_err();
+            assert!(error.contains("internal"), "{error}");
+        }
+        assert!(parse_vsock_port("80").unwrap_err().contains("1024"));
+        assert!(parse_vsock_port("port").is_err());
     }
 
     #[test]

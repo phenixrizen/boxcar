@@ -152,10 +152,9 @@ impl DeviceSet {
         }
     }
 
-    /// The devices `Vmm::new` creates for `cfg`. There is no vsock device
-    /// yet.
+    /// The devices `Vmm::new` creates for `cfg`.
     pub fn from_config(cfg: &VmConfig) -> DeviceSet {
-        DeviceSet::new(cfg.fs_shares.len(), cfg.net.is_some(), false)
+        DeviceSet::new(cfg.fs_shares.len(), cfg.net.is_some(), cfg.vsock.is_some())
     }
 
     /// Whether the device of slot `id` is present.
@@ -299,6 +298,12 @@ mod tests {
         assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::new(2, true, false));
         cfg.fs_shares.clear();
         assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::new(0, true, false));
+        cfg.vsock = Some(boxcar_vsock::VsockConfig::new(
+            dir.path().join("vsock.sock"),
+        ));
+        assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::new(0, true, true));
+        cfg.net = None;
+        assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::new(0, false, true));
         drop(cfg);
         writer.close().unwrap();
     }

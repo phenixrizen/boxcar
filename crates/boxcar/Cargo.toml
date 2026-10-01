@@ -21,6 +21,7 @@ boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
 boxcar-net = { workspace = true }
+boxcar-vsock = { workspace = true }
 arc-swap = { workspace = true }
 
 [dev-dependencies]

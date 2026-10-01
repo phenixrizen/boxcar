@@ -146,6 +146,7 @@ dependencies = [
  "boxcar-net",
  "boxcar-proto",
  "boxcar-vmm",
+ "boxcar-vsock",
  "clap",
  "libc",
  "serde_json",
@@ -262,6 +263,7 @@ dependencies = [
  "boxcar-net",
  "boxcar-proto",
  "boxcar-virtio",
+ "boxcar-vsock",
  "event-manager",
  "kvm-bindings",
  "kvm-ioctls",
@@ -276,6 +278,26 @@ dependencies = [
  "vm-allocator",
  "vm-memory",
  "vm-superio",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "boxcar-vsock"
+version = "0.1.0"
+dependencies = [
+ "boxcar-audit",
+ "boxcar-proto",
+ "boxcar-virtio",
+ "event-manager",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "virtio-bindings",
+ "virtio-queue",
+ "virtio-vsock",
+ "vm-memory",
  "vmm-sys-util",
 ]
 

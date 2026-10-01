@@ -12,6 +12,7 @@ pub mod kick;
 pub mod kvm;
 pub mod lifecycle;
 pub mod memory;
+pub mod services;
 pub mod stdin;
 pub mod vcpu;
 pub mod vmm;

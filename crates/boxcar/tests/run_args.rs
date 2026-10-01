@@ -449,3 +449,44 @@ fn network_policy_flags_without_a_network_exit_2() {
         stderr(&output)
     );
 }
+
+/// Without shares the VM has no vsock device unless `--vsock` asks for
+/// one: `--vsock-allow` is then refused as a usage error, not ignored.
+#[test]
+fn vsock_allow_without_a_vsock_device_exits_2() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--no-fs",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--vsock-allow",
+        "5000",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("error: --vsock-allow needs --vsock"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// An internal port cannot be allowlisted: it is the VMM's.
+#[test]
+fn vsock_allow_refuses_an_internal_port() {
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--no-fs",
+        "--vsock",
+        "--vsock-allow",
+        "1025",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("internal"), "{}", stderr(&output));
+}

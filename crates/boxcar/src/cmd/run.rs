@@ -26,6 +26,7 @@ use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
 };
+use boxcar_vsock::VsockConfig;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{AuditLevelArg, RunArgs};
@@ -46,14 +47,23 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     init_tracing();
     // Everything that can be refused is checked before the session exists,
     // so that a typo does not leave an empty session behind: the network
-    // flags, the policy, the ready descriptor, the shares, where the audit
-    // log and the control socket go, and the kernel command line.
-    // clap requires --rootfs unless --no-fs, so the shares are known here.
+    // flags, the policy, the vsock flags, the ready descriptor, the shares,
+    // where the audit log and the control socket go, and the kernel command
+    // line. clap requires --rootfs unless --no-fs, so the shares are known
+    // here.
     let net = net_enabled(args.rootfs.is_some(), args.net, args.no_net);
     if !net && policy_flags_given(&args) {
         tell(
             "error: network policy flags need --net: without shares (--no-fs) the VM has no \
              network, and --allow, --deny, --policy-file and --dns would go unused",
+        );
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let vsock = vsock_enabled(args.rootfs.is_some(), args.vsock, args.no_vsock);
+    if !vsock && !args.vsock_allow.is_empty() {
+        tell(
+            "error: --vsock-allow needs --vsock: without shares (--no-fs) the VM has no vsock \
+             device, and the ports would go unused",
         );
         return Ok(ExitCode::from(USAGE_EXIT));
     }
@@ -99,7 +109,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command);
     // The devices the VM will have, derived as `Vmm::new` derives them.
-    let devices = DeviceSet::new(share_count, net, false);
+    let devices = DeviceSet::new(share_count, net, vsock);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
     if net {
         // Every relayed connection is a host socket.
@@ -139,6 +149,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => Vec::new(),
     };
 
+    let state_dir = sessions_root.join(session_id.as_str());
     let cfg = VmConfig {
         kernel: args.kernel,
         initramfs: args.initramfs,
@@ -156,8 +167,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         fs_shares,
         net: net.then(|| net_config(&args.dns)),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
+        vsock: vsock.then(|| vsock_config(&state_dir, &args.vsock_allow)),
         control: Some(ControlConfig {
-            state_dir: sessions_root.join(session_id.as_str()),
+            state_dir,
             session_id: session_id.clone(),
         }),
         fs_audit: AuditFsOptions {
@@ -401,6 +413,26 @@ fn policy_flags_given(args: &RunArgs) -> bool {
 fn net_enabled(shares: bool, net: bool, no_net: bool) -> bool {
     !no_net && (net || shares)
 }
+
+/// Whether the VM gets a vsock device: as the network card, with shares
+/// unless `--no-vsock`, and without them only with `--vsock` (clap leaves at
+/// most one of the two set, the last given).
+fn vsock_enabled(shares: bool, vsock: bool, no_vsock: bool) -> bool {
+    !no_vsock && (vsock || shares)
+}
+
+/// The vsock device's config: the guest at CID 3, the host socket
+/// `vsock.sock` in the session's `state_dir` (which the VMM makes, mode
+/// 0700, beside the control socket), and the host ports `allow` lists.
+fn vsock_config(state_dir: &Path, allow: &[u32]) -> VsockConfig {
+    VsockConfig {
+        allow_ports: allow.to_vec(),
+        ..VsockConfig::new(state_dir.join(VSOCK_SOCKET))
+    }
+}
+
+/// The name of the vsock device's host socket in the state directory.
+const VSOCK_SOCKET: &str = "vsock.sock";
 
 /// The guest network's config: the fixed addressing, and DNS forwarded to
 /// `dns`, or to the host's resolvers when it is empty.
@@ -804,6 +836,27 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "--policy-file p line 2: default is given twice");
+    }
+
+    #[test]
+    fn vsock_is_on_with_the_shares_unless_asked_otherwise() {
+        assert!(vsock_enabled(true, false, false));
+        assert!(!vsock_enabled(false, false, false), "--no-fs");
+        assert!(vsock_enabled(false, true, false), "--no-fs --vsock");
+        assert!(!vsock_enabled(true, false, true), "--no-vsock");
+    }
+
+    /// The vsock socket is in the session's state directory, beside the
+    /// control socket, and the allowlist is the flags'.
+    #[test]
+    fn the_vsock_config_is_in_the_state_directory() {
+        let cfg = vsock_config(Path::new("/run/user/1000/boxcar/s1"), &[5000, 6000]);
+        assert_eq!(cfg.guest_cid, 3);
+        assert_eq!(
+            cfg.uds_path,
+            Path::new("/run/user/1000/boxcar/s1/vsock.sock")
+        );
+        assert_eq!(cfg.allow_ports, [5000, 6000]);
     }
 
     #[test]
