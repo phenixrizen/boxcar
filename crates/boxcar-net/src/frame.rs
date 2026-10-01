@@ -190,13 +190,37 @@ pub(crate) fn udp_frame(
 /// Whether a guest frame [`classify`] sorted as TCP is a reset (RST
 /// without SYN).
 pub(crate) fn tcp_reset_flag(frame: &[u8]) -> bool {
-    let Ok(eth) = EthernetFrame::new_checked(frame) else {
-        return false;
-    };
-    let Ok(packet) = Ipv4Packet::new_checked(eth.payload()) else {
-        return false;
-    };
-    TcpPacket::new_checked(packet.payload()).is_ok_and(|tcp| tcp.rst() && !tcp.syn())
+    tcp_header(frame).is_some_and(|tcp| tcp.rst() && !tcp.syn())
+}
+
+/// The TCP header of a guest frame, if it is IPv4 TCP.
+fn tcp_header(frame: &[u8]) -> Option<TcpPacket<&[u8]>> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let packet = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if packet.next_header() != IpProtocol::Tcp {
+        return None;
+    }
+    TcpPacket::new_checked(packet.payload()).ok()
+}
+
+/// The sequence number of a guest TCP segment (a SYN's is the guest's
+/// initial sequence number).
+pub(crate) fn tcp_seq(frame: &[u8]) -> Option<u32> {
+    tcp_header(frame).map(|tcp| tcp.seq_number().0 as u32)
+}
+
+/// Where a guest TCP segment's FIN sits in the sequence space (after its
+/// data), if it carries one (without SYN or RST).
+pub(crate) fn tcp_fin_position(frame: &[u8]) -> Option<u32> {
+    let tcp = tcp_header(frame)?;
+    if !tcp.fin() || tcp.syn() || tcp.rst() {
+        return None;
+    }
+    let data = u32::try_from(tcp.payload().len()).ok()?;
+    Some((tcp.seq_number().0 as u32).wrapping_add(data))
 }
 
 /// The RST+ACK that refuses a guest's TCP segment `segment` (a SYN, for

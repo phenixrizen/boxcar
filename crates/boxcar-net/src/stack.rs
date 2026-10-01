@@ -243,12 +243,16 @@ impl NetStack {
             Dispatch::TcpSyn { src, dst } => self.tcp_syn(frame, src, dst, now),
             // Segments of the relay's connections; smoltcp resets any other.
             // A reset for a connect still under way goes no further.
+            // The relay notes where the guest's stream ends.
             Dispatch::Tcp { src, dst } => {
                 if frame::tcp_reset_flag(frame) {
                     let (tcp, mut cx) = self.split(now);
                     if tcp.guest_rst(&mut cx, src, dst) {
                         return;
                     }
+                }
+                if let Some(fin) = frame::tcp_fin_position(frame) {
+                    self.tcp.guest_fin_at(src, dst, fin);
                 }
                 self.send_to_smoltcp(frame.to_vec(), now)
             }

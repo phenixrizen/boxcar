@@ -38,7 +38,11 @@
 //! smoltcp socket as soon as the FIN is seen (into the flow's
 //! [`tail`](Flow::tail), written first), because the end of smoltcp's
 //! TIME-WAIT empties its receive buffer; the flow stays until the host has
-//! taken them. The host's EOF closes the smoltcp socket, which sends its
+//! taken them. They are taken once, exactly up to the FIN (the dispatcher
+//! notes where each guest FIN sits): smoltcp still takes in-window data
+//! after a FIN, so a guest that sends any is reset and its flow ends
+//! (`error`), the host still getting every byte from before the FIN, then
+//! a FIN. The host's EOF closes the smoltcp socket, which sends its
 //! FIN after the bytes before it. A flow ends (`fin`) when both have gone
 //! and smoltcp is done. A reset from the guest resets the host socket
 //! (`reset`), as does a guest that goes silent for
@@ -184,6 +188,12 @@ enum Step {
     Done(&'static str),
     /// To be aborted for this reason: both sides reset.
     Abort(&'static str),
+    /// The guest sent data after its FIN: its side is reset, and the host
+    /// gets what came before the FIN, then a FIN (`error`).
+    Violation,
+    /// An ending flow's host socket is done with: it has every byte owed
+    /// it and its FIN, or failed (`reset`).
+    Drained { reset: bool },
 }
 
 /// What the gate made of a flow's first bytes: its `net.tls` record when
@@ -367,6 +377,15 @@ impl Relay {
         false
     }
 
+    /// The guest sent a FIN for `guest` → `dst` at sequence number `fin`.
+    /// The first a flow sees is where its stream ends.
+    pub(crate) fn guest_fin_at(&mut self, guest: SocketAddrV4, dst: SocketAddrV4, fin: u32) {
+        let id = self.table.id_of(guest, dst);
+        if let Some(flow) = id.and_then(|id| self.table.get_mut(id)) {
+            flow.fin_at.get_or_insert(fin);
+        }
+    }
+
     /// Resets the guest for every connect that has taken too long.
     pub(crate) fn expire(&mut self, cx: &mut Ctx) {
         for id in self.table.timed_out(cx.now, self.limits.connect_timeout) {
@@ -519,9 +538,10 @@ impl Relay {
                 "evicted",
             ));
             cx.socket(&flow).abort();
-            if let Some(host) = flow.host.take() {
-                self.discard(id, host, &mut flow.watched, true);
-            }
+        }
+        // An ending flow's host may still be draining.
+        if let Some(host) = flow.host.take() {
+            self.discard(id, host, &mut flow.watched, true);
         }
         cx.flush();
         cx.sockets.remove(flow.socket);
@@ -597,6 +617,43 @@ impl Relay {
                 }
                 self.ending.push(id);
             }
+            Step::Violation => {
+                let Some(flow) = self.table.get_mut(id) else {
+                    return;
+                };
+                // Recorded with what the host is owed: every byte before
+                // the guest's FIN.
+                let owed = flow.tx.saturating_add(flow.tail.len() as u64);
+                cx.record(close_record(
+                    id,
+                    owed,
+                    flow.rx,
+                    flow.opened,
+                    cx.now,
+                    "error",
+                ));
+                cx.sockets.get_mut::<tcp::Socket>(flow.socket).abort();
+                flow.state = FlowState::Ending("error");
+                flow.gate = None;
+                self.ending.push(id);
+                // The host keeps its socket until it has them.
+                self.pump_one(cx, id);
+            }
+            Step::Drained { reset } => {
+                let Some(flow) = self.table.get_mut(id) else {
+                    return;
+                };
+                if let Some(host) = flow.host.take() {
+                    discard(
+                        &mut self.fd_changes,
+                        &mut self.graveyard,
+                        id,
+                        host,
+                        &mut flow.watched,
+                        reset,
+                    );
+                }
+            }
         }
     }
 
@@ -608,17 +665,18 @@ impl Relay {
                 return false;
             };
             // After an abort smoltcp forgets the connection once it has
-            // sent the reset.
+            // sent the reset; a host still being given its bytes waits.
             let sent = cx
                 .sockets
                 .get::<tcp::Socket>(flow.socket)
                 .remote_endpoint()
                 .is_none();
-            if sent {
+            let gone = sent && flow.host.is_none();
+            if gone {
                 cx.sockets.remove(flow.socket);
                 table.remove(*id);
             }
-            !sent
+            !gone
         });
     }
 
@@ -707,6 +765,11 @@ fn watch(fd_changes: &mut Vec<FdChange>, flow: &mut Flow, socket: &tcp::Socket) 
             // Room for the guest's data that waits.
             writable: !flow.host_writable && (socket.can_recv() || !flow.tail.is_empty()),
         },
+        // An ending flow whose host is still owed bytes.
+        (Some(_), FlowState::Ending(_)) => Interest {
+            readable: false,
+            writable: !flow.host_writable && !flow.tail.is_empty(),
+        },
         _ => Interest::default(),
     };
     if wanted != flow.watched {
@@ -727,7 +790,7 @@ fn watch(fd_changes: &mut Vec<FdChange>, flow: &mut Flow, socket: &tcp::Socket) 
 fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
     use tcp::State;
     if flow.ending() {
-        return Step::Open;
+        return drain(flow);
     }
     let state = socket.state();
     if matches!(
@@ -751,7 +814,10 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
             // Not reached: a gated flow has its gate.
             return Step::Abort("error");
         };
-        match gate(flow.id, flow.dst.port(), held, flow.guest_fin, socket, env) {
+        let before = held.seen.len();
+        let step = gate(flow.id, flow.dst.port(), held, flow.guest_fin, socket, env);
+        flow.taken = flow.taken.wrapping_add(count(held.seen.len() - before));
+        match step {
             GateStep::Wait => return Step::Open,
             GateStep::Pass(record) => {
                 audit::record(env.sink, record);
@@ -767,14 +833,23 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
             }
         }
     }
+    // At the guest's FIN, the bytes before it are taken out of the socket
+    // at once, before the end of TIME-WAIT can empty it. smoltcp still
+    // takes in-window data after a FIN (in CLOSE-WAIT), and every byte
+    // taken out would open its window again: so the bytes are taken once,
+    // exactly up to the FIN, and any byte after it ends the flow.
+    if flow.guest_fin && !flow.fin_taken {
+        flow.fin_taken = true;
+        if !take_before_fin(flow, socket) {
+            return Step::Violation;
+        }
+    }
+    if flow.fin_taken && socket.recv_queue() > 0 {
+        return Step::Violation;
+    }
     let Some(host) = flow.host.as_mut() else {
         return Step::Open;
     };
-    // Once the guest has sent its FIN nothing more comes: what the socket
-    // holds is taken out now, before the end of TIME-WAIT can empty it.
-    if flow.guest_fin {
-        take_all(socket, &mut flow.tail);
-    }
     // Guest to host, as far as the host takes it: first what was taken
     // out of the socket, then what it holds (dequeued only as far as each
     // write took it, so what the host refuses stays, and the guest's
@@ -796,6 +871,7 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
         match socket.recv(|data| io_step(host.write(data))) {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
+                flow.taken = flow.taken.wrapping_add(count(n));
                 flow.tx = flow.tx.saturating_add(n as u64);
                 flow.last_active = env.now;
             }
@@ -836,17 +912,85 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
     Step::Open
 }
 
-/// Takes everything the socket has received into `into`.
-fn take_all(socket: &mut tcp::Socket, into: &mut Vec<u8>) {
-    while socket.can_recv() {
+/// Takes the bytes before the guest's FIN out of the socket into the
+/// flow's tail, and says whether they were all there was: `false` when
+/// bytes after the FIN came too (they are not taken, or are cut off the
+/// tail if the gate took them with the FIN), or when the FIN smoltcp took
+/// is not where the guest's FIN segment put it.
+fn take_before_fin(flow: &mut Flow, socket: &mut tcp::Socket) -> bool {
+    let held = socket.recv_queue();
+    let Some(fin) = flow.fin_at else {
+        // Not reached: the dispatcher sees every FIN before smoltcp does.
+        let took = take(socket, &mut flow.tail, held);
+        flow.taken = flow.taken.wrapping_add(count(took));
+        return true;
+    };
+    // How far the FIN is past the next byte the socket holds: negative
+    // when bytes after it were taken already.
+    let next = flow.first_seq.wrapping_add(flow.taken);
+    let ahead = fin.wrapping_sub(next) as i32;
+    let Ok(ahead) = usize::try_from(ahead) else {
+        let over = ahead.unsigned_abs() as usize;
+        let keep = flow.tail.len().saturating_sub(over);
+        flow.tail.truncate(keep);
+        return false;
+    };
+    if ahead > held {
+        return false;
+    }
+    let took = take(socket, &mut flow.tail, ahead);
+    flow.taken = flow.taken.wrapping_add(count(took));
+    socket.recv_queue() == 0
+}
+
+/// Takes up to `n` of the bytes the socket has received into `into`, and
+/// says how many it took.
+fn take(socket: &mut tcp::Socket, into: &mut Vec<u8>, n: usize) -> usize {
+    let mut took = 0;
+    while took < n && socket.can_recv() {
+        let left = n - took;
         let taken = socket.recv(|data| {
-            into.extend_from_slice(data);
-            (data.len(), ())
+            let part = data.get(..left).unwrap_or(data);
+            into.extend_from_slice(part);
+            (part.len(), part.len())
         });
-        if taken.is_err() {
-            break;
+        match taken {
+            Ok(k) if k > 0 => took += k,
+            _ => break,
         }
     }
+    took
+}
+
+/// A byte count in the sequence space, modulo 2^32.
+fn count(n: usize) -> u32 {
+    n as u32
+}
+
+/// Gives an ending flow's host the bytes it is owed (those before the
+/// guest's FIN, when the guest broke the stream after it), then a FIN.
+fn drain(flow: &mut Flow) -> Step {
+    let Some(host) = flow.host.as_mut() else {
+        return Step::Open;
+    };
+    while flow.host_writable && !flow.tail.is_empty() {
+        match io_retry(host.write(&flow.tail)) {
+            Ok(None) => {}
+            Ok(Some(0)) => break,
+            Ok(Some(n)) => {
+                flow.tail.drain(..n.min(flow.tail.len()));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => flow.host_writable = false,
+            Err(_) => return Step::Drained { reset: true },
+        }
+    }
+    if !flow.tail.is_empty() {
+        return Step::Open;
+    }
+    // The bytes are in the kernel's hands; a plain close sends them, then
+    // the FIN.
+    let _ = host.shutdown(Shutdown::Write);
+    Step::Drained { reset: false }
 }
 
 /// An I/O result with `Interrupted` as `Ok(None)`, to try again.

@@ -47,7 +47,10 @@ pub enum FlowState {
     /// Moving bytes both ways.
     Relaying,
     /// Over, for this `net.close` reason (already recorded): its smoltcp
-    /// socket is sending the guest a reset, and then the flow goes.
+    /// socket is sending the guest a reset, and then the flow goes. A flow
+    /// that ended because the guest sent data after its FIN keeps its host
+    /// socket until the host has the bytes from before the FIN, then ends
+    /// it with a FIN.
     Ending(&'static str),
 }
 
@@ -125,6 +128,18 @@ pub struct Flow {
     /// The guest sent a reset for this connection: a socket that closes
     /// without both FINs was reset, not timed out.
     pub(crate) guest_rst: bool,
+    /// The sequence number of the guest's first data byte (its initial
+    /// sequence number, from the parked SYN, plus one).
+    pub(crate) first_seq: u32,
+    /// Bytes taken out of the smoltcp socket so far, modulo 2^32: with
+    /// `first_seq`, the sequence number of the next byte it holds.
+    pub(crate) taken: u32,
+    /// Where the guest's FIN sits in the sequence space, from the first
+    /// FIN segment the dispatcher saw for this connection.
+    pub(crate) fin_at: Option<u32>,
+    /// The bytes before the guest's FIN have been taken out of the socket:
+    /// anything it receives from now on came after the FIN.
+    pub(crate) fin_taken: bool,
 }
 
 impl Flow {
@@ -138,6 +153,8 @@ impl Flow {
         // `TcpLimits::check` keeps the timeout to a day.
         let deadline = now.checked_add(gate_timeout).unwrap_or(now);
         let gate = pending.gated.then(|| GateBuf::new(deadline));
+        // The parked frame was classified as a TCP SYN, so it reads.
+        let isn = crate::frame::tcp_seq(&pending.syn).unwrap_or(0);
         Flow {
             id: pending.id,
             guest: pending.guest,
@@ -163,6 +180,10 @@ impl Flow {
             host_shut: false,
             guest_fin: false,
             guest_rst: false,
+            first_seq: isn.wrapping_add(1),
+            taken: 0,
+            fin_at: None,
+            fin_taken: false,
         }
     }
 

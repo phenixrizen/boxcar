@@ -1570,6 +1570,331 @@ fn frames_from_another_source_are_dropped_as_spoofed() {
     assert_eq!(spoofed, 3);
 }
 
+/// A guest that plays TCP by hand, one segment at a time: what the stack
+/// last acknowledged and offered, and the resets it sent.
+struct RawGuest {
+    h: Harness,
+    events: FakeEventLoop,
+    guest: SocketAddrV4,
+    server: SocketAddrV4,
+    /// The next sequence number the guest sends, and what it acknowledges.
+    seq: u32,
+    ack: u32,
+    acked: u32,
+    window: u32,
+    resets: usize,
+}
+
+impl RawGuest {
+    /// A guest connected through `h` to `server`.
+    fn connect(h: Harness, server: SocketAddrV4) -> RawGuest {
+        let mut raw = RawGuest {
+            h,
+            events: FakeEventLoop::new(),
+            guest: SocketAddrV4::new(GUEST, 40_000),
+            server,
+            seq: 1000,
+            ack: 0,
+            acked: 0,
+            window: 0,
+            resets: 0,
+        };
+        raw.turn();
+        raw.h.stack.push_guest_frame(&guest_arp());
+        raw.h.drain();
+        raw.h.stack.push_guest_frame(&syn(raw.guest, server, 1000));
+        let start = Instant::now();
+        while raw.ack == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no SYN-ACK");
+            raw.events
+                .dispatch(&mut raw.h.stack, Duration::from_millis(10));
+            raw.turn();
+        }
+        raw.seq = 1001;
+        raw.send(TcpControl::None, &[]);
+        raw
+    }
+
+    /// The stack's turn: its poll, the host fds, its poll again; what it
+    /// sent the guest is read.
+    fn turn(&mut self) {
+        let outcome = self.h.stack.poll(Instant::now());
+        self.events.apply(&outcome.fd_changes);
+        self.events.dispatch(&mut self.h.stack, Duration::ZERO);
+        let outcome = self.h.stack.poll(Instant::now());
+        self.events.apply(&outcome.fd_changes);
+        for frame in self.h.drain() {
+            let Some(s) = segment(&frame) else { continue };
+            if s.rst {
+                self.resets += 1;
+            } else if s.syn && s.ack {
+                self.ack = s.seq.wrapping_add(1);
+                self.acked = s.ack_number;
+                self.window = u32::from(s.window);
+            } else if s.ack {
+                self.acked = s.ack_number;
+                self.window = u32::from(s.window);
+            }
+        }
+    }
+
+    /// The guest sends `payload` (and `control`) at its next sequence
+    /// number, and the stack takes its turn.
+    fn send(&mut self, control: TcpControl, payload: &[u8]) {
+        let frame = self.segment(control, payload);
+        self.h.stack.push_guest_frame(&frame);
+        self.seq = self
+            .seq
+            .wrapping_add(payload.len() as u32 + u32::from(control == TcpControl::Fin));
+        self.turn();
+    }
+
+    /// A segment at the guest's next sequence number, acknowledging
+    /// everything (no window scaling).
+    fn segment(&self, control: TcpControl, payload: &[u8]) -> Vec<u8> {
+        let repr = smoltcp::wire::TcpRepr {
+            src_port: self.guest.port(),
+            dst_port: self.server.port(),
+            control,
+            seq_number: smoltcp::wire::TcpSeqNumber(self.seq as i32),
+            ack_number: Some(smoltcp::wire::TcpSeqNumber(self.ack as i32)),
+            window_len: 65_535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        common::ipv4(
+            GATEWAY_MAC,
+            *self.guest.ip(),
+            *self.server.ip(),
+            smoltcp::wire::IpProtocol::Tcp,
+            repr.buffer_len(),
+            |buf| {
+                repr.emit(
+                    &mut TcpPacket::new_unchecked(buf),
+                    &(*self.guest.ip()).into(),
+                    &(*self.server.ip()).into(),
+                    &smoltcp::phy::ChecksumCapabilities::default(),
+                )
+            },
+        )
+    }
+
+    /// Room in the stack's window at the guest's next sequence number.
+    fn room(&self) -> u32 {
+        let room = self.acked.wrapping_add(self.window).wrapping_sub(self.seq);
+        if room < 1 << 30 {
+            room
+        } else {
+            0
+        }
+    }
+}
+
+/// What a stalled peer got: how many bytes, its last 16, and how its
+/// connection ended.
+type Got = (u64, Vec<u8>, Result<(), ErrorKind>);
+
+/// A host peer on 127.0.0.1 with a small receive buffer that reads
+/// nothing until told, then reads to the end (checking the test pattern,
+/// if `patterned`): what it got, once it is done.
+fn stalled_peer(patterned: bool) -> (SocketAddrV4, mpsc::Sender<()>, mpsc::Receiver<Got>) {
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener.set_recv_buffer_size(4096).unwrap();
+    listener
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    listener.listen(1).unwrap();
+    let server = listener.local_addr().unwrap().as_socket_ipv4().unwrap();
+    let (go, read_now) = mpsc::channel::<()>();
+    let (report, received) = mpsc::channel();
+    thread::spawn(move || {
+        let (conn, _) = listener.accept().unwrap();
+        let mut conn = std::net::TcpStream::from(conn);
+        let _ = read_now.recv();
+        conn.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut buf = vec![0; 64 * 1024];
+        let (mut n, mut last) = (0_u64, Vec::new());
+        let end = loop {
+            match conn.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(k) => {
+                    for (i, b) in buf[..k].iter().enumerate() {
+                        let want = pattern(n + i as u64);
+                        assert!(!patterned || *b == want, "byte {}", n + i as u64);
+                    }
+                    n += k as u64;
+                    last.extend_from_slice(&buf[..k]);
+                    let cut = last.len().saturating_sub(16);
+                    last.drain(..cut);
+                }
+                Err(e) => break Err(e.kind()),
+            }
+        };
+        let _ = report.send((n, last, end));
+    });
+    (server, go, received)
+}
+
+#[test]
+fn data_after_the_guests_fin_ends_the_flow() {
+    let (server, go, received) = stalled_peer(true);
+    let mut raw = RawGuest::connect(harness_with(policy(&["allow 127.0.0.0/8"])), server);
+    // The guest fills the host's kernel and the stack's buffer.
+    let mut sent = 0_u64;
+    let mut chunk = vec![0; 1460];
+    let mut stuck = 0;
+    while stuck < 200 {
+        if raw.room() >= 1460 {
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = pattern(sent + i as u64);
+            }
+            raw.send(TcpControl::Psh, &chunk);
+            sent += 1460;
+            stuck = 0;
+        } else {
+            stuck += 1;
+            thread::sleep(Duration::from_micros(200));
+            raw.turn();
+        }
+        assert!(sent < 64 << 20, "the window never closed");
+    }
+    assert_eq!(
+        raw.acked, raw.seq,
+        "everything before the FIN is acknowledged"
+    );
+    raw.send(TcpControl::Fin, &[]);
+    let fin_end = raw.seq;
+    assert_eq!(raw.acked, fin_end, "the FIN is acknowledged");
+
+    // The guest goes on sending, in the window, past one window's worth.
+    let mut offered = 0_u64;
+    while raw.resets == 0 && offered < 4 << 20 {
+        let n = if raw.room() >= 1460 { 1460 } else { 1 };
+        raw.send(TcpControl::Psh, &chunk[..n]);
+        offered += n as u64;
+    }
+    assert!(raw.resets > 0, "the guest is reset");
+    let past_fin = raw.acked.wrapping_sub(fin_end);
+    assert!(
+        past_fin <= 64 * 1024,
+        "at most a window past the FIN was acknowledged: {past_fin}"
+    );
+    assert_eq!(raw.h.stack.open_flows(), 1, "the host is still owed bytes");
+
+    // The host reads: exactly what came before the FIN, then its end.
+    go.send(()).unwrap();
+    let mut got = None;
+    let start = Instant::now();
+    while got.is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the host never finished"
+        );
+        raw.events
+            .dispatch(&mut raw.h.stack, Duration::from_millis(2));
+        raw.turn();
+        got = received.try_recv().ok();
+    }
+    let (n, _, end) = got.unwrap();
+    assert_eq!((n, end), (sent, Ok(())));
+    let start = Instant::now();
+    while raw.h.stack.open_flows() > 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "the flow stayed");
+        raw.turn();
+    }
+    let events = raw.h.events();
+    assert_eq!(close_summary(&events), [(1, sent, 0, "error".into())]);
+}
+
+#[test]
+fn data_after_the_fin_in_the_same_batch_is_not_forwarded() {
+    let (server, go, received) = stalled_peer(true);
+    go.send(()).unwrap();
+    let mut raw = RawGuest::connect(harness_with(policy(&["allow 127.0.0.0/8"])), server);
+    let first: Vec<u8> = (0..8).map(pattern).collect();
+    raw.send(TcpControl::Psh, &first[..5]);
+    // A FIN carrying three bytes, and three more after it, before the
+    // stack's next poll.
+    let fin = raw.segment(TcpControl::Fin, &first[5..]);
+    raw.seq = raw.seq.wrapping_add(4);
+    let after = raw.segment(TcpControl::Psh, b"xyz");
+    raw.h.stack.push_guest_frame(&fin);
+    raw.h.stack.push_guest_frame(&after);
+    raw.turn();
+    assert!(raw.resets > 0, "the guest is reset");
+    let mut got = None;
+    let start = Instant::now();
+    while got.is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the host never finished"
+        );
+        raw.events
+            .dispatch(&mut raw.h.stack, Duration::from_millis(2));
+        raw.turn();
+        got = received.try_recv().ok();
+    }
+    let (n, last, end) = got.unwrap();
+    assert_eq!((n, last.as_slice(), end), (8, &first[..], Ok(())));
+    let events = raw.h.events();
+    assert_eq!(close_summary(&events), [(1, 8, 0, "error".into())]);
+}
+
+#[test]
+fn post_fin_bytes_the_gate_took_are_not_forwarded() {
+    let (server, go, received) = stalled_peer(false);
+    go.send(()).unwrap();
+    let mut h = harness_with(policy(&["allow example.com", "allow 127.0.0.0/8"]));
+    resolve(&mut h, "example.com", Ipv4Addr::LOCALHOST);
+    let mut raw = RawGuest::connect(h, server);
+    // The hello with a FIN on it, and bytes after the FIN, all before the
+    // gate looks: it takes them all, and the FIN cuts them off.
+    let hello = client_hello(Some("example.com"), &[]);
+    let fin = raw.segment(TcpControl::Fin, &hello);
+    raw.seq = raw.seq.wrapping_add(hello.len() as u32 + 1);
+    let after = raw.segment(TcpControl::Psh, b"after the end");
+    raw.h.stack.push_guest_frame(&fin);
+    raw.h.stack.push_guest_frame(&after);
+    raw.turn();
+    assert!(raw.resets > 0, "the guest is reset");
+    let mut got = None;
+    let start = Instant::now();
+    while got.is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the host never finished"
+        );
+        raw.events
+            .dispatch(&mut raw.h.stack, Duration::from_millis(2));
+        raw.turn();
+        got = received.try_recv().ok();
+    }
+    let (n, last, end) = got.unwrap();
+    assert_eq!(n, hello.len() as u64, "the hello and nothing after the FIN");
+    assert_eq!(last, hello[hello.len() - 16..]);
+    assert_eq!(end, Ok(()));
+    let events = raw.h.events();
+    assert_eq!(
+        tls(&events),
+        [tls_record(
+            1,
+            "tls",
+            Some("example.com"),
+            &[],
+            Verdict::Allow
+        )]
+    );
+    assert_eq!(
+        close_summary(&events),
+        [(1, hello.len() as u64, 0, "error".into())]
+    );
+}
+
 #[test]
 fn host_local_addresses_are_denied() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

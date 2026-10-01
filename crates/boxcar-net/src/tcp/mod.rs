@@ -51,8 +51,14 @@ pub use flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
 /// [`DNS_TOKEN`](crate::DNS_TOKEN).
 pub const FLOW_TOKEN_BASE: u64 = 1 << 32;
 
-/// The size of each smoltcp socket buffer, receive and send: at the flow
-/// cap, 4096 × 128 KiB = 512 MiB that a guest could fill.
+/// The size of each smoltcp socket buffer, receive and send.
+///
+/// What a flow can hold, at worst: both buffers (128 KiB, allocated with
+/// the flow), plus its tail of guest bytes taken out for the host: up to a
+/// gate prefix ([`GATE_LIMIT`], about 16 KiB) after a gate pass, and the
+/// receive buffer's worth (64 KiB) taken once at the guest's FIN. That is
+/// about 208 KiB a flow, and 4096 × 208 KiB ≈ 832 MiB at the flow cap,
+/// beside the host sockets' kernel buffers.
 pub const SOCKET_BUFFER: usize = 64 * 1024;
 
 /// The gate's default byte limit: one TLS record of the largest size, with
