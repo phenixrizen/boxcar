@@ -464,11 +464,17 @@ pub struct NetDrop {
 /// verdict on it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetUdp {
-    /// The flow's id, unique within the session; its `net.close` carries it.
+    /// The flow's id, unique within the session (TCP and UDP flows share
+    /// one count); its `net.close` carries it.
     pub flow: u64,
     /// The guest's address and source port.
     pub src: SocketAddrV4,
     /// The address and port the guest sent to.
     pub dst: SocketAddrV4,
+    /// The names the guest's DNS answers gave `dst`'s address, newest first.
+    pub names: Vec<String>,
     pub verdict: Verdict,
+    /// The policy rule that decided, as written; `null` when the policy's
+    /// default did.
+    pub rule: Option<String>,
 }

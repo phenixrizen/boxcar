@@ -988,13 +988,17 @@ mod tests {
                     flow: 8,
                     src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 5353),
                     dst: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 123),
-                    verdict: Verdict::Deny,
+                    names: vec!["time.example".into()],
+                    verdict: Verdict::Allow,
+                    rule: Some("allow 192.0.2.0/24:123".into()),
                 }),
                 json!({
                     "flow": 8,
                     "src": "10.0.2.15:5353",
                     "dst": "192.0.2.1:123",
-                    "verdict": "deny",
+                    "names": ["time.example"],
+                    "verdict": "allow",
+                    "rule": "allow 192.0.2.0/24:123",
                 }),
             ),
         ]
@@ -1155,6 +1159,26 @@ mod tests {
                     verdict: Verdict::Deny,
                 }),
                 json!({"flow": 9, "kind": "http", "sni": null, "alpn": [], "verdict": "deny"}),
+            ),
+            (
+                // Denied by the policy's default, to an address no DNS
+                // answer named.
+                Payload::NetUdp(NetUdp {
+                    flow: 10,
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40001),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 9),
+                    names: Vec::new(),
+                    verdict: Verdict::Deny,
+                    rule: None,
+                }),
+                json!({
+                    "flow": 10,
+                    "src": "10.0.2.15:40001",
+                    "dst": "198.51.100.9:9",
+                    "names": [],
+                    "verdict": "deny",
+                    "rule": null,
+                }),
             ),
         ]
     }
