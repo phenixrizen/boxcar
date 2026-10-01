@@ -14,15 +14,18 @@
 // arch/src/x86_64/mod.rs (configure_vcpu and update_cpuid_topology) at commit
 // 853c440425ebe23bcf5fb43d9058bd1d8a0abe2a. Adapted: one flat topology (one
 // thread per core, `num_cpus` cores, one die, one package) patched in place on
-// `kvm_bindings::CpuId` entries KVM already reports; no entries are added.
+// `kvm_bindings::CpuId` entries KVM already reports; the only entries added
+// are the leaf 0xB subleaves KVM leaves out on some hosts.
 
 //! Per-vCPU CPUID: KVM's supported CPUID with the APIC ID, the topology and
 //! the hypervisor bit filled in for this vCPU.
 
-use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES};
+use kvm_bindings::{
+    kvm_cpuid_entry2, CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_MAX_CPUID_ENTRIES,
+};
 use kvm_ioctls::{Kvm, VcpuFd};
 
-use crate::arch::{kvm_error, Result};
+use crate::arch::{kvm_error, Error, Result};
 
 /// Basic feature information.
 const LEAF_FEATURES: u32 = 0x1;
@@ -114,20 +117,59 @@ pub fn patch_cpuid(cpuid: &mut CpuId, vcpu_id: u8, num_cpus: u8) {
     }
 }
 
+/// The subleaves of leaf 0xB that [`patch_cpuid`] fills in: the thread
+/// level, the core level, and the invalid level that ends the enumeration.
+const EXT_TOPOLOGY_SUBLEAVES: u32 = 3;
+
+/// Gives leaf 0xB the subleaves [`patch_cpuid`] patches, when KVM reports
+/// the leaf with fewer, as it does on a host whose own leaf 0xB is empty
+/// (one subleaf of zeroes, on an AMD Threadripper under WSL2). Patching
+/// only what is there leaves a guest with a thread level and no core level,
+/// which Linux reads as one package for each vCPU. The added
+/// entries are zeroed; `patch_cpuid` fills them in. A list with no leaf 0xB
+/// at all is left alone: the guest does not look for one.
+fn add_missing_ext_topology_levels(cpuid: &mut CpuId) -> Result<()> {
+    let has_leaf = |cpuid: &CpuId, index| {
+        cpuid
+            .as_slice()
+            .iter()
+            .any(|e| e.function == LEAF_EXT_TOPOLOGY && e.index == index)
+    };
+    if !has_leaf(cpuid, 0) {
+        return Ok(());
+    }
+    for index in 1..EXT_TOPOLOGY_SUBLEAVES {
+        if !has_leaf(cpuid, index) {
+            cpuid
+                .push(kvm_cpuid_entry2 {
+                    function: LEAF_EXT_TOPOLOGY,
+                    index,
+                    flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    ..Default::default()
+                })
+                .map_err(Error::Cpuid)?;
+        }
+    }
+    Ok(())
+}
+
 /// Sets the CPUID of `vcpu` to KVM's supported CPUID patched by
-/// [`patch_cpuid`] for vCPU `vcpu_id` of `num_cpus`.
+/// [`patch_cpuid`] for vCPU `vcpu_id` of `num_cpus`. With more than one
+/// vCPU, leaf 0xB gets the subleaves it needs first (see
+/// [`add_missing_ext_topology_levels`]); one vCPU is left as KVM reports it.
 pub fn setup_cpuid(kvm: &Kvm, vcpu: &VcpuFd, vcpu_id: u8, num_cpus: u8) -> Result<()> {
     let mut cpuid = kvm
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
         .map_err(kvm_error("get_supported_cpuid"))?;
+    if num_cpus > 1 {
+        add_missing_ext_topology_levels(&mut cpuid)?;
+    }
     patch_cpuid(&mut cpuid, vcpu_id, num_cpus);
     vcpu.set_cpuid2(&cpuid).map_err(kvm_error("set_cpuid2"))
 }
 
 #[cfg(test)]
 mod tests {
-    use kvm_bindings::{kvm_cpuid_entry2, KVM_CPUID_FLAG_SIGNIFCANT_INDEX};
-
     use super::*;
 
     const ALL: u32 = 0xffff_ffff;
@@ -263,10 +305,82 @@ mod tests {
         }
     }
 
+    /// What KVM reports on a host whose own leaf 0xB is empty (an AMD
+    /// Threadripper under WSL2): one subleaf of zeroes, and nothing for the
+    /// core level.
+    fn single_subleaf_cpuid() -> CpuId {
+        CpuId::from_entries(&[
+            entry(0x0, 0, [0xd, 0x6874_7541, 0x444d_4163, 0x6974_6e65]),
+            entry(0x1, 0, [0x0080_0f82, 0x0100_0800, 0xf7f8_3203, 0x078b_fbff]),
+            entry(0xb, 0, [0, 0, 0, 0x26]),
+            entry(0x8000_0008, 0, [0x30_3030, 0x0200_1005, 0x0000_603f, 0]),
+            entry(0x8000_001e, 0, [0, 0, 0, 0]),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_core_level_is_added_for_several_vcpus() {
+        for vcpu_id in 0..4 {
+            let mut cpuid = single_subleaf_cpuid();
+            add_missing_ext_topology_levels(&mut cpuid).unwrap();
+            patch_cpuid(&mut cpuid, vcpu_id, 4);
+
+            // Thread level, core level (all 4 vCPUs in one package), then
+            // the invalid level that ends the enumeration.
+            assert_eq!(regs(&cpuid, 0xb, 0), [0, 1, 1 << 8, u32::from(vcpu_id)]);
+            assert_eq!(
+                regs(&cpuid, 0xb, 1),
+                [2, 4, (2 << 8) | 1, u32::from(vcpu_id)]
+            );
+            assert_eq!(regs(&cpuid, 0xb, 2), [0, 0, 2, u32::from(vcpu_id)]);
+            let leaf_b = cpuid.as_slice().iter().filter(|e| e.function == 0xb);
+            assert_eq!(leaf_b.count(), 3);
+            // Only leaf 0xB gained entries; leaf 0x1F was not there.
+            assert_eq!(cpuid.as_slice().len(), 7);
+        }
+    }
+
+    #[test]
+    fn levels_that_are_there_are_not_added_again() {
+        let mut cpuid = synthetic_cpuid();
+        add_missing_ext_topology_levels(&mut cpuid).unwrap();
+        assert_eq!(cpuid.as_slice().len(), synthetic_cpuid().as_slice().len());
+
+        let mut cpuid = single_subleaf_cpuid();
+        add_missing_ext_topology_levels(&mut cpuid).unwrap();
+        let once = cpuid.as_slice().len();
+        add_missing_ext_topology_levels(&mut cpuid).unwrap();
+        assert_eq!(cpuid.as_slice().len(), once);
+    }
+
+    #[test]
+    fn a_host_without_leaf_0xb_gets_none() {
+        let mut cpuid = CpuId::from_entries(&[entry(0x1, 0, [0, 0, 0, 0])]).unwrap();
+        add_missing_ext_topology_levels(&mut cpuid).unwrap();
+        assert_eq!(cpuid.as_slice().len(), 1);
+    }
+
     #[cfg(feature = "kvm-tests")]
     mod kvm {
         use super::*;
         use crate::arch::x86_64::test_utils::vcpu_or_skip;
+
+        /// Whatever leaf 0xB KVM reports on this host, the guest must see a
+        /// core level of `num_cpus` CPUs, or it takes each vCPU for a
+        /// package of its own.
+        #[test]
+        fn setup_cpuid_enumerates_the_core_level() {
+            let Some((kvm, _vm, vcpu)) = vcpu_or_skip("setup_cpuid_enumerates_the_core_level")
+            else {
+                return;
+            };
+            setup_cpuid(&kvm, &vcpu, 0, 4).unwrap();
+
+            let cpuid = vcpu.get_cpuid2(KVM_MAX_CPUID_ENTRIES).unwrap();
+            assert_eq!(regs(&cpuid, 0xb, 0), [0, 1, 1 << 8, 0]);
+            assert_eq!(regs(&cpuid, 0xb, 1), [2, 4, (2 << 8) | 1, 0]);
+        }
 
         #[test]
         fn setup_cpuid_sets_the_apic_id() {
