@@ -2,11 +2,13 @@
 // Copyright 2026 The boxcar Authors
 
 //! The devices the VMM puts on its buses. The legacy PIO devices live in
-//! [`legacy`]; the virtio-mmio devices come from `boxcar-virtio`, and the
-//! virtio-fs shares, [`FsDevices`], from `boxcar-fs`. Where each virtio
-//! device sits is fixed by the table in [`slots`].
+//! [`legacy`]; the virtio-mmio devices come from `boxcar-virtio`, the
+//! virtio-fs shares, [`FsDevices`], from `boxcar-fs`, and the network card,
+//! [`NetDevice`], from `boxcar-net`. Where each virtio device sits is fixed
+//! by the table in [`slots`].
 
 pub mod legacy;
+pub mod net;
 pub mod slots;
 
 use std::io;
@@ -25,10 +27,12 @@ use self::slots::{slot, SlotId};
 
 pub use crate::console::ConsoleOut;
 pub use legacy::{EventFdTrigger, LegacyDevices, SerialDevice, I8042};
+pub use net::NetDevice;
 
 /// The tags of the virtio-fs shares, in slot order: slot 0 (`0xC000_0000`,
 /// GSI 5) is the root filesystem, slot 1 (`0xC000_1000`, GSI 6) the
-/// workspace. Slots 2 and 3 are kept for net and vsock.
+/// workspace. Slot 2 is the network card's ([`NetDevice`]), slot 3 is kept
+/// for vsock.
 pub const FS_TAGS: [&str; 2] = ["root", "workspace"];
 
 /// The slot of each of the [`FS_TAGS`], in the same order.
@@ -64,6 +68,16 @@ pub enum DeviceError {
         #[source]
         source: io::Error,
     },
+    /// The network card's stack cannot be built.
+    #[error("cannot create the virtio-net device")]
+    Net(#[source] boxcar_net::ConfigError),
+    /// The network card's fixed slot or GSI could not be reserved.
+    #[error("cannot reserve the virtio-mmio slot of the virtio-net device")]
+    NetSlot(#[source] SlotError),
+    /// The network card's eventfds could not be created or registered with
+    /// KVM.
+    #[error("cannot wire the virtio-net device into KVM")]
+    NetWiring(#[source] io::Error),
     #[error("cannot place a virtio-mmio device on the bus")]
     Bus(#[from] BusError),
 }
@@ -146,6 +160,16 @@ impl FsDevices {
             devices.devices.push(transport);
         }
         Ok(devices)
+    }
+
+    /// How many shares have a device.
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Whether there are no shares.
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
     }
 
     /// Resets every device through its transport, as a driver's status-0

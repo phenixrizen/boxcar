@@ -317,3 +317,71 @@ fn a_session_dir_as_the_workspace_is_refused() {
     let sessions = std::fs::read_dir(audit.join("sessions")).unwrap().count();
     assert_eq!(sessions, 1, "no session was started");
 }
+
+/// A policy rule that does not parse exits 2, as a usage error does, naming
+/// the flag and its value, before a session starts.
+#[test]
+fn a_bad_allow_rule_exits_2_before_a_session_starts() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--allow",
+        "example.com",
+        "--allow",
+        "example.com:99999",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "error: --allow \"example.com:99999\": \"99999\" is not a port from 1 to 65535"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// The same for a line of `--policy-file`: the file and the line.
+#[test]
+fn a_bad_policy_file_line_exits_2_naming_the_file_and_line() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let policy = scratch.path().join("team.policy");
+    std::fs::write(
+        &policy,
+        "# rules\nallow example.com\nallow 10.0.0.0/8 extra\n",
+    )
+    .unwrap();
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--policy-file",
+        policy.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!(
+            "error: --policy-file {} line 3: allow takes one target",
+            policy.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}

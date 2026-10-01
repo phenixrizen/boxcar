@@ -36,7 +36,10 @@ pub struct TestKvmArgs {
 /// A milestone with KVM-gated tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Milestone {
-    /// M1: boot, the console session, the shares and their audit log.
+    /// M1: boot, the console session, the shares and their audit log. Until
+    /// M2's own target exists (Task 15), this also runs the M2 gated tests
+    /// of the same packages, such as `boot_net` (the guest's network, which
+    /// skips when `BOXCAR_TEST_NET=0` or the host cannot reach example.com).
     M1,
 }
 

@@ -6,14 +6,18 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::{env, fs, io};
 
 use anyhow::{bail, Context};
+use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, WriterConfig, WriterHandle};
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
+use boxcar_net::{NetConfig, Policy};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
@@ -26,7 +30,11 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{AuditLevelArg, RunArgs};
 use crate::client;
-use crate::cmd::tell;
+use crate::cmd::{nofile, tell};
+
+/// The exit code of a usage error, as clap's: a policy rule that does not
+/// parse.
+const USAGE_EXIT: u8 = 2;
 
 /// Starts the session's audit writer, boots the VM, and waits for it to
 /// stop. The exit code is the VM's (see `exit_code_for`), except that
@@ -37,9 +45,16 @@ use crate::cmd::tell;
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     init_tracing();
     // Everything that can be refused is checked before the session exists,
-    // so that a typo does not leave an empty session behind: the ready
-    // descriptor, the shares, where the audit log and the control socket
-    // go, and the kernel command line.
+    // so that a typo does not leave an empty session behind: the policy,
+    // the ready descriptor, the shares, where the audit log and the control
+    // socket go, and the kernel command line.
+    let policy = match load_policy(&args)? {
+        Ok(policy) => policy,
+        Err(message) => {
+            tell(&format!("error: {message}"));
+            return Ok(ExitCode::from(USAGE_EXIT));
+        }
+    };
     let ready = args.ready_fd.map(ReadyFd::take).transpose()?;
     let rootfs = args
         .rootfs
@@ -74,9 +89,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => (GuestMode::Hello, 0),
     };
     let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command);
+    let net = net_enabled(share_count > 0, args.net, args.no_net);
     // The devices the VM will have, derived as `Vmm::new` derives them.
-    let devices = DeviceSet::from_shares(share_count);
+    let devices = DeviceSet::new(share_count, net, false);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
+    if net {
+        // Every relayed connection is a host socket.
+        match nofile::raise() {
+            Ok(soft) => {
+                if let Some(warning) = nofile::warning(soft) {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Err(error) => eprintln!("warning: cannot raise the open file limit: {error}"),
+        }
+    }
     let sessions_root =
         client::ensure_sessions_root().context("cannot set up the control socket's directory")?;
 
@@ -119,6 +146,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         stdin: args.command.is_empty(),
         audit: sink,
         fs_shares,
+        net: net.then(|| net_config(&args.dns)),
+        policy: Arc::new(ArcSwap::from_pointee(policy)),
         control: Some(ControlConfig {
             state_dir: sessions_root.join(session_id.as_str()),
             session_id: session_id.clone(),
@@ -285,6 +314,85 @@ mod fault {
             }
         }
     }
+}
+
+/// The policy of `--policy-file`, `--deny` and `--allow` (see
+/// [`build_policy`]). The outer error is a policy file that cannot be read;
+/// the inner one a rule that does not parse, said as the user should see
+/// it.
+fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Policy, String>> {
+    let file = match &args.policy_file {
+        Some(path) => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("--policy-file {}", path.display()))?;
+            Some((path.as_path(), text))
+        }
+        None => None,
+    };
+    let file = file.as_ref().map(|(path, text)| (*path, text.as_str()));
+    Ok(build_policy(file, &args.deny, &args.allow))
+}
+
+/// Where a line of the policy came from.
+enum Source<'a> {
+    File { path: &'a Path, line: usize },
+    Flag { flag: &'static str, rule: &'a str },
+}
+
+/// The policy the guest's network gets: the lines of the policy file
+/// (`file`, its path and its text) first, then a `deny` line for each of
+/// `deny`, then an `allow` line for each of `allow`, in order; the first
+/// rule that matches decides. Deny by default, unless the file gives a
+/// `default`. A rule that does not parse is refused with where it came
+/// from: `--policy-file PATH line N: ...` or `--allow "RULE": ...`.
+fn build_policy(
+    file: Option<(&Path, &str)>,
+    deny: &[String],
+    allow: &[String],
+) -> Result<Policy, String> {
+    let mut lines: Vec<(String, Source<'_>)> = Vec::new();
+    if let Some((path, text)) = file {
+        for (index, line) in text.lines().enumerate() {
+            let source = Source::File {
+                path,
+                line: index + 1,
+            };
+            lines.push((line.to_owned(), source));
+        }
+    }
+    for (verb, flag, rules) in [("deny", "--deny", deny), ("allow", "--allow", allow)] {
+        for rule in rules {
+            lines.push((format!("{verb} {rule}"), Source::Flag { flag, rule }));
+        }
+    }
+    let texts: Vec<&str> = lines.iter().map(|(text, _)| text.as_str()).collect();
+    Policy::parse(&texts).map_err(|error| {
+        let source = match lines.get(error.line.wrapping_sub(1)) {
+            Some((_, Source::File { path, line })) => {
+                format!("--policy-file {} line {line}", path.display())
+            }
+            Some((_, Source::Flag { flag, rule })) => format!("{flag} {rule:?}"),
+            None => "the policy".to_owned(),
+        };
+        format!("{source}: {}", error.kind)
+    })
+}
+
+/// Whether the VM gets a network card: with shares unless `--no-net`, and
+/// without them only with `--net` (clap leaves at most one of the two set,
+/// the last given).
+fn net_enabled(shares: bool, net: bool, no_net: bool) -> bool {
+    !no_net && (net || shares)
+}
+
+/// The guest network's config: the fixed addressing, and DNS forwarded to
+/// `dns`, or to the host's resolvers when it is empty.
+fn net_config(dns: &[SocketAddr]) -> NetConfig {
+    let mut cfg = NetConfig::from_host();
+    if !dns.is_empty() {
+        cfg.dns_upstreams = dns.to_vec();
+    }
+    cfg
 }
 
 /// How many shares a run with `--rootfs` gives the VM ([`shares`]), for
@@ -561,9 +669,14 @@ mod tests {
         assert_eq!(guestcmd::decode(value).unwrap(), command);
     }
 
+    /// The devices of a run with `--rootfs`: the shares and the network.
+    fn devices() -> DeviceSet {
+        DeviceSet::new(SHARE_COUNT, true, false)
+    }
+
     /// Size of the command line the VM would get, from the VMM itself.
     fn size(extra: &[String]) -> usize {
-        boxcar_vmm::vmm::cmdline_size(false, extra, &DeviceSet::from_shares(SHARE_COUNT)).unwrap()
+        boxcar_vmm::vmm::cmdline_size(false, extra, &devices()).unwrap()
     }
 
     #[test]
@@ -577,19 +690,9 @@ mod tests {
         // terminator included.
         let fits = 2048 - (size(&with_filler(1)) - 1);
         assert_eq!(size(&with_filler(fits)), 2048);
-        check_cmdline_size(
-            false,
-            &with_filler(fits),
-            &DeviceSet::from_shares(SHARE_COUNT),
-        )
-        .unwrap();
+        check_cmdline_size(false, &with_filler(fits), &devices()).unwrap();
 
-        let error = check_cmdline_size(
-            false,
-            &with_filler(fits + 1),
-            &DeviceSet::from_shares(SHARE_COUNT),
-        )
-        .unwrap_err();
+        let error = check_cmdline_size(false, &with_filler(fits + 1), &devices()).unwrap_err();
         assert_eq!(
             error.to_string(),
             "command line too long (2049 bytes > 2048)"
@@ -600,8 +703,7 @@ mod tests {
     fn a_long_command_is_refused_with_the_size_it_would_have() {
         let command = strings(&["/bin/sh", "-c", &"echo x; ".repeat(300)]);
         let cmdline = guest_cmdline(CONSOLE, &[], &command);
-        let error =
-            check_cmdline_size(false, &cmdline, &DeviceSet::from_shares(SHARE_COUNT)).unwrap_err();
+        let error = check_cmdline_size(false, &cmdline, &devices()).unwrap_err();
         assert_eq!(
             error.to_string(),
             format!("command line too long ({} bytes > 2048)", size(&cmdline))
@@ -609,6 +711,91 @@ mod tests {
         // The shares' virtio_mmio.device= entries count: without them the
         // same command may fit.
         assert!(size(&cmdline) > 2048);
+    }
+
+    /// The policy is the file's lines, then each `--deny`, then each
+    /// `--allow`, in the order given; deny by default unless the file says
+    /// otherwise.
+    use boxcar_net::Verdict;
+
+    #[test]
+    fn the_policy_is_the_file_then_the_denies_then_the_allows() {
+        let file = "# the team's rules\nallow api.example.com:443\n\ndeny *.ads.example\n";
+        let policy = build_policy(
+            Some((Path::new("team.policy"), file)),
+            &strings(&["203.0.113.0/24", "tracker.example"]),
+            &strings(&["example.com", "192.0.2.10:22"]),
+        )
+        .unwrap();
+        let texts: Vec<&str> = policy.rules.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "allow api.example.com:443",
+                "deny *.ads.example",
+                "deny 203.0.113.0/24",
+                "deny tracker.example",
+                "allow example.com",
+                "allow 192.0.2.10:22",
+            ]
+        );
+        assert_eq!(policy.default, Verdict::Deny);
+
+        // A deny flag comes before an allow flag for the same name.
+        let both =
+            build_policy(None, &strings(&["example.com"]), &strings(&["example.com"])).unwrap();
+        assert_eq!(both.dns("example.com"), Verdict::Deny);
+
+        // The file may set the default; the flags cannot.
+        let open = build_policy(Some((Path::new("p"), "default allow\n")), &[], &[]).unwrap();
+        assert_eq!(open.default, Verdict::Allow);
+        assert_eq!(build_policy(None, &[], &[]).unwrap(), Policy::default());
+    }
+
+    /// A rule that does not parse is named by where it came from: the
+    /// file and its line, or the flag and its value.
+    #[test]
+    fn a_bad_rule_is_named_by_its_source() {
+        let file = "allow a.example\n\nfrobnicate x\n";
+        let error =
+            build_policy(Some((Path::new("/etc/team.policy"), file)), &[], &[]).unwrap_err();
+        assert_eq!(
+            error,
+            "--policy-file /etc/team.policy line 3: \"frobnicate\" is not a rule; a rule \
+             starts with allow, deny or default"
+        );
+        let error = build_policy(
+            Some((Path::new("p"), "allow a.example\n")),
+            &strings(&["b.example"]),
+            &strings(&["c.example", "d.example:99999"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "--allow \"d.example:99999\": \"99999\" is not a port from 1 to 65535"
+        );
+        let error = build_policy(None, &strings(&["two words"]), &[]).unwrap_err();
+        assert!(
+            error.starts_with("--deny \"two words\": deny takes one target"),
+            "{error}"
+        );
+        // A default only the file may give, and only once.
+        let error = build_policy(
+            Some((Path::new("p"), "default deny\ndefault allow\n")),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error, "--policy-file p line 2: default is given twice");
+    }
+
+    #[test]
+    fn the_network_is_on_with_the_shares_unless_asked_otherwise() {
+        // (shares, --net, --no-net)
+        assert!(net_enabled(true, false, false));
+        assert!(!net_enabled(false, false, false), "--no-fs");
+        assert!(net_enabled(false, true, false), "--no-fs --net");
+        assert!(!net_enabled(true, false, true), "--no-net");
     }
 
     fn os(s: &str) -> Option<OsString> {

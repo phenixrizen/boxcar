@@ -4,6 +4,7 @@
 //! What `boxcar` accepts on its command line.
 
 use std::ffi::OsString;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
@@ -79,7 +80,14 @@ pub enum Command {
     /// SIGHUP and 131 after SIGQUIT. When stdin is a terminal, the console
     /// is on stdout and no command is given, every key goes to the guest,
     /// Ctrl-C included; press Ctrl-] twice within a second to stop the VM.
-    Run(RunArgs),
+    ///
+    /// With shares the guest also gets a network card (see `--net`): it
+    /// reaches only what the policy allows (`--policy-file`, `--deny`,
+    /// `--allow`; everything else is denied), and every DNS query and
+    /// connection is in the audit log. A policy rule that does not parse
+    /// exits 2.
+    // Boxed: the run's arguments are most of the enum's size.
+    Run(Box<RunArgs>),
     /// Show a running VM's status.
     ///
     /// Asks the session's control socket and prints a short table, or with
@@ -224,6 +232,57 @@ pub struct RunArgs {
     /// close it. FD must be open for writing, and not 0, 1 or 2.
     #[arg(long, value_name = "FD", allow_negative_numbers = true)]
     pub ready_fd: Option<i32>,
+    /// Give the guest a network card. The network is played on the host,
+    /// with no TAP device and no privileges: the guest is 10.0.2.15/24,
+    /// and 10.0.2.2 is its gateway and DNS server. Default: on with shares,
+    /// off with `--no-fs`. The last of `--net` and `--no-net` wins.
+    #[arg(long, overrides_with = "no_net")]
+    pub net: bool,
+    /// No network card: the guest has no network at all.
+    #[arg(long, overrides_with = "net")]
+    pub no_net: bool,
+    /// Let the guest reach RULE: `domain[:port]` (the name, or every name
+    /// under it for `*.domain`) or `cidr[:port]` (an address or a network,
+    /// such as 192.0.2.10:22 or 198.51.100.0/24). A domain rule admits only
+    /// clients that present the name, in a TLS SNI or an HTTP Host header,
+    /// and lets it resolve; SSH, SMTP, and UDP need a CIDR rule. Private
+    /// and local networks stay denied unless a rule names one exactly.
+    /// Repeatable; the allows come after `--policy-file` and `--deny`, and
+    /// the first rule that matches decides.
+    #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
+    pub allow: Vec<String>,
+    /// Deny the guest RULE, written as for `--allow`. Repeatable; the
+    /// denies come after `--policy-file` and before `--allow`.
+    #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
+    pub deny: Vec<String>,
+    /// Read policy rules from PATH, one a line: `allow RULE`, `deny RULE`,
+    /// and at most one `default allow` or `default deny` (deny if none
+    /// says); `#` starts a comment. Its rules come first.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_net")]
+    pub policy_file: Option<PathBuf>,
+    /// Where the guest's DNS queries are forwarded: an address, on port 53
+    /// unless given as `ip:port`. Repeatable, in order of preference.
+    /// Default: the nameservers in the host's /etc/resolv.conf.
+    #[arg(
+        long,
+        value_name = "UPSTREAM",
+        value_parser = parse_upstream,
+        conflicts_with = "no_net"
+    )]
+    pub dns: Vec<SocketAddr>,
+}
+
+/// A DNS upstream for `--dns`: `ip`, on port 53, or `ip:port` (an IPv6
+/// address with a port in brackets).
+pub fn parse_upstream(text: &str) -> Result<SocketAddr, String> {
+    let addr = text
+        .parse::<SocketAddr>()
+        .or_else(|_| text.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+        .map_err(|_| format!("{text:?} is not an address or address:port"))?;
+    if addr.port() == 0 {
+        return Err(format!("{text:?}: port 0"));
+    }
+    Ok(addr)
 }
 
 /// `--audit-level`.
@@ -235,6 +294,8 @@ pub enum AuditLevelArg {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn run(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -267,6 +328,81 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("after `--`"), "{error}");
+    }
+
+    fn run_args(cli: &Cli) -> &RunArgs {
+        match &cli.command {
+            Command::Run(args) => args,
+            _ => panic!("not a run"),
+        }
+    }
+
+    /// `--net` and `--no-net`: the last one given wins; neither leaves the
+    /// default to `boxcar run`.
+    #[test]
+    fn net_and_no_net_override_each_other() {
+        let cli = run(&[]).unwrap();
+        assert_eq!((run_args(&cli).net, run_args(&cli).no_net), (false, false));
+        let cli = run(&["--net", "--no-net"]).unwrap();
+        assert_eq!((run_args(&cli).net, run_args(&cli).no_net), (false, true));
+        let cli = run(&["--no-net", "--net"]).unwrap();
+        assert_eq!((run_args(&cli).net, run_args(&cli).no_net), (true, false));
+    }
+
+    #[test]
+    fn policy_flags_repeat_and_keep_their_order() {
+        let cli = run(&[
+            "--allow",
+            "a.example",
+            "--deny",
+            "b.example",
+            "--allow",
+            "192.0.2.0/24:22",
+            "--policy-file",
+            "team.policy",
+            "--dns",
+            "9.9.9.9",
+            "--dns",
+            "[::1]:5353",
+        ])
+        .unwrap();
+        let args = run_args(&cli);
+        assert_eq!(args.allow, ["a.example", "192.0.2.0/24:22"]);
+        assert_eq!(args.deny, ["b.example"]);
+        assert_eq!(args.policy_file.as_deref(), Some(Path::new("team.policy")));
+        let dns: Vec<String> = args.dns.iter().map(|a| a.to_string()).collect();
+        assert_eq!(dns, ["9.9.9.9:53", "[::1]:5353"]);
+        let error = run(&["--dns", "dns.example"]).err().unwrap();
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    /// Rules for a network the VM does not have are refused.
+    #[test]
+    fn policy_flags_conflict_with_no_net() {
+        for flag in [
+            ["--allow", "a.example"],
+            ["--deny", "a.example"],
+            ["--policy-file", "p"],
+            ["--dns", "9.9.9.9"],
+        ] {
+            let error = run(&["--no-net", flag[0], flag[1]]).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn a_dns_upstream_is_an_address_with_port_53_by_default() {
+        let parsed = |s: &str| parse_upstream(s).map(|a| a.to_string());
+        assert_eq!(parsed("9.9.9.9"), Ok("9.9.9.9:53".to_owned()));
+        assert_eq!(parsed("9.9.9.9:5353"), Ok("9.9.9.9:5353".to_owned()));
+        assert_eq!(
+            parsed("2606:4700:4700::1111"),
+            Ok("[2606:4700:4700::1111]:53".to_owned())
+        );
+        assert_eq!(parsed("[::1]:5353"), Ok("[::1]:5353".to_owned()));
+        for bad in ["dns.example", "9.9.9.9:0", "9.9.9.9:x", ""] {
+            assert!(parse_upstream(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

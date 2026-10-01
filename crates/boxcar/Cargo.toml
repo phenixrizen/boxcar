@@ -20,6 +20,8 @@ boxcar-proto = { workspace = true, features = ["hash"] }
 boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
+boxcar-net = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }

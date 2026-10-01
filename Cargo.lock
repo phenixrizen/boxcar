@@ -139,9 +139,11 @@ name = "boxcar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "blake3",
  "boxcar-audit",
  "boxcar-fs",
+ "boxcar-net",
  "boxcar-proto",
  "boxcar-vmm",
  "clap",
@@ -253,9 +255,11 @@ dependencies = [
 name = "boxcar-vmm"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "blake3",
  "boxcar-audit",
  "boxcar-fs",
+ "boxcar-net",
  "boxcar-proto",
  "boxcar-virtio",
  "event-manager",

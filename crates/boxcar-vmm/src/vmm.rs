@@ -7,10 +7,12 @@
 //! Boot order in `Vmm::new`: open KVM and check its capabilities, raise
 //! `RLIMIT_NOFILE`, create the VM with its TSS, in-kernel irqchip and PIT,
 //! map guest memory, load the kernel and the initramfs, create the devices
-//! (the legacy PIO devices, then one virtio-fs device per share, each in its
-//! fixed slot of [`crate::devices::slots`]), write the command line with a
-//! `virtio_mmio.device=` entry for each slot of the [`DeviceSet`], write the
-//! zero page and MP table, create and set up the vCPUs, record `vmm.start`,
+//! (the legacy PIO devices, then one virtio-fs device per share and the
+//! network card, each in its fixed slot of [`crate::devices::slots`]), write
+//! the command line with the network's arguments ([`NET_CMDLINE`]) when
+//! there is a network card and a `virtio_mmio.device=` entry for each slot
+//! of the [`DeviceSet`], write the zero page and MP table, create and set up
+//! the vCPUs, record `vmm.start`,
 //! and bind the control socket when the config asks for one, so that a
 //! client can connect while the VM boots (its state is `booting` until
 //! [`Vmm::run`] starts the vCPU threads).
@@ -24,8 +26,10 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
+use boxcar_net::{NetConfig, Policy};
 use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
@@ -48,7 +52,7 @@ use crate::console::ConsoleWriter;
 use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
-use crate::devices::{DeviceError, FsDevices, LegacyDevices};
+use crate::devices::{DeviceError, FsDevices, LegacyDevices, NetDevice};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
@@ -80,21 +84,32 @@ pub fn base_cmdline(debug_boot: bool) -> String {
     }
 }
 
+/// What the command line says when the VM has a network card, after the
+/// base and before the extras (which can override them): the kernel
+/// configures `eth0` itself as the guest at the stack's fixed addressing
+/// (`boxcar_net::config`), with no DHCP (`off`) and the gateway as its DNS
+/// server; and init writes the guest's resolver configuration.
+pub const NET_CMDLINE: [&str; 2] = [
+    "ip=10.0.2.15::10.0.2.2:255.255.255.0:boxcar:eth0:off:10.0.2.2",
+    "boxcar.net=1",
+];
+
 /// The size, NUL terminator included, of the kernel command line
 /// [`Vmm::new`] writes for a VM with `debug_boot`, `extra` and the devices
 /// in `set`, whether or not it fits in the [`CMDLINE_MAX_SIZE`] bytes the
 /// kernel takes: composed by `kernel_cmdline`, the function `Vmm::new`
-/// uses (the base, `extra`, a `virtio_mmio.device=` entry for each present
-/// slot of the fixed table), without building the VM. A caller can refuse a
-/// command line that is too long, with its size, before it starts anything.
-/// `set` is [`DeviceSet::from_config`] of the config the VM is built from,
-/// or [`DeviceSet::from_shares`] for a caller that has no [`VmConfig`] yet.
+/// uses (the base, [`NET_CMDLINE`] with a network card, `extra`, a
+/// `virtio_mmio.device=` entry for each present slot of the fixed table),
+/// without building the VM. A caller can refuse a command line that is too
+/// long, with its size, before it starts anything. `set` is
+/// [`DeviceSet::from_config`] of the config the VM is built from, or
+/// [`DeviceSet::new`] for a caller that has no [`VmConfig`] yet.
 pub fn cmdline_size(
     debug_boot: bool,
     extra: &[String],
     set: &DeviceSet,
 ) -> Result<usize, VmmError> {
-    let (base, extras) = cmdline_parts(debug_boot, extra);
+    let (base, extras) = cmdline_parts(debug_boot, extra, set);
     Ok(crate::cmdline::cmdline_size(
         &base,
         &extras,
@@ -118,16 +133,24 @@ fn kernel_cmdline(
     extra: &[String],
     set: &DeviceSet,
 ) -> crate::arch::Result<linux_loader::cmdline::Cmdline> {
-    let (base, extras) = cmdline_parts(debug_boot, extra);
+    let (base, extras) = cmdline_parts(debug_boot, extra, set);
     build_cmdline(&base, &extras, &cmdline_entries(set))
 }
 
-/// The base command line and the extra arguments, in order.
-fn cmdline_parts(debug_boot: bool, extra: &[String]) -> (String, Vec<&str>) {
-    (
-        base_cmdline(debug_boot),
-        extra.iter().map(String::as_str).collect(),
-    )
+/// The base command line, and the arguments after it in order: the
+/// network's when `set` has the network card, then `extra`.
+fn cmdline_parts<'a>(
+    debug_boot: bool,
+    extra: &'a [String],
+    set: &DeviceSet,
+) -> (String, Vec<&'a str>) {
+    let net: &[&str] = if set.net { &NET_CMDLINE } else { &[] };
+    let args = net
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .collect();
+    (base_cmdline(debug_boot), args)
 }
 
 /// Guest memory when not configured.
@@ -163,6 +186,14 @@ pub struct VmConfig {
     pub fs_shares: Vec<FsShareConfig>,
     /// How much the shares record.
     pub fs_audit: AuditFsOptions,
+    /// The network card's stack, if the VM has one (slot 2): see
+    /// `boxcar_net::NetStack`. The guest's addressing is fixed; the config
+    /// gives the DNS upstreams and the relays' bounds.
+    pub net: Option<NetConfig>,
+    /// What the guest may reach and resolve. The stack reads it at every
+    /// decision; storing a new policy in it (the control server's
+    /// `policy.update`) decides the next query or connection.
+    pub policy: Arc<ArcSwap<Policy>>,
     /// The control socket, if any: see [`ControlConfig`].
     pub control: Option<ControlConfig>,
 }
@@ -181,8 +212,8 @@ pub struct ControlConfig {
 impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
-    /// boot, the console on stdio with stdin, no shares, and no control
-    /// socket.
+    /// boot, the console on stdio with stdin, no shares, no network card (and
+    /// a policy that denies everything), and no control socket.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
         VmConfig {
             kernel: kernel.into(),
@@ -196,6 +227,8 @@ impl VmConfig {
             audit,
             fs_shares: Vec::new(),
             fs_audit: AuditFsOptions::default(),
+            net: None,
+            policy: Arc::new(ArcSwap::from_pointee(Policy::default())),
             control: None,
         }
     }
@@ -292,6 +325,9 @@ pub struct Vmm {
     /// Console input the stdin subscriber dropped; read for `vmm.stop`.
     stdin_dropped: Arc<AtomicU64>,
     fs: FsDevices,
+    net: NetDevice,
+    /// What the guest may reach: the network card's stack reads it.
+    policy: Arc<ArcSwap<Policy>>,
     latch: Arc<StopLatch>,
     info: Arc<VmInfo>,
     /// Closed by the stop sequence, before `vmm.stop`.
@@ -369,6 +405,21 @@ impl Vmm {
             &cfg.audit,
             cfg.fs_audit,
         )?;
+        let net = NetDevice::attach(
+            &vm,
+            &mem,
+            &mut mmio,
+            &mut slots,
+            cfg.net.as_ref(),
+            &cfg.audit,
+            &cfg.policy,
+        )?;
+        // What was attached is what the command line and `status` say.
+        debug_assert_eq!(
+            set,
+            DeviceSet::new(fs.len(), net.is_attached(), false),
+            "the devices attached are not DeviceSet::from_config's"
+        );
 
         let cmdline = kernel_cmdline(cfg.debug_boot, &cfg.cmdline_extra, &set)?;
         load_cmdline(&*mem, GuestAddress(CMDLINE_START), &cmdline).map_err(VmmError::Cmdline)?;
@@ -463,6 +514,8 @@ impl Vmm {
             console,
             stdin_dropped: Arc::new(AtomicU64::new(0)),
             fs,
+            net,
+            policy: cfg.policy,
             latch,
             info,
             control,
@@ -482,6 +535,12 @@ impl Vmm {
         self.control_path.as_deref()
     }
 
+    /// The policy the network card's stack reads ([`VmConfig::policy`]):
+    /// storing a new one in it decides the next query or connection.
+    pub fn policy(&self) -> Arc<ArcSwap<Policy>> {
+        Arc::clone(&self.policy)
+    }
+
     /// Runs the VM until it stops, then runs the stop sequence (see
     /// [`crate::lifecycle`]) and returns how it ended. `vmm.stop` is
     /// recorded on every path, with reason `vmm_error` when the VMM itself
@@ -496,6 +555,7 @@ impl Vmm {
             Ok(started) => started,
             Err(error) => {
                 self.fs.close();
+                self.net.close();
                 let console = self.console.flush_and_join(CONSOLE_DEADLINE);
                 self.latch.mark_stopped();
                 if let Some(control) = self.control.take() {
@@ -517,6 +577,7 @@ impl Vmm {
         let teardown = Teardown {
             vcpus,
             fs: &self.fs,
+            net: &self.net,
             console: self.console,
             // The main loop is done: this is the final count.
             stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),
@@ -811,7 +872,12 @@ mod tests {
         for debug_boot in [false, true] {
             let text = two_share_cmdline(debug_boot, &extra);
             assert_eq!(
-                cmdline_size(debug_boot, &strings(&extra), &DeviceSet::from_shares(2)).unwrap(),
+                cmdline_size(
+                    debug_boot,
+                    &strings(&extra),
+                    &DeviceSet::new(2, false, false)
+                )
+                .unwrap(),
                 text.len() + 1,
                 "{text}"
             );
@@ -823,7 +889,7 @@ mod tests {
             cmdline_size(
                 false,
                 &strings(&["boxcar.mode=hello"]),
-                &DeviceSet::from_shares(0)
+                &DeviceSet::new(0, false, false)
             )
             .unwrap(),
             hello.as_cstring().unwrap().as_bytes_with_nul().len()
@@ -835,7 +901,8 @@ mod tests {
     #[test]
     fn cmdline_size_measures_a_command_line_over_the_limit() {
         let long = "x".repeat(3000);
-        let size = cmdline_size(false, &strings(&[&long]), &DeviceSet::from_shares(2)).unwrap();
+        let size =
+            cmdline_size(false, &strings(&[&long]), &DeviceSet::new(2, false, false)).unwrap();
         // The extra and the space before it, then the NUL terminator.
         let without = two_share_cmdline(false, &[]).len();
         assert_eq!(size, without + 1 + long.len() + 1);
@@ -845,7 +912,11 @@ mod tests {
     #[test]
     fn cmdline_size_refuses_what_the_vm_would_refuse() {
         assert!(matches!(
-            cmdline_size(false, &strings(&["bad\u{7}"]), &DeviceSet::from_shares(0)),
+            cmdline_size(
+                false,
+                &strings(&["bad\u{7}"]),
+                &DeviceSet::new(0, false, false)
+            ),
             Err(VmmError::Arch(crate::arch::Error::Cmdline(_)))
         ));
     }
@@ -907,6 +978,62 @@ mod tests {
             cmdline_size(false, &strings(&extra), &set).unwrap(),
             text.len() + 1
         );
+    }
+
+    /// With the net device, the kernel configures eth0 itself (`ip=`, no
+    /// DHCP) and init writes the resolver (`boxcar.net=1`); both follow
+    /// the base, before the extras, which can override them. Without it,
+    /// neither is there.
+    #[test]
+    fn the_network_arguments_come_only_with_the_net_device() {
+        let extra = ["boxcar.mode=console"];
+        let net = DeviceSet::new(2, true, false);
+        let text = cmdline_text(&extra, &net);
+        assert!(
+            text.contains(
+                " rdinit=/init ip=10.0.2.15::10.0.2.2:255.255.255.0:boxcar:eth0:off:10.0.2.2 \
+                 boxcar.net=1 boxcar.mode=console virtio_mmio.device="
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("virtio_mmio.device=4K@0xc0001000:6 virtio_mmio.device=4K@0xc0002000:7"),
+            "{text}"
+        );
+        assert_eq!(
+            cmdline_size(false, &strings(&extra), &net).unwrap(),
+            text.len() + 1
+        );
+
+        // Net without the shares keeps slot 2.
+        let alone = cmdline_text(&["boxcar.mode=hello"], &DeviceSet::new(0, true, false));
+        assert!(alone.contains(" boxcar.net=1 "), "{alone}");
+        assert!(
+            alone.ends_with("boxcar.mode=hello virtio_mmio.device=4K@0xc0002000:7"),
+            "{alone}"
+        );
+
+        for set in [
+            DeviceSet::new(2, false, false),
+            DeviceSet::new(0, false, false),
+            DeviceSet::new(2, false, true),
+        ] {
+            let text = cmdline_text(&extra, &set);
+            assert!(!text.contains("ip="), "{set:?}: {text}");
+            assert!(!text.contains("boxcar.net"), "{set:?}: {text}");
+        }
+    }
+
+    /// The `ip=` argument names the stack's fixed addressing.
+    #[test]
+    fn the_ip_argument_is_the_stacks_addressing() {
+        use boxcar_net::config::{GATEWAY_IP, GUEST_IP, HOSTNAME};
+        let mask = boxcar_net::NetConfig::default().netmask_addr();
+        assert_eq!(
+            NET_CMDLINE[0],
+            format!("ip={GUEST_IP}::{GATEWAY_IP}:{mask}:{HOSTNAME}:eth0:off:{GATEWAY_IP}")
+        );
+        assert_eq!(NET_CMDLINE[1], "boxcar.net=1");
     }
 
     #[test]

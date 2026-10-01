@@ -9,8 +9,10 @@
 //! - `hello` prints a marker on the console and reboots, which proves the
 //!   whole boot path from the VMM to a Rust PID 1 and back.
 //! - `console` runs the session: it mounts the `root` and `workspace`
-//!   virtio-fs shares, makes the root share `/`, hardens the kernel
-//!   settings, makes `/dev/ttyS0` its own controlling terminal, runs the
+//!   virtio-fs shares, makes the root share `/`, points the resolver at the
+//!   gateway when the VM has a network card (`boxcar.net=1`; the kernel has
+//!   configured `eth0` from `ip=` by then), hardens the kernel settings,
+//!   makes `/dev/ttyS0` its own controlling terminal, runs the
 //!   session command (`boxcar.cmd`, or a login shell) in the foreground of
 //!   it as `boxcar.uid` and `boxcar.gid`, reaps until no child is left,
 //!   reports how the session ended and reboots.
@@ -31,7 +33,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::panic;
 
-use console::{die, write_console, write_to, Failed, StackLine, Step};
+use console::{die, warn, write_console, write_to, Failed, StackLine, Step};
 use nix::unistd::sethostname;
 use reaper::{Ended, Reaper};
 use session::{Exec, Session, Terminal};
@@ -88,6 +90,12 @@ fn run_session(args: &BTreeMap<String, String>) -> Result<Ended, Failed> {
     mounts::mount_shares()?;
     let mounted = mounts::mount_api()?;
     mounts::switch_root()?;
+    if cmdline::net_enabled(args) {
+        // The session can run without it: a warning, not a reboot.
+        if let Err(failed) = mounts::set_up_resolver() {
+            warn(&format!("resolver: {failed}"));
+        }
+    }
 
     sethostname(HOSTNAME).step(&format!("sethostname {HOSTNAME}"))?;
     sysctl::apply();

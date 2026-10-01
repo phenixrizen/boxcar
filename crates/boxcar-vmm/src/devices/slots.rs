@@ -136,25 +136,26 @@ pub struct DeviceSet {
 }
 
 impl DeviceSet {
-    /// The devices of a VM with `fs_shares` virtio-fs shares: both
-    /// virtio-fs devices when there are any shares (the VMM takes none, or
-    /// `root` and `workspace` together), and neither net nor vsock yet. The
-    /// one place that decides what the devices are, for [`from_config`] and
-    /// for `boxcar run`, which has to know before it can build a
-    /// [`VmConfig`].
+    /// The devices of a VM with `fs_shares` virtio-fs shares, with or
+    /// without the net and vsock devices: both virtio-fs devices when there
+    /// are any shares (the VMM takes none, or `root` and `workspace`
+    /// together). The one place that decides what the devices are, for
+    /// [`from_config`], for what `Vmm::new` attached, and for `boxcar run`,
+    /// which has to know before it can build a [`VmConfig`].
     ///
     /// [`from_config`]: DeviceSet::from_config
-    pub fn from_shares(fs_shares: usize) -> DeviceSet {
+    pub fn new(fs_shares: usize, net: bool, vsock: bool) -> DeviceSet {
         DeviceSet {
             fs: fs_shares > 0,
-            net: false,
-            vsock: false,
+            net,
+            vsock,
         }
     }
 
-    /// The devices `Vmm::new` creates for `cfg`.
+    /// The devices `Vmm::new` creates for `cfg`. There is no vsock device
+    /// yet.
     pub fn from_config(cfg: &VmConfig) -> DeviceSet {
-        DeviceSet::from_shares(cfg.fs_shares.len())
+        DeviceSet::new(cfg.fs_shares.len(), cfg.net.is_some(), false)
     }
 
     /// Whether the device of slot `id` is present.
@@ -227,7 +228,7 @@ mod tests {
         };
         assert_eq!(present_slots(&all), SLOT_TABLE);
         assert!(present_slots(&DeviceSet::default()).is_empty());
-        let fs: Vec<SlotId> = present_slots(&DeviceSet::from_shares(2))
+        let fs: Vec<SlotId> = present_slots(&DeviceSet::new(2, false, false))
             .iter()
             .map(|s| s.id)
             .collect();
@@ -236,7 +237,7 @@ mod tests {
 
     #[test]
     fn present_slots_are_named_for_the_status() {
-        let names: Vec<&str> = present_slots(&DeviceSet::from_shares(2))
+        let names: Vec<&str> = present_slots(&DeviceSet::new(2, false, false))
             .iter()
             .map(|slot| slot.id.name())
             .collect();
@@ -258,17 +259,21 @@ mod tests {
     }
 
     #[test]
-    fn the_device_set_follows_the_shares() {
-        let none = DeviceSet::from_shares(0);
+    fn the_device_set_follows_the_shares_and_the_flags() {
+        let none = DeviceSet::new(0, false, false);
         assert_eq!(none, DeviceSet::default());
         for shares in [1, 2] {
-            let set = DeviceSet::from_shares(shares);
+            let set = DeviceSet::new(shares, false, false);
             assert_eq!((set.fs, set.net, set.vsock), (true, false, false));
         }
+        let set = DeviceSet::new(0, true, false);
+        assert_eq!((set.fs, set.net, set.vsock), (false, true, false));
+        let set = DeviceSet::new(2, true, true);
+        assert_eq!((set.fs, set.net, set.vsock), (true, true, true));
     }
 
     #[test]
-    fn from_config_and_from_shares_agree() {
+    fn from_config_and_new_agree() {
         let dir = tempfile::tempdir().unwrap();
         let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
             dir.path(),
@@ -276,7 +281,10 @@ mod tests {
         ))
         .unwrap();
         let mut cfg = VmConfig::new("vmlinux", sink);
-        assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::from_shares(0));
+        assert_eq!(
+            DeviceSet::from_config(&cfg),
+            DeviceSet::new(0, false, false)
+        );
         let share = |tag: &str| boxcar_fs::FsShareConfig {
             tag: tag.into(),
             host_dir: dir.path().to_path_buf(),
@@ -285,8 +293,12 @@ mod tests {
         };
         cfg.fs_shares = vec![share("root"), share("workspace")];
         let set = DeviceSet::from_config(&cfg);
-        assert_eq!(set, DeviceSet::from_shares(2));
+        assert_eq!(set, DeviceSet::new(2, false, false));
         assert!(set.fs);
+        cfg.net = Some(boxcar_net::NetConfig::default());
+        assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::new(2, true, false));
+        cfg.fs_shares.clear();
+        assert_eq!(DeviceSet::from_config(&cfg), DeviceSet::new(0, true, false));
         drop(cfg);
         writer.close().unwrap();
     }

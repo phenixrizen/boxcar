@@ -15,7 +15,9 @@
 //! The stop sequence, run on the main thread: tell the control clients the
 //! VM is `stopping`, kick and join every vCPU, close the devices (reset
 //! every virtio-fs device through its transport, which joins its workers
-//! and records the close of every file the guest left open), let the
+//! and records the close of every file the guest left open, and the
+//! network card, whose net thread records the end of every flow before it
+//! is joined), let the
 //! console writer drain what it can for at most [`CONSOLE_DEADLINE`]
 //! (it counts what it could not deliver), mark the VM `stopped` and shut
 //! the control server down (each client hears `stopped` and is
@@ -52,7 +54,7 @@ use vmm_sys_util::signal::create_sigset;
 
 use crate::console::ConsoleWriter;
 use crate::control::ControlServer;
-use crate::devices::FsDevices;
+use crate::devices::{FsDevices, NetDevice};
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
 
@@ -511,6 +513,7 @@ pub(crate) fn wait_for_stop(
 pub(crate) struct Teardown<'a> {
     pub(crate) vcpus: VcpuSet,
     pub(crate) fs: &'a FsDevices,
+    pub(crate) net: &'a NetDevice,
     pub(crate) console: ConsoleWriter,
     /// Console input bytes the stdin subscriber dropped, read once the main
     /// loop is done.
@@ -530,6 +533,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     let Teardown {
         vcpus,
         fs,
+        net,
         console,
         stdin_dropped_bytes,
         control,
@@ -542,6 +546,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     }
     vcpus.stop_and_join();
     fs.close();
+    net.close();
     let console = console.flush_and_join(CONSOLE_DEADLINE);
     latch.mark_stopped();
     if let Some(control) = control {
