@@ -286,6 +286,13 @@ impl NetStack {
         self.pipe.to_guest.pop_front()
     }
 
+    /// How many frames wait for the guest: at most [`QUEUE_CAP`]. The
+    /// device takes one only when it has a buffer for it, and leaves the
+    /// rest here.
+    pub fn host_frames(&self) -> usize {
+        self.pipe.to_guest.len()
+    }
+
     /// Lets smoltcp take the frames queued for it, moves the relayed
     /// connections' bytes, sends what all that queued, and records the
     /// dropped-frame counts that have fallen due. `now` must come from the
@@ -371,6 +378,12 @@ impl NetStack {
     /// [`poll`](Self::poll), as do the watch changes it makes. For a UDP
     /// mapping's socket, every datagram waiting on it is queued for the
     /// guest. Events for tokens the stack no longer uses are ignored.
+    ///
+    /// The fds must be watched level-triggered, never edge-triggered: one
+    /// event reads a bounded number of datagrams from a UDP socket (64), and
+    /// the TCP relay stops reading or writing when the guest or the host
+    /// has no room, so readiness the stack left unhandled must be reported
+    /// again at the next wait.
     pub fn on_host_fd_event(&mut self, token: u64, readable: bool, writable: bool) {
         let now = Instant::now();
         match owner(token) {

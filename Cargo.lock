@@ -208,12 +208,17 @@ dependencies = [
  "boxcar-audit",
  "boxcar-proto",
  "boxcar-virtio",
+ "event-manager",
  "libc",
  "proptest",
  "smoltcp",
  "socket2",
  "tempfile",
  "thiserror",
+ "virtio-bindings",
+ "virtio-queue",
+ "vm-memory",
+ "vmm-sys-util",
 ]
 
 [[package]]

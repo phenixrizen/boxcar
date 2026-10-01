@@ -29,12 +29,15 @@
 //!   relayed connections), and the counted drops.
 //! - [`audit`]: the `net.*` records.
 //! - [`config`]: the addressing, the DNS upstreams, and the relays' bounds.
+//! - [`device`]: the virtio-net device in front of the stack, and the net
+//!   thread that runs it.
 //!
 //! IPv6 is dropped and counted.
 
 pub mod arp;
 pub mod audit;
 pub mod config;
+pub mod device;
 pub mod dhcp;
 pub mod dns;
 pub mod frame;
@@ -49,6 +52,7 @@ pub mod upstream;
 
 pub use audit::DropReason;
 pub use config::{ConfigError, NetConfig};
+pub use device::VirtioNet;
 pub use frame::Dispatch;
 pub use policy::{Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};

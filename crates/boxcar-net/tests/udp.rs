@@ -982,6 +982,48 @@ fn parked_sockets_are_bounded() {
     assert_eq!(evicted, 2 + 2 + 1);
 }
 
+/// At the parked bound only new tuples are dropped (`udp_table_full`): a
+/// datagram on a mapping the table still holds is carried, not dropped.
+/// (Task 8's re-review probe.)
+#[test]
+fn existing_mappings_carry_at_the_parked_bound() {
+    let (server, at) = server();
+    let mut h = harness_config(policy(&["allow 127.0.0.0/8"]), |c| {
+        c.udp.mapping_cap = 2;
+        c.udp.parked_cap = 1;
+    });
+    h.stack.poll(Instant::now());
+    for port in [1, 2] {
+        h.stack
+            .push_guest_frame(&udp(GATEWAY_MAC, guest(port), at, b"a"));
+        assert_eq!(recv(&server).0, b"a");
+    }
+    h.stack.poll(Instant::now());
+    // A new tuple evicts tuple 1, whose socket is parked: the bound.
+    h.stack
+        .push_guest_frame(&udp(GATEWAY_MAC, guest(3), at, b"b"));
+    assert_eq!(recv(&server).0, b"b");
+    // Another new tuple finds the table full.
+    h.stack
+        .push_guest_frame(&udp(GATEWAY_MAC, guest(4), at, b"c"));
+    // The mappings still in the table carry on, with nothing between.
+    for port in [2, 3] {
+        h.stack
+            .push_guest_frame(&udp(GATEWAY_MAC, guest(port), at, b"still"));
+        assert_eq!(recv(&server).0, b"still", "tuple {port}");
+    }
+    assert!(nothing_at(&server));
+
+    h.stack.shutdown();
+    let events = h.events();
+    assert_eq!(dropped(&events, "udp_table_full"), 1);
+    let closes = closes(&events);
+    assert!(
+        closes.iter().any(|c| c.0 == 1 && c.3 == "evicted"),
+        "{closes:?}"
+    );
+}
+
 /// Waits until the net thread sees `token` ready.
 fn wait_ready(rig: &Rig, token: u64) {
     let start = Instant::now();
