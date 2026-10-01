@@ -78,6 +78,9 @@ pub enum EmitError {
 pub(crate) struct Shared {
     /// Events `try_emit` dropped because the channel was full.
     pub(crate) dropped: AtomicU64,
+    /// The seq the writer gives the next record it writes. Only the writer
+    /// stores it, after each record it chains.
+    pub(crate) next_seq: AtomicU64,
     /// Set once, by [`Shared::close`]. Each send holds the read lock across
     /// the send itself, so the write lock is granted only when no send is in
     /// flight.
@@ -89,9 +92,11 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new() -> io::Result<Self> {
+    /// `next_seq` is the seq of the first record the writer will write.
+    pub(crate) fn new(next_seq: u64) -> io::Result<Self> {
         Ok(Shared {
             dropped: AtomicU64::new(0),
+            next_seq: AtomicU64::new(next_seq),
             closed: RwLock::new(false),
             failure: OnceLock::new(),
             failure_evt: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
@@ -199,6 +204,14 @@ impl AuditSink {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// The seq the writer will give the next record it writes: 1 for a new
+    /// log, one past its last record for a resumed one. A hint, read
+    /// without waiting: events already accepted but not yet written take
+    /// the seqs from here on.
+    pub fn next_seq(&self) -> u64 {
+        self.shared.next_seq.load(Ordering::Relaxed)
+    }
+
     /// Whether the writer thread has failed.
     pub fn has_failed(&self) -> bool {
         self.shared.has_failed()
@@ -249,7 +262,7 @@ mod tests {
     #[test]
     fn try_emit_does_not_wait_while_close_waits_out_a_blocked_emit() {
         let (tx, rx) = bounded(1);
-        let shared = Arc::new(Shared::new().unwrap());
+        let shared = Arc::new(Shared::new(1).unwrap());
         let sink = AuditSink::new(tx, shared.clone());
         sink.emit(event(0)).unwrap(); // the channel is now full
 

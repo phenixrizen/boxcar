@@ -67,18 +67,31 @@ pub enum Command {
     /// `--workspace` at /workspace, both over virtio-fs, and records what
     /// the guest does to them. The guest runs a login shell on its serial
     /// console as the invoking user's uid and gid, or, after `--`, the
-    /// command given. Prints the session id, its audit log directory and
-    /// the workspace on stderr, runs the guest with its serial console on
-    /// stdout (or in `--console-log`), and exits when it stops: 0 when the
-    /// guest reset or shut down (whatever the session's own exit status,
-    /// which the console shows as `boxcar: session exited <code>`), 1 after
-    /// a vCPU error, 3 when the audit log could not be written (the VM is
-    /// stopped and stderr says `audit log failed: <why>`), 130 after SIGINT
-    /// (Ctrl-C) or the console escape, 143 after SIGTERM, 129 after SIGHUP
-    /// and 131 after SIGQUIT. When stdin is a terminal, the console is on
-    /// stdout and no command is given, every key goes to the guest, Ctrl-C
-    /// included; press Ctrl-] twice within a second to stop the VM.
+    /// command given. Prints the session id, its audit log directory, the
+    /// workspace and the control socket (see `boxcar status`) on stderr,
+    /// runs the guest with its serial console on stdout (or in
+    /// `--console-log`), and exits when it stops: 0 when the guest reset or
+    /// shut down (whatever the session's own exit status, which the console
+    /// shows as `boxcar: session exited <code>`) and after `boxcar stop`, 1
+    /// after a vCPU error, 3 when the audit log could not be written (the
+    /// VM is stopped and stderr says `audit log failed: <why>`), 130 after
+    /// SIGINT (Ctrl-C) or the console escape, 143 after SIGTERM, 129 after
+    /// SIGHUP and 131 after SIGQUIT. When stdin is a terminal, the console
+    /// is on stdout and no command is given, every key goes to the guest,
+    /// Ctrl-C included; press Ctrl-] twice within a second to stop the VM.
     Run(RunArgs),
+    /// Show a running VM's status.
+    ///
+    /// Asks the session's control socket and prints a short table, or with
+    /// `--json` the status object as the socket returns it. The session is
+    /// the one `--control` or SESSION_ID names, or the only one running.
+    Status(StatusArgs),
+    /// Stop a running VM.
+    ///
+    /// Asks the session's VMM to stop, waits until it has, and exits 0;
+    /// `boxcar run` then exits 0 as well. The session is the one
+    /// `--control` or SESSION_ID names, or the only one running.
+    Stop(StopArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -95,6 +108,41 @@ pub struct VerifyArgs {
     /// Print the report, or the first break, as one JSON object.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Which session a control command talks to.
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    /// The session's control socket. Default: the session's, under
+    /// $XDG_RUNTIME_DIR/boxcar/, or /tmp/boxcar-<uid>/ without a usable
+    /// XDG_RUNTIME_DIR.
+    #[arg(long, value_name = "PATH", conflicts_with = "session_id")]
+    pub control: Option<PathBuf>,
+    /// The session's id, or a prefix of it that names one session.
+    /// Default: the one session running.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// Print the status as one JSON object.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StopArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// Stop at once, without asking the guest to end its session first.
+    #[arg(long)]
+    pub force: bool,
+    /// How long a graceful stop waits for the guest. Default: 5000.
+    #[arg(long, value_name = "N")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -171,6 +219,11 @@ pub struct RunArgs {
     /// and the terminal is left as it is.
     #[arg(last = true, value_name = "CMD", conflicts_with = "no_fs")]
     pub command: Vec<String>,
+    /// Once the control socket is ready, write one line to file descriptor
+    /// FD, `{"ready":true,"control":"<path>","session_id":"<id>"}`, and
+    /// close it. FD must be open for writing, and not 0, 1 or 2.
+    #[arg(long, value_name = "FD", allow_negative_numbers = true)]
+    pub ready_fd: Option<i32>,
 }
 
 /// `--audit-level`.

@@ -39,6 +39,19 @@ pub enum SlotId {
     Vsock = 3,
 }
 
+impl SlotId {
+    /// The slot's name as the control socket's `status` lists it:
+    /// `fs:root`, `fs:workspace`, `net`, `vsock`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SlotId::FsRoot => "fs:root",
+            SlotId::FsWorkspace => "fs:workspace",
+            SlotId::Net => "net",
+            SlotId::Vsock => "vsock",
+        }
+    }
+}
+
 /// One entry of the table: where a device's registers are and which
 /// interrupt it raises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +232,17 @@ mod tests {
             .map(|s| s.id)
             .collect();
         assert_eq!(fs, [SlotId::FsRoot, SlotId::FsWorkspace]);
+    }
+
+    #[test]
+    fn present_slots_are_named_for_the_status() {
+        let names: Vec<&str> = present_slots(&DeviceSet::from_shares(2))
+            .iter()
+            .map(|slot| slot.id.name())
+            .collect();
+        assert_eq!(names, ["fs:root", "fs:workspace"]);
+        let all: Vec<&str> = SLOT_TABLE.iter().map(|slot| slot.id.name()).collect();
+        assert_eq!(all, ["fs:root", "fs:workspace", "net", "vsock"]);
     }
 
     #[test]

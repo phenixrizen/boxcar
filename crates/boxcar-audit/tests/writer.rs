@@ -427,6 +427,33 @@ fn a_torn_tail_is_cut_and_the_chain_resumes() {
     assert_eq!(report.last_hash, stats.last_hash);
 }
 
+/// `next_seq` is the seq the writer gives the next record it writes: 1 for
+/// a new log, one past the last record once those sent are written
+/// (checkpoints included), and one past the last record of a resumed log.
+#[test]
+fn next_seq_follows_the_writer() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.checkpoint_every = 4;
+    let (sink, writer) = spawn(cfg.clone()).unwrap();
+    assert_eq!(sink.next_seq(), 1);
+    for n in 0..10 {
+        sink.emit(critical(n)).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // 10 events and the checkpoints after the 4th and 8th: seq 1..=12.
+    while sink.next_seq() < 13 {
+        assert!(Instant::now() < deadline, "next_seq {}", sink.next_seq());
+        thread::sleep(Duration::from_millis(1));
+    }
+    let stats = writer.close().unwrap();
+    assert_eq!(sink.next_seq(), stats.last_seq + 1);
+
+    let (sink, writer) = spawn(cfg).unwrap();
+    assert_eq!(sink.next_seq(), stats.last_seq + 1, "resumed");
+    writer.close().unwrap();
+}
+
 #[test]
 fn recovery_does_not_keep_a_complete_but_corrupted_record() {
     let tmp = TempDir::new().unwrap();

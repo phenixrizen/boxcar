@@ -4,6 +4,9 @@
 //! `boxcar run`: boots a microVM and records its session.
 
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::{env, fs, io};
@@ -11,14 +14,18 @@ use std::{env, fs, io};
 use anyhow::{bail, Context};
 use boxcar_audit::{AuditSink, WriterConfig, WriterHandle};
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
+use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
 use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
-use boxcar_vmm::vmm::{cmdline_size, ConsoleOut, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE};
+use boxcar_vmm::vmm::{
+    cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{AuditLevelArg, RunArgs};
+use crate::client;
 
 /// Starts the session's audit writer, boots the VM, and waits for it to
 /// stop. The exit code is the VM's (see `exit_code_for`), except that
@@ -29,8 +36,10 @@ use crate::cli::{AuditLevelArg, RunArgs};
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     init_tracing();
     // Everything that can be refused is checked before the session exists,
-    // so that a typo does not leave an empty session behind: the shares,
-    // where the audit log goes, and the kernel command line.
+    // so that a typo does not leave an empty session behind: the ready
+    // descriptor, the shares, where the audit log and the control socket
+    // go, and the kernel command line.
+    let ready = args.ready_fd.map(ReadyFd::take).transpose()?;
     let rootfs = args
         .rootfs
         .as_deref()
@@ -67,6 +76,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // The devices the VM will have, derived as `Vmm::new` derives them.
     let devices = DeviceSet::from_shares(share_count);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
+    let sessions_root =
+        client::ensure_sessions_root().context("cannot set up the control socket's directory")?;
 
     // Before any thread starts, so that every thread inherits the mask and
     // the signals reach only the VMM's signalfd.
@@ -107,6 +118,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         stdin: args.command.is_empty(),
         audit: sink,
         fs_shares,
+        control: Some(ControlConfig {
+            state_dir: sessions_root.join(session_id.as_str()),
+            session_id: session_id.clone(),
+        }),
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -117,7 +132,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     // The VM's stop sequence resets the virtio-fs devices, which records
     // the closes of files the guest left open, before `run` returns.
-    let outcome = Vmm::new(cfg).and_then(Vmm::run);
+    let outcome = Vmm::new(cfg).and_then(|vmm| {
+        if let Some(path) = vmm.control_path() {
+            eprintln!("control: {}", path.display());
+            if let Some(ready) = ready {
+                ready.announce(path, &session_id);
+            }
+        }
+        vmm.run()
+    });
     // Drains every accepted record (vmm.stop included), checkpoints, syncs.
     let closed = writer.close();
 
@@ -145,6 +168,57 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(
         u8::try_from(exit_code_for(&exit)).unwrap_or(1),
     ))
+}
+
+/// The descriptor `--ready-fd` names, owned from the start.
+struct ReadyFd {
+    fd: i32,
+    file: File,
+}
+
+impl ReadyFd {
+    /// Takes `fd` over, once it is known to be open for writing and not
+    /// one of boxcar's own stdin, stdout and stderr.
+    fn take(fd: i32) -> anyhow::Result<ReadyFd> {
+        let own = match fd {
+            0 => Some("stdin"),
+            1 => Some("stdout"),
+            2 => Some("stderr"),
+            _ => None,
+        };
+        if let Some(own) = own {
+            bail!("--ready-fd {fd}: boxcar's own {own}");
+        }
+        // SAFETY: F_GETFL only reads the descriptor's status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            bail!("--ready-fd {fd}: not open");
+        }
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            bail!("--ready-fd {fd}: not open for writing");
+        }
+        // SAFETY: `fd` is open, and boxcar was handed it to write one line
+        // to and close: this File is the only thing in the process that
+        // uses it from here on.
+        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(ReadyFd { fd, file })
+    }
+
+    /// Writes the ready line for the socket at `path` and closes the
+    /// descriptor. A reader that is gone does not stop the VM.
+    fn announce(mut self, path: &Path, session_id: &SessionId) {
+        let ready = Ready {
+            ready: true,
+            control: path.display().to_string(),
+            session_id: session_id.to_string(),
+        };
+        let written = to_line(&ready)
+            .map_err(io::Error::other)
+            .and_then(|line| self.file.write_all(&line));
+        if let Err(error) = written {
+            eprintln!("warning: cannot write to --ready-fd {}: {error}", self.fd);
+        }
+    }
 }
 
 /// Starts the session's audit writer.

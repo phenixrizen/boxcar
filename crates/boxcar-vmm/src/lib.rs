@@ -5,6 +5,7 @@
 
 pub mod arch;
 pub mod cmdline;
+pub mod control;
 pub mod devices;
 pub mod kick;
 pub mod kvm;

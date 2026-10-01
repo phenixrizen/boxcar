@@ -4,6 +4,7 @@
 //! The `boxcar` command-line interface.
 
 mod cli;
+mod client;
 mod cmd;
 
 use std::process::ExitCode;

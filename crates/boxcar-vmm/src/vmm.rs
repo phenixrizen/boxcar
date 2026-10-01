@@ -10,8 +10,10 @@
 //! (the legacy PIO devices, then one virtio-fs device per share, each in its
 //! fixed slot of [`crate::devices::slots`]), write the command line with a
 //! `virtio_mmio.device=` entry for each slot of the [`DeviceSet`], write the
-//! zero page and MP table, create and set up the vCPUs, and record
-//! `vmm.start`.
+//! zero page and MP table, create and set up the vCPUs, record `vmm.start`,
+//! and bind the control socket when the config asks for one, so that a
+//! client can connect while the VM boots (its state is `booting` until
+//! [`Vmm::run`] starts the vCPU threads).
 
 use std::fs::File;
 use std::io;
@@ -19,10 +21,11 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
-use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, ShareRef, VmmStart};
+use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
 use event_manager::{EventManager, EventSet, Events, MutEventSubscriber, SubscriberOps};
@@ -40,6 +43,7 @@ pub use crate::arch::x86_64::layout::CMDLINE_MAX_SIZE;
 use crate::arch::x86_64::layout::{CMDLINE_START, HIMEM_START, KVM_TSS_ADDRESS};
 use crate::arch::x86_64::{cpuid, interrupts, msr, regs};
 use crate::cmdline::{build_cmdline, MmioDeviceEntry};
+use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
 use crate::devices::{DeviceError, FsDevices, LegacyDevices};
@@ -47,7 +51,7 @@ use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
     block_stop_signals, exit_code_for, record_stop, stop, wait_for_stop, ControlSubscriber,
-    MainLoop, SignalFd, StopLatch, Teardown,
+    MainLoop, SignalFd, StopLatch, Teardown, VmInfo,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
@@ -157,12 +161,26 @@ pub struct VmConfig {
     pub fs_shares: Vec<FsShareConfig>,
     /// How much the shares record.
     pub fs_audit: AuditFsOptions,
+    /// The control socket, if any: see [`ControlConfig`].
+    pub control: Option<ControlConfig>,
+}
+
+/// Where the control socket goes and which session it serves.
+#[derive(Clone, Debug)]
+pub struct ControlConfig {
+    /// The session's state directory, created mode 0700 if missing; the
+    /// socket is `control.sock` in it, mode 0600. Both are removed when
+    /// the VM stops (the directory only when it is empty).
+    pub state_dir: PathBuf,
+    /// The session the hello and `status` name: the audit log's.
+    pub session_id: SessionId,
 }
 
 impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
-    /// boot, the console on stdio with stdin, and no shares.
+    /// boot, the console on stdio with stdin, no shares, and no control
+    /// socket.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
         VmConfig {
             kernel: kernel.into(),
@@ -176,6 +194,7 @@ impl VmConfig {
             audit,
             fs_shares: Vec::new(),
             fs_audit: AuditFsOptions::default(),
+            control: None,
         }
     }
 }
@@ -234,6 +253,12 @@ pub enum VmmError {
     Device(#[from] DeviceError),
     #[error("cannot record vmm.start")]
     Audit(#[from] EmitError),
+    #[error("cannot bind the control socket in {}", state_dir.display())]
+    Control {
+        state_dir: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("the main event loop failed")]
     EventLoop(#[source] event_manager::Error),
 }
@@ -260,6 +285,10 @@ pub struct Vmm {
     legacy: LegacyDevices,
     fs: FsDevices,
     latch: Arc<StopLatch>,
+    info: Arc<VmInfo>,
+    /// Closed by the stop sequence, before `vmm.stop`.
+    control: Option<ControlServer>,
+    control_path: Option<PathBuf>,
     audit: AuditSink,
     /// Forward stdin to the console and put the terminal in raw mode.
     interactive: bool,
@@ -269,6 +298,7 @@ impl Vmm {
     /// Builds the VM described by `cfg`, in the boot order of the module
     /// docs, and records `vmm.start`.
     pub fn new(cfg: VmConfig) -> Result<Vmm, VmmError> {
+        let built = Instant::now();
         if cfg.vcpus == 0 {
             return Err(VmmError::Config("a VM needs at least one vCPU".into()));
         }
@@ -349,6 +379,21 @@ impl Vmm {
 
         let vcpus = create_vcpus(&kvm, &vm, &mem, cfg.vcpus, entry)?;
         let latch = Arc::new(StopLatch::new().map_err(setup("stop eventfd"))?);
+        let info = Arc::new(VmInfo {
+            session_id: cfg
+                .control
+                .as_ref()
+                .map(|control| control.session_id.to_string())
+                .unwrap_or_default(),
+            built,
+            vcpus: cfg.vcpus,
+            mem_mib: cfg.mem_mib,
+            devices: present_slots(&set)
+                .iter()
+                .map(|slot| slot.id.name().to_owned())
+                .collect(),
+            audit: cfg.audit.clone(),
+        });
 
         let start = VmmStart {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -372,6 +417,26 @@ impl Vmm {
             priority: Priority::Normal,
         })?;
 
+        // After vmm.start, so the log never has a control.connect before
+        // it; a failure here is recorded like one in `run`.
+        let (control, control_path) = match &cfg.control {
+            None => (None, None),
+            Some(control) => {
+                let handle = VmmHandle::new(latch.clone(), info.clone());
+                let ops = Arc::new(VmmOps::new(handle.clone()));
+                match ControlServer::bind(&control.state_dir, handle, ops) {
+                    Ok((server, path)) => (Some(server), Some(path)),
+                    Err(source) => {
+                        record_stop(&cfg.audit, "vmm_error", 1);
+                        return Err(VmmError::Control {
+                            state_dir: control.state_dir.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+        };
+
         Ok(Vmm {
             vcpus,
             _vm: vm,
@@ -382,6 +447,9 @@ impl Vmm {
             legacy,
             fs,
             latch,
+            info,
+            control,
+            control_path,
             interactive: cfg.stdin && matches!(cfg.console, ConsoleOut::Stdio) && stdin_is_tty(),
             audit: cfg.audit,
         })
@@ -389,7 +457,12 @@ impl Vmm {
 
     /// A handle that can stop the VM from another thread.
     pub fn handle(&self) -> VmmHandle {
-        VmmHandle::new(self.latch.clone())
+        VmmHandle::new(self.latch.clone(), self.info.clone())
+    }
+
+    /// The control socket's path, when the VM has one.
+    pub fn control_path(&self) -> Option<&Path> {
+        self.control_path.as_deref()
     }
 
     /// Runs the VM until it stops, then runs the stop sequence (see
@@ -406,6 +479,10 @@ impl Vmm {
             Ok(started) => started,
             Err(error) => {
                 self.fs.close();
+                self.latch.mark_stopped();
+                if let Some(control) = self.control.take() {
+                    control.shutdown();
+                }
                 record_stop(&self.audit, "vmm_error", 1);
                 return Err(error);
             }
@@ -419,6 +496,8 @@ impl Vmm {
             vcpus,
             fs: &self.fs,
             devices: &self.legacy,
+            control: self.control.take(),
+            latch: &self.latch,
             audit: &self.audit,
             terminal,
         };
@@ -470,6 +549,7 @@ impl Vmm {
 
         let vcpus = VcpuSet::spawn(vcpus, &self.pio, &self.mmio, &exits_tx, exited)
             .map_err(setup("vCPU threads"))?;
+        self.latch.mark_running();
         Ok(Started {
             main_loop,
             vcpus,

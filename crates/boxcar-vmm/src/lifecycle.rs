@@ -12,33 +12,41 @@
 //! decides the [`VmExit`]; the VM is then `Stopping` and later triggers are
 //! ignored.
 //!
-//! The stop sequence, run on the main thread: kick and join every vCPU,
-//! close the devices (reset every virtio-fs device through its transport,
-//! which joins its workers and records the close of every file the guest
-//! left open, then flush the console), emit `vmm.stop` through the audit
-//! sink, restore the terminal, and return the `VmExit`. The caller
-//! (`boxcar run`) then closes the audit writer, which drains, checkpoints
-//! and syncs the log, so every record the devices made is in it. After an
-//! audit failure the sequence is the same; the records it makes are
-//! refused, and each refusal is logged.
+//! The stop sequence, run on the main thread: tell the control clients the
+//! VM is `stopping`, kick and join every vCPU, close the devices (reset
+//! every virtio-fs device through its transport, which joins its workers
+//! and records the close of every file the guest left open, then flush the
+//! console), mark the VM `stopped` and shut the control server down (each
+//! client hears `stopped` and is disconnected, with no wait on any of
+//! them), emit `vmm.stop` through the audit sink, restore the terminal,
+//! and return the `VmExit`. The caller (`boxcar run`) then closes the audit
+//! writer, which drains, checkpoints and syncs the log, so every record the
+//! devices made is in it. After an audit failure the sequence is the same;
+//! the records it makes are refused, and each refusal is logged.
 
 use std::fmt;
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use boxcar_audit::{AuditSink, Priority, Submission};
+use boxcar_proto::control::{AuditStatus, GuestStatus, Status};
 use boxcar_proto::{Payload, Ring, VmmStop};
 use event_manager::{EventManager, EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 use vmm_sys_util::signal::create_sigset;
 
+use crate::control::ControlServer;
 use crate::devices::{FsDevices, LegacyDevices};
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
+
+pub use boxcar_proto::control::{SessionOutcome, VmState};
 
 /// The exit code of a run whose audit log failed.
 pub const AUDIT_FAILED_EXIT: i32 = 3;
@@ -53,16 +61,6 @@ pub enum StopReason {
     ConsoleEscape,
     /// [`VmmHandle::request_stop`] was called.
     Requested,
-}
-
-/// How the guest's session ended, as its init reported it: the exit code of
-/// the session's process, or the signal that killed it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SessionOutcome {
-    /// The exit code, when the process exited.
-    pub code: Option<i32>,
-    /// The signal number, when a signal killed the process.
-    pub signal: Option<i32>,
 }
 
 /// How the VM ended.
@@ -93,7 +91,9 @@ pub enum VmExit {
 /// - a vCPU error: 1;
 /// - a failed audit log: [`AUDIT_FAILED_EXIT`] (3);
 /// - a stop by a host signal: 128 plus the signal number (130 for Ctrl-C,
-///   129 for a hangup), and 130 for any other requested stop.
+///   129 for a hangup), and 130 for the console escape;
+/// - a stop asked for through [`VmmHandle::request_stop`] (the control
+///   socket's `stop`): 0.
 pub fn exit_code_for(exit: &VmExit) -> i32 {
     match exit {
         VmExit::GuestReset {
@@ -112,7 +112,8 @@ pub fn exit_code_for(exit: &VmExit) -> i32 {
         VmExit::VcpuError(_) => 1,
         VmExit::AuditFailed(_) => AUDIT_FAILED_EXIT,
         VmExit::StopRequested(StopReason::Signal(signo)) => 128 + signo,
-        VmExit::StopRequested(_) => 130,
+        VmExit::StopRequested(StopReason::ConsoleEscape) => 130,
+        VmExit::StopRequested(StopReason::Requested) => 0,
     }
 }
 
@@ -149,20 +150,17 @@ impl fmt::Display for VmExit {
     }
 }
 
-/// Where the VM is in its life.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VmState {
-    Running,
-    /// A stop trigger fired; the stop sequence runs or has run.
-    Stopping,
-}
-
 /// Records the first stop trigger and wakes the main loop. Shared by the
-/// main loop's subscribers and every [`VmmHandle`].
+/// main loop's subscribers and every [`VmmHandle`]. Also keeps where the VM
+/// is in its life, [`VmState`]: `Booting` until the vCPUs start, `Running`,
+/// `Stopping` from the first trigger, `Stopped` once the stop sequence has
+/// stopped the vCPUs and closed the devices.
 pub(crate) struct StopLatch {
     exit: Mutex<Option<VmExit>>,
     /// Written on every trigger so the main loop's epoll returns.
     wake: EventFd,
+    running: AtomicBool,
+    stopped: AtomicBool,
 }
 
 impl StopLatch {
@@ -170,7 +168,19 @@ impl StopLatch {
         Ok(StopLatch {
             exit: Mutex::new(None),
             wake: EventFd::new(EFD_NONBLOCK)?,
+            running: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         })
+    }
+
+    /// The vCPU threads have started.
+    pub(crate) fn mark_running(&self) {
+        self.running.store(true, Ordering::Release);
+    }
+
+    /// The stop sequence has stopped the vCPUs and closed the devices.
+    pub(crate) fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
     }
 
     /// Makes `exit` the VM's outcome unless a trigger came first, and wakes
@@ -194,9 +204,14 @@ impl StopLatch {
     }
 
     pub(crate) fn state(&self) -> VmState {
-        match *self.lock() {
-            None => VmState::Running,
-            Some(_) => VmState::Stopping,
+        if self.stopped.load(Ordering::Acquire) {
+            VmState::Stopped
+        } else if self.lock().is_some() {
+            VmState::Stopping
+        } else if self.running.load(Ordering::Acquire) {
+            VmState::Running
+        } else {
+            VmState::Booting
         }
     }
 
@@ -210,15 +225,29 @@ impl StopLatch {
     }
 }
 
-/// Stops a VM from another thread. Cheap to clone.
+/// What a [`VmmHandle`] reports about its VM that does not change.
+pub(crate) struct VmInfo {
+    /// The session's id, or empty for a VM built without a control socket.
+    pub(crate) session_id: String,
+    /// When the VM was built.
+    pub(crate) built: Instant,
+    pub(crate) vcpus: u8,
+    pub(crate) mem_mib: u64,
+    /// The virtio devices present, by slot name in slot order.
+    pub(crate) devices: Vec<String>,
+    pub(crate) audit: AuditSink,
+}
+
+/// Stops a VM from another thread, and reports its status. Cheap to clone.
 #[derive(Clone)]
 pub struct VmmHandle {
     latch: Arc<StopLatch>,
+    info: Arc<VmInfo>,
 }
 
 impl VmmHandle {
-    pub(crate) fn new(latch: Arc<StopLatch>) -> Self {
-        VmmHandle { latch }
+    pub(crate) fn new(latch: Arc<StopLatch>, info: Arc<VmInfo>) -> Self {
+        VmmHandle { latch, info }
     }
 
     /// Asks the VM to stop with `reason`. Returns at once; `Vmm::run` then
@@ -228,9 +257,44 @@ impl VmmHandle {
         self.latch.trigger(VmExit::StopRequested(reason));
     }
 
-    /// Whether the VM is still running.
+    /// Where the VM is in its life.
     pub fn state(&self) -> VmState {
         self.latch.state()
+    }
+
+    /// The VM's status, as the control socket's `status` reports it. What
+    /// the guest's init reports is not known yet: `guest` says not ready,
+    /// no session.
+    pub fn status(&self) -> Status {
+        let info = &self.info;
+        Status {
+            state: self.state(),
+            session_id: info.session_id.clone(),
+            pid: std::process::id(),
+            uptime_ms: u64::try_from(info.built.elapsed().as_millis()).unwrap_or(u64::MAX),
+            vcpus: info.vcpus,
+            mem_mib: info.mem_mib,
+            guest: GuestStatus {
+                init_ready: false,
+                session_pid: None,
+                exit: None,
+            },
+            audit: AuditStatus {
+                next_seq: info.audit.next_seq(),
+                failed: info.audit.has_failed(),
+            },
+            devices: info.devices.clone(),
+        }
+    }
+
+    /// The session's id; empty for a VM built without a control socket.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.info.session_id
+    }
+
+    /// The sink of the session's audit log.
+    pub(crate) fn audit(&self) -> &AuditSink {
+        &self.info.audit
     }
 }
 
@@ -433,23 +497,37 @@ pub(crate) struct Teardown<'a> {
     pub(crate) vcpus: VcpuSet,
     pub(crate) fs: &'a FsDevices,
     pub(crate) devices: &'a LegacyDevices,
+    pub(crate) control: Option<ControlServer>,
+    pub(crate) latch: &'a StopLatch,
     pub(crate) audit: &'a AuditSink,
     pub(crate) terminal: Option<RawModeGuard>,
 }
 
 /// The stop sequence. The VM is already `Stopping` (a trigger fired, or the
-/// main loop failed); `reason` and `exit_code` go into `vmm.stop`.
+/// main loop failed); `reason` and `exit_code` go into `vmm.stop`. The
+/// control clients hear `stopping` first, then `stopped` as the server
+/// shuts down, which closes every connection without waiting on any client,
+/// before `vmm.stop`: the log has no `control.*` record after it.
 pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     let Teardown {
         vcpus,
         fs,
         devices,
+        control,
+        latch,
         audit,
         terminal,
     } = teardown;
+    if let Some(control) = &control {
+        control.notify_state(VmState::Stopping);
+    }
     vcpus.stop_and_join();
     fs.close();
     devices.close();
+    latch.mark_stopped();
+    if let Some(control) = control {
+        control.shutdown();
+    }
     record_stop(audit, reason, exit_code);
     drop(terminal);
 }
@@ -472,6 +550,26 @@ pub(crate) fn record_stop(audit: &AuditSink, reason: &str, exit_code: i32) {
     }
 }
 
+/// A handle on a VM that was never built: a fresh latch, 2 vCPUs, 256 MiB,
+/// both virtio-fs devices, and an audit log under `dir`.
+#[cfg(test)]
+pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::WriterHandle) {
+    let session_id = boxcar_proto::SessionId::new();
+    let (sink, writer) =
+        boxcar_audit::spawn(boxcar_audit::WriterConfig::new(dir, session_id.clone()))
+            .expect("audit writer");
+    let info = VmInfo {
+        session_id: session_id.to_string(),
+        built: Instant::now(),
+        vcpus: 2,
+        mem_mib: 256,
+        devices: vec!["fs:root".into(), "fs:workspace".into()],
+        audit: sink,
+    };
+    let latch = Arc::new(StopLatch::new().expect("stop latch"));
+    (VmmHandle::new(latch, Arc::new(info)), writer)
+}
+
 #[cfg(test)]
 mod tests {
     use event_manager::SubscriberOps;
@@ -481,6 +579,12 @@ mod tests {
     #[test]
     fn exit_codes_and_reasons() {
         let cases = [
+            (
+                VmExit::StopRequested(StopReason::Requested),
+                0,
+                "stop_requested",
+                "stop requested",
+            ),
             (
                 VmExit::GuestReset { session: None },
                 0,
@@ -568,8 +672,10 @@ mod tests {
 
     #[test]
     fn the_first_trigger_wins_and_wakes_the_loop() {
-        let latch = Arc::new(StopLatch::new().unwrap());
-        let handle = VmmHandle::new(latch.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        let latch = handle.latch.clone();
+        latch.mark_running();
         assert_eq!(handle.state(), VmState::Running);
         assert!(latch.outcome().is_none());
 
@@ -580,6 +686,47 @@ mod tests {
         assert_eq!(handle.state(), VmState::Stopping);
         assert_eq!(latch.outcome(), Some(VmExit::GuestReset { session: None }));
         assert_eq!(latch.wake.read().unwrap(), 3);
+        writer.close().unwrap();
+    }
+
+    /// Booting until the vCPUs start, running, stopping from the first
+    /// trigger, stopped once the stop sequence is done; and the rest of the
+    /// status from the VM's config and the audit sink.
+    #[test]
+    fn the_status_follows_the_vm_through_its_life() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        let status = handle.status();
+        assert_eq!(status.state, VmState::Booting);
+        assert_eq!(status.session_id, handle.session_id());
+        assert_eq!(status.pid, std::process::id());
+        assert_eq!((status.vcpus, status.mem_mib), (2, 256));
+        assert_eq!(status.devices, ["fs:root", "fs:workspace"]);
+        assert_eq!(
+            status.guest,
+            GuestStatus {
+                init_ready: false,
+                session_pid: None,
+                exit: None
+            }
+        );
+        assert_eq!(
+            status.audit,
+            AuditStatus {
+                next_seq: 1,
+                failed: false
+            }
+        );
+
+        handle.latch.mark_running();
+        assert_eq!(handle.status().state, VmState::Running);
+        handle.request_stop(StopReason::Requested);
+        assert_eq!(handle.status().state, VmState::Stopping);
+        handle.latch.mark_stopped();
+        assert_eq!(handle.status().state, VmState::Stopped);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(handle.status().uptime_ms >= 5);
+        writer.close().unwrap();
     }
 
     #[test]

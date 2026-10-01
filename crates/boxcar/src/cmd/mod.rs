@@ -6,6 +6,8 @@
 mod audit;
 mod doctor;
 mod run;
+mod status;
+mod stop;
 
 use std::process::ExitCode;
 
@@ -17,5 +19,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Audit(command) => audit::run(command),
         Command::Doctor => doctor::run(),
         Command::Run(args) => run::run(args),
+        Command::Status(args) => status::run(&args),
+        Command::Stop(args) => stop::run(&args),
     }
 }

@@ -222,7 +222,7 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
 
     let (tx, rx) = bounded(cfg.channel_capacity);
     let (stop, stopped) = bounded(0);
-    let shared = Arc::new(Shared::new()?);
+    let shared = Arc::new(Shared::new(resume.last_seq + 1)?);
     let pending_since = (!resume.window.is_empty()).then(Instant::now);
     let consistent_len = segments.len();
     let writer = Writer {
@@ -387,7 +387,7 @@ impl<S: Syncer> Writer<S> {
         span: Option<SpanRef>,
     ) -> Record {
         let (kind, data) = payload.into_parts();
-        self.chain.next(PartialRecord {
+        let record = self.chain.next(PartialRecord {
             session_id: self.session_id.clone(),
             ring,
             src: payload.source(),
@@ -398,7 +398,11 @@ impl<S: Syncer> Writer<S> {
             subject,
             data,
             span,
-        })
+        });
+        self.shared
+            .next_seq
+            .store(record.seq + 1, Ordering::Relaxed);
+        record
     }
 
     /// Appends a record's line; returns its segment and offset.
