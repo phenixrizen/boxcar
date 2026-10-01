@@ -33,7 +33,14 @@ cargo xtask test-kvm m1          # needs /dev/kvm and target/guest/*
 sudo modprobe kvm_amd            # or kvm_intel
 sudo setfacl -m "u:$(id -un):rw" /dev/kvm
 cargo run -p boxcar -- doctor
+cargo xtask test-kvm m1          # the KVM-gated tests, once the artifacts below are built
 ```
+
+`cargo xtask test-kvm m1` runs the gated tests of `boxcar-vmm` and `boxcar`,
+which boot real VMs: one at a time, with their output shown, and with
+`BOXCAR_TEST_KERNEL`, `BOXCAR_TEST_INITRAMFS` and `BOXCAR_TEST_ROOTFS` set to
+the artifacts in `target/guest`. Without `/dev/kvm` or an artifact it says
+what is missing and exits 0.
 
 ## Guest artifacts
 

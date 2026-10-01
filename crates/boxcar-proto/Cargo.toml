@@ -1,0 +1,21 @@
+[package]
+name = "boxcar-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+# `hash` gates everything that needs blake3 (a C build). The static musl guest
+# init depends on this crate with default features off so it needs no C compiler.
+default = ["hash"]
+hash = ["dep:blake3"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true, optional = true }

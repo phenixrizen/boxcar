@@ -1,0 +1,878 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The boxcar Authors
+
+//! The session: the command init runs on the serial console, as the host
+//! user, in a process group of its own in the foreground of `/dev/ttyS0`.
+//!
+//! The terminal belongs to init ([`Terminal`]): PID 1 is the leader of the
+//! session `/dev/ttyS0` is the controlling terminal of, and the session
+//! command is a process group within it. When a session leader exits, the
+//! kernel hangs up its controlling terminal and discards the output the
+//! serial port has not sent yet, so the command's last lines could be lost;
+//! init never exits, so that never happens. A shell still gets job control:
+//! it leads its own process group, in the foreground, on a terminal it can
+//! open as `/dev/tty`.
+//!
+//! Everything the child needs is prepared before the fork ([`Exec`]), so
+//! that between `fork` and `execve` it only makes system calls on memory
+//! that already exists. Init is single-threaded, which is what makes the
+//! fork safe at all.
+
+use std::collections::BTreeMap;
+use std::ffi::{CStr, CString};
+use std::fmt::Write as _;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::{iter, ptr};
+
+use boxcar_proto::guestcmd;
+use nix::errno::Errno;
+use nix::fcntl::{open, OFlag};
+use nix::sys::prctl;
+use nix::sys::signal::SigSet;
+use nix::sys::stat::Mode;
+use nix::unistd::{
+    chdir, fork, getpgrp, getpid, getsid, setgroups, setpgid, setresgid, setresuid, setsid,
+    tcsetpgrp, ForkResult, Gid, Pid, Uid,
+};
+
+use crate::console::{warn, write_console, Failed, StackLine, Step};
+use crate::mounts::ensure_dir;
+use crate::search::{self, Miss};
+
+/// What runs when the command line names no command: a login shell, which
+/// reads `/etc/profile`.
+pub const DEFAULT_ARGV: [&str; 2] = ["/bin/sh", "-l"];
+
+/// The session's whole environment.
+pub const ENV: [&CStr; 4] = [
+    c"HOME=/workspace",
+    c"TERM=xterm-256color",
+    c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    c"USER=agent",
+];
+
+/// The serial console: init's controlling terminal, and the session's
+/// terminal.
+const TTY: &CStr = c"/dev/ttyS0";
+
+/// Where the session starts.
+const WORKDIR: &CStr = c"/workspace";
+
+/// The cgroups init creates: `system` for init's own helpers, `session` for
+/// the session and everything it starts.
+pub const CGROUPS: [&str; 2] = ["/sys/fs/cgroup/system", "/sys/fs/cgroup/session"];
+
+/// The file the session child writes its pid to, to join its cgroup.
+const SESSION_PROCS: &CStr = c"/sys/fs/cgroup/session/cgroup.procs";
+
+/// The exit status of a session child that could not start its command.
+pub const SPAWN_FAILED: i32 = 127;
+
+/// Who the session runs as, and what.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    pub uid: Uid,
+    pub gid: Gid,
+    pub argv: Vec<String>,
+}
+
+impl Session {
+    /// The session the `boxcar.*` keys describe: `boxcar.uid` and
+    /// `boxcar.gid`, both required, and the command from `boxcar.cmd`
+    /// ([`guestcmd::decode`]) or else [`DEFAULT_ARGV`].
+    pub fn from_cmdline(args: &BTreeMap<String, String>) -> Result<Session, Failed> {
+        let uid = id(args, "uid")?;
+        let gid = id(args, "gid")?;
+        let argv = match args.get("cmd") {
+            Some(cmd) => guestcmd::decode(cmd).step("boxcar.cmd")?,
+            None => DEFAULT_ARGV.map(str::to_owned).to_vec(),
+        };
+        Ok(Session {
+            uid: Uid::from_raw(uid),
+            gid: Gid::from_raw(gid),
+            argv,
+        })
+    }
+}
+
+/// `boxcar.<key>`, a uid or gid in decimal. The all-ones id is refused: to
+/// `setresuid` and `setresgid` it means "leave this id alone", which would
+/// keep the session root.
+fn id(args: &BTreeMap<String, String>, key: &str) -> Result<u32, Failed> {
+    let step = format!("boxcar.{key}");
+    let value = args.get(key).ok_or_else(|| Failed::new(&step, "not set"))?;
+    match value.parse::<u32>() {
+        Ok(u32::MAX) => Err(Failed::new(&step, format!("{value:?} is not a usable id"))),
+        Ok(id) => Ok(id),
+        Err(e) => Err(Failed::new(&step, format!("{value:?}: {e}"))),
+    }
+}
+
+/// The session's command, ready for `execve` without allocating: the
+/// argument strings, the files it may be and the NULL-terminated pointer
+/// arrays of the arguments and of [`ENV`] are all built before the fork.
+pub struct Exec {
+    argv: Vec<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+    env_ptrs: Vec<*const libc::c_char>,
+    /// Where the program may be, in the order they are tried
+    /// ([`search::candidates`] of the first argument on the session's
+    /// PATH).
+    candidates: Vec<CString>,
+}
+
+impl Exec {
+    /// `argv` with the environment [`ENV`], its program looked for on
+    /// [`session_path`]. Fails when `argv` is empty or an argument holds a
+    /// NUL byte, which `execve` cannot pass.
+    pub fn new(argv: &[String]) -> Result<Exec, Failed> {
+        Exec::new_in(argv, session_path())
+    }
+
+    /// [`Exec::new`] with the program looked for on `path`.
+    fn new_in(argv: &[String], path: &str) -> Result<Exec, Failed> {
+        if argv.is_empty() {
+            return Err(Failed::new("session command", "empty"));
+        }
+        let argv = argv
+            .iter()
+            .map(|arg| CString::new(arg.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .step("session command")?;
+        let name = argv[0].to_str().step("session command")?;
+        let candidates = search::candidates(name, path)
+            .into_iter()
+            .map(CString::new)
+            .collect::<Result<Vec<_>, _>>()
+            .step("session command")?;
+        Ok(Exec {
+            argv_ptrs: pointers(argv.iter().map(CString::as_c_str)),
+            env_ptrs: pointers(ENV.into_iter()),
+            candidates,
+            argv,
+        })
+    }
+
+    /// The command's name: the first argument, as given.
+    fn name(&self) -> &str {
+        // Every argument came from a String.
+        self.argv[0].to_str().unwrap_or("?")
+    }
+
+    /// Runs the first of the candidates this process may run, as `execvp`
+    /// would; returns only if none could be run, with why.
+    ///
+    /// Called in the session child once it is the session's user, so that
+    /// `access(X_OK)`, which checks the real uid and gid, answers for it,
+    /// and only async-signal-safe calls are made. A candidate `access`
+    /// passes may still fail `execve` (a directory does, with `EACCES`);
+    /// either error is read with [`search::miss`]: the search goes on past
+    /// a file that is not there or may not be run, and ends at any other
+    /// error. Running out of candidates is `EACCES` if one was refused,
+    /// else `ENOENT`.
+    fn exec(&self) -> Errno {
+        let mut refused = false;
+        for candidate in &self.candidates {
+            // SAFETY: access only reads the C string, which `self` owns.
+            let errno = if unsafe { libc::access(candidate.as_ptr(), libc::X_OK) } == 0 {
+                // SAFETY: the path and every pointer of both arrays point at
+                // C strings that `self` owns or that are static, and both
+                // arrays end with a null pointer.
+                unsafe {
+                    libc::execve(
+                        candidate.as_ptr(),
+                        self.argv_ptrs.as_ptr(),
+                        self.env_ptrs.as_ptr(),
+                    );
+                }
+                Errno::last()
+            } else {
+                Errno::last()
+            };
+            match search::miss(errno) {
+                Miss::Absent => {}
+                Miss::Refused => refused = true,
+                Miss::Fatal => return errno,
+            }
+        }
+        search::not_run(refused)
+    }
+}
+
+/// The `PATH` of [`ENV`], which the session's command is searched in.
+pub fn session_path() -> &'static str {
+    ENV.iter()
+        .find_map(|var| var.to_str().ok()?.strip_prefix("PATH="))
+        .unwrap_or("")
+}
+
+/// Pointers to each of `strings`, then a null pointer.
+fn pointers<'a>(strings: impl Iterator<Item = &'a CStr>) -> Vec<*const libc::c_char> {
+    strings
+        .map(CStr::as_ptr)
+        .chain(iter::once(ptr::null()))
+        .collect()
+}
+
+/// `/dev/ttyS0` as init's controlling terminal, open in init for as long
+/// as it runs.
+pub struct Terminal {
+    fd: OwnedFd,
+}
+
+impl Terminal {
+    /// Makes init the leader of a session of its own (the kernel starts
+    /// PID 1 in session 0, which has no leader) and `/dev/ttyS0` that
+    /// session's controlling terminal, and ignores `SIGTTOU` from here on.
+    ///
+    /// Init takes the terminal's foreground back from a background process
+    /// group ([`Terminal::take_foreground`]) and writes its own lines
+    /// whatever terminal modes (`tostop`) the session left. From the
+    /// background, the kernel lets either through only when `SIGTTOU` is
+    /// ignored; otherwise, since init's group has no parent in its session
+    /// (it is orphaned), the call fails with `EIO`.
+    pub fn claim() -> Result<Terminal, Failed> {
+        match setsid() {
+            Ok(_) => {}
+            // Already a process group leader: fine if it leads its session.
+            Err(Errno::EPERM) if getsid(None) == Ok(getpid()) => {}
+            Err(errno) => return Err(Failed::new("setsid", errno)),
+        }
+        // SAFETY: SIG_IGN installs no handler; this only changes the action
+        // of SIGTTOU in init, which the session child sets back.
+        if unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(Failed::new("ignore SIGTTOU", Errno::last()));
+        }
+        // O_CLOEXEC: the session gets the terminal as 0, 1 and 2 only.
+        let fd = open(
+            TTY,
+            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .step("open /dev/ttyS0")?;
+        // SAFETY: TIOCSCTTY takes an int by value; 0 refuses to take the
+        // terminal from another session.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSCTTY, 0) } != 0 {
+            return Err(Failed::new("TIOCSCTTY /dev/ttyS0", Errno::last()));
+        }
+        Ok(Terminal { fd })
+    }
+
+    /// Makes init's process group the terminal's foreground again, once the
+    /// session has ended, before init writes its own lines. Best effort: a
+    /// failure gets a warning.
+    pub fn take_foreground(&self) {
+        if let Err(errno) = tcsetpgrp(&self.fd, getpgrp()) {
+            warn(&format!("tcsetpgrp /dev/ttyS0: {errno}"));
+        }
+    }
+
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+/// Step 6: creates [`CGROUPS`]. Returns whether the session can join its
+/// cgroup: without `cgroup2` mounted there is none, which gets a warning.
+pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
+    if !cgroup2 {
+        warn("cgroup2 is not mounted: the session stays in the root cgroup");
+        return Ok(false);
+    }
+    for dir in CGROUPS {
+        ensure_dir(dir, 0o755)?;
+    }
+    Ok(true)
+}
+
+/// Step 7: forks the session child and returns its pid. The child sets
+/// itself up ([`setup`]) and execs the command; if it cannot, it says why
+/// on the console ([`failure_line`]) and exits with [`SPAWN_FAILED`].
+pub fn spawn(
+    session: &Session,
+    exec: &Exec,
+    terminal: &Terminal,
+    join_cgroup: bool,
+) -> Result<Pid, Failed> {
+    let signals = CleanSignals {
+        unblocked: SigSet::empty(),
+        sigrtmax: libc::SIGRTMAX(),
+    };
+    // SAFETY: init is single-threaded, so the child is a whole copy of it
+    // with no lock held by a thread that is gone. The child only makes
+    // system calls on memory prepared before the fork, then execs or exits.
+    match unsafe { fork() }.step("fork")? {
+        ForkResult::Parent { child } => Ok(child),
+        ForkResult::Child => child(session, exec, terminal.as_fd(), join_cgroup, &signals),
+    }
+}
+
+/// What the child needs, gathered before the fork, to hand the command the
+/// signal state of a fresh process: every signal unblocked and at its
+/// default action.
+struct CleanSignals {
+    /// The empty mask.
+    unblocked: SigSet,
+    /// The highest signal number.
+    sigrtmax: libc::c_int,
+}
+
+/// The step of the child that runs the command.
+const EXEC_STEP: &str = "execve";
+
+/// A step of the child that failed.
+struct ChildFailure {
+    step: &'static str,
+    errno: Errno,
+    /// Whether stderr is the session's terminal yet. Before it is, the
+    /// child is still root and reports on `/dev/console`; after, it may no
+    /// longer open that and reports on stderr.
+    on_tty: bool,
+}
+
+/// The session child, from `fork` to `execve`. Never returns.
+fn child(
+    session: &Session,
+    exec: &Exec,
+    tty: BorrowedFd<'_>,
+    join_cgroup: bool,
+    signals: &CleanSignals,
+) -> ! {
+    let failure = match setup(session, tty, join_cgroup, signals) {
+        Ok(()) => ChildFailure {
+            step: EXEC_STEP,
+            errno: exec.exec(),
+            on_tty: true,
+        },
+        Err(failure) => failure,
+    };
+    let mut line = failure_line(&failure, exec);
+    let bytes = line.finish();
+    if failure.on_tty {
+        let _ = nix::unistd::write(std::io::stderr(), bytes);
+    } else {
+        let _ = write_console(bytes);
+    }
+    // SAFETY: _exit ends the process at once, running nothing of init's.
+    unsafe { libc::_exit(SPAWN_FAILED) }
+}
+
+/// The console line for `failure`: `boxcar-init: exec: <command>: <error>`
+/// when the command could not be run (`ENOENT` when it was found nowhere,
+/// `EACCES` when what was found may not be run), else
+/// `boxcar-init: session: <step>: <error>`. Built on the stack: the child
+/// may not allocate.
+fn failure_line(failure: &ChildFailure, exec: &Exec) -> StackLine {
+    let mut line = StackLine::new();
+    let _ = if failure.step == EXEC_STEP {
+        write!(
+            line,
+            "boxcar-init: exec: {}: {}",
+            exec.name(),
+            failure.errno
+        )
+    } else {
+        write!(
+            line,
+            "boxcar-init: session: {}: {}",
+            failure.step, failure.errno
+        )
+    };
+    line
+}
+
+/// The child's setup, in order: a process group of its own, in the
+/// foreground of the terminal `tty` (init's `/dev/ttyS0`), which becomes
+/// stdin, stdout and stderr; the `session` cgroup; an empty capability
+/// bounding set and ambient set; no supplementary groups; the session's gid
+/// and uid, real, effective and saved; no new privileges; `/workspace`; then
+/// every signal back at its default action and unblocked, since an ignored
+/// signal and the mask both survive exec (Rust ignores SIGPIPE in init, init
+/// ignores SIGTTOU and blocks SIGCHLD for its signalfd).
+fn setup(
+    session: &Session,
+    tty: BorrowedFd<'_>,
+    join_cgroup: bool,
+    signals: &CleanSignals,
+) -> Result<(), ChildFailure> {
+    let fail = |step: &'static str, on_tty: bool| {
+        move |errno: Errno| ChildFailure {
+            step,
+            errno,
+            on_tty,
+        }
+    };
+    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(fail("setpgid", false))?;
+    foreground(tty).map_err(fail("tcsetpgrp /dev/ttyS0", false))?;
+    onto(tty, libc::STDIN_FILENO).map_err(fail("dup2 stdin", false))?;
+    onto(tty, libc::STDOUT_FILENO).map_err(fail("dup2 stdout", false))?;
+    onto(tty, libc::STDERR_FILENO).map_err(fail("dup2 stderr", false))?;
+    if join_cgroup {
+        join_session_cgroup().map_err(fail("join the session cgroup", true))?;
+    }
+    // While still root (dropping needs CAP_SETPCAP). With both sets empty
+    // and no inheritable capabilities, no exec grants one again, even when
+    // the session's uid is 0.
+    drop_bounding_set().map_err(fail("PR_CAPBSET_DROP", true))?;
+    clear_ambient_set().map_err(fail("PR_CAP_AMBIENT_CLEAR_ALL", true))?;
+    setgroups(&[]).map_err(fail("setgroups", true))?;
+    setresgid(session.gid, session.gid, session.gid).map_err(fail("setresgid", true))?;
+    setresuid(session.uid, session.uid, session.uid).map_err(fail("setresuid", true))?;
+    prctl::set_no_new_privs().map_err(fail("PR_SET_NO_NEW_PRIVS", true))?;
+    chdir(WORKDIR).map_err(fail("chdir /workspace", true))?;
+    reset_signals(signals.sigrtmax).map_err(fail("reset signal actions", true))?;
+    signals
+        .unblocked
+        .thread_set_mask()
+        .map_err(fail("unblock all signals", true))
+}
+
+/// Makes this process's group the foreground of `tty`. The group is in the
+/// background until then, where the kernel lets `tcsetpgrp` through only
+/// when `SIGTTOU` is ignored (the group's parent is init, so it counts as
+/// orphaned and the call would fail with `EIO`): it is ignored for the call
+/// and set back to its default after.
+fn foreground(tty: BorrowedFd<'_>) -> Result<(), Errno> {
+    // SAFETY: SIG_IGN and SIG_DFL install no handler; this only changes the
+    // action of SIGTTOU in this process.
+    unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+    let result = tcsetpgrp(tty, getpid());
+    // SAFETY: as above.
+    unsafe { libc::signal(libc::SIGTTOU, libc::SIG_DFL) };
+    result
+}
+
+/// Makes `target` a copy of `tty` that stays open across exec. `tty` is
+/// close-on-exec, and `dup2` onto itself would keep the flag, so when they
+/// are the same descriptor the flag is cleared instead.
+fn onto(tty: BorrowedFd<'_>, target: RawFd) -> Result<(), Errno> {
+    let tty = tty.as_raw_fd();
+    // SAFETY: fcntl and dup2 on descriptors, with integer arguments only.
+    let rc = unsafe {
+        if tty == target {
+            libc::fcntl(target, libc::F_SETFD, 0)
+        } else {
+            libc::dup2(tty, target)
+        }
+    };
+    if rc < 0 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
+/// Empties the capability bounding set: `PR_CAPBSET_DROP` for each
+/// capability from 0 until the kernel answers `EINVAL`, for the first one
+/// past the last it knows.
+fn drop_bounding_set() -> Result<(), Errno> {
+    // The capability sets are 64 bits wide.
+    for cap in 0..64 {
+        // SAFETY: prctl with integer arguments only.
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                cap as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if rc != 0 {
+            return match Errno::last() {
+                Errno::EINVAL if cap > 0 => Ok(()),
+                errno => Err(errno),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Empties the ambient capability set.
+fn clear_ambient_set() -> Result<(), Errno> {
+    // SAFETY: prctl with integer arguments only; the kernel requires the
+    // unused ones to be 0.
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last())
+    }
+}
+
+/// Sets every signal from 1 to `sigrtmax` back to its default action,
+/// SIGKILL and SIGSTOP aside (they cannot be changed). libc refuses, with
+/// `EINVAL`, the few real-time signals it keeps for itself, which init
+/// never changes; that is not a failure.
+fn reset_signals(sigrtmax: libc::c_int) -> Result<(), Errno> {
+    for signal in 1..=sigrtmax {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: SIG_DFL installs no handler; this only changes the
+        // action of `signal` in this process.
+        if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+            match Errno::last() {
+                Errno::EINVAL => {}
+                errno => return Err(errno),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes this process's pid to the `session` cgroup's `cgroup.procs`.
+fn join_session_cgroup() -> Result<(), Errno> {
+    let mut pid = StackLine::new();
+    let _ = write!(pid, "{}", getpid());
+    let pid = pid.finish();
+    let procs = open(
+        SESSION_PROCS,
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    if nix::unistd::write(&procs, pid)? != pid.len() {
+        return Err(Errno::EIO);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::*;
+
+    fn args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|&a| a.to_owned()).collect()
+    }
+
+    #[test]
+    fn without_a_command_the_session_is_a_login_shell() {
+        let session = Session::from_cmdline(&args(&[
+            ("mode", "console"),
+            ("uid", "1000"),
+            ("gid", "1001"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            session,
+            Session {
+                uid: Uid::from_raw(1000),
+                gid: Gid::from_raw(1001),
+                argv: strings(&["/bin/sh", "-l"]),
+            }
+        );
+    }
+
+    #[test]
+    fn the_command_comes_from_boxcar_cmd() {
+        let argv = strings(&["/bin/sh", "-c", "echo hi > /workspace/a.txt"]);
+        let cmd = guestcmd::encode(&argv);
+        let session =
+            Session::from_cmdline(&args(&[("uid", "0"), ("gid", "0"), ("cmd", &cmd)])).unwrap();
+        assert_eq!(session.argv, argv);
+        assert_eq!(session.uid, Uid::from_raw(0));
+    }
+
+    #[test]
+    fn a_bad_command_is_refused() {
+        let failed =
+            Session::from_cmdline(&args(&[("uid", "1"), ("gid", "1"), ("cmd", "!!")])).unwrap_err();
+        assert!(failed.to_string().starts_with("boxcar.cmd: "), "{failed}");
+    }
+
+    #[test]
+    fn uid_and_gid_are_required_decimal_ids() {
+        for (pairs, step) in [
+            (&[("gid", "1")][..], "boxcar.uid"),
+            (&[("uid", "1")][..], "boxcar.gid"),
+            (&[("uid", ""), ("gid", "1")][..], "boxcar.uid"),
+            (&[("uid", "x"), ("gid", "1")][..], "boxcar.uid"),
+            (&[("uid", "-1"), ("gid", "1")][..], "boxcar.uid"),
+            (&[("uid", "1"), ("gid", "4294967296")][..], "boxcar.gid"),
+        ] {
+            let failed = Session::from_cmdline(&args(pairs)).unwrap_err();
+            assert!(
+                failed.to_string().starts_with(&format!("{step}: ")),
+                "{pairs:?}: {failed}"
+            );
+        }
+    }
+
+    /// To setresuid, -1 means "leave this id alone": the session would
+    /// stay root.
+    #[test]
+    fn the_all_ones_id_is_refused() {
+        for (pairs, step) in [
+            (&[("uid", "4294967295"), ("gid", "1")][..], "boxcar.uid"),
+            (&[("uid", "1"), ("gid", "4294967295")][..], "boxcar.gid"),
+        ] {
+            let failed = Session::from_cmdline(&args(pairs)).unwrap_err();
+            assert!(
+                failed.to_string().starts_with(&format!("{step}: ")),
+                "{failed}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_is_exactly_the_four_variables() {
+        let env: Vec<&str> = ENV.iter().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(
+            env,
+            [
+                "HOME=/workspace",
+                "TERM=xterm-256color",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "USER=agent",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_pointer_arrays_point_at_the_strings_and_end_in_null() {
+        let exec = Exec::new(&strings(&["/bin/sh", "-c", "exit 7"])).unwrap();
+        let argv: Vec<&CStr> = exec.argv.iter().map(CString::as_c_str).collect();
+        for (strings, ptrs) in [(&argv[..], &exec.argv_ptrs), (&ENV[..], &exec.env_ptrs)] {
+            assert_eq!(ptrs.len(), strings.len() + 1);
+            for (s, &p) in strings.iter().zip(ptrs.iter()) {
+                assert_eq!(p, s.as_ptr());
+            }
+            assert!(ptrs[strings.len()].is_null());
+        }
+        let argv: Vec<&str> = exec.argv.iter().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(argv, ["/bin/sh", "-c", "exit 7"]);
+    }
+
+    /// Whether `signal`'s action in this process is the default one.
+    fn is_default(signal: libc::c_int) -> bool {
+        // SAFETY: a zeroed sigaction is a valid out-parameter, and a null
+        // new action only reads the current one.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_DFL
+        }
+    }
+
+    /// Rust ignores SIGPIPE in every program, init included, and an ignored
+    /// signal stays ignored across execve. In a child, so that the test
+    /// harness keeps its own dispositions.
+    #[test]
+    fn reset_signals_restores_the_default_of_ignored_signals() {
+        // SAFETY: the child makes only async-signal-safe calls, then _exits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let code = unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                    libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                    libc::signal(libc::SIGRTMIN() + 1, libc::SIG_IGN);
+                    let reset = reset_signals(libc::SIGRTMAX()).is_ok();
+                    let defaults = [libc::SIGPIPE, libc::SIGUSR1, libc::SIGRTMIN() + 1]
+                        .into_iter()
+                        .all(is_default);
+                    match (reset, defaults) {
+                        (true, true) => 0,
+                        (false, _) => 1,
+                        (true, false) => 2,
+                    }
+                };
+                // SAFETY: ends the child without running the harness.
+                unsafe { libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => {
+                let status = nix::sys::wait::waitpid(child, None).unwrap();
+                assert_eq!(
+                    status,
+                    nix::sys::wait::WaitStatus::Exited(child, 0),
+                    "1: reset_signals failed, 2: a signal is still ignored"
+                );
+            }
+        }
+    }
+
+    /// Whether `fd` is open with `FD_CLOEXEC` set.
+    fn cloexec(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD takes no argument.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fd {fd} is not open");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    /// The terminal is close-on-exec in init; its copies on 0, 1 and 2 must
+    /// not be, including when it is itself one of them. Descriptors other
+    /// than 0, 1 and 2 stand in for them here.
+    #[test]
+    fn the_terminal_lands_on_a_descriptor_that_survives_exec() {
+        let tty = open(
+            c"/dev/null",
+            OFlag::O_RDWR | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let other = open(
+            c"/dev/null",
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let (tty_fd, other_fd) = (tty.as_raw_fd(), other.as_raw_fd());
+
+        onto(tty.as_fd(), other_fd).unwrap();
+        assert!(!cloexec(other_fd), "the copy survives exec");
+        assert!(cloexec(tty_fd), "the original stays close-on-exec");
+        // SAFETY: F_GETFL takes no argument.
+        let access = unsafe { libc::fcntl(other_fd, libc::F_GETFL) } & libc::O_ACCMODE;
+        assert_eq!(access, libc::O_RDWR, "the copy is the terminal's");
+
+        onto(tty.as_fd(), tty_fd).unwrap();
+        assert!(!cloexec(tty_fd), "onto itself clears the flag");
+    }
+
+    #[test]
+    fn the_search_path_is_the_one_in_the_environment() {
+        assert_eq!(
+            session_path(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+    }
+
+    fn candidates(exec: &Exec) -> Vec<&str> {
+        exec.candidates
+            .iter()
+            .map(|c| c.to_str().unwrap())
+            .collect()
+    }
+
+    /// `ls` is looked for through the session's PATH; argv[0] stays what
+    /// was asked for.
+    #[test]
+    fn a_bare_name_is_looked_for_in_the_session_path() {
+        let exec = Exec::new(&strings(&["ls", "/workspace"])).unwrap();
+        assert_eq!(
+            candidates(&exec),
+            [
+                "/usr/local/sbin/ls",
+                "/usr/local/bin/ls",
+                "/usr/sbin/ls",
+                "/usr/bin/ls",
+                "/sbin/ls",
+                "/bin/ls"
+            ]
+        );
+        assert_eq!(exec.name(), "ls");
+        assert_eq!(exec.argv_ptrs[0], exec.argv[0].as_ptr());
+    }
+
+    #[test]
+    fn a_path_is_its_own_only_candidate() {
+        let exec = Exec::new(&strings(&["/bin/sh", "-c", "true"])).unwrap();
+        assert_eq!(candidates(&exec), ["/bin/sh"]);
+    }
+
+    /// Three PATH entries under a scratch directory, `a:b:c`.
+    fn scratch_path(dir: &Path) -> String {
+        ["a", "b", "c"]
+            .map(|entry| {
+                let entry = dir.join(entry);
+                fs::create_dir(&entry).unwrap();
+                entry.to_str().unwrap().to_owned()
+            })
+            .join(":")
+    }
+
+    /// Neither of these runs anything, so they can run in the test process.
+    #[test]
+    fn a_name_found_nowhere_fails_with_enoent_and_one_not_runnable_with_eacces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch_path(dir.path());
+        let exec = Exec::new_in(&strings(&["tool"]), &path).unwrap();
+        assert_eq!(exec.exec(), Errno::ENOENT);
+
+        fs::write(dir.path().join("b/tool"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(dir.path().join("b/tool"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(exec.exec(), Errno::EACCES);
+    }
+
+    /// The first candidate the session may run is the one that runs: a
+    /// directory (which `access` passes and `execve` refuses) and a file
+    /// without an execute bit are passed over. In a child, which the
+    /// command replaces.
+    #[test]
+    fn the_first_candidate_that_can_be_run_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch_path(dir.path());
+        fs::create_dir(dir.path().join("a/tool")).unwrap();
+        fs::write(dir.path().join("b/tool"), b"").unwrap();
+        fs::set_permissions(dir.path().join("b/tool"), fs::Permissions::from_mode(0o644)).unwrap();
+        let exit_0 = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap();
+        std::os::unix::fs::symlink(exit_0, dir.path().join("c/tool")).unwrap();
+        let exec = Exec::new_in(&strings(&["tool"]), &path).unwrap();
+
+        // SAFETY: the child only calls access and execve, then _exits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let errno = exec.exec();
+                // SAFETY: ends the child without running the harness.
+                unsafe { libc::_exit(100 + errno as i32 % 100) }
+            }
+            ForkResult::Parent { child } => {
+                let status = nix::sys::wait::waitpid(child, None).unwrap();
+                assert_eq!(
+                    status,
+                    nix::sys::wait::WaitStatus::Exited(child, 0),
+                    "100 + errno: the exec failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_exec_failure_line_names_the_command() {
+        let exec = Exec::new(&strings(&["nosuchcmd"])).unwrap();
+        let failure = ChildFailure {
+            step: EXEC_STEP,
+            errno: Errno::ENOENT,
+            on_tty: true,
+        };
+        assert_eq!(
+            failure_line(&failure, &exec).finish(),
+            b"boxcar-init: exec: nosuchcmd: ENOENT: No such file or directory\n"
+        );
+        let setup = ChildFailure {
+            step: "setresuid",
+            errno: Errno::EPERM,
+            on_tty: true,
+        };
+        assert_eq!(
+            failure_line(&setup, &exec).finish(),
+            b"boxcar-init: session: setresuid: EPERM: Operation not permitted\n"
+        );
+    }
+
+    #[test]
+    fn an_argument_with_a_nul_or_no_argument_is_refused() {
+        assert!(Exec::new(&strings(&["/bin/sh", "a\0b"])).is_err());
+        assert!(Exec::new(&[]).is_err());
+    }
+}

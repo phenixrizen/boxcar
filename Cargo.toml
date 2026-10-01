@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.96"
+repository = "https://github.com/phenixrizen/boxcar"
+
+[workspace.dependencies]
+# Internal crates. boxcar-proto is declared without default features because
+# cargo ignores `default-features = false` on a member that inherits a
+# workspace dependency unless the workspace entry says it too. That keeps
+# `blake3` (which builds C code) out of the static musl guest init; host-side
+# crates opt in with `features = ["hash"]`.
+boxcar-proto = { path = "crates/boxcar-proto", default-features = false }
+boxcar-audit = { path = "crates/boxcar-audit" }
+boxcar-virtio = { path = "crates/boxcar-virtio" }
+boxcar-fs = { path = "crates/boxcar-fs" }
+boxcar-vmm = { path = "crates/boxcar-vmm" }
+
+# rust-vmm and fuse-backend-rs: exact pins, one coherent vm-memory 0.17 set.
+# crates.io only: no git dependencies and no [patch] sections.
+vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-atomic"] }
+virtio-queue = "=0.17.0"
+virtio-bindings = "=0.2.7"
+virtio-vsock = "=0.11.0"
+fuse-backend-rs = { version = "=0.14.0", default-features = false, features = ["virtiofs"] }
+kvm-ioctls = "=0.25.0"
+kvm-bindings = { version = "=0.14.1", features = ["fam-wrappers"] }
+linux-loader = { version = "=0.13.2", default-features = false, features = ["elf"] }
+vm-superio = "=0.8.2"
+event-manager = "=0.4.2"
+vm-allocator = "=0.1.4"
+vmm-sys-util = "=0.15.0"
+
+blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crossbeam-channel = "0.5"
+uuid = { version = "1", features = ["v7", "serde"] }
+hex = "0.4"
+base64 = "0.22"
+libc = "0.2"
+thiserror = "2"
+anyhow = "1"   # binaries and xtask only
+nix = "0.31"   # guest only
+cpio = "0.4"   # xtask only
+tempfile = "3" # dev only
+
+# Static musl guest init: `cargo build -p boxcar-init --target
+# x86_64-unknown-linux-musl --profile guest`.
+[profile.guest]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

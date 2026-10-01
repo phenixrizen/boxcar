@@ -1,0 +1,23 @@
+[licenses]
+# The graph's needs and nothing more: every listed license is used by at least
+# one crate. Add a license only after deciding it belongs in a shipped binary.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "deny"
+# Nothing that builds AWS-LC (a C library) may enter the graph: the host stays
+# pure Rust apart from blake3, and the static musl guest needs no C compiler.
+deny = [{ crate = "aws-lc-sys", reason = "builds a C library" }]
+# Duplicates forced by the pinned rust-vmm and fuse-backend-rs set that we
+# cannot resolve ourselves. Never skip a rust-vmm crate here: a duplicated
+# vm-memory, virtio-queue, kvm-* or vmm-sys-util is a broken pin set.
+skip = [
+    { crate = "bitflags:^1", reason = "vmm-sys-util 0.15.0, fuse-backend-rs 0.14.0 and nix 0.24 use bitflags 1; kvm-ioctls, nix 0.31 and rustix use bitflags 2" },
+    { crate = "nix:^0.24", reason = "fuse-backend-rs 0.14.0 requires nix 0.24; boxcar-init (guest only) uses nix 0.31 and the two never link into one binary" },
+    { crate = "syn:^2", reason = "tracing-attributes 0.1.31 still uses syn 2 while serde_derive, thiserror-impl and clap_derive use syn 3; proc macros, build time only" },
+    { crate = "windows-sys:^0.48", reason = "mio 0.8 (via fuse-backend-rs 0.14.0) requires windows-sys 0.48; Windows is not a target, so it never builds" },
+]
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"

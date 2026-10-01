@@ -3,3 +3,4 @@
 /guest/kernel/build/
 *.swp
 .DS_Store
+/boxcar-data/

@@ -17,7 +17,7 @@
 - **No git dependencies and no `[patch]` sections.** `Cargo.lock` must contain no `git+` source. `cargo tree -d` must show no duplicate rust-vmm crate.
 - Every new source file starts with `// SPDX-License-Identifier: Apache-2.0` and `// Copyright 2026 The boxcar Authors`. A file ported from Firecracker, Cloud Hypervisor, or rust-vmm keeps that project's original header above ours, names the source repository, path, and commit in a comment, and gets an entry in `NOTICE`.
 - Commands are argv arrays. Never build a shell string from user input.
-- Every commit: `git commit -s` (adds `Signed-off-by`), subject `area: summary` in the imperative, and the body ends with these two lines exactly:
+- Every commit: `git commit -s` (which appends `Signed-off-by` last), subject `area: short summary` (the subjects given in each task are used verbatim), and the body's trailer block contains these two lines exactly:
   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
   `Claude-Session: https://claude.ai/code/session_01Xm6wxRmFTbEVJQ7zrfbuJX`
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace` (or `cargo test --workspace`), and `cargo deny check` must pass at the end of every task. Test output must be pristine: no warnings.
@@ -62,7 +62,7 @@
 
 **Requirements:**
 - Root `Cargo.toml`: `[workspace] resolver = "2"`, `members = ["crates/*", "xtask"]`, `[workspace.package] edition = "2021"`, `license = "Apache-2.0"`, `rust-version = "1.96"`, `repository = "https://github.com/phenixrizen/boxcar"`, and the full `[workspace.dependencies]` pin table from Global Constraints. Add a `[profile.guest]` that inherits `release` with `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`.
-- Each crate's `Cargo.toml` uses `edition.workspace = true`, `license.workspace = true`, `rust-version.workspace = true`, `repository.workspace = true`, and declares only the dependencies it needs, all via `{ workspace = true }`. Dependencies per crate: `boxcar-proto` → serde, serde_json, uuid, base64, thiserror, plus blake3 and hex as optional dependencies behind a default-on feature (`[features] default = ["hash"]`, `hash = ["dep:blake3", "dep:hex"]`) so the crate builds for musl without a C compiler; everything that needs blake3 (`Hash::from_blake3`, `compute_hash`, `genesis_prev`) is gated on `hash`, while the serde types and the `Hash` newtype's hex serialization are not. `boxcar-audit` → boxcar-proto, serde_json, blake3, crossbeam-channel, thiserror, tracing, libc; dev tempfile. `boxcar-virtio` → vm-memory, virtio-queue, virtio-bindings, vmm-sys-util, kvm-ioctls, kvm-bindings, vm-allocator, thiserror, tracing. `boxcar-fs` → boxcar-proto, boxcar-audit, boxcar-virtio, fuse-backend-rs, vm-memory, virtio-queue, virtio-bindings, vmm-sys-util, blake3, libc, thiserror, tracing; dev tempfile, virtio-vsock (pin-set canary for Task 2). `boxcar-vmm` → boxcar-proto, boxcar-audit, boxcar-virtio, boxcar-fs, kvm-ioctls, kvm-bindings, vm-memory, linux-loader, vm-superio, event-manager, vm-allocator, vmm-sys-util, blake3, libc, thiserror, tracing; `[features] kvm-tests = []`. `boxcar` (bin) → clap, anyhow, tracing, tracing-subscriber, serde_json, boxcar-proto, boxcar-audit, boxcar-vmm, boxcar-fs; `[features] kvm-tests = []`. `boxcar-init` (bin) → boxcar-proto with `default-features = false`, nix (features `mount`, `fs`, `process`, `signal`, `term`, `user`, `reboot`, `poll`, `ioctl`), libc. `xtask` (bin) → anyhow, clap, cpio, blake3, hex.
+- Each crate's `Cargo.toml` uses `edition.workspace = true`, `license.workspace = true`, `rust-version.workspace = true`, `repository.workspace = true`, and declares only the dependencies it needs, all via `{ workspace = true }`. Dependencies per crate: `boxcar-proto` → serde, serde_json, uuid, base64, thiserror, plus blake3 as an optional dependency behind a default-on feature (`[features] default = ["hash"]`, `hash = ["dep:blake3"]`) so the crate builds for musl without a C compiler; everything that needs blake3 (`Hash::from_blake3`, `compute_hash`, `genesis_prev`) is gated on `hash`, while the serde types and the `Hash` newtype's hand-rolled hex serialization are not. `boxcar-audit` → boxcar-proto, serde_json, blake3, crossbeam-channel, thiserror, tracing, libc; dev tempfile. `boxcar-virtio` → vm-memory, virtio-queue, virtio-bindings, vmm-sys-util, kvm-ioctls, kvm-bindings, vm-allocator, thiserror, tracing. `boxcar-fs` → boxcar-proto, boxcar-audit, boxcar-virtio, fuse-backend-rs, vm-memory, virtio-queue, virtio-bindings, vmm-sys-util, blake3, libc, thiserror, tracing; dev tempfile, virtio-vsock (pin-set canary for Task 2). `boxcar-vmm` → boxcar-proto, boxcar-audit, boxcar-virtio, boxcar-fs, kvm-ioctls, kvm-bindings, vm-memory, linux-loader, vm-superio, event-manager, vm-allocator, vmm-sys-util, blake3, libc, thiserror, tracing; `[features] kvm-tests = []`. `boxcar` (bin) → clap, anyhow, tracing, tracing-subscriber, serde_json, boxcar-proto, boxcar-audit, boxcar-vmm, boxcar-fs; `[features] kvm-tests = []`. `boxcar-init` (bin) → boxcar-proto with `default-features = false`, nix (features `mount`, `fs`, `process`, `signal`, `term`, `user`, `reboot`, `poll`, `ioctl`), libc. `xtask` (bin) → anyhow, clap, cpio, blake3, hex.
 - `boxcar-init` must build for `x86_64-unknown-linux-musl` with only pure-Rust dependencies (no `musl-gcc` needed).
 - Placeholder sources: the license header, a one-line crate doc comment, and for binaries a clap `Parser` with `--version` only. `boxcar --version` prints `boxcar 0.1.0`.
 - `.cargo/config.toml`: `[alias] xtask = "run -p xtask --"`.
@@ -94,7 +94,7 @@
 - [ ] Add the dev-dependency features, make it compile and pass.
 - [ ] Commit: `fs: pin-set canary for virtio-queue type unification`.
 
-**Verify:** `cargo test -p boxcar-fs dep_check` passes; `cargo tree -d` still prints no rust-vmm duplicate.
+**Verify:** `cargo test -p boxcar-fs dep_check` passes; no rust-vmm crate appears as a duplicated root line in `cargo tree -d` (dependents listed under a duplicated transitive crate do not count) and `cargo deny check bans` passes.
 
 ---
 
@@ -154,7 +154,7 @@ pub struct FsCreate { pub mount: String, pub path: String, pub fh: u64, pub mode
 pub enum HashStatus { Ok, Raced, Gone, SkippedSize, NotHashed, Error }     // snake_case strings
 pub enum Attrib { Caller, Handle }                                          // "caller" | "handle"
 pub struct FsClose { pub mount: String, pub path: String, pub path_at_open: String, pub fh: u64, pub bytes_read: u64, pub bytes_written: u64, pub size: Option<u64>, pub blake3: Option<Hash>, pub hash_status: HashStatus, pub open_seq: Option<u64>, pub attrib: Attrib }
-pub struct FsIo { pub mount: String, pub path: String, pub fh: u64, pub offset: u64, pub len: u32, pub result: OpResult }
+pub struct FsIo { pub mount: String, pub path: String, pub fh: u64, pub offset: u64, pub len: u32, pub result: OpResult, pub attrib: Attrib }
 pub struct FsPathOp { pub mount: String, pub path: String, pub result: OpResult }
 pub struct FsMkdir { pub mount: String, pub path: String, pub mode: u32, pub result: OpResult }
 pub struct FsMknod { pub mount: String, pub path: String, pub mode: u32, pub rdev: u32, pub result: OpResult }
@@ -207,8 +207,8 @@ pub enum Priority { Normal, Critical }   // Critical forces fdatasync right afte
 pub struct Submission { pub ring: Ring, pub ts_guest_ns: Option<u64>, pub subject: Option<Subject>, pub payload: Payload, pub span: Option<SpanRef>, pub priority: Priority }
 #[derive(Clone)] pub struct AuditSink { /* crossbeam Sender<Submission>, plus an Arc<AtomicU64> dropped counter */ }
 impl AuditSink {
-    pub fn emit(&self, s: Submission) -> Result<(), SinkClosed>;   // blocking send; for never-drop events
-    pub fn try_emit(&self, s: Submission) -> bool;                  // non-blocking; increments dropped on full
+    pub fn emit(&self, s: Submission) -> Result<(), EmitError>;    // blocking send; for never-drop events. EmitError::{Closed, Checkpoint} (a producer may not submit Payload::Checkpoint)
+    pub fn try_emit(&self, s: Submission) -> bool;                  // never waits (try_read on the close gate); increments dropped only when the channel is full
     pub fn dropped(&self) -> u64;
 }
 
@@ -326,7 +326,7 @@ Smoke test (`tests/smoke.rs`, `#![cfg(feature = "kvm-tests")]`, skips with a pri
 - [ ] Run `cargo xtask initramfs`.
 - [ ] Commit: `init: PID 1 hello mode; xtask: reproducible initramfs`.
 
-**Verify:** `cpio -itv < target/guest/initramfs.cpio` lists `init` with mode `-rwxr-xr-x` and `dev/console` with `crw-------` and `5, 1`; `file target/x86_64-unknown-linux-musl/guest/boxcar-init` reports `statically linked`; running `cargo xtask initramfs` twice prints the same blake3.
+**Verify:** `cpio -itv < target/guest/initramfs.cpio` lists `init` with mode `-rwxr-xr-x` and `dev/console` with `crw-------` and `5, 1`; `readelf -l target/x86_64-unknown-linux-musl/guest/boxcar-init | grep -c INTERP` prints `0` (a static-pie; `file` 5.38 misreports it as dynamically linked); running `cargo xtask initramfs` twice prints the same blake3.
 
 ---
 
@@ -377,7 +377,7 @@ pub const BASE_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule 
 - `kick.rs`: capture `*mut kvm_run` from `VcpuFd::get_kvm_run()` per thread; register a no-op handler for `SIGRTMIN()` with `vmm_sys_util::signal::register_signal_handler`; `VcpuKicker::kick()` writes `immediate_exit = 1` with `write_volatile` then `pthread_kill(tid, SIGRTMIN())`. Port the pattern from Firecracker/Cloud Hypervisor and cite it.
 - `devices/legacy.rs`: COM1 at PIO `0x3f8..=0x3ff` via `vm_superio::Serial::with_events(EventFdTrigger, ConsoleEvents, out)` behind `Arc<Mutex>` with the trigger's `EventFd` registered as an irqfd on GSI 4; i8042 at PIO `0x60..=0x64` via `vm_superio::I8042Device::new(EventFdTrigger(reset_evt))`. `EventFdTrigger(EventFd)` implements `vm_superio::Trigger`. Serial output goes to stdout or a file per `ConsoleOut`.
 - `stdin.rs`: on the main thread's `event_manager::EventManager`, a subscriber for stdin that reads up to the serial's free FIFO capacity and calls `enqueue_raw_bytes`; when the FIFO is full it drops stdin interest and re-adds it when the serial's `in_buffer_empty` event fires. Put the host TTY in raw mode with `vmm_sys_util::terminal::Terminal::set_raw_mode` only when stdin is a TTY; restore it in a guard on every exit path and in a panic hook. Pressing Ctrl-] twice within one second requests a stop.
-- `lifecycle.rs`: stop triggers: i8042 reset event, `Shutdown`/`SystemEvent` exits, vCPU error, `SIGTERM`/`SIGINT` via a signalfd on the main thread, `VmmHandle::request_stop`. Sequence: set state `Stopping` → kick and join every vCPU → close devices → emit `Payload::VmmStop { reason, exit_code }` and `AuditSink` flush → restore the terminal → return `VmExit`.
+- `lifecycle.rs`: stop triggers: i8042 reset event, `Shutdown`/`SystemEvent` exits, vCPU error, `SIGTERM`/`SIGINT` via a signalfd on the main thread, `VmmHandle::request_stop`. Sequence: set state `Stopping` → kick and join every vCPU → close devices → emit `Payload::VmmStop { reason, exit_code }` through the sink, then the caller (`boxcar run`) calls `WriterHandle::close()` (drains, final checkpoint, fsync) → restore the terminal → return `VmExit`.
 - `boxcar run`: flags `--kernel PATH` (required), `--initramfs PATH`, `--mem-mib N` (512), `--vcpus N` (1), `--no-fs`, `--cmdline-extra STR` (repeatable), `--debug-boot`, `--audit-dir DIR` (default `./boxcar-data`; creates `<dir>/sessions/<session_id>/`), `--console-log PATH` (serial output to a file instead of stdout). Prints `session: <id>` and `audit: <session-dir>` to stderr before boot. Exit code 0 on `GuestReset` or `GuestShutdown`, 1 on `VcpuError`, 130 on Ctrl-C.
 
 **Steps:**
