@@ -33,12 +33,18 @@ pub(crate) trait PacketExt {
     /// Zeroes every header field, in the packet and in guest memory.
     fn clear_hdr(&mut self) -> &mut Self;
 
-    /// Whether the packet has a data buffer: an RX packet always does, a TX
-    /// packet when its `len` is not 0.
+    /// Whether the packet has a data buffer: a TX packet when its `len` is
+    /// not 0, an RX packet when the driver gave it room for data. An empty
+    /// data buffer is none, as it was for Cloud Hypervisor's packet: 0.11
+    /// hands out a zero-length data descriptor as an empty slice, and the
+    /// state machine would read 0 bytes into it and take that for the host
+    /// end's EOF.
     fn has_buf(&self) -> bool;
 
-    /// The length of the data buffer, if there is one: for a TX packet its
-    /// `len`, for an RX packet the room the driver gave.
+    /// The length of the data buffer, if there is one ([`has_buf`]): for a
+    /// TX packet its `len`, for an RX packet the room the driver gave.
+    ///
+    /// [`has_buf`]: PacketExt::has_buf
     fn buf_capacity(&self) -> Option<usize>;
 
     /// Copies `dst.len()` bytes of the data buffer from `offset` into `dst`.
@@ -82,11 +88,13 @@ impl PacketExt for VsockPacket<'_> {
     }
 
     fn has_buf(&self) -> bool {
-        self.data_slice().is_some()
+        self.buf_capacity().is_some()
     }
 
     fn buf_capacity(&self) -> Option<usize> {
-        self.data_slice().map(VolatileSlice::len)
+        self.data_slice()
+            .map(VolatileSlice::len)
+            .filter(|&len| len > 0)
     }
 
     fn copy_buf_to_slice(&self, offset: usize, dst: &mut [u8]) -> io::Result<()> {
@@ -223,6 +231,22 @@ mod tests {
         assert!(pkt.copy_buf_to_slice(DATA_LEN - 1, &mut [0u8; 2]).is_err());
         assert!(pkt.write_volatile_to(&mut Vec::new(), DATA_LEN, 1).is_err());
         assert!(pkt.read_volatile_from(&mut source, DATA_LEN + 1).is_err());
+    }
+
+    /// An empty data buffer is no buffer: the state machine then says
+    /// `PktBufMissing`, as Cloud Hypervisor's packet made it.
+    #[test]
+    fn an_empty_data_buffer_is_no_buffer() {
+        let mut hdr = vec![0u8; virtio_vsock::packet::PKT_HEADER_SIZE];
+        let mut data: Vec<u8> = Vec::new();
+        // SAFETY: both buffers outlive the packet, which only this test uses.
+        let pkt = unsafe { VsockPacket::new(&mut hdr, Some(&mut data)) }.unwrap();
+        assert!(pkt.data_slice().is_some());
+        assert!(!pkt.has_buf());
+        assert_eq!(pkt.buf_capacity(), None);
+        // SAFETY: as above.
+        let pkt = unsafe { VsockPacket::new(&mut hdr, None) }.unwrap();
+        assert!(!pkt.has_buf());
     }
 
     #[test]

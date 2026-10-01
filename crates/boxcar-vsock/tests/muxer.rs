@@ -12,11 +12,14 @@
 
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use boxcar_audit::{LogReader, WriterConfig, WriterHandle};
 use boxcar_proto::{Record, SessionId};
@@ -26,6 +29,7 @@ use boxcar_vsock::{
     VsockEpollListener, VsockMuxer, VsockPacket,
 };
 use serde_json::{json, Value};
+use socket2::{Domain, SockAddr, Socket, Type};
 use tempfile::TempDir;
 use vm_memory::{Bytes, VolatileSlice};
 use vmm_sys_util::epoll::EventSet;
@@ -546,4 +550,176 @@ fn the_listener_socket_is_0600() {
     // A second bind at the same path fails, and leaves the first alone.
     assert!(bind_listener(&path).is_err());
     assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+}
+
+/// A host service that does not accept: its accept queue (backlog 1) is
+/// full. The guest's request to it is refused at once, as for a socket
+/// nobody listens on, and the muxer goes on serving another port: the
+/// connect does not wait for the host service. (Review probe A: a blocking
+/// connect held the muxer, and the whole vsock thread, until the host
+/// accepted.)
+#[test]
+fn a_host_socket_with_a_full_accept_queue_is_refused_at_once() {
+    let fx = Fixture::new(&[5000, 5001], FakeServices::on(&[]));
+    let full = port_socket_path(&fx.uds_path, 5000);
+    let busy = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    busy.bind(&SockAddr::unix(&full).unwrap()).unwrap();
+    busy.listen(1).unwrap();
+    // Clients queue up until the queue is full and a connect would wait.
+    let mut queued = Vec::new();
+    loop {
+        let client = Socket::new(Domain::UNIX, Type::STREAM.nonblocking(), None).unwrap();
+        match client.connect(&SockAddr::unix(&full).unwrap()) {
+            Ok(()) => queued.push(client),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("{error}"),
+        }
+        assert!(queued.len() < 64, "the accept queue never filled");
+    }
+    let open = listen(&port_socket_path(&fx.uds_path, 5001));
+
+    // The muxer runs on a thread of its own, as on the vsock thread, so that
+    // a connect that waits fails the test instead of hanging it.
+    let Fixture {
+        muxer,
+        uds_path,
+        writer,
+        _dir,
+        ..
+    } = fx;
+    let (done, answers) = mpsc::channel();
+    let guest = thread::spawn(move || {
+        let mut fx = GuestSide {
+            muxer,
+            pkt: Pkt::new(),
+        };
+        let started = Instant::now();
+        let refused = fx.request(5000, 40_000);
+        let served = fx.request(5001, 40_001);
+        done.send((refused, served, started.elapsed())).unwrap();
+        fx.muxer
+    });
+    let (refused, served, took) = answers
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the muxer waited on a host socket that does not accept");
+    let fx = Fixture {
+        muxer: guest.join().unwrap(),
+        pkt: Pkt::new(),
+        uds_path,
+        writer,
+        _dir,
+    };
+    assert_eq!(refused, (uapi::VSOCK_OP_RST, 5000, 40_000));
+    assert_eq!(served, (uapi::VSOCK_OP_RESPONSE, 5001, 40_001));
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    open.accept().unwrap();
+    drop(queued);
+
+    let records = fx.vsock_records();
+    assert_eq!(
+        records,
+        [
+            connect_record(5000, "guest", "uds", 40_000, None),
+            close_record(5000, "guest", 0, 0),
+            connect_record(5001, "guest", "uds", 40_001, None),
+        ]
+    );
+}
+
+/// The muxer and a packet, on a thread of their own.
+struct GuestSide {
+    muxer: VsockMuxer,
+    pkt: Pkt,
+}
+
+impl GuestSide {
+    fn request(&mut self, host_port: u32, port: u32) -> (u16, u32, u32) {
+        self.pkt.guest(host_port, port, uapi::VSOCK_OP_REQUEST);
+        self.muxer.send_pkt(&self.pkt.pkt).unwrap();
+        self.muxer.recv_pkt(&mut self.pkt.pkt).unwrap();
+        self.pkt.route()
+    }
+}
+
+/// An RX buffer with no room for data (a zero-length data descriptor, which
+/// virtio-vsock 0.11 hands out as an empty slice) is no buffer: the
+/// connection does not read 0 bytes into it and take that for the host's
+/// half-close, and its data reaches the guest in the next buffer.
+/// (Review probe C: the guest got SHUTDOWN(SEND) while the host end was open
+/// with data.)
+#[test]
+fn an_rx_buffer_without_room_for_data_is_not_a_host_eof() {
+    let mut fx = Fixture::new(&[5000], FakeServices::on(&[]));
+    let host = listen(&port_socket_path(&fx.uds_path, 5000));
+    assert_eq!(
+        fx.request(5000, 40_000),
+        (uapi::VSOCK_OP_RESPONSE, 5000, 40_000)
+    );
+    let (mut stream, _) = host.accept().unwrap();
+    stream.write_all(b"data for the guest").unwrap();
+    fx.notify();
+    assert!(fx.muxer.has_pending_rx());
+
+    let mut hdr = vec![0u8; HEADER_LEN];
+    let mut empty: Vec<u8> = Vec::new();
+    // SAFETY: both buffers outlive the packet, which only this test uses.
+    let mut rx = unsafe { VsockPacket::new(&mut hdr, Some(&mut empty)) }.unwrap();
+    assert!(fx.muxer.recv_pkt(&mut rx).is_err());
+    assert_ne!(rx.op(), uapi::VSOCK_OP_SHUTDOWN);
+
+    // The host end is still readable: the data is offered again, in full.
+    fx.notify();
+    assert_eq!(fx.recv(), (uapi::VSOCK_OP_RW, 5000, 40_000));
+    assert_eq!(fx.pkt.payload(), b"data for the guest");
+    assert_eq!(
+        fx.vsock_records(),
+        [connect_record(5000, "guest", "uds", 40_000, None)]
+    );
+}
+
+/// The service at 1024 hands over, first, a stream the muxer cannot watch
+/// (a regular file), then real ones.
+struct FlakyServices {
+    calls: AtomicUsize,
+    dir: PathBuf,
+}
+
+impl InternalServices for FlakyServices {
+    fn connect(&self, _port: u32, _meta: ConnMeta) -> Option<UnixStream> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let file = fs::File::create(self.dir.join("not-a-socket")).ok()?;
+            return Some(UnixStream::from(OwnedFd::from(file)));
+        }
+        UnixStream::pair().ok().map(|(ours, _theirs)| ours)
+    }
+}
+
+/// A connection a service took but the muxer could not add (here, epoll
+/// refuses its fd) is reset, its end recorded at once, and leaves the
+/// internal port free: init's next privileged connection is served, not
+/// refused as a duplicate.
+#[test]
+fn a_connection_the_muxer_could_not_add_leaves_the_internal_port_free() {
+    let scratch = TempDir::new().unwrap();
+    let services = Arc::new(FlakyServices {
+        calls: AtomicUsize::new(0),
+        dir: scratch.path().to_owned(),
+    });
+    let mut fx = Fixture::new(&[], services.clone());
+    assert_eq!(fx.request(1024, 1023), (uapi::VSOCK_OP_RST, 1024, 1023));
+    assert_eq!(
+        fx.request(1024, 1022),
+        (uapi::VSOCK_OP_RESPONSE, 1024, 1022)
+    );
+    assert_eq!(fx.request(1024, 1021), (uapi::VSOCK_OP_RST, 1024, 1021));
+    assert_eq!(services.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fx.vsock_records(),
+        [
+            connect_record(1024, "guest", "internal", 1023, None),
+            close_record(1024, "guest", 0, 0),
+            connect_record(1024, "guest", "internal", 1022, None),
+            connect_record(1024, "guest", "internal", 1021, Some("duplicate")),
+        ]
+    );
 }

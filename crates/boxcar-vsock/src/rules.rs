@@ -12,8 +12,13 @@
 //!   refused as `unprivileged` from a guest source port of 1024 or more, as
 //!   `duplicate` once a connection to that port was served in this
 //!   activation, as `no_service` when [`InternalServices::connect`] does
-//!   not take it; otherwise served by the service, and the port is taken;
-//! - to an allowlisted port: connected to the host socket `<uds>_<port>`;
+//!   not take it; otherwise served by the service, and the port is taken
+//!   once the muxer has added the connection (`Rules::served`): a
+//!   connection the muxer could not add leaves the port free;
+//! - to an allowlisted port: connected to the host socket `<uds>_<port>`,
+//!   without waiting (`connect_port_socket`): a socket whose accept queue
+//!   is full refuses at once, as one nobody listens on does, so a host
+//!   service that does not accept cannot hold up the vsock thread;
 //! - to any other port: refused as `port`.
 //!
 //! A refused request is reset and recorded as `vsock.connect` with verdict
@@ -27,12 +32,14 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_proto::{Payload, Ring, Verdict, VsockClose, VsockConnect};
+use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::services::{ConnMeta, InternalServices, PRIVILEGED_PORT_LIMIT};
 
@@ -115,7 +122,7 @@ pub(crate) struct Rules {
     uds_path: PathBuf,
     allow_ports: HashSet<u32>,
     services: Arc<dyn InternalServices>,
-    /// The internal ports a service took a connection on: each is served
+    /// The internal ports whose connection the muxer added: each is served
     /// once an activation.
     served: HashSet<u32>,
 }
@@ -148,10 +155,7 @@ impl Rules {
                 guest_port: src_port,
             };
             return match self.services.connect(port, meta) {
-                Some(stream) => {
-                    self.served.insert(port);
-                    Decision::Internal(stream)
-                }
+                Some(stream) => Decision::Internal(stream),
                 None => Decision::Deny(Peer::Internal, Refusal::NoService),
             };
         }
@@ -161,6 +165,26 @@ impl Rules {
             Decision::Deny(Peer::Uds, Refusal::Port)
         }
     }
+}
+
+impl Rules {
+    /// Takes the internal `port`: the muxer added the connection a service
+    /// handed it, and any later one in this activation is a `duplicate`.
+    pub(crate) fn served(&mut self, port: u32) {
+        self.served.insert(port);
+    }
+}
+
+/// Connects to the host socket at `path` without waiting. A Unix socket
+/// connects at once or not at all; one whose accept queue is full refuses
+/// (`EAGAIN`) instead of blocking, and so does anything else that is not an
+/// immediate connection (`EINPROGRESS`, which `AF_UNIX` does not return):
+/// the guest's request is reset as for a socket nobody listens on. The
+/// stream is non-blocking, as the connection state machine wants it.
+pub(crate) fn connect_port_socket(path: &Path) -> io::Result<UnixStream> {
+    let socket = Socket::new(Domain::UNIX, Type::STREAM.nonblocking(), None)?;
+    socket.connect(&SockAddr::unix(path)?)?;
+    Ok(UnixStream::from(socket))
 }
 
 /// The host socket a guest connection to an allowlisted `port` reaches:
@@ -276,6 +300,8 @@ mod tests {
             Some((Peer::Internal, Refusal::Unprivileged))
         );
         assert!(matches!(rules.decide(1024, 1023), Decision::Internal(_)));
+        // Taken once the muxer added the connection.
+        rules.served(1024);
         assert_eq!(
             refusal(rules.decide(1024, 1022)),
             Some((Peer::Internal, Refusal::Duplicate))

@@ -7,10 +7,10 @@
 //! with the VMM's [`ServiceRegistry`] behind its internal ports, and puts it
 //! on the bus.
 
-use std::fs::DirBuilder;
+use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_audit::AuditSink;
@@ -32,9 +32,15 @@ pub type VsockTransport = MmioTransport<VirtioVsock>;
 const DIR_MODE: u32 = 0o700;
 
 /// The VM's vsock device, if it has one.
+///
+/// Dropping it closes it (see [`VsockDevice::close`]): when `Vmm::new`
+/// fails after the device was attached, the socket, and the state directory
+/// the device made for it if nothing else is in it, are gone with it.
 #[derive(Default)]
 pub struct VsockDevice {
     device: Option<Arc<Mutex<VsockTransport>>>,
+    /// The socket's directory, when the device made it.
+    made_dir: Option<PathBuf>,
 }
 
 impl VsockDevice {
@@ -62,10 +68,15 @@ impl VsockDevice {
         let slot = slots
             .reserve(fixed.base, fixed.gsi)
             .map_err(DeviceError::VsockSlot)?;
-        socket_dir(&cfg.uds_path).map_err(|source| DeviceError::VsockDir {
+        let made_dir = socket_dir(&cfg.uds_path).map_err(|source| DeviceError::VsockDir {
             path: cfg.uds_path.clone(),
             source,
         })?;
+        // From here on, a failure removes the directory again, if it is empty.
+        let mut vsock = VsockDevice {
+            device: None,
+            made_dir,
+        };
         let device = VirtioVsock::new(cfg.clone(), services.clone(), audit.clone())
             .map_err(DeviceError::Vsock)?;
         let ctx: DeviceContext =
@@ -73,11 +84,11 @@ impl VsockDevice {
         // Before the transport takes the context apart.
         ctx.register(vm).map_err(DeviceError::VsockWiring)?;
         let transport = Arc::new(Mutex::new(MmioTransport::new(device, Arc::clone(mem), ctx)));
-        mmio.insert(transport.clone(), slot.base, slot.size)?;
+        // Before it can fail: the device is closed, its socket unlinked, on the way out.
+        vsock.device = Some(transport.clone());
+        mmio.insert(transport, slot.base, slot.size)?;
         log_slot(&slot, &cfg.uds_path);
-        Ok(VsockDevice {
-            device: Some(transport),
-        })
+        Ok(vsock)
     }
 
     /// Whether the VM has the device.
@@ -88,24 +99,56 @@ impl VsockDevice {
     /// Resets the device through its transport, as a driver's status-0
     /// write would: an activated device stops its vsock thread, which
     /// records the end of every connection, and joins it. Then unlinks the
-    /// host socket, so that the state directory can go. Called once the
-    /// vCPUs have stopped, and before the audit writer is closed.
+    /// host socket, so that the state directory can go, and removes that
+    /// directory if the device made it and nothing else is in it (the
+    /// control server's socket keeps it, and the control server removes
+    /// it). Called once the vCPUs have stopped, and before the audit writer
+    /// is closed; again, doing nothing more, when the device is dropped.
     pub fn close(&self) {
         if let Some(device) = &self.device {
             let mut transport = device.lock().unwrap_or_else(PoisonError::into_inner);
             transport.reset();
             transport.device_mut().close_socket();
         }
+        if let Some(dir) = &self.made_dir {
+            remove_if_empty(dir);
+        }
     }
 }
 
-/// Creates the directory `uds_path` goes in, mode 0700, unless it exists.
-fn socket_dir(uds_path: &Path) -> io::Result<()> {
-    match uds_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => {
-            DirBuilder::new().recursive(true).mode(DIR_MODE).create(dir)
-        }
-        _ => Ok(()),
+impl Drop for VsockDevice {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Creates the directory `uds_path` goes in, mode 0700, unless it exists,
+/// and returns it when it was made here.
+fn socket_dir(uds_path: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(dir) = uds_path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Ok(None);
+    };
+    if dir.exists() {
+        return Ok(None);
+    }
+    DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(dir)?;
+    Ok(Some(dir.to_owned()))
+}
+
+/// Removes `dir` if it is empty; a directory with something in it, or none
+/// at all, is left as it is.
+fn remove_if_empty(dir: &Path) {
+    match fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => tracing::warn!("vsock: cannot remove {}: {error}", dir.display()),
     }
 }
 
@@ -156,7 +199,10 @@ mod tests {
     fn the_socket_directory_is_made_0700() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("boxcar").join("session");
-        socket_dir(&state.join("vsock.sock")).unwrap();
+        assert_eq!(
+            socket_dir(&state.join("vsock.sock")).unwrap(),
+            Some(state.clone())
+        );
         for made in [&state, &dir.path().join("boxcar")] {
             assert_eq!(
                 fs::metadata(made).unwrap().permissions().mode() & 0o777,
@@ -165,8 +211,35 @@ mod tests {
                 made.display()
             );
         }
-        // One that exists is left as it is.
-        socket_dir(&state.join("vsock.sock")).unwrap();
-        socket_dir(Path::new("vsock.sock")).unwrap();
+        // One that exists is left as it is, and is not the device's.
+        assert_eq!(socket_dir(&state.join("vsock.sock")).unwrap(), None);
+        assert_eq!(socket_dir(Path::new("vsock.sock")).unwrap(), None);
+    }
+
+    /// The directory the device made goes with it when it is empty, and
+    /// stays when something else (the control socket) is in it.
+    #[test]
+    fn closing_removes_the_directory_it_made_only_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("session");
+        let vsock = VsockDevice {
+            device: None,
+            made_dir: socket_dir(&state.join("vsock.sock")).unwrap(),
+        };
+        fs::write(state.join("control.sock"), b"").unwrap();
+        vsock.close();
+        assert!(state.exists());
+        fs::remove_file(state.join("control.sock")).unwrap();
+        drop(vsock);
+        assert!(!state.exists());
+
+        // A directory that was there before is not the device's to remove.
+        fs::create_dir(&state).unwrap();
+        let vsock = VsockDevice {
+            device: None,
+            made_dir: socket_dir(&state.join("vsock.sock")).unwrap(),
+        };
+        drop(vsock);
+        assert!(state.exists());
     }
 }

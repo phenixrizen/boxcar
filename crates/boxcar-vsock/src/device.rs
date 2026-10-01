@@ -32,17 +32,24 @@
 //!    connections, `CONNECT` lines, data and hang-ups on host ends;
 //! 2. if the driver kicked TX, every chain on the TX queue becomes a
 //!    packet ([`VsockPacket::from_tx_virtq_chain`]) for the muxer
-//!    (`send_pkt`), and goes back to the used ring with nothing written;
+//!    (`send_pkt`), and goes back to the used ring with nothing written. A
+//!    payload split over several data descriptors (Linux sends those for
+//!    `MSG_ZEROCOPY`), which 0.11 does not take, is copied out of guest
+//!    memory into a packet of its own, as Cloud Hypervisor's packet did,
+//!    up to [`MAX_PKT_BUF_SIZE`] bytes;
 //! 3. while the muxer has packets for the guest and the RX queue a free
 //!    chain, each chain gets one ([`VsockPacket::from_rx_virtq_chain`],
 //!    `recv_pkt`) and goes back to the used ring with the header's and the
-//!    data's length;
+//!    data's length. A chain with no room for data is used empty. When the
+//!    muxer says it has packets and then gives none (its RX queue
+//!    overflowed and is rebuilt on the next call), it is asked once more;
 //! 4. the guest is interrupted if either queue's driver wants to hear of
 //!    the buffers used.
 //!
-//! When the muxer still has packets for the guest after step 3 (no RX chain
-//! is free, or the RX queue failed), the thread stops watching the muxer's
-//! epoll until the driver kicks RX, which the device asked it to: a host end
+//! When the muxer still has packets for the guest after step 3 because no
+//! RX chain is free (or the RX queue failed), the thread stops watching the
+//! muxer's epoll until the driver kicks RX, which the device asked it to: a
+//! host end
 //! with data waiting stays readable, and level-triggered readiness would
 //! otherwise wake the thread at once, again and again, with nothing it
 //! could do. The host ends wait meanwhile; vsock's flow control keeps the
@@ -67,7 +74,7 @@
 //! the rings and the interrupt.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
@@ -84,13 +91,13 @@ use boxcar_virtio::{ActivateError, ActivatedQueue, IrqTrigger, VirtioDevice};
 use event_manager::{
     EventManager, EventOps, EventSet, Events, MutEventSubscriber, SubscriberId, SubscriberOps,
 };
-use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueT, Reader};
 use virtio_vsock::packet::PKT_HEADER_SIZE;
 use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use crate::defs::MAX_PKT_BUF_SIZE;
-use crate::packet_ext::VsockPacket;
+use crate::packet_ext::{PacketExt, VsockPacket};
 use crate::services::InternalServices;
 use crate::unix::{bind_listener, VsockMuxer, VsockUnixError};
 use crate::{VsockChannel, VsockEpollListener};
@@ -116,6 +123,8 @@ pub const JOIN_LIMIT: Duration = Duration::from_secs(5);
 
 /// The largest packet payload either way, as a descriptor length.
 const MAX_DATA_SIZE: u32 = MAX_PKT_BUF_SIZE as u32;
+/// Where the payload length is in a packet header (`virtio_vsock_hdr.len`).
+const HDR_LEN_OFFSET: usize = 24;
 
 /// The guest's vsock address and what its connections may reach.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,24 +380,11 @@ fn transmit(
             if stop.is_set() {
                 return Ok(false);
             }
-            let Some(mut chain) = queue.pop_descriptor_chain(mem) else {
+            let Some(chain) = queue.pop_descriptor_chain(mem) else {
                 break;
             };
             let head = chain.head_index();
-            match VsockPacket::from_tx_virtq_chain(mem, &mut chain, MAX_DATA_SIZE) {
-                Ok(pkt) => {
-                    if let Err(error) = muxer.send_pkt(&pkt) {
-                        boxcar_virtio::limited!(
-                            warn,
-                            "virtio-vsock: a packet the guest sent was not taken: {error}"
-                        );
-                    }
-                }
-                Err(error) => boxcar_virtio::limited!(
-                    warn,
-                    "virtio-vsock: cannot read a packet the guest sent: {error}; dropped"
-                ),
-            }
+            send_tx_chain(mem, chain, muxer);
             if stop.is_set() {
                 return Ok(false);
             }
@@ -409,28 +405,128 @@ fn transmit(
     queue.needs_notification(mem)
 }
 
+/// Hands the packet in a TX `chain` to `muxer`, or logs why there is none.
+/// A payload split over several data descriptors, which 0.11 refuses with
+/// `DescriptorLengthTooSmall`, is copied out ([`read_split_tx`]).
+fn send_tx_chain(
+    mem: &GuestMemoryMmap,
+    chain: DescriptorChain<&GuestMemoryMmap>,
+    muxer: &mut VsockMuxer,
+) {
+    let mut parsed = chain.clone();
+    let split = match VsockPacket::from_tx_virtq_chain(mem, &mut parsed, MAX_DATA_SIZE) {
+        Ok(pkt) => return send_tx_packet(muxer, &pkt),
+        Err(virtio_vsock::packet::Error::DescriptorLengthTooSmall) => read_split_tx(mem, chain),
+        Err(error) => Err(error.to_string()),
+    };
+    let (header, mut data) = match split {
+        Ok(split) => split,
+        Err(error) => {
+            boxcar_virtio::limited!(
+                warn,
+                "virtio-vsock: cannot read a packet the guest sent: {error}; dropped"
+            );
+            return;
+        }
+    };
+    let mut hdr = header;
+    // SAFETY: `hdr` and `data` are this function's own, outlive the packet,
+    // and nothing else touches them while it lives.
+    let pkt = unsafe { VsockPacket::new(&mut hdr, Some(&mut data)) }.and_then(|mut pkt| {
+        pkt.set_header_from_raw(&header)?;
+        Ok(pkt)
+    });
+    match pkt {
+        Ok(pkt) => send_tx_packet(muxer, &pkt),
+        Err(error) => boxcar_virtio::limited!(
+            warn,
+            "virtio-vsock: cannot rebuild a packet the guest sent: {error}; dropped"
+        ),
+    }
+}
+
+fn send_tx_packet(muxer: &mut VsockMuxer, pkt: &VsockPacket<'_>) {
+    if let Err(error) = muxer.send_pkt(pkt) {
+        boxcar_virtio::limited!(
+            warn,
+            "virtio-vsock: a packet the guest sent was not taken: {error}"
+        );
+    }
+}
+
+/// The header and payload of a TX `chain` whose header or payload is split
+/// over several descriptors, copied out of guest memory. The payload, as
+/// long as the header's `len` says, must be there and at most
+/// [`MAX_PKT_BUF_SIZE`] bytes; bytes past it are ignored.
+fn read_split_tx(
+    mem: &GuestMemoryMmap,
+    chain: DescriptorChain<&GuestMemoryMmap>,
+) -> Result<([u8; PKT_HEADER_SIZE], Vec<u8>), String> {
+    let mut reader: Reader<'_> = chain.reader(mem).map_err(|error| error.to_string())?;
+    let mut header = [0u8; PKT_HEADER_SIZE];
+    reader
+        .read_exact(&mut header)
+        .map_err(|error| format!("the header: {error}"))?;
+    let mut len = [0u8; 4];
+    len.copy_from_slice(&header[HDR_LEN_OFFSET..HDR_LEN_OFFSET + 4]);
+    let len = u32::from_le_bytes(len);
+    if len > MAX_DATA_SIZE {
+        return Err(format!("a {len}-byte payload, over {MAX_DATA_SIZE}"));
+    }
+    let len = len as usize;
+    if reader.available_bytes() < len {
+        return Err(format!(
+            "a {len}-byte payload in {} bytes of descriptors",
+            reader.available_bytes()
+        ));
+    }
+    let mut data = vec![0u8; len];
+    reader
+        .read_exact(&mut data)
+        .map_err(|error| format!("the payload: {error}"))?;
+    Ok((header, data))
+}
+
+/// What [`deliver`] did.
+struct Delivered {
+    /// Chains used, including any given back empty.
+    used: usize,
+    /// It stopped with packets left because no RX chain was free; the
+    /// driver will kick RX when it adds one.
+    out_of_chains: bool,
+}
+
 /// Gives the guest the packets `muxer` has for it, one a chain, for as long
 /// as there are both packets and chains on the RX `queue`. With packets left
 /// and no chain, the driver is asked to notify the queue when it adds a
-/// buffer. Returns how many chains were used, including any given back
-/// empty because they held no packet. Once `stop` is set it touches the
-/// ring no more. An `Err` means the ring is unusable: it announces chains
-/// that cannot be popped, or its used ring cannot be written.
+/// buffer. A chain that holds no packet, or has no room for data, is given
+/// back empty. When the muxer says it has packets and then gives none, the
+/// chain goes back and the muxer is asked once more: its RX queue
+/// overflowed and the next call rebuilds it. Once `stop` is set it touches
+/// the ring no more. An `Err` means the ring is unusable: it announces
+/// chains that cannot be popped, or its used ring cannot be written.
 fn deliver(
     queue: &mut Queue,
     mem: &GuestMemoryMmap,
     muxer: &mut VsockMuxer,
     stop: &StopFlag,
-) -> Result<usize, virtio_queue::Error> {
-    let mut used = 0;
+) -> Result<Delivered, virtio_queue::Error> {
+    let mut delivered = Delivered {
+        used: 0,
+        out_of_chains: false,
+    };
     // Consecutive times the ring announced a buffer that could not be
     // popped: once is a race with the driver, twice a broken ring.
     let mut idle = 0;
+    // Consecutive times the muxer had packets and gave none: once is a
+    // queue it rebuilds on the next call, twice nothing more to give.
+    let mut empty_handed = 0;
     while !stop.is_set() && muxer.has_pending_rx() {
         let Some(mut chain) = queue.pop_descriptor_chain(mem) else {
             // Re-enabling notifications reports a buffer added since the
             // pop; take it now, as no kick may come for it.
             if !queue.enable_notification(mem)? {
+                delivered.out_of_chains = true;
                 break;
             }
             idle += 1;
@@ -442,14 +538,31 @@ fn deliver(
         idle = 0;
         let head = chain.head_index();
         let len = match VsockPacket::from_rx_virtq_chain(mem, &mut chain, MAX_DATA_SIZE) {
+            // No room for data: it would take a packet the guest cannot be
+            // given in it (and with a host end that keeps data waiting,
+            // again and again).
+            Ok(pkt) if !pkt.has_buf() => {
+                boxcar_virtio::limited!(
+                    warn,
+                    "virtio-vsock: an RX buffer has no room for data; it is returned empty"
+                );
+                0
+            }
             Ok(mut pkt) => match muxer.recv_pkt(&mut pkt) {
                 // The header, and as much data as the packet says.
-                Ok(()) => PKT_HEADER_SIZE as u32 + pkt.len(),
+                Ok(()) => {
+                    empty_handed = 0;
+                    PKT_HEADER_SIZE as u32 + pkt.len()
+                }
                 Err(_) => {
                     // Nothing after all: the chain goes back for the next
                     // packet.
                     queue.go_to_previous_position();
-                    break;
+                    empty_handed += 1;
+                    if empty_handed == 2 {
+                        break;
+                    }
+                    continue;
                 }
             },
             Err(error) => {
@@ -464,9 +577,9 @@ fn deliver(
             break;
         }
         queue.add_used(mem, head, len)?;
-        used += 1;
+        delivered.used += 1;
     }
-    Ok(used)
+    Ok(delivered)
 }
 
 // The vsock thread.
@@ -625,13 +738,18 @@ impl Worker {
         if self.stop.is_set() {
             return false;
         }
+        let mut out_of_chains = false;
         if !self.rx.failed {
             match deliver(&mut self.rx.queue, &self.mem, &mut self.muxer, &self.stop) {
-                Ok(0) => {}
-                Ok(_) => match self.rx.queue.needs_notification(&*self.mem) {
-                    Ok(notify) => interrupt |= notify,
-                    Err(error) => self.rx.fail(&self.irq, &self.stop, error),
-                },
+                Ok(delivered) => {
+                    out_of_chains = delivered.out_of_chains;
+                    if delivered.used > 0 {
+                        match self.rx.queue.needs_notification(&*self.mem) {
+                            Ok(notify) => interrupt |= notify,
+                            Err(error) => self.rx.fail(&self.irq, &self.stop, error),
+                        }
+                    }
+                }
                 Err(error) => self.rx.fail(&self.irq, &self.stop, error),
             }
         }
@@ -643,10 +761,16 @@ impl Worker {
                 boxcar_virtio::limited!(error, "virtio-vsock: cannot interrupt the guest: {error}");
             }
         }
-        // Packets left for the guest mean it has no room for them: the host
-        // ends wait for an RX kick (see the module docs). A kick resumes
-        // them even when the muxer still has packets: some may have fit.
-        let starved = self.muxer.has_pending_rx() && !rx_kicked;
+        // Packets left for the guest with no RX chain free (or no RX queue)
+        // mean it has no room for them: the host ends wait for an RX kick
+        // (see the module docs). A kick resumes them even when the muxer
+        // still has packets: some may have fit.
+        let starved = starved(
+            out_of_chains,
+            self.rx.failed,
+            self.muxer.has_pending_rx(),
+            rx_kicked,
+        );
         self.watch_muxer(manager, id, !starved);
         true
     }
@@ -673,6 +797,16 @@ impl Worker {
             ),
         }
     }
+}
+
+/// Whether the guest has no room for the packets the muxer has for it, so
+/// that the thread stops watching the muxer until an RX kick: packets are
+/// left (`pending`) because no RX chain was free (`out_of_chains`) or the
+/// RX queue is not served (`rx_failed`), and the cycle was not an RX kick's
+/// (after a kick the muxer is watched once more: some may have fit). With
+/// RX chains free the muxer stays watched, whatever it says it has.
+fn starved(out_of_chains: bool, rx_failed: bool, pending: bool, rx_kicked: bool) -> bool {
+    (out_of_chains || rx_failed) && pending && !rx_kicked
 }
 
 /// Sets up the thread's `EventManager` for `worker`, so that a failure is
@@ -1069,8 +1203,20 @@ mod tests {
         header: &[u8],
         data: &[u8],
     ) {
-        let parts: Vec<&[u8]> = [header, data]
-            .into_iter()
+        offer_tx_parts(mem, mock, head, &[header, data]);
+    }
+
+    /// Offers one TX chain of readable descriptors, one for each of the
+    /// `parts` that is not empty, from descriptor and buffer `head` on.
+    fn offer_tx_parts(
+        mem: &GuestMemoryMmap,
+        mock: &MockSplitQueue<'_, GuestMemoryMmap>,
+        head: u16,
+        parts: &[&[u8]],
+    ) {
+        let parts: Vec<&[u8]> = parts
+            .iter()
+            .copied()
             .filter(|part| !part.is_empty())
             .collect();
         let descs: Vec<RawDescriptor> = parts
@@ -1106,6 +1252,34 @@ mod tests {
             n,
         )
         .unwrap();
+    }
+
+    /// Offers one RX chain of device-writable descriptors of `lens` bytes,
+    /// from descriptor and buffer `head` on.
+    fn offer_rx_parts(
+        mem: &GuestMemoryMmap,
+        mock: &MockSplitQueue<'_, GuestMemoryMmap>,
+        head: u16,
+        lens: &[u32],
+    ) {
+        let descs: Vec<RawDescriptor> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let n = head + i as u16;
+                mem.write_slice(&vec![0xaa; len as usize], buffer(n))
+                    .unwrap();
+                let last = i + 1 == lens.len();
+                let next = if last { 0 } else { VRING_DESC_F_NEXT as u16 };
+                RawDescriptor::from(SplitDescriptor::new(
+                    buffer(n).0,
+                    len,
+                    VRING_DESC_F_WRITE as u16 | next,
+                    if last { 0 } else { n + 1 },
+                ))
+            })
+            .collect();
+        mock.add_desc_chains(&descs, head).unwrap();
     }
 
     /// The `used` RX buffer `n`: its header's (op, src_port, dst_port,
@@ -1385,6 +1559,228 @@ mod tests {
             rx_packet(&mem, 1, used.len()),
             ((uapi::VSOCK_OP_RW, 5000, GUEST_PORT, 4), b"data".to_vec())
         );
+        worker.muxer.close_all();
+    }
+
+    /// Connects the guest from `GUEST_PORT` to the allowlisted host port
+    /// 5000 through the transport, with RX chain 0 for the RESPONSE, and
+    /// returns the host end.
+    fn established(
+        driver: &mut Driver,
+        rx: &MockSplitQueue<'_, GuestMemoryMmap>,
+        tx: &MockSplitQueue<'_, GuestMemoryMmap>,
+        host: &UnixListener,
+    ) -> UnixStream {
+        driver.handshake();
+        offer_rx(&driver.mem, rx, 0);
+        offer_tx(
+            &driver.mem,
+            tx,
+            0,
+            &header(5000, GUEST_PORT, uapi::VSOCK_OP_REQUEST, 0),
+            &[],
+        );
+        driver.kicks[TX_QUEUE].write(1).unwrap();
+        driver.wait_used(TX_QUEUE, 1);
+        driver.wait_used(RX_QUEUE, 1);
+        let used = used_elem(&driver.mem, RX_QUEUE, 0);
+        assert_eq!(
+            rx_packet(&driver.mem, 0, used.len()).0,
+            (uapi::VSOCK_OP_RESPONSE, 5000, GUEST_PORT, 0)
+        );
+        let (stream, _) = host.accept().unwrap();
+        stream.set_read_timeout(Some(THREAD_LIMIT)).unwrap();
+        stream
+    }
+
+    /// A payload split over several data descriptors (and a header split
+    /// over two) is put back together, as Cloud Hypervisor's packet did; a
+    /// payload over the largest a packet carries is dropped, split or not,
+    /// and the connection goes on.
+    #[test]
+    fn split_tx_payloads_are_reassembled_and_oversized_ones_dropped() {
+        let session = Session::new();
+        let host = UnixListener::bind(port_socket_path(&session.uds_path(), 5000)).unwrap();
+        let mut driver = Driver::new(session.device(&[5000]));
+        let mem = driver.mem.clone();
+        let rx = queue_mock(&mem, RX_QUEUE);
+        let tx = queue_mock(&mem, TX_QUEUE);
+        let mut stream = established(&mut driver, &rx, &tx, &host);
+
+        // The payload over three descriptors: 1 to 4.
+        let rw = header(5000, GUEST_PORT, uapi::VSOCK_OP_RW, 12);
+        offer_tx_parts(&mem, &tx, 1, &[&rw, b"hel", b"lo, ", b"world"]);
+        // Too long, its header split: 5 to 7.
+        let over = header(5000, GUEST_PORT, uapi::VSOCK_OP_RW, MAX_DATA_SIZE + 1);
+        offer_tx_parts(&mem, &tx, 5, &[&over[..20], &over[20..], b"x"]);
+        // Too long, its header whole: 8 and 9.
+        offer_tx_parts(&mem, &tx, 8, &[&over, b"y"]);
+        // Its header split, its payload whole: 10 to 12.
+        let bang = header(5000, GUEST_PORT, uapi::VSOCK_OP_RW, 1);
+        offer_tx_parts(&mem, &tx, 10, &[&bang[..30], &bang[30..], b"!"]);
+        driver.kicks[TX_QUEUE].write(1).unwrap();
+        driver.wait_used(TX_QUEUE, 5);
+        for i in 1..5 {
+            assert_eq!(used_elem(&mem, TX_QUEUE, i).len(), 0);
+        }
+
+        let mut got = [0u8; 13];
+        stream.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello, world!");
+        driver.set_status(0);
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        drop(driver);
+        let records = session.vsock_records();
+        assert_eq!(
+            records.last().unwrap(),
+            &(
+                "vsock.close".to_owned(),
+                serde_json::json!({"port": 5000, "dir": "guest", "tx": 13, "rx": 0})
+            )
+        );
+    }
+
+    /// An RX chain with no room for data (a zero-length data descriptor) is
+    /// used empty, and the data waiting for the guest goes into the next
+    /// chain whole.
+    #[test]
+    fn an_rx_chain_without_room_for_data_is_returned_empty() {
+        let session = Session::new();
+        let host = UnixListener::bind(port_socket_path(&session.uds_path(), 5000)).unwrap();
+        let mut driver = Driver::new(session.device(&[5000]));
+        let mem = driver.mem.clone();
+        let rx = queue_mock(&mem, RX_QUEUE);
+        let tx = queue_mock(&mem, TX_QUEUE);
+        let mut stream = established(&mut driver, &rx, &tx, &host);
+
+        offer_rx_parts(&mem, &rx, 1, &[PKT_HEADER_SIZE as u32, 0]);
+        offer_rx(&mem, &rx, 3);
+        stream.write_all(b"data").unwrap();
+        driver.wait_used(RX_QUEUE, 3);
+        let empty = used_elem(&mem, RX_QUEUE, 1);
+        assert_eq!((empty.id(), empty.len()), (1, 0));
+        let used = used_elem(&mem, RX_QUEUE, 2);
+        assert_eq!(used.id(), 3);
+        assert_eq!(
+            rx_packet(&mem, 3, used.len()),
+            ((uapi::VSOCK_OP_RW, 5000, GUEST_PORT, 4), b"data".to_vec())
+        );
+        driver.set_status(0);
+        drop(driver);
+        assert_eq!(session.vsock_records().len(), 2);
+    }
+
+    #[test]
+    fn the_muxer_is_unwatched_only_when_the_guest_has_no_room() {
+        // Out of chains (or no RX queue) with packets left, and no kick.
+        assert!(starved(true, false, true, false));
+        assert!(starved(false, true, true, false));
+        // Chains free: watched, whatever the muxer says it has.
+        assert!(!starved(false, false, true, false));
+        // Nothing left, or an RX kick: watched.
+        assert!(!starved(true, false, false, false));
+        assert!(!starved(true, true, true, true));
+    }
+
+    /// The reviewer's probe B, through the device: 300 connections answered
+    /// with no RX buffer posted overflow the muxer's RX queue, and the guest
+    /// resets those at its tail. When the guest then posts buffers, the muxer
+    /// first runs dry with packets left (its queue overflowed), and is asked
+    /// again: one cycle delivers all 244 answers, and the muxer is still
+    /// watched, as RX chains are left.
+    #[test]
+    fn an_overflowed_muxer_queue_is_drained_in_one_cycle() {
+        const RING: u16 = 256;
+        let session = Session::new();
+        let host = UnixListener::bind(port_socket_path(&session.uds_path(), 5000)).unwrap();
+        host.set_nonblocking(true).unwrap();
+        let mem = guest_memory(GUEST_MEM_SIZE).unwrap();
+        // A full-size RX ring: its used ring past the mock's tables.
+        let rx_start = queue_start(RX_QUEUE);
+        let rx_used = GuestAddress(rx_start.0 + 0x2000);
+        let rx = MockSplitQueue::create(&*mem, rx_start, RING);
+        let mut rx_queue: Queue = rx.create_queue().unwrap();
+        rx_queue.set_used_ring_address(Some(rx_used.0 as u32), Some((rx_used.0 >> 32) as u32));
+        let tx = queue_mock(&mem, TX_QUEUE);
+        let cfg = session.config(&[5000]);
+        let listener = bind_listener(&cfg.uds_path).unwrap();
+        let muxer =
+            VsockMuxer::new(&cfg, listener, Arc::new(NoServices), session.sink.clone()).unwrap();
+        let mut worker = Worker {
+            mem: mem.clone(),
+            irq: Arc::new(IrqTrigger::new().unwrap()),
+            muxer,
+            rx: Ring::new(
+                RX_QUEUE,
+                ActivatedQueue {
+                    queue: rx_queue,
+                    evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+                },
+            ),
+            tx: Ring::new(
+                TX_QUEUE,
+                ActivatedQueue {
+                    queue: device_queue(&tx, TX_QUEUE),
+                    evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+                },
+            ),
+            evq: EventFd::new(EFD_NONBLOCK).unwrap(),
+            kill: EventFd::new(EFD_NONBLOCK).unwrap(),
+            stop: StopFlag::default(),
+            muxer_watched: true,
+        };
+        let mut manager = EventManager::new().unwrap();
+        let id = manager.add_subscriber(Ready::default());
+        manager
+            .event_ops(id)
+            .unwrap()
+            .add(Events::new_raw(worker.muxer.get_polled_fd(), EventSet::IN))
+            .unwrap();
+
+        let mut pkt = crate::packet_ext::testing::PacketBuf::new();
+        let mut guest = |worker: &mut Worker, port: u32, op: u16| {
+            pkt.clear_hdr()
+                .set_src_cid(GUEST_CID)
+                .set_dst_cid(uapi::VSOCK_HOST_CID)
+                .set_src_port(port)
+                .set_dst_port(5000)
+                .set_type(uapi::VSOCK_TYPE_STREAM)
+                .set_op(op)
+                .set_buf_alloc(256 * 1024);
+            worker.muxer.send_pkt(&pkt).unwrap();
+        };
+        let mut held = Vec::new();
+        for port in 1..=300 {
+            guest(&mut worker, 20_000 + port, uapi::VSOCK_OP_REQUEST);
+            while let Ok((stream, _)) = host.accept() {
+                held.push(stream);
+            }
+        }
+        assert_eq!(held.len(), 300);
+        for port in 201..=256 {
+            guest(&mut worker, 20_000 + port, uapi::VSOCK_OP_RST);
+        }
+
+        for n in 0..RING {
+            let buf = 0x8_0000 + 0x80 * u64::from(n);
+            rx.add_desc_chains(
+                &[RawDescriptor::from(SplitDescriptor::new(
+                    buf,
+                    0x80,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                ))],
+                n,
+            )
+            .unwrap();
+        }
+        assert!(worker.cycle(&mut manager, id, false, false));
+        let used: u16 = u16::from_le(mem.read_obj(GuestAddress(rx_used.0 + 2)).unwrap());
+        assert_eq!(used, 244);
+        assert!(!worker.muxer.has_pending_rx());
+        assert!(worker.muxer_watched);
         worker.muxer.close_all();
     }
 }

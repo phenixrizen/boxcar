@@ -9,10 +9,18 @@
 //! of them is served by [`InternalServices::connect`], and only when it
 //! comes from a guest source port below [`PRIVILEGED_PORT_LIMIT`] (which
 //! only root can bind, so an unprivileged process in the guest cannot pose
-//! as init) and is the first to that port since the device was activated
-//! (so a process that got root later cannot take over a channel init
-//! already holds). Any other guest connection to them is reset and
-//! recorded as refused (see the muxer).
+//! as init) and is the first to that port since the device was activated.
+//! Any other guest connection to them is reset and recorded as refused
+//! (see the muxer).
+//!
+//! The first-connection rule holds within one activation of the device, not
+//! for the VM's life. Guest root can unbind and rebind the vsock driver: the
+//! device is reset, which closes every connection, init's included, and the
+//! next activation serves the first privileged connection to each port
+//! again, which root can then make before init does. A service is therefore
+//! asked again after every re-activation, and must decide itself whether to
+//! take a second connection: the guest control channel treats a `hello`
+//! from a later activation as an anomaly.
 
 use std::os::unix::net::UnixStream;
 

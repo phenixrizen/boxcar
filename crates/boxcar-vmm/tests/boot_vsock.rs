@@ -21,7 +21,9 @@
 //!   reset.)
 //! - such a refused host connection leaves no `vsock.*` record: host
 //!   connections are recorded only once the guest accepts them;
-//! - the socket is gone once the VM has stopped.
+//! - the socket is gone once the VM has stopped;
+//! - a VM whose build fails after the vsock device was attached leaves
+//!   neither the socket nor the state directory the device made for it.
 //!
 //! What it does not prove: a guest-initiated connection. The console init
 //! opens none, and the Alpine rootfs has no tool that speaks AF_VSOCK; the
@@ -48,7 +50,7 @@ use boxcar_audit::{verify_session, LogReader, WriterConfig};
 use boxcar_fs::{CachePolicyKind, FsShareConfig};
 use boxcar_proto::{guestcmd, Record, SessionId};
 use boxcar_vmm::kvm::kvm_available;
-use boxcar_vmm::vmm::{ConsoleOut, StopReason, VmConfig, VmExit, Vmm};
+use boxcar_vmm::vmm::{ConsoleOut, StopReason, VmConfig, VmExit, Vmm, VmmError};
 use boxcar_vsock::VsockConfig;
 
 const TEST: &str = "boot_vsock";
@@ -271,4 +273,38 @@ fn the_guest_probes_the_vsock_device_and_resets_a_host_connect_to_a_closed_port(
         .filter(|r| r.kind.starts_with("vsock."))
         .collect();
     assert!(vsock.is_empty(), "{vsock:?}");
+}
+
+/// A VM that fails to build after its vsock device was attached (here, at
+/// the kernel command line, which is too long) leaves neither the socket nor
+/// the state directory the device made for it.
+#[test]
+fn a_build_that_fails_after_the_vsock_device_leaves_nothing_behind() {
+    let Some((kernel, initramfs, _rootfs)) = guest_or_skip() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (sink, writer) =
+        boxcar_audit::spawn(WriterConfig::new(dir.path().join("data"), SessionId::new())).unwrap();
+    let state = dir.path().join("state");
+    let uds = state.join("vsock.sock");
+    let cfg = VmConfig {
+        cmdline_extra: vec!["x".repeat(4096)],
+        console: ConsoleOut::File(dir.path().join("console.log")),
+        stdin: false,
+        initramfs: Some(initramfs),
+        vsock: Some(VsockConfig::new(&uds)),
+        ..VmConfig::new(kernel, sink)
+    };
+    match Vmm::new(cfg) {
+        Ok(_) => panic!("a 4 KiB command line was accepted"),
+        Err(VmmError::Arch(_)) => {}
+        Err(error) => panic!("{error}"),
+    }
+    assert!(!uds.exists(), "the socket outlived the failed build");
+    assert!(
+        !state.exists(),
+        "the state directory outlived the failed build"
+    );
+    writer.close().unwrap();
 }

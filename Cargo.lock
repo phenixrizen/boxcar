@@ -291,6 +291,7 @@ dependencies = [
  "event-manager",
  "libc",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror",
  "tracing",

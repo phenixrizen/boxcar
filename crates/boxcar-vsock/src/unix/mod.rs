@@ -7,9 +7,10 @@
 // Copyright 2026 The boxcar Authors
 //
 // Cloud Hypervisor is https://github.com/cloud-hypervisor/cloud-hypervisor.
-// Adapted: the muxer is exported under its own name, and `bind_listener`
+// Adapted: the muxer is exported under its own name, `bind_listener`
 // (`// boxcar:`) binds the host socket, mode 0600, which the device keeps
-// for every activation's muxer.
+// for every activation's muxer, and the error gains the `CONNECT` deadline
+// timer's (`// boxcar:`).
 
 //! This module implements the Unix Domain Sockets backend for vsock - a mediator between
 //! guest-side AF_VSOCK sockets and host-side AF_UNIX sockets. The heavy lifting is performed by
@@ -69,6 +70,10 @@ pub enum Error {
     /// Muxer connection limit reached.
     #[error("Muxer connection limit reached")]
     TooManyConnections,
+    // boxcar: the timer that drops host clients slow to send their `CONNECT` line.
+    /// The `CONNECT` deadline timer could not be created.
+    #[error("Error creating the CONNECT deadline timer")]
+    CommandTimer(#[source] io::Error),
 }
 
 type Result<T> = result::Result<T, Error>;

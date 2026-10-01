@@ -16,7 +16,11 @@
 // vmm-sys-util's; packets are virtio-vsock 0.11's (`crate::packet_ext`);
 // log lines go through `boxcar_virtio::limited!` and the per-packet and
 // per-event debug lines are gone; `unwrap`s, `unreachable!` and let-chains (edition 2024)
-// are rewritten; the snapshot hooks (`VsockBackend`) are dropped. The tests
+// are rewritten; the snapshot hooks (`VsockBackend`) are dropped. An
+// allowlisted port's host socket is connected without waiting, a host client
+// of the vsock socket has 5 s to send its `CONNECT` line and counts toward
+// the connection limit meanwhile, and an internal port is taken only once its
+// connection is added (all `// boxcar:`). The tests
 // build their packets over plain buffers, use ports outside the internal
 // ones (which the rules keep for the VMM) and allowlist them, and keep
 // their sockets in a temporary directory.
@@ -63,6 +67,10 @@
 //! VMM service (privileged source port, first connection only), an allowlisted port reaches
 //! `<uds>_<port>`, and anything else is reset. Every decision, and the end of every connection
 //! let through, is recorded (`vsock.connect`, `vsock.close`); see `crate::rules`.
+//!
+//! A host client of the vsock socket has [`CONNECT_TIMEOUT`] to send its whole
+//! `CONNECT <port>\n` line, at most 32 bytes, or it is closed; until it has, it counts toward
+//! the connection limit, with the connections.
 
 use std::cmp::max;
 use std::collections::hash_map::Entry;
@@ -72,9 +80,13 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::str;
 use std::sync::Arc;
+// boxcar: for the `CONNECT` deadlines.
+use std::time::{Duration, Instant};
 
 use boxcar_audit::AuditSink;
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+// boxcar: the `CONNECT` deadlines' timer.
+use vmm_sys_util::timerfd::TimerFd;
 
 use super::super::csm::ConnState;
 use super::super::defs::uapi;
@@ -118,9 +130,20 @@ enum EpollListener {
     /// A listener interested in reading host "connect \<port>" commands from a freshly
     /// connected host socket.
     LocalStream(UnixStream),
+    // boxcar: fires at the earliest `CONNECT` deadline of the `LocalStream`s.
+    /// The timer of the host clients' `CONNECT` deadlines.
+    CommandTimer,
 }
 
+// boxcar: the bound on a host client's `CONNECT` line, documented: the line, newline included,
+// is at most this many bytes (Cloud Hypervisor's buffer), or the client is dropped.
 const PARTIALLY_READ_COMMAND_BUF_SIZE: usize = 32;
+
+// boxcar: how long a host client has, from its accept, to send its whole `CONNECT <port>\n`
+// line before it is dropped.
+/// How long a host client of the vsock socket has to send its whole `CONNECT <port>\n` line
+/// (at most 32 bytes, newline included) before the muxer closes it.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A partially read "CONNECT" command.
 #[derive(Default)]
@@ -171,6 +194,18 @@ pub struct VsockMuxer {
     /// The connections a `vsock.connect` let through, and who opened them: each gets its
     /// `vsock.close` when it is removed.
     audited: HashMap<ConnMapKey, Dir>,
+    // boxcar: host clients still sending their `CONNECT` line, and the bounds on them.
+    /// When each host client still sending its `CONNECT` line (a `LocalStream`, by fd) must
+    /// have sent it.
+    command_deadlines: HashMap<RawFd, Instant>,
+    /// Armed for the earliest of `command_deadlines`; never read, only re-armed or cleared,
+    /// which resets it.
+    command_timer: TimerFd,
+    /// How long a host client has to send its `CONNECT` line: [`CONNECT_TIMEOUT`].
+    command_timeout: Duration,
+    /// The most connections and host clients still sending their `CONNECT` line there may be,
+    /// together: `defs::MAX_CONNECTIONS`.
+    max_connections: usize,
 }
 
 impl VsockChannel for VsockMuxer {
@@ -407,9 +442,15 @@ impl VsockMuxer {
             rules: Rules::new(&cfg.uds_path, &cfg.allow_ports, services),
             audit,
             audited: HashMap::new(),
+            command_deadlines: HashMap::new(),
+            command_timer: TimerFd::new().map_err(|e| Error::CommandTimer(e.into()))?,
+            command_timeout: CONNECT_TIMEOUT,
+            max_connections: defs::MAX_CONNECTIONS,
         };
 
         muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
+        // boxcar: the `CONNECT` deadlines' timer is watched with the rest.
+        muxer.add_listener(muxer.command_timer.as_raw_fd(), EpollListener::CommandTimer)?;
         Ok(muxer)
     }
 
@@ -444,7 +485,8 @@ impl VsockMuxer {
             // A new host-initiated connection is ready to be accepted.
             //
             Some(EpollListener::HostSock) => {
-                if self.conn_map.len() == defs::MAX_CONNECTIONS {
+                // boxcar: host clients still sending their `CONNECT` line count too.
+                if self.conn_map.len() + self.command_deadlines.len() >= self.max_connections {
                     // If we're already maxed-out on connections, we'll just accept and
                     // immediately discard this potentially new one.
                     boxcar_virtio::limited!(
@@ -468,7 +510,16 @@ impl VsockMuxer {
                         // the guest side, we need to know the destination port. We'll read
                         // that port from a "connect" command received on this socket, so the
                         // next step is to ask to be notified the moment we can read from it.
-                        self.add_listener(stream.as_raw_fd(), EpollListener::LocalStream(stream))
+                        // boxcar: the fd, for its `CONNECT` deadline.
+                        let fd = stream.as_raw_fd();
+                        self.add_listener(fd, EpollListener::LocalStream(stream))
+                            .map(|()| fd)
+                    })
+                    .map(|fd| {
+                        // boxcar: and to have it within `CONNECT_TIMEOUT`.
+                        self.command_deadlines
+                            .insert(fd, Instant::now() + self.command_timeout);
+                        self.arm_command_timer();
                     })
                     .unwrap_or_else(|err| {
                         boxcar_virtio::limited!(
@@ -497,6 +548,9 @@ impl VsockMuxer {
                     // Error::InvalidPortRequest, either way we must remove
                     // the command from the map
                     self.partial_command_map.remove(&stream.as_raw_fd());
+                    // boxcar: no deadline any more; the timer goes on to the next one, or finds
+                    // none when it fires.
+                    self.command_deadlines.remove(&stream.as_raw_fd());
 
                     // boxcar: just found as a `LocalStream`; a `let`-`else` for `unreachable!`.
                     let Some(EpollListener::LocalStream(stream)) = self.remove_listener(fd) else {
@@ -529,12 +583,58 @@ impl VsockMuxer {
                 }
             }
 
+            // boxcar: a `CONNECT` deadline passed.
+            Some(EpollListener::CommandTimer) => self.expire_commands(),
+
             _ => {
                 boxcar_virtio::limited!(
                     debug,
                     "vsock: unexpected event: fd={fd:?}, event_set={event_set:?}"
                 );
             }
+        }
+    }
+
+    // boxcar: the `CONNECT` deadlines.
+    /// Closes every host client whose `CONNECT` deadline has passed, and arms the timer for
+    /// the next deadline.
+    fn expire_commands(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<RawFd> = self
+            .command_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in expired {
+            self.command_deadlines.remove(&fd);
+            self.partial_command_map.remove(&fd);
+            // Dropping the stream closes it: the client reads EOF, with no `OK`.
+            self.remove_listener(fd);
+            boxcar_virtio::limited!(
+                debug,
+                "vsock: a host client sent no CONNECT line within {:?}; closed",
+                self.command_timeout
+            );
+        }
+        self.arm_command_timer();
+    }
+
+    /// Arms the timer for the earliest `CONNECT` deadline, or disarms it when there is none.
+    /// Either resets its expiration count, so the timer is never read.
+    fn arm_command_timer(&mut self) {
+        let next = self.command_deadlines.values().min().copied();
+        let armed = match next {
+            None => self.command_timer.clear(),
+            // At least 1 ms: a zero duration would disarm it.
+            Some(at) => self.command_timer.reset(
+                at.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+                None,
+            ),
+        };
+        if let Err(err) = armed {
+            boxcar_virtio::limited!(warn, "vsock: cannot arm the CONNECT deadline timer: {err}");
         }
     }
 
@@ -617,7 +717,8 @@ impl VsockMuxer {
         //   termination.
         self.sweep_killq();
 
-        if self.conn_map.len() >= defs::MAX_CONNECTIONS {
+        // boxcar: host clients still sending their `CONNECT` line count too.
+        if self.conn_map.len() + self.command_deadlines.len() >= self.max_connections {
             boxcar_virtio::limited!(
                 warn,
                 "vsock: muxer connection limit reached ({})",
@@ -688,6 +789,8 @@ impl VsockMuxer {
             EpollListener::Connection { evset, .. } => evset,
             EpollListener::LocalStream(_) => EventSet::IN,
             EpollListener::HostSock => EventSet::IN,
+            // boxcar: the `CONNECT` deadlines' timer.
+            EpollListener::CommandTimer => EventSet::IN,
         };
 
         self.epoll
@@ -763,7 +866,9 @@ impl VsockMuxer {
                 return;
             }
             Decision::Internal(stream) => (Ok(stream), Peer::Internal),
-            Decision::Uds(port_path) => (UnixStream::connect(port_path), Peer::Uds),
+            // boxcar: without waiting, so a host service that does not accept cannot hold up
+            // the vsock thread: a full accept queue refuses as a missing listener does.
+            Decision::Uds(port_path) => (rules::connect_port_socket(&port_path), Peer::Uds),
         };
         rules::record_connect(&self.audit, port, Dir::Guest, peer, src_port, None);
 
@@ -790,6 +895,10 @@ impl VsockMuxer {
         match added {
             Ok(()) => {
                 self.audited.insert(key, Dir::Guest);
+                // boxcar: an internal port is taken only once its connection is added.
+                if peer == Peer::Internal {
+                    self.rules.served(port);
+                }
             }
             Err(_) => {
                 rules::record_close(&self.audit, port, Dir::Guest, 0, 0);
@@ -1792,6 +1901,72 @@ mod tests {
         // Since initially the connection had two flags set, now there should
         // not be any pending RX in the muxer.
         assert!(!ctx.muxer.has_pending_rx());
+    }
+
+    // boxcar: a host client has `CONNECT_TIMEOUT` to send its whole `CONNECT` line, and counts
+    // toward the connection limit while it does.
+    #[test]
+    fn a_host_client_slow_to_send_its_connect_line_is_dropped() {
+        let mut ctx = MuxerTestContext::new("slow_connect");
+        ctx.muxer.command_timeout = Duration::from_millis(100);
+
+        // One client sends half a line, then nothing.
+        let mut slow = UnixStream::connect(&ctx.uds_path).unwrap();
+        slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        ctx.notify_muxer();
+        slow.write_all(b"CONN").unwrap();
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners(), (1, 0));
+        assert_eq!(ctx.muxer.command_deadlines.len(), 1);
+        // Another one finishes in time, and is not dropped later.
+        let (_fast, local_port) = ctx.local_connect(1025);
+        let key = ConnMapKey {
+            local_port,
+            peer_port: 1025,
+        };
+
+        thread::sleep(Duration::from_millis(150));
+        // The deadline timer fires: the muxer's epoll is readable.
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners(), (0, 1));
+        assert!(ctx.muxer.command_deadlines.is_empty());
+        let mut rest = Vec::new();
+        slow.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        assert!(ctx.muxer.conn_map.contains_key(&key));
+        assert!(!ctx.muxer.has_pending_rx());
+        // With no deadline left, the timer is disarmed: nothing wakes the muxer.
+        assert!(!ctx.muxer.command_timer.is_armed().unwrap());
+    }
+
+    #[test]
+    fn host_clients_still_sending_their_connect_line_count_toward_the_limit() {
+        let mut ctx = MuxerTestContext::new("connect_limit");
+        ctx.muxer.max_connections = 2;
+        let mut waiting = Vec::new();
+        for _ in 0..2 {
+            waiting.push(UnixStream::connect(&ctx.uds_path).unwrap());
+            ctx.notify_muxer();
+        }
+        assert_eq!(ctx.count_epoll_listeners(), (2, 0));
+
+        // A third is accepted and closed at once.
+        let mut third = UnixStream::connect(&ctx.uds_path).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        ctx.notify_muxer();
+        let mut rest = Vec::new();
+        third.read_to_end(&mut rest).unwrap();
+        assert_eq!(ctx.count_epoll_listeners(), (2, 0));
+
+        // And the guest cannot connect while they wait.
+        let _listener = ctx.create_local_listener(LOCAL_PORT_A);
+        ctx.init_pkt(LOCAL_PORT_A, 1025, uapi::VSOCK_OP_REQUEST);
+        ctx.send();
+        ctx.recv();
+        assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
+        assert!(ctx.muxer.conn_map.is_empty());
     }
 
     #[test]

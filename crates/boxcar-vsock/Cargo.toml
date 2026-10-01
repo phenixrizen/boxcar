@@ -20,6 +20,8 @@ vmm-sys-util = { workspace = true }
 event-manager = { workspace = true }
 # shutdown(2) on the host end of a connection, and the socket's mode.
 libc = { workspace = true }
+# The non-blocking connect to an allowlisted port's host socket.
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
