@@ -12,15 +12,16 @@ use anyhow::{bail, Context};
 use boxcar_audit::{AuditSink, WriterConfig, WriterHandle};
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_proto::{guestcmd, SessionId};
+use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
-use boxcar_vmm::lifecycle::{block_stop_signals, AUDIT_FAILED_EXIT};
+use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
 use boxcar_vmm::vmm::{cmdline_size, ConsoleOut, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{AuditLevelArg, RunArgs};
 
 /// Starts the session's audit writer, boots the VM, and waits for it to
-/// stop. The exit code is the VM's (see `VmExit::exit_code`), except that
+/// stop. The exit code is the VM's (see `exit_code_for`), except that
 /// a run whose audit log failed at any point, while the VM ran or while
 /// the log was closed, exits [`AUDIT_FAILED_EXIT`] (3) after saying
 /// `audit log failed: <why>` on stderr: the log is incomplete, whatever the
@@ -63,7 +64,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => (GuestMode::Hello, 0),
     };
     let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command);
-    check_cmdline_size(args.debug_boot, &cmdline_extra, share_count)?;
+    // The devices the VM will have, derived as `Vmm::new` derives them.
+    let devices = DeviceSet::from_shares(share_count);
+    check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
 
     // Before any thread starts, so that every thread inherits the mask and
     // the signals reach only the VMM's signalfd.
@@ -139,7 +142,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     eprintln!("{exit}");
     closed.context("cannot close the audit log")?;
-    Ok(ExitCode::from(u8::try_from(exit.exit_code()).unwrap_or(1)))
+    Ok(ExitCode::from(
+        u8::try_from(exit_code_for(&exit)).unwrap_or(1),
+    ))
 }
 
 /// Starts the session's audit writer.
@@ -344,10 +349,14 @@ fn resolve_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Refuses a kernel command line the kernel cannot take: `extra` after the
-/// base, and a device entry for each of `fs_shares` shares, measured as
-/// the VMM composes it.
-fn check_cmdline_size(debug_boot: bool, extra: &[String], fs_shares: usize) -> anyhow::Result<()> {
-    let size = cmdline_size(debug_boot, extra, fs_shares)?;
+/// base, and a device entry for each slot of `devices`, measured as the VMM
+/// composes it.
+fn check_cmdline_size(
+    debug_boot: bool,
+    extra: &[String],
+    devices: &DeviceSet,
+) -> anyhow::Result<()> {
+    let size = cmdline_size(debug_boot, extra, devices)?;
     if size > CMDLINE_MAX_SIZE {
         bail!("command line too long ({size} bytes > {CMDLINE_MAX_SIZE})");
     }
@@ -476,7 +485,7 @@ mod tests {
 
     /// Size of the command line the VM would get, from the VMM itself.
     fn size(extra: &[String]) -> usize {
-        boxcar_vmm::vmm::cmdline_size(false, extra, 2).unwrap()
+        boxcar_vmm::vmm::cmdline_size(false, extra, &DeviceSet::from_shares(SHARE_COUNT)).unwrap()
     }
 
     #[test]
@@ -490,9 +499,19 @@ mod tests {
         // terminator included.
         let fits = 2048 - (size(&with_filler(1)) - 1);
         assert_eq!(size(&with_filler(fits)), 2048);
-        check_cmdline_size(false, &with_filler(fits), 2).unwrap();
+        check_cmdline_size(
+            false,
+            &with_filler(fits),
+            &DeviceSet::from_shares(SHARE_COUNT),
+        )
+        .unwrap();
 
-        let error = check_cmdline_size(false, &with_filler(fits + 1), 2).unwrap_err();
+        let error = check_cmdline_size(
+            false,
+            &with_filler(fits + 1),
+            &DeviceSet::from_shares(SHARE_COUNT),
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "command line too long (2049 bytes > 2048)"
@@ -503,7 +522,8 @@ mod tests {
     fn a_long_command_is_refused_with_the_size_it_would_have() {
         let command = strings(&["/bin/sh", "-c", &"echo x; ".repeat(300)]);
         let cmdline = guest_cmdline(CONSOLE, &[], &command);
-        let error = check_cmdline_size(false, &cmdline, 2).unwrap_err();
+        let error =
+            check_cmdline_size(false, &cmdline, &DeviceSet::from_shares(SHARE_COUNT)).unwrap_err();
         assert_eq!(
             error.to_string(),
             format!("command line too long ({} bytes > 2048)", size(&cmdline))

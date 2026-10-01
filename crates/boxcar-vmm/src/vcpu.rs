@@ -127,7 +127,7 @@ fn dispatch(
             }
             Step::Continue
         }
-        Ok(VcpuExit::Shutdown) => Step::Exit(VmExit::GuestReset),
+        Ok(VcpuExit::Shutdown) => Step::Exit(VmExit::GuestReset { session: None }),
         Ok(VcpuExit::SystemEvent(kind, data)) => {
             tracing::debug!("vCPU {}: system event {kind}, data {data:x?}", ctx.id);
             Step::Exit(VmExit::GuestShutdown)

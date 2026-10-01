@@ -113,7 +113,7 @@ fn hello_init_prints_its_marker_and_resets_the_guest() {
         "no {HELLO} on the console:\n{output}"
     );
     assert!(
-        matches!(exit, VmExit::GuestReset),
+        matches!(exit, VmExit::GuestReset { .. }),
         "{exit:?} after {elapsed:?}; console:\n{output}"
     );
     assert!(elapsed < LIMIT, "took {elapsed:?}");
@@ -191,7 +191,7 @@ fn hello_boots_with_the_root_and_workspace_shares_attached() {
     }
     assert!(!output.contains("probe of"), "a probe failed:\n{output}");
     assert!(
-        matches!(exit, VmExit::GuestReset),
+        matches!(exit, VmExit::GuestReset { .. }),
         "{exit:?}; console:\n{output}"
     );
 
@@ -202,6 +202,69 @@ fn hello_boots_with_the_root_and_workspace_shares_attached() {
         "{kinds:?}"
     );
     assert!(kinds.contains(&"vmm.stop".to_owned()), "{kinds:?}");
+}
+
+/// The hello boot with no shares: virtio-fs's slots 0 and 1 stay empty and
+/// the command line lists no `virtio_mmio.device=`, so the guest finds no
+/// virtio-mmio device at all. `--debug-boot`'s kernel messages would show a
+/// probe.
+#[test]
+fn hello_boots_with_no_shares_and_probes_no_virtio_device() {
+    const TEST: &str = "boot_hello_no_virtio";
+    let Some((kernel, initramfs)) = guest_or_skip(TEST) else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let (sink, writer) =
+        boxcar_audit::spawn(WriterConfig::new(dir.path(), SessionId::new())).unwrap();
+    let session_dir = writer.session_dir().to_path_buf();
+    let console = dir.path().join("console.log");
+    let cfg = VmConfig {
+        cmdline_extra: vec!["boxcar.mode=hello".into()],
+        debug_boot: true,
+        console: ConsoleOut::File(console.clone()),
+        initramfs: Some(initramfs),
+        ..VmConfig::new(kernel, sink)
+    };
+    let vmm = Vmm::new(cfg).unwrap();
+    let handle = vmm.handle();
+    let (done, finished) = mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        if finished.recv_timeout(LIMIT).is_err() {
+            handle.request_stop(StopReason::Requested);
+        }
+    });
+    let exit = vmm.run().unwrap();
+    drop(done);
+    watchdog.join().unwrap();
+    writer.close().unwrap();
+
+    let output = String::from_utf8_lossy(&fs::read(&console).unwrap()).into_owned();
+    eprintln!("{TEST}: {exit:?}");
+    assert!(
+        output.contains(HELLO),
+        "no {HELLO} on the console:\n{output}"
+    );
+    // The kernel logs "Registering device" for each virtio_mmio.device=
+    // entry it is given, and a failed probe by name.
+    for absent in ["virtio-mmio: Registering device", "virtiofs", "probe of"] {
+        assert!(
+            !output.contains(absent),
+            "{absent:?} on the console:\n{output}"
+        );
+    }
+    assert!(
+        matches!(exit, VmExit::GuestReset { .. }),
+        "{exit:?}; console:\n{output}"
+    );
+
+    let kinds = record_kinds(&session_dir);
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("vmm.start"),
+        "{kinds:?}"
+    );
 }
 
 /// A guest with no init panics and, with `panic=0`, spins forever: two vCPUs,

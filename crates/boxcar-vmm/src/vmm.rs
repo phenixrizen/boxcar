@@ -7,10 +7,11 @@
 //! Boot order in `Vmm::new`: open KVM and check its capabilities, raise
 //! `RLIMIT_NOFILE`, create the VM with its TSS, in-kernel irqchip and PIT,
 //! map guest memory, load the kernel and the initramfs, create the devices
-//! (the legacy PIO devices, then one virtio-fs device per share in the
-//! fixed slot order), write the command line with a `virtio_mmio.device=`
-//! entry per virtio device, write the zero page and MP table, create and
-//! set up the vCPUs, and record `vmm.start`.
+//! (the legacy PIO devices, then one virtio-fs device per share, each in its
+//! fixed slot of [`crate::devices::slots`]), write the command line with a
+//! `virtio_mmio.device=` entry for each slot of the [`DeviceSet`], write the
+//! zero page and MP table, create and set up the vCPUs, and record
+//! `vmm.start`.
 
 use std::fs::File;
 use std::io;
@@ -40,19 +41,20 @@ use crate::arch::x86_64::layout::{CMDLINE_START, HIMEM_START, KVM_TSS_ADDRESS};
 use crate::arch::x86_64::{cpuid, interrupts, msr, regs};
 use crate::cmdline::{build_cmdline, MmioDeviceEntry};
 use crate::devices::legacy::COM1_GSI;
-use crate::devices::{DeviceError, FsDevices, LegacyDevices, FS_TAGS};
+use crate::devices::slots::{present_slots, DeviceSet};
+use crate::devices::{DeviceError, FsDevices, LegacyDevices};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
-    block_stop_signals, record_stop, stop, wait_for_stop, ControlSubscriber, MainLoop, SignalFd,
-    StopLatch, Teardown,
+    block_stop_signals, exit_code_for, record_stop, stop, wait_for_stop, ControlSubscriber,
+    MainLoop, SignalFd, StopLatch, Teardown,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
 use crate::vcpu::VcpuSet;
 
 pub use crate::devices::ConsoleOut;
-pub use crate::lifecycle::{StopReason, VmExit, VmState, VmmHandle};
+pub use crate::lifecycle::{SessionOutcome, StopReason, VmExit, VmState, VmmHandle};
 
 /// The kernel command line every boot starts from.
 pub const BASE_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.dumbkbd lockdown=integrity random.trust_cpu=on quiet loglevel=4 rdinit=/init";
@@ -73,37 +75,45 @@ pub fn base_cmdline(debug_boot: bool) -> String {
 }
 
 /// The size, NUL terminator included, of the kernel command line
-/// [`Vmm::new`] writes for a VM with `debug_boot`, `extra` and `fs_shares`
-/// virtio-fs shares, whether or not it fits in the [`CMDLINE_MAX_SIZE`]
-/// bytes the kernel takes: composed from the same parts in the same order
-/// (the base, `extra`, a `virtio_mmio.device=` entry for each share in its
-/// fixed slot), without building the VM. A caller can refuse a command
-/// line that is too long, with its size, before it starts anything.
+/// [`Vmm::new`] writes for a VM with `debug_boot`, `extra` and the devices
+/// in `set`, whether or not it fits in the [`CMDLINE_MAX_SIZE`] bytes the
+/// kernel takes: composed by `kernel_cmdline`, the function `Vmm::new`
+/// uses (the base, `extra`, a `virtio_mmio.device=` entry for each present
+/// slot of the fixed table), without building the VM. A caller can refuse a
+/// command line that is too long, with its size, before it starts anything.
+/// `set` is [`DeviceSet::from_config`] of the config the VM is built from,
+/// or [`DeviceSet::from_shares`] for a caller that has no [`VmConfig`] yet.
 pub fn cmdline_size(
     debug_boot: bool,
     extra: &[String],
-    fs_shares: usize,
+    set: &DeviceSet,
 ) -> Result<usize, VmmError> {
-    let tags = FS_TAGS.get(..fs_shares).ok_or_else(|| {
-        VmmError::Config(format!(
-            "{fs_shares} virtio-fs shares; there are at most {}",
-            FS_TAGS.len()
-        ))
-    })?;
-    let devices = FsDevices::cmdline_entries_for(&mut SlotAllocator::new()?, tags)?;
     let (base, extras) = cmdline_parts(debug_boot, extra);
-    Ok(crate::cmdline::cmdline_size(&base, &extras, &devices)?)
+    Ok(crate::cmdline::cmdline_size(
+        &base,
+        &extras,
+        &cmdline_entries(set),
+    )?)
+}
+
+/// The `virtio_mmio.device=` entries of the devices in `set`: one per
+/// present slot of the fixed table, in slot order.
+fn cmdline_entries(set: &DeviceSet) -> Vec<MmioDeviceEntry> {
+    present_slots(set)
+        .iter()
+        .map(|slot| slot.cmdline_entry())
+        .collect()
 }
 
 /// The kernel command line of a VM with `debug_boot`, `extra` and the
-/// virtio-mmio `devices`.
+/// devices in `set`.
 fn kernel_cmdline(
     debug_boot: bool,
     extra: &[String],
-    devices: &[MmioDeviceEntry],
+    set: &DeviceSet,
 ) -> crate::arch::Result<linux_loader::cmdline::Cmdline> {
     let (base, extras) = cmdline_parts(debug_boot, extra);
-    build_cmdline(&base, &extras, devices)
+    build_cmdline(&base, &extras, &cmdline_entries(set))
 }
 
 /// The base command line and the extra arguments, in order.
@@ -143,7 +153,7 @@ pub struct VmConfig {
     /// Receives `vmm.start` and `vmm.stop`, and every share's records.
     pub audit: AuditSink,
     /// The directories shared with the guest over virtio-fs, in slot order:
-    /// `root`, then `workspace` (see [`crate::devices::FS_TAGS`]).
+    /// none, or `root` then `workspace` (see [`crate::devices::FS_TAGS`]).
     pub fs_shares: Vec<FsShareConfig>,
     /// How much the shares record.
     pub fs_audit: AuditFsOptions,
@@ -308,6 +318,7 @@ impl Vmm {
             vm.register_irqfd(serial.interrupt_evt(), COM1_GSI)
                 .map_err(kvm_ioctl("register_irqfd"))?;
         }
+        let set = DeviceSet::from_config(&cfg);
         let mut mmio = Bus::new();
         let mut slots = SlotAllocator::new()?;
         let fs = FsDevices::attach(
@@ -320,7 +331,7 @@ impl Vmm {
             cfg.fs_audit,
         )?;
 
-        let cmdline = kernel_cmdline(cfg.debug_boot, &cfg.cmdline_extra, fs.cmdline_entries())?;
+        let cmdline = kernel_cmdline(cfg.debug_boot, &cfg.cmdline_extra, &set)?;
         load_cmdline(&*mem, GuestAddress(CMDLINE_START), &cmdline).map_err(VmmError::Cmdline)?;
         let cmdline = cmdline
             .as_cstring()
@@ -401,7 +412,7 @@ impl Vmm {
         };
         let outcome = wait_for_stop(&mut main_loop, &self.latch).map_err(VmmError::EventLoop);
         let (reason, exit_code) = match &outcome {
-            Ok(exit) => (exit.audit_reason(), exit.exit_code()),
+            Ok(exit) => (exit.audit_reason(), exit_code_for(exit)),
             Err(_) => ("vmm_error", 1),
         };
         let teardown = Teardown {
@@ -692,7 +703,7 @@ mod tests {
         for debug_boot in [false, true] {
             let text = two_share_cmdline(debug_boot, &extra);
             assert_eq!(
-                cmdline_size(debug_boot, &strings(&extra), 2).unwrap(),
+                cmdline_size(debug_boot, &strings(&extra), &DeviceSet::from_shares(2)).unwrap(),
                 text.len() + 1,
                 "{text}"
             );
@@ -701,7 +712,12 @@ mod tests {
             crate::cmdline::build_cmdline(&base_cmdline(false), &["boxcar.mode=hello"], &[])
                 .unwrap();
         assert_eq!(
-            cmdline_size(false, &strings(&["boxcar.mode=hello"]), 0).unwrap(),
+            cmdline_size(
+                false,
+                &strings(&["boxcar.mode=hello"]),
+                &DeviceSet::from_shares(0)
+            )
+            .unwrap(),
             hello.as_cstring().unwrap().as_bytes_with_nul().len()
         );
     }
@@ -711,7 +727,7 @@ mod tests {
     #[test]
     fn cmdline_size_measures_a_command_line_over_the_limit() {
         let long = "x".repeat(3000);
-        let size = cmdline_size(false, &strings(&[&long]), 2).unwrap();
+        let size = cmdline_size(false, &strings(&[&long]), &DeviceSet::from_shares(2)).unwrap();
         // The extra and the space before it, then the NUL terminator.
         let without = two_share_cmdline(false, &[]).len();
         assert_eq!(size, without + 1 + long.len() + 1);
@@ -721,12 +737,8 @@ mod tests {
     #[test]
     fn cmdline_size_refuses_what_the_vm_would_refuse() {
         assert!(matches!(
-            cmdline_size(false, &strings(&["bad\u{7}"]), 0),
+            cmdline_size(false, &strings(&["bad\u{7}"]), &DeviceSet::from_shares(0)),
             Err(VmmError::Arch(crate::arch::Error::Cmdline(_)))
-        ));
-        assert!(matches!(
-            cmdline_size(false, &[], 3),
-            Err(VmmError::Config(_))
         ));
     }
 
@@ -745,6 +757,48 @@ mod tests {
             .collect();
         assert_eq!(named, [("root", "/r/rootfs"), ("workspace", "/w")]);
         assert!(share_refs(&[]).is_empty());
+    }
+
+    /// The kernel command line of a VM with `set`, as text.
+    fn cmdline_text(extra: &[&str], set: &DeviceSet) -> String {
+        let extra = strings(extra);
+        kernel_cmdline(false, &extra, set)
+            .unwrap()
+            .as_cstring()
+            .unwrap()
+            .into_string()
+            .unwrap()
+    }
+
+    #[test]
+    fn cmdline_size_uses_only_present_slots() {
+        let none = DeviceSet {
+            fs: false,
+            net: false,
+            vsock: false,
+        };
+        let text = cmdline_text(&[], &none);
+        assert!(!text.contains("virtio_mmio.device="), "{text}");
+
+        // Without virtio-fs, net and vsock keep their own slots: the entries
+        // for slots 0 and 1 are not there to be taken over.
+        let set = DeviceSet {
+            fs: false,
+            net: true,
+            vsock: true,
+        };
+        let extra = ["boxcar.mode=hello"];
+        let text = cmdline_text(&extra, &set);
+        assert!(!text.contains("0xc0000000"), "{text}");
+        assert!(!text.contains("0xc0001000"), "{text}");
+        assert!(
+            text.ends_with("virtio_mmio.device=4K@0xc0002000:7 virtio_mmio.device=4K@0xc0003000:8"),
+            "{text}"
+        );
+        assert_eq!(
+            cmdline_size(false, &strings(&extra), &set).unwrap(),
+            text.len() + 1
+        );
     }
 
     #[test]

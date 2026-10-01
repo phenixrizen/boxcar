@@ -55,12 +55,24 @@ pub enum StopReason {
     Requested,
 }
 
+/// How the guest's session ended, as its init reported it: the exit code of
+/// the session's process, or the signal that killed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionOutcome {
+    /// The exit code, when the process exited.
+    pub code: Option<i32>,
+    /// The signal number, when a signal killed the process.
+    pub signal: Option<i32>,
+}
+
 /// How the VM ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmExit {
     /// The guest reset the machine: the i8042 reset command, or a triple
-    /// fault (`KVM_EXIT_SHUTDOWN`). This is how the guest reboots.
-    GuestReset,
+    /// fault (`KVM_EXIT_SHUTDOWN`). This is how the guest reboots. `session`
+    /// is how the guest's session ended when its init reported that before
+    /// the reset, and `None` when it did not.
+    GuestReset { session: Option<SessionOutcome> },
     /// The guest reported a system event (`KVM_EXIT_SYSTEM_EVENT`).
     GuestShutdown,
     /// The host stopped the VM.
@@ -71,25 +83,44 @@ pub enum VmExit {
     AuditFailed(String),
 }
 
-impl VmExit {
-    /// The process exit code `boxcar run` uses: 0 when the guest reset or
-    /// shut down, 1 after a vCPU error, [`AUDIT_FAILED_EXIT`] (3) after the
-    /// audit log failed, 128 plus the signal number after a signal (130 for
-    /// Ctrl-C, 129 for a hangup), and 130 for any other requested stop.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            VmExit::GuestReset | VmExit::GuestShutdown => 0,
-            VmExit::VcpuError(_) => 1,
-            VmExit::AuditFailed(_) => AUDIT_FAILED_EXIT,
-            VmExit::StopRequested(StopReason::Signal(signo)) => 128 + signo,
-            VmExit::StopRequested(_) => 130,
-        }
+/// The process exit code `boxcar run` uses for `exit`, and the one
+/// `vmm.stop` records:
+///
+/// - a guest reset that carries the session's exit code: that code;
+/// - one that carries the signal that killed the session: 128 plus the
+///   signal number (137 for `SIGKILL`);
+/// - a guest reset with no session report, and a guest shutdown: 0;
+/// - a vCPU error: 1;
+/// - a failed audit log: [`AUDIT_FAILED_EXIT`] (3);
+/// - a stop by a host signal: 128 plus the signal number (130 for Ctrl-C,
+///   129 for a hangup), and 130 for any other requested stop.
+pub fn exit_code_for(exit: &VmExit) -> i32 {
+    match exit {
+        VmExit::GuestReset {
+            session: Some(SessionOutcome {
+                code: Some(code), ..
+            }),
+        } => *code,
+        VmExit::GuestReset {
+            session:
+                Some(SessionOutcome {
+                    signal: Some(signal),
+                    ..
+                }),
+        } => 128 + signal,
+        VmExit::GuestReset { .. } | VmExit::GuestShutdown => 0,
+        VmExit::VcpuError(_) => 1,
+        VmExit::AuditFailed(_) => AUDIT_FAILED_EXIT,
+        VmExit::StopRequested(StopReason::Signal(signo)) => 128 + signo,
+        VmExit::StopRequested(_) => 130,
     }
+}
 
+impl VmExit {
     /// The `reason` of the `vmm.stop` record.
     pub fn audit_reason(&self) -> &'static str {
         match self {
-            VmExit::GuestReset => "guest_reset",
+            VmExit::GuestReset { .. } => "guest_reset",
             VmExit::GuestShutdown => "guest_shutdown",
             VmExit::StopRequested(StopReason::Signal(_)) => "signal",
             VmExit::StopRequested(StopReason::ConsoleEscape) => "console_escape",
@@ -103,7 +134,7 @@ impl VmExit {
 impl fmt::Display for VmExit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VmExit::GuestReset => f.write_str("guest reset"),
+            VmExit::GuestReset { .. } => f.write_str("guest reset"),
             VmExit::GuestShutdown => f.write_str("guest shutdown"),
             VmExit::StopRequested(StopReason::Signal(signo)) => {
                 write!(f, "stopped by signal {signo}")
@@ -371,7 +402,7 @@ impl MutEventSubscriber for ControlSubscriber {
             let _ = self.latch.wake.read();
         } else if fd == self.reset_evt.as_raw_fd() {
             if self.reset_evt.read().is_ok() {
-                self.latch.trigger(VmExit::GuestReset);
+                self.latch.trigger(VmExit::GuestReset { session: None });
             }
         } else if fd == self.signals.as_raw_fd() {
             self.on_signal();
@@ -450,7 +481,12 @@ mod tests {
     #[test]
     fn exit_codes_and_reasons() {
         let cases = [
-            (VmExit::GuestReset, 0, "guest_reset", "guest reset"),
+            (
+                VmExit::GuestReset { session: None },
+                0,
+                "guest_reset",
+                "guest reset",
+            ),
             (VmExit::GuestShutdown, 0, "guest_shutdown", "guest shutdown"),
             (
                 VmExit::StopRequested(StopReason::Signal(libc::SIGINT)),
@@ -496,9 +532,37 @@ mod tests {
             ),
         ];
         for (exit, code, reason, text) in cases {
-            assert_eq!(exit.exit_code(), code, "{exit:?}");
+            assert_eq!(exit_code_for(&exit), code, "{exit:?}");
             assert_eq!(exit.audit_reason(), reason, "{exit:?}");
             assert_eq!(exit.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn run_exit_code_maps_session_outcome() {
+        let reset = |session| VmExit::GuestReset { session };
+        let outcome = |code, signal| Some(SessionOutcome { code, signal });
+        let cases = [
+            // The session's own exit code, when init reported one.
+            (reset(outcome(Some(7), None)), 7),
+            (reset(outcome(Some(0), None)), 0),
+            // 128 plus the signal that killed the session.
+            (reset(outcome(None, Some(9))), 137),
+            // A clean reset with no session report.
+            (reset(None), 0),
+            (reset(outcome(None, None)), 0),
+            (VmExit::GuestShutdown, 0),
+            (VmExit::VcpuError("vCPU 0".into()), 1),
+            (VmExit::AuditFailed("EIO".into()), 3),
+            // A host stop signal.
+            (
+                VmExit::StopRequested(StopReason::Signal(libc::SIGTERM)),
+                143,
+            ),
+            (VmExit::StopRequested(StopReason::Signal(libc::SIGINT)), 130),
+        ];
+        for (exit, code) in cases {
+            assert_eq!(exit_code_for(&exit), code, "{exit:?}");
         }
     }
 
@@ -509,12 +573,12 @@ mod tests {
         assert_eq!(handle.state(), VmState::Running);
         assert!(latch.outcome().is_none());
 
-        assert!(latch.trigger(VmExit::GuestReset));
+        assert!(latch.trigger(VmExit::GuestReset { session: None }));
         handle.request_stop(StopReason::Requested);
         assert!(!latch.trigger(VmExit::VcpuError("late".into())));
 
         assert_eq!(handle.state(), VmState::Stopping);
-        assert_eq!(latch.outcome(), Some(VmExit::GuestReset));
+        assert_eq!(latch.outcome(), Some(VmExit::GuestReset { session: None }));
         assert_eq!(latch.wake.read().unwrap(), 3);
     }
 
@@ -582,7 +646,7 @@ mod tests {
         let failure = sink.failure().expect("the writer failed");
         assert_eq!(exit, VmExit::AuditFailed(failure.to_string()));
         assert_eq!(failure.path, segment);
-        assert_eq!(exit.exit_code(), AUDIT_FAILED_EXIT);
+        assert_eq!(exit_code_for(&exit), AUDIT_FAILED_EXIT);
         // The eventfd is left readable for anyone else who waits on it.
         assert_eq!(sink.failure_event().read().unwrap(), 1);
         assert!(writer.close().is_err());
