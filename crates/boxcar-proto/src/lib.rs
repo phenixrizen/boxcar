@@ -32,7 +32,7 @@ pub use audit::{
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
     FsSymlink, FsXattr, Hash, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls,
     NetUdp, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, ShareRef, Source, SpanRef,
-    Subject, Verdict, VmmStart, VmmStop, SCHEMA_VERSION,
+    Subject, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

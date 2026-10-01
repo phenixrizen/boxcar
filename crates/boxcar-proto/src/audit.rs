@@ -44,7 +44,7 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
     FsSymlink, FsXattr, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp,
-    OpResult, SetAttr, ShareRef, Verdict, VmmStart, VmmStop,
+    OpResult, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -99,8 +99,9 @@ pub enum Source {
 impl Source {
     /// The source of an event kind this crate defines a payload for:
     /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
-    /// device, `net.*` from the network stack, `control.*` from the control
-    /// socket. `None` for every other kind; later milestones add theirs.
+    /// device, `net.*` from the network stack, `vsock.*` from the vsock
+    /// device, `control.*` from the control socket. `None` for every other
+    /// kind; later milestones add theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
         if kind == "checkpoint" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
@@ -108,6 +109,8 @@ impl Source {
             Some(Source::Fs)
         } else if kind.starts_with("net.") {
             Some(Source::Net)
+        } else if kind.starts_with("vsock.") {
+            Some(Source::Vsock)
         } else if kind.starts_with("control.") {
             Some(Source::Control)
         } else {
@@ -374,6 +377,10 @@ pub enum Payload {
     NetDrop(NetDrop),
     #[serde(rename = "net.udp")]
     NetUdp(NetUdp),
+    #[serde(rename = "vsock.connect")]
+    VsockConnect(VsockConnect),
+    #[serde(rename = "vsock.close")]
+    VsockClose(VsockClose),
 }
 
 impl Payload {
@@ -411,14 +418,16 @@ impl Payload {
             Payload::NetClose(_) => "net.close",
             Payload::NetDrop(_) => "net.drop",
             Payload::NetUdp(_) => "net.udp",
+            Payload::VsockConnect(_) => "vsock.connect",
+            Payload::VsockClose(_) => "vsock.close",
         }
     }
 
     /// The source of the record that carries this payload: the VMM for
     /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, the
-    /// network stack for `net.*`, the control socket for `control.*`, as
-    /// [`Source::from_kind`] says. A new variant does not compile until it
-    /// is given one.
+    /// network stack for `net.*`, the vsock device for `vsock.*`, the
+    /// control socket for `control.*`, as [`Source::from_kind`] says. A new
+    /// variant does not compile until it is given one.
     pub fn source(&self) -> Source {
         match self {
             Payload::VmmStart(_) | Payload::VmmStop(_) | Payload::Checkpoint(_) => Source::Vmm,
@@ -448,6 +457,7 @@ impl Payload {
             | Payload::NetClose(_)
             | Payload::NetDrop(_)
             | Payload::NetUdp(_) => Source::Net,
+            Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
         }
     }
 
@@ -481,8 +491,8 @@ mod tests {
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 30 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 30] = [
+    /// The 32 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 32] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -513,6 +523,8 @@ mod tests {
         "net.close",
         "net.drop",
         "net.udp",
+        "vsock.connect",
+        "vsock.close",
     ];
 
     fn session() -> SessionId {
@@ -1001,6 +1013,35 @@ mod tests {
                     "rule": "allow 192.0.2.0/24:123",
                 }),
             ),
+            (
+                // Init's control channel: the guest, from a privileged
+                // source port, to the internal service at 1024.
+                Payload::VsockConnect(VsockConnect {
+                    port: 1024,
+                    dir: "guest".into(),
+                    peer: "internal".into(),
+                    src_port: 1023,
+                    verdict: Verdict::Allow,
+                    reason: None,
+                }),
+                json!({
+                    "port": 1024,
+                    "dir": "guest",
+                    "peer": "internal",
+                    "src_port": 1023,
+                    "verdict": "allow",
+                    "reason": null,
+                }),
+            ),
+            (
+                Payload::VsockClose(VsockClose {
+                    port: 1024,
+                    dir: "guest".into(),
+                    tx: 4096,
+                    rx: 10_485_760,
+                }),
+                json!({"port": 1024, "dir": "guest", "tx": 4096, "rx": 10485760}),
+            ),
         ]
     }
 
@@ -1180,6 +1221,53 @@ mod tests {
                     "rule": null,
                 }),
             ),
+            (
+                // An unprivileged guest process trying an internal port.
+                Payload::VsockConnect(VsockConnect {
+                    port: 1025,
+                    dir: "guest".into(),
+                    peer: "internal".into(),
+                    src_port: 50_000,
+                    verdict: Verdict::Deny,
+                    reason: Some("unprivileged".into()),
+                }),
+                json!({
+                    "port": 1025,
+                    "dir": "guest",
+                    "peer": "internal",
+                    "src_port": 50000,
+                    "verdict": "deny",
+                    "reason": "unprivileged",
+                }),
+            ),
+            (
+                // A host process through the vsock socket, to a guest port.
+                Payload::VsockConnect(VsockConnect {
+                    port: 5000,
+                    dir: "host".into(),
+                    peer: "guest".into(),
+                    src_port: 1_073_741_824,
+                    verdict: Verdict::Allow,
+                    reason: None,
+                }),
+                json!({
+                    "port": 5000,
+                    "dir": "host",
+                    "peer": "guest",
+                    "src_port": 1073741824,
+                    "verdict": "allow",
+                    "reason": null,
+                }),
+            ),
+            (
+                Payload::VsockClose(VsockClose {
+                    port: 5000,
+                    dir: "host".into(),
+                    tx: 0,
+                    rx: 0,
+                }),
+                json!({"port": 5000, "dir": "host", "tx": 0, "rx": 0}),
+            ),
         ]
     }
 
@@ -1265,6 +1353,8 @@ mod tests {
                 Source::Fs
             } else if payload.kind().starts_with("net.") {
                 Source::Net
+            } else if payload.kind().starts_with("vsock.") {
+                Source::Vsock
             } else if payload.kind().starts_with("control.") {
                 Source::Control
             } else {
@@ -1278,8 +1368,8 @@ mod tests {
         assert_eq!(Source::from_kind("checkpoint"), Some(Source::Vmm));
         assert_eq!(Source::from_kind("control.stop"), Some(Source::Control));
         assert_eq!(Source::from_kind("net.drop"), Some(Source::Net));
+        assert_eq!(Source::from_kind("vsock.close"), Some(Source::Vsock));
         for other in [
-            "vsock.open",
             "proc.exec",
             "finding",
             "",
@@ -1291,6 +1381,8 @@ mod tests {
             "controls.stop",
             "net",
             "network.drop",
+            "vsock",
+            "vsocks.close",
         ] {
             assert_eq!(Source::from_kind(other), None, "{other:?}");
         }

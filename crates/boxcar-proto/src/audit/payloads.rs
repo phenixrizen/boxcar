@@ -478,3 +478,49 @@ pub struct NetUdp {
     /// default did.
     pub rule: Option<String>,
 }
+
+/// `vsock.connect`: a vsock connection between the guest and the host, and
+/// whether it was let through.
+///
+/// A guest connection to an internal port (1024, 1025, 1026) is served by
+/// the VMM only from a guest source port below 1024, and only the first
+/// such connection to each port; a guest connection to any other port
+/// reaches the host socket `<uds>_<port>` only when the port is
+/// allowlisted. A host connection, through the vsock socket, is recorded
+/// once the guest accepts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VsockConnect {
+    /// The port connected to: the host port for a guest connection, the
+    /// guest port for a host one.
+    pub port: u32,
+    /// Who connected: `guest` or `host`.
+    pub dir: String,
+    /// The other end: for a guest connection, `internal` (a VMM service)
+    /// or `uds` (the host socket `<uds>_<port>`); for a host connection,
+    /// `guest`.
+    pub peer: String,
+    /// The connecting side's port: the guest's source port, or the port the
+    /// VMM gave a host connection.
+    pub src_port: u32,
+    pub verdict: Verdict,
+    /// Why a connection was refused: `unprivileged` (an internal port from
+    /// a guest source port of 1024 or more), `duplicate` (an internal port
+    /// that was already connected), `no_service` (an internal port nothing
+    /// serves) or `port` (a port that is not allowlisted). `null` when it
+    /// was let through.
+    pub reason: Option<String>,
+}
+
+/// `vsock.close`: a vsock connection that a `vsock.connect` let through
+/// ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VsockClose {
+    /// The `port` of the connection's `vsock.connect`.
+    pub port: u32,
+    /// The `dir` of the connection's `vsock.connect`.
+    pub dir: String,
+    /// Payload bytes the guest sent.
+    pub tx: u64,
+    /// Payload bytes the guest received.
+    pub rx: u64,
+}
