@@ -7,19 +7,22 @@
 //! Every guest frame goes through the dispatcher first ([`classify`]):
 //! ARP, DHCP and ICMP are answered here, deterministically, DNS to the
 //! gateway goes to the [forwarder](crate::dns), a TCP SYN to the
-//! [relay](crate::tcp), which decides it before anything answers it, and
-//! what is not carried is dropped and counted. Only the rest of TCP, and
-//! what smoltcp must learn from ARP, reaches smoltcp. smoltcp's interface
-//! owns the gateway's MAC and address, with any-IP on and a default route
-//! through itself, so its sockets can be any destination; the relay makes
-//! one for each connection it lets through.
+//! [TCP relay](crate::tcp), which decides it before anything answers it,
+//! other UDP to the [UDP relay](crate::udp), and what is not carried is
+//! dropped and counted. Only the rest of TCP, and what smoltcp must learn
+//! from ARP, reaches smoltcp. smoltcp's interface owns the gateway's MAC
+//! and address, with any-IP on and a default route through itself, so its
+//! sockets can be any destination; the TCP relay makes one for each
+//! connection it lets through. TCP connections and UDP flows take their
+//! ids from one count.
 //!
 //! The stack's host fds are the forwarder's upstream socket (token
-//! [`DNS_TOKEN`], asked for by the first [`poll`](NetStack::poll)) and one
+//! [`DNS_TOKEN`], asked for by the first [`poll`](NetStack::poll)), one
 //! socket for each relayed connection (tokens from
-//! [`FLOW_TOKEN_BASE`](crate::FLOW_TOKEN_BASE)). The stack asks the net
-//! thread to start, change and stop watching them through the
-//! [`FdChange`]s each poll returns, and
+//! [`FLOW_TOKEN_BASE`](crate::FLOW_TOKEN_BASE)), and one for each UDP
+//! mapping (tokens from [`UDP_TOKEN_BASE`]). The
+//! stack asks the net thread to start, change and stop watching them
+//! through the [`FdChange`]s each poll returns, and
 //! [`on_host_fd_event`](NetStack::on_host_fd_event) handles their
 //! readiness; the net thread polls again after handing events over. An fd
 //! the stack is done with stays open until the poll after the one whose
@@ -57,7 +60,9 @@ use crate::dns::forwarder::{self, ForwardError, Forwarder, Pending, Received};
 use crate::dns::{self as dns, parse};
 use crate::frame::{self, classify, Dispatch, DNS_PORT};
 use crate::policy::{Policy, Verdict};
-use crate::tcp::relay::{Ctx, Relay};
+use crate::tcp::flow::FlowIds;
+use crate::tcp::relay::Relay;
+use crate::udp::{UdpRelay, UDP_TOKEN_BASE};
 use crate::upstream::HostAddrs;
 use crate::{arp, dhcp, icmp};
 
@@ -113,6 +118,12 @@ pub struct NetStack {
     dns_watched: bool,
     /// The TCP relay: the guest's connections and their host sockets.
     tcp: Relay,
+    /// The UDP relay: the guest's mappings and their host sockets.
+    udp: UdpRelay,
+    /// The flow ids, which TCP and UDP share.
+    ids: FlowIds,
+    /// The host's own addresses, which the guest may not reach.
+    host_addrs: HostAddrs,
     /// smoltcp's time zero.
     epoch: Instant,
 }
@@ -154,7 +165,8 @@ impl NetStack {
             .add_default_ipv4_route(cfg.gateway)
             .map_err(|_| ConfigError::Interface("the default route"))?;
         iface.set_any_ip(true);
-        let tcp = Relay::new(cfg.tcp.clone(), HostAddrs::system());
+        let tcp = Relay::new(cfg.tcp.clone());
+        let udp = UdpRelay::new(cfg.udp.clone());
         Ok(NetStack {
             cfg,
             sink,
@@ -167,6 +179,9 @@ impl NetStack {
             dns_cache: DnsCache::new(),
             dns_watched: false,
             tcp,
+            udp,
+            ids: FlowIds::default(),
+            host_addrs: HostAddrs::system(),
             epoch,
         })
     }
@@ -188,13 +203,19 @@ impl NetStack {
     /// guest may not reach unless a rule names one exactly (by default,
     /// [`HostAddrs::system`]).
     pub fn set_host_addrs(&mut self, addrs: HostAddrs) {
-        self.tcp.set_host_addrs(addrs);
+        self.host_addrs = addrs;
     }
 
     /// The TCP connections the stack holds: those relayed or ending, and
     /// those waiting on their host connect.
     pub fn open_flows(&self) -> usize {
         self.tcp.open_flows()
+    }
+
+    /// The UDP mappings the stack holds: the 5-tuples the policy allowed,
+    /// each with its host socket.
+    pub fn udp_mappings(&self) -> usize {
+        self.udp.len()
     }
 
     /// Takes one Ethernet frame the guest sent.
@@ -231,9 +252,7 @@ impl NetStack {
                 dhcp::Answer::Unanswered => self.drop_frame(DropReason::Dhcp, now),
             },
             Dispatch::Dns { src, .. } => self.dns_query(frame, src, now),
-            // The UDP relay (M2 Task 8) carries these, under the egress
-            // policy. Until it lands they are dropped.
-            Dispatch::Udp { .. } => self.drop_frame(DropReason::UdpUnimplemented, now),
+            Dispatch::Udp { src, dst } => self.udp_datagram(frame, src, dst, now),
             Dispatch::Icmp { .. } => match icmp::reply(&self.cfg, frame) {
                 Some(reply) => {
                     self.send_to_guest(reply, now);
@@ -246,7 +265,7 @@ impl NetStack {
             // The relay notes where the guest's stream ends.
             Dispatch::Tcp { src, dst } => {
                 if frame::tcp_reset_flag(frame) {
-                    let (tcp, mut cx) = self.split(now);
+                    let Parts { tcp, mut cx, .. } = self.split(now);
                     if tcp.guest_rst(&mut cx, src, dst) {
                         return;
                     }
@@ -277,23 +296,28 @@ impl NetStack {
     /// also polls after handing host fd events over.
     ///
     /// DNS queries whose time is up get SERVFAIL here, host connects whose
-    /// time is up reset the guest, and gated connections whose time is up
-    /// are denied, so `next_deadline` counts the next of each too. The
-    /// first poll asks for the DNS socket to be watched. Host sockets the
-    /// last outcome asked to be unwatched are closed first.
+    /// time is up reset the guest, gated connections whose time is up are
+    /// denied, and UDP mappings idle too long are closed, so
+    /// `next_deadline` counts the next of each too. The first poll asks for
+    /// the DNS socket to be watched. Host sockets the last outcome asked to
+    /// be unwatched are closed first.
     pub fn poll(&mut self, now: Instant) -> PollOutcome {
         self.tcp.bury();
+        self.udp.bury();
         for pending in self.dns.expire(now) {
             self.refuse(pending, dns::SERVFAIL, now);
         }
         let stamp = smoltcp_time(self.epoch, now);
         {
-            let (tcp, mut cx) = self.split(now);
+            let Parts {
+                tcp, udp, mut cx, ..
+            } = self.split(now);
             tcp.expire(&mut cx);
+            udp.expire(&mut cx);
         }
         self.iface.poll(stamp, &mut self.pipe, &mut self.sockets);
         {
-            let (tcp, mut cx) = self.split(now);
+            let Parts { tcp, mut cx, .. } = self.split(now);
             tcp.relay(&mut cx);
         }
         let refused = std::mem::take(&mut self.pipe.refused);
@@ -316,6 +340,7 @@ impl NetStack {
             });
         }
         fd_changes.extend(self.tcp.take_fd_changes());
+        fd_changes.extend(self.udp.take_fd_changes());
         let smoltcp_due = self
             .iface
             .poll_delay(stamp, &self.sockets)
@@ -325,6 +350,7 @@ impl NetStack {
             self.drops.next_due(),
             self.dns.next_deadline(),
             self.tcp.next_deadline(now),
+            self.udp.next_deadline(now),
         ]
         .into_iter()
         .flatten()
@@ -341,12 +367,17 @@ impl NetStack {
     /// guest, and what answers nothing is counted as `dns_bogus`. For a
     /// relayed connection's socket, its connect completes or fails, or
     /// bytes move; what that queues for the guest goes at the next
-    /// [`poll`](Self::poll), as do the watch changes it makes. Events for
-    /// tokens the stack no longer uses are ignored.
+    /// [`poll`](Self::poll), as do the watch changes it makes. For a UDP
+    /// mapping's socket, every datagram waiting on it is queued for the
+    /// guest. Events for tokens the stack no longer uses are ignored.
     pub fn on_host_fd_event(&mut self, token: u64, readable: bool, writable: bool) {
         let now = Instant::now();
+        if token >= UDP_TOKEN_BASE {
+            let Parts { udp, mut cx, .. } = self.split(now);
+            return udp.host_event(&mut cx, token, readable);
+        }
         if token != DNS_TOKEN {
-            let (tcp, mut cx) = self.split(now);
+            let Parts { tcp, mut cx, .. } = self.split(now);
             return tcp.host_event(&mut cx, token, readable, writable);
         }
         if !readable {
@@ -361,20 +392,23 @@ impl NetStack {
     }
 
     /// Records the DNS queries still waiting for the upstream as
-    /// unanswered (SERVFAIL), ends every TCP connection (`net.close` with
-    /// reason `shutdown`; the guest's side is reset), and records every
-    /// dropped-frame count still held, due or not, so the stack's last
-    /// second is not lost. The net thread (M2 Task 9) calls it as it stops,
-    /// before the audit log closes, and then drops the stack, which closes
-    /// the host sockets.
+    /// unanswered (SERVFAIL), ends every TCP connection and UDP mapping
+    /// (`net.close` with reason `shutdown`; the guest's side of a TCP
+    /// connection is reset), and records every dropped-frame count still
+    /// held, due or not, so the stack's last second is not lost. The net
+    /// thread (M2 Task 9) calls it as it stops, before the audit log
+    /// closes, and then drops the stack, which closes the host sockets.
     pub fn shutdown(&mut self) {
         let now = Instant::now();
         for pending in self.dns.abandon() {
             self.record(dns_record(pending, dns::SERVFAIL, Vec::new()));
         }
         {
-            let (tcp, mut cx) = self.split(now);
+            let Parts {
+                tcp, udp, mut cx, ..
+            } = self.split(now);
             tcp.shutdown(&mut cx);
+            udp.shutdown(&mut cx);
         }
         for counted in self.drops.flush_all(now) {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
@@ -385,8 +419,27 @@ impl NetStack {
     /// policy and the names the DNS cache has for `dst`.
     fn tcp_syn(&mut self, frame: &[u8], guest: SocketAddrV4, dst: SocketAddrV4, now: Instant) {
         let names = self.dns_cache.names_for_at(*dst.ip(), now);
-        let (tcp, mut cx) = self.split(now);
+        let Parts { tcp, mut cx, .. } = self.split(now);
         tcp.syn(&mut cx, frame, guest, dst, names);
+    }
+
+    /// A guest UDP datagram from `guest` to `dst` (not DHCP, and not DNS
+    /// to the gateway): the UDP relay carries it, deciding a new 5-tuple
+    /// on the policy and the names the DNS cache has for `dst`.
+    fn udp_datagram(&mut self, frame: &[u8], guest: SocketAddrV4, dst: SocketAddrV4, now: Instant) {
+        let Some(payload) = frame::udp_payload(frame) else {
+            // Unreachable: the frame was classified as UDP.
+            return self.drop_frame(DropReason::Other, now);
+        };
+        let Parts {
+            udp,
+            dns_cache,
+            mut cx,
+            ..
+        } = self.split(now);
+        udp.datagram(&mut cx, guest, dst, payload, || {
+            dns_cache.names_for_at(*dst.ip(), now)
+        });
     }
 
     /// Whether `dispatch` is IP traffic the stack carries or answers (DHCP
@@ -403,8 +456,9 @@ impl NetStack {
         src != self.cfg.guest_ip
     }
 
-    /// The relay, and what it borrows from the rest of the stack.
-    fn split(&mut self, now: Instant) -> (&mut Relay, Ctx<'_>) {
+    /// The relays, the DNS cache, and what the relays borrow from the
+    /// rest of the stack.
+    fn split(&mut self, now: Instant) -> Parts<'_> {
         let cx = Ctx {
             cfg: &self.cfg,
             sink: &self.sink,
@@ -413,10 +467,17 @@ impl NetStack {
             pipe: &mut self.pipe,
             sockets: &mut self.sockets,
             drops: &mut self.drops,
+            ids: &mut self.ids,
+            host_addrs: &mut self.host_addrs,
             now,
             stamp: smoltcp_time(self.epoch, now),
         };
-        (&mut self.tcp, cx)
+        Parts {
+            tcp: &mut self.tcp,
+            udp: &mut self.udp,
+            dns_cache: &self.dns_cache,
+            cx,
+        }
     }
 
     /// A guest DNS message to the gateway, from `guest`. One shorter than a
@@ -583,6 +644,79 @@ fn dns_record(pending: Pending, rcode: u16, answers: Vec<String>) -> Payload {
         verdict: pending.verdict,
         rule: pending.rule,
     })
+}
+
+/// The stack, split for a relay's call.
+struct Parts<'a> {
+    tcp: &'a mut Relay,
+    udp: &'a mut UdpRelay,
+    dns_cache: &'a DnsCache,
+    cx: Ctx<'a>,
+}
+
+/// What a relay (TCP or UDP) borrows from the rest of the stack for one
+/// call.
+pub(crate) struct Ctx<'a> {
+    pub(crate) cfg: &'a NetConfig,
+    pub(crate) sink: &'a AuditSink,
+    /// The policy as it stands now.
+    pub(crate) policy: Arc<Policy>,
+    pub(crate) iface: &'a mut Interface,
+    pub(crate) pipe: &'a mut Pipe,
+    pub(crate) sockets: &'a mut SocketSet<'static>,
+    pub(crate) drops: &'a mut Drops,
+    /// The flow ids, which TCP and UDP share.
+    pub(crate) ids: &'a mut FlowIds,
+    /// The host's own addresses, which the guest may not reach.
+    pub(crate) host_addrs: &'a mut HostAddrs,
+    /// Now, on the stack's clock and on smoltcp's.
+    pub(crate) now: Instant,
+    pub(crate) stamp: SmolInstant,
+}
+
+impl Ctx<'_> {
+    /// Records an event that must not be dropped (see [`audit::record`]).
+    pub(crate) fn record(&self, payload: Payload) {
+        audit::record(self.sink, payload);
+    }
+
+    /// Counts a guest frame dropped for `reason`.
+    pub(crate) fn drop_frame(&mut self, reason: DropReason) {
+        if let Some(counted) = self.drops.count(reason, self.now) {
+            audit::try_emit(self.sink, Payload::NetDrop(counted));
+        }
+    }
+
+    /// Queues `frame` for the guest, and says whether it was: a full queue
+    /// drops it as `queue_full`.
+    pub(crate) fn send_to_guest(&mut self, frame: Vec<u8>) -> bool {
+        if self.pipe.queue_for_guest(frame) {
+            return true;
+        }
+        boxcar_virtio::limited!(warn, "net: the guest is not taking frames; dropping");
+        self.drop_frame(DropReason::QueueFull);
+        false
+    }
+
+    /// Queues for the guest (by its MAC) a UDP datagram from `src` to
+    /// `dst` carrying `payload`, and says whether it was: a full queue
+    /// drops it as `queue_full`, and a payload too long for one IPv4
+    /// packet is not sent.
+    pub(crate) fn udp_to_guest(
+        &mut self,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        payload: &[u8],
+    ) -> bool {
+        let built = frame::udp_frame(
+            EthernetAddress(self.cfg.gateway_mac),
+            EthernetAddress(self.cfg.guest_mac),
+            src,
+            dst,
+            payload,
+        );
+        built.is_some_and(|built| self.send_to_guest(built))
+    }
 }
 
 /// `now` on smoltcp's clock: microseconds since `epoch`, the stack's time
@@ -922,6 +1056,66 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         peer.read_exact(&mut got).unwrap();
         assert_eq!(got, hello, "and then the hello went on");
+        drop(stack);
+        writer.close().unwrap();
+    }
+
+    /// A UDP mapping's `net.udp{allow}` is in the log's channel before its
+    /// first datagram goes to the host.
+    #[test]
+    fn a_mapping_is_recorded_before_its_first_datagram_goes_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(dir.path().join("data"), SessionId::new()))
+                .unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cfg = NetConfig {
+            dns_upstreams: vec![upstream.local_addr().unwrap()],
+            ..NetConfig::default()
+        };
+        let policy = Policy::parse(&["allow 127.0.0.0/8"]).unwrap();
+        let mut stack =
+            NetStack::new(cfg.clone(), sink, Arc::new(ArcSwap::from_pointee(policy))).unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let SocketAddr::V4(at) = server.local_addr().unwrap() else {
+            panic!("not IPv4");
+        };
+        let probe = server.try_clone().unwrap();
+        probe.set_nonblocking(true).unwrap();
+        let at_record: Rc<Cell<Option<bool>>> = Rc::default();
+        let seen = Rc::clone(&at_record);
+        crate::audit::tests::RECORDED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |payload| {
+                if matches!(payload, Payload::NetUdp(_)) {
+                    let mut byte = [0];
+                    let empty = matches!(probe.peek(&mut byte),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock);
+                    seen.set(Some(empty));
+                }
+            }));
+        });
+        let guest = SocketAddrV4::new(cfg.guest_ip, 40_000);
+        let datagram = frame::udp_frame(
+            EthernetAddress(cfg.guest_mac),
+            EthernetAddress(cfg.gateway_mac),
+            guest,
+            at,
+            b"first",
+        )
+        .unwrap();
+        stack.push_guest_frame(&datagram);
+        crate::audit::tests::RECORDED.with(|hook| hook.borrow_mut().take());
+        assert_eq!(
+            at_record.get(),
+            Some(true),
+            "net.udp was recorded, with nothing at the server yet"
+        );
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut got = [0; 16];
+        let n = server.recv(&mut got).unwrap();
+        assert_eq!(&got[..n], b"first", "and then the datagram went on");
         drop(stack);
         writer.close().unwrap();
     }

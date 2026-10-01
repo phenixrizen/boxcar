@@ -13,7 +13,9 @@
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
-use boxcar_proto::{NetDrop, Payload, Ring};
+use boxcar_proto::{NetClose, NetDrop, Payload, Ring};
+
+use crate::tcp::FlowId;
 
 /// The shortest time between two `net.drop` records for one reason.
 pub const DROP_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,6 +41,26 @@ pub(crate) fn record(sink: &AuditSink, payload: Payload) {
             boxcar_virtio::limited!(error, "net: audit record refused: {error}");
         }
     }
+}
+
+/// The `net.close` of flow `id`, opened at `opened` and ending at `now`
+/// for `reason`, having moved `tx` bytes from the guest and `rx` to it.
+pub(crate) fn close_record(
+    id: FlowId,
+    tx: u64,
+    rx: u64,
+    opened: Instant,
+    now: Instant,
+    reason: &str,
+) -> Payload {
+    let dur_ms = now.saturating_duration_since(opened).as_millis();
+    Payload::NetClose(NetClose {
+        flow: id.0,
+        tx,
+        rx,
+        dur_ms: u64::try_from(dur_ms).unwrap_or(u64::MAX),
+        reason: reason.to_owned(),
+    })
 }
 
 /// Records `payload` if the log's channel has room, and says whether it
@@ -77,8 +99,16 @@ pub enum DropReason {
     /// its id is not in flight, its question is not that query's, or it
     /// does not read.
     DnsBogus,
-    /// UDP other than DHCP and DNS, before the relay carries it.
-    UdpUnimplemented,
+    /// A datagram for a 5-tuple the UDP relay refused within the last
+    /// minute: its first datagram was recorded (`net.udp` with the
+    /// policy's denial), and the rest are counted here.
+    UdpDenied,
+    /// A guest datagram the host socket of its UDP mapping did not take
+    /// (it had no room, or failed); datagrams are not queued.
+    UdpSend,
+    /// A reply too long for one datagram on the link (over 1472 bytes of
+    /// payload): the relay does not fragment.
+    UdpOversize,
     /// A queue between the guest and the stack was full.
     QueueFull,
     /// A guest SYN the policy allowed while the most host connects were
@@ -94,13 +124,15 @@ pub enum DropReason {
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 10] = [
+    pub const ALL: [DropReason; 12] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
         DropReason::Dns,
         DropReason::DnsBogus,
-        DropReason::UdpUnimplemented,
+        DropReason::UdpDenied,
+        DropReason::UdpSend,
+        DropReason::UdpOversize,
         DropReason::QueueFull,
         DropReason::TcpPendingFull,
         DropReason::SrcSpoof,
@@ -115,7 +147,9 @@ impl DropReason {
             DropReason::Dhcp => "dhcp",
             DropReason::Dns => "dns",
             DropReason::DnsBogus => "dns_bogus",
-            DropReason::UdpUnimplemented => "udp_unimplemented",
+            DropReason::UdpDenied => "udp_denied",
+            DropReason::UdpSend => "udp_send",
+            DropReason::UdpOversize => "udp_oversize",
             DropReason::QueueFull => "queue_full",
             DropReason::TcpPendingFull => "tcp_pending_full",
             DropReason::SrcSpoof => "src_spoof",
@@ -325,6 +359,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn durations_are_whole_milliseconds() {
+        let t0 = Instant::now();
+        let Payload::NetClose(close) = close_record(
+            FlowId(3),
+            1,
+            2,
+            t0,
+            t0 + std::time::Duration::from_micros(2_500),
+            "fin",
+        ) else {
+            panic!("not a close");
+        };
+        assert_eq!((close.flow, close.tx, close.rx, close.dur_ms), (3, 1, 2, 2));
+        let Payload::NetClose(close) = close_record(FlowId(3), 0, 0, t0, t0, "fin") else {
+            panic!("not a close");
+        };
+        assert_eq!(close.dur_ms, 0);
+    }
+
+    #[test]
     fn every_reason_has_its_own_slot_and_name() {
         for (i, reason) in DropReason::ALL.into_iter().enumerate() {
             assert_eq!(reason.index(), i, "{reason:?}");
@@ -338,7 +392,9 @@ pub(crate) mod tests {
                 "dhcp",
                 "dns",
                 "dns_bogus",
-                "udp_unimplemented",
+                "udp_denied",
+                "udp_send",
+                "udp_oversize",
                 "queue_full",
                 "tcp_pending_full",
                 "src_spoof",

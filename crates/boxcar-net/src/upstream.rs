@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! The relay's host side: the non-blocking connect a guest's SYN waits on,
-//! and the host's own addresses, which the guest may not reach unless a
-//! rule names one exactly.
+//! The relays' host side: how a guest flow is decided ([`decide`], for a
+//! TCP SYN and for the first datagram of a UDP 5-tuple alike), the
+//! non-blocking connect a guest's SYN waits on, and the host's own
+//! addresses, which the guest may not reach unless a rule names one
+//! exactly.
 //!
 //! A guest connection to one of the host's own interface addresses reaches
 //! whatever the host serves on `0.0.0.0`, and no static range covers those
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::policy::{Ipv4Net, Policy};
+use crate::policy::{Ipv4Net, Policy, Rule, Target, Verdict};
 
 /// The rule text records give for a destination that is one of the host's
 /// own addresses.
@@ -92,6 +94,56 @@ pub fn close_reason(error: &io::Error) -> &'static str {
 pub fn reset_on_close(stream: &TcpStream) {
     // Nothing to do if the socket refuses: it closes with a FIN instead.
     let _ = SockRef::from(stream).set_linger(Some(Duration::ZERO));
+}
+
+/// The verdict on a guest flow, and what decided it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub verdict: Verdict,
+    /// The text of the rule that decided, or `None` for the default.
+    pub rule: Option<String>,
+    /// An allowing domain rule decided: the TCP relay gates the flow on
+    /// the name it shows, and the UDP relay, which cannot, denies it.
+    pub by_domain: bool,
+}
+
+/// Decides a guest flow to `dst`, which the guest knows by `names` (those
+/// the DNS cache holds for its address): one of the host's own addresses
+/// that no rule lifts is denied as [`BUILTIN_HOST_LOCAL`] ([`host_local`]),
+/// and anything else is the policy's [`egress`](Policy::egress) verdict.
+pub fn decide(
+    addrs: &mut HostAddrs,
+    policy: &Policy,
+    dst: SocketAddrV4,
+    names: &[String],
+    now: Instant,
+) -> Decision {
+    if host_local(addrs, policy, dst, now) {
+        return Decision {
+            verdict: Verdict::Deny,
+            rule: Some(BUILTIN_HOST_LOCAL.to_owned()),
+            by_domain: false,
+        };
+    }
+    let (verdict, rule) = policy.egress(dst, names);
+    Decision {
+        verdict,
+        rule,
+        by_domain: allowed_by_domain(policy.egress_rule(dst, names)),
+    }
+}
+
+/// Whether `rule`, the rule that decided a flow, is an allowing domain
+/// rule.
+fn allowed_by_domain(rule: Option<&Rule>) -> bool {
+    matches!(
+        rule,
+        Some(Rule {
+            verdict: Verdict::Allow,
+            target: Target::Domain { .. },
+            ..
+        })
+    )
 }
 
 /// Whether a connection to `dst` is to one of the host's own addresses
@@ -287,6 +339,68 @@ mod tests {
             other,
             now
         ));
+    }
+
+    #[test]
+    fn only_an_allowing_domain_rule_decides_by_domain() {
+        let policy = Policy::parse(&[
+            "allow example.com",
+            "deny evil.example",
+            "allow 192.0.2.0/24",
+        ])
+        .unwrap();
+        let by_domain = |i: usize| allowed_by_domain(policy.rules.get(i));
+        assert!(by_domain(0));
+        assert!(!by_domain(1));
+        assert!(!by_domain(2));
+        assert!(!allowed_by_domain(None));
+    }
+
+    #[test]
+    fn decide_is_host_local_then_egress() {
+        let host = Ipv4Addr::new(203, 0, 113, 7);
+        let mut addrs = HostAddrs::fixed(vec![host]);
+        let now = Instant::now();
+        let policy = Policy::parse(&["allow example.com", "allow 203.0.113.0/24"]).unwrap();
+        let names = vec!["example.com".to_owned()];
+        let decided = |addrs: &mut HostAddrs, ip: Ipv4Addr, names: &[String]| {
+            decide(addrs, &policy, SocketAddrV4::new(ip, 443), names, now)
+        };
+        assert_eq!(
+            decided(&mut addrs, host, &names),
+            Decision {
+                verdict: Verdict::Deny,
+                rule: Some(BUILTIN_HOST_LOCAL.to_owned()),
+                by_domain: false,
+            },
+            "the host's own address, whatever the names"
+        );
+        let other = Ipv4Addr::new(203, 0, 113, 8);
+        assert_eq!(
+            decided(&mut addrs, other, &names),
+            Decision {
+                verdict: Verdict::Allow,
+                rule: Some("allow example.com".to_owned()),
+                by_domain: true,
+            }
+        );
+        assert_eq!(
+            decided(&mut addrs, other, &[]),
+            Decision {
+                verdict: Verdict::Allow,
+                rule: Some("allow 203.0.113.0/24".to_owned()),
+                by_domain: false,
+            }
+        );
+        assert_eq!(
+            decided(&mut addrs, Ipv4Addr::new(198, 51, 100, 1), &[]),
+            Decision {
+                verdict: Verdict::Deny,
+                rule: None,
+                by_domain: false,
+            },
+            "the default"
+        );
     }
 
     #[test]

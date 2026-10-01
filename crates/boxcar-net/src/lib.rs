@@ -20,15 +20,17 @@
 //! - [`tcp`]: the TCP relay, which decides each connection before
 //!   answering it, carries it over a host socket, and gates the ones a
 //!   domain rule allowed on the name they ask for ([`sni`],
-//!   [`http_host`]); [`upstream`]: its host connects, and the host's own
-//!   addresses, which the guest may not reach.
+//!   [`http_host`]); [`upstream`]: how a flow is decided, its host
+//!   connects, and the host's own addresses, which the guest may not
+//!   reach.
+//! - [`udp`]: the UDP relay, NAT with one connected host socket for each
+//!   5-tuple the policy allows by address.
 //! - [`stack`]: the queues, smoltcp's interface (the far end of the
 //!   relayed connections), and the counted drops.
 //! - [`audit`]: the `net.*` records.
-//! - [`config`]: the addressing, the DNS upstreams, and the relay's bounds.
+//! - [`config`]: the addressing, the DNS upstreams, and the relays' bounds.
 //!
-//! IPv6 is dropped. UDP other than DHCP and DNS is dropped and counted
-//! until its relay lands.
+//! IPv6 is dropped and counted.
 
 pub mod arp;
 pub mod audit;
@@ -42,6 +44,7 @@ pub mod policy;
 pub mod sni;
 pub mod stack;
 pub mod tcp;
+pub mod udp;
 pub mod upstream;
 
 pub use audit::DropReason;
@@ -50,3 +53,4 @@ pub use frame::Dispatch;
 pub use policy::{Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};
 pub use tcp::{TcpLimits, FLOW_TOKEN_BASE};
+pub use udp::{UdpLimits, UDP_TOKEN_BASE};

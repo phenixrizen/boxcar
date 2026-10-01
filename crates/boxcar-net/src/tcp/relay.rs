@@ -75,49 +75,23 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use boxcar_audit::AuditSink;
-use boxcar_proto::{NetClose, NetConnect, NetTls, Payload};
-use smoltcp::iface::{Interface, SocketSet};
+use boxcar_proto::{NetConnect, NetTls, Payload};
+use smoltcp::iface::SocketSet;
 use smoltcp::socket::{tcp, Socket};
-use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::EthernetAddress;
 
 use super::flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
 use super::{TcpLimits, GUEST_TIMEOUT, KEEP_ALIVE, SOCKET_BUFFER};
-use crate::audit::{self, DropReason, Drops};
-use crate::config::NetConfig;
+use crate::audit::{self, close_record, DropReason};
 use crate::frame;
 use crate::http_host::{self, Request};
-use crate::policy::{Policy, Rule, Target, Verdict};
+use crate::policy::{Policy, Verdict};
 use crate::sni::{self, Hello};
-use crate::stack::{FdChange, Interest, Pipe};
-use crate::upstream::{self, ConnectTarget, HostAddrs, Progress, BUILTIN_HOST_LOCAL};
+use crate::stack::{Ctx, FdChange, Interest};
+use crate::upstream::{self, ConnectTarget, Progress};
 
-/// What the relay borrows from the stack for one call.
-pub(crate) struct Ctx<'a> {
-    pub(crate) cfg: &'a NetConfig,
-    pub(crate) sink: &'a AuditSink,
-    /// The policy as it stands now.
-    pub(crate) policy: Arc<Policy>,
-    pub(crate) iface: &'a mut Interface,
-    pub(crate) pipe: &'a mut Pipe,
-    pub(crate) sockets: &'a mut SocketSet<'static>,
-    pub(crate) drops: &'a mut Drops,
-    /// Now, on the stack's clock and on smoltcp's.
-    pub(crate) now: Instant,
-    pub(crate) stamp: SmolInstant,
-}
-
+/// The relay's uses of what it borrows from the stack.
 impl Ctx<'_> {
-    fn record(&self, payload: Payload) {
-        audit::record(self.sink, payload);
-    }
-
-    fn drop_frame(&mut self, reason: DropReason) {
-        if let Some(counted) = self.drops.count(reason, self.now) {
-            audit::try_emit(self.sink, Payload::NetDrop(counted));
-        }
-    }
-
     /// Refuses the guest's `syn` with an RST+ACK from where it was sent.
     fn reset_guest(&mut self, syn: &[u8]) {
         let reset = frame::tcp_reset(
@@ -126,10 +100,7 @@ impl Ctx<'_> {
             EthernetAddress(self.cfg.guest_mac),
         );
         if let Some(reset) = reset {
-            if !self.pipe.queue_for_guest(reset) {
-                boxcar_virtio::limited!(warn, "net: the guest is not taking frames; dropping");
-                self.drop_frame(DropReason::QueueFull);
-            }
+            self.send_to_guest(reset);
         }
     }
 
@@ -154,9 +125,6 @@ impl Ctx<'_> {
 pub(crate) struct Relay {
     limits: TcpLimits,
     table: FlowTable,
-    /// The last flow id given.
-    last_id: u64,
-    host_addrs: HostAddrs,
     /// Ending flows: their reset is on its way to the guest.
     ending: Vec<FlowId>,
     /// Watch changes for the next outcome.
@@ -205,22 +173,16 @@ enum GateStep {
 }
 
 impl Relay {
-    pub(crate) fn new(limits: TcpLimits, host_addrs: HostAddrs) -> Relay {
+    pub(crate) fn new(limits: TcpLimits) -> Relay {
         Relay {
             table: FlowTable::new(limits.flow_cap, limits.pending_cap),
             limits,
-            last_id: 0,
-            host_addrs,
             ending: Vec::new(),
             fd_changes: Vec::new(),
             graveyard: Vec::new(),
             buried: Vec::new(),
             gate_due: None,
         }
-    }
-
-    pub(crate) fn set_host_addrs(&mut self, addrs: HostAddrs) {
-        self.host_addrs = addrs;
     }
 
     /// Flows and connects held.
@@ -258,9 +220,10 @@ impl Relay {
     }
 
     /// Decides the guest's SYN `frame`, from `guest` to `dst`, which the
-    /// guest knows by `names`, on the current policy: a retransmit of one
-    /// being handled is dropped; a denied one is reset at once; an allowed
-    /// one waits on a host connect.
+    /// guest knows by `names`, on the current policy
+    /// ([`upstream::decide`]): a retransmit of one being handled is
+    /// dropped; a denied one is reset at once; an allowed one waits on a
+    /// host connect, gated if a domain rule allowed it.
     pub(crate) fn syn(
         &mut self,
         cx: &mut Ctx,
@@ -274,19 +237,16 @@ impl Relay {
             return;
         }
         let policy = Arc::clone(&cx.policy);
-        let (verdict, rule, gated) =
-            if upstream::host_local(&mut self.host_addrs, &policy, dst, cx.now) {
-                (Verdict::Deny, Some(BUILTIN_HOST_LOCAL.to_owned()), false)
-            } else {
-                let (verdict, rule) = policy.egress(dst, &names);
-                (verdict, rule, gated_by(policy.egress_rule(dst, &names)))
-            };
+        let upstream::Decision {
+            verdict,
+            rule,
+            by_domain: gated,
+        } = upstream::decide(cx.host_addrs, &policy, dst, &names, cx.now);
         if verdict == Verdict::Allow && self.table.pending_full() {
             // Not decided as far as the log goes: the guest sends it again.
             return cx.drop_frame(DropReason::TcpPendingFull);
         }
-        self.last_id = self.last_id.saturating_add(1);
-        let id = FlowId(self.last_id);
+        let id = cx.ids.next();
         cx.record(Payload::NetConnect(NetConnect {
             flow: id.0,
             proto: "tcp".to_owned(),
@@ -691,18 +651,6 @@ impl Relay {
             reset,
         );
     }
-}
-
-/// Whether a flow `rule` decided is gated: an allowing domain rule did.
-fn gated_by(rule: Option<&Rule>) -> bool {
-    matches!(
-        rule,
-        Some(Rule {
-            verdict: Verdict::Allow,
-            target: Target::Domain { .. },
-            ..
-        })
-    )
 }
 
 /// A smoltcp socket that has taken `pending`'s SYN: listening on the
@@ -1137,24 +1085,6 @@ fn tls_record(
     })
 }
 
-fn close_record(
-    id: FlowId,
-    tx: u64,
-    rx: u64,
-    opened: Instant,
-    now: Instant,
-    reason: &str,
-) -> Payload {
-    let dur_ms = now.saturating_duration_since(opened).as_millis();
-    Payload::NetClose(NetClose {
-        flow: id.0,
-        tx,
-        rx,
-        dur_ms: u64::try_from(dur_ms).unwrap_or(u64::MAX),
-        reason: reason.to_owned(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,21 +1125,6 @@ mod tests {
     }
 
     #[test]
-    fn only_an_allowing_domain_rule_gates() {
-        let policy = Policy::parse(&[
-            "allow example.com",
-            "deny evil.example",
-            "allow 192.0.2.0/24",
-        ])
-        .unwrap();
-        let gated = |i: usize| gated_by(policy.rules.get(i));
-        assert!(gated(0));
-        assert!(!gated(1));
-        assert!(!gated(2));
-        assert!(!gated_by(None));
-    }
-
-    #[test]
     fn held_bytes_are_read_again_only_when_more_come() {
         let mut held = GateBuf::new(Instant::now());
         assert_eq!(read_new(&mut held), None, "nothing yet");
@@ -1224,25 +1139,5 @@ mod tests {
             Some(Shown::name(Some("a.example".into())))
         );
         assert_eq!(held.parsed, held.seen.len());
-    }
-
-    #[test]
-    fn durations_are_whole_milliseconds() {
-        let t0 = Instant::now();
-        let Payload::NetClose(close) = close_record(
-            FlowId(3),
-            1,
-            2,
-            t0,
-            t0 + std::time::Duration::from_micros(2_500),
-            "fin",
-        ) else {
-            panic!("not a close");
-        };
-        assert_eq!((close.flow, close.tx, close.rx, close.dur_ms), (3, 1, 2, 2));
-        let Payload::NetClose(close) = close_record(FlowId(3), 0, 0, t0, t0, "fin") else {
-            panic!("not a close");
-        };
-        assert_eq!(close.dur_ms, 0);
     }
 }

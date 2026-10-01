@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use boxcar_net::frame::{classify, Dispatch};
 use boxcar_net::stack::QUEUE_CAP;
-use boxcar_net::{NetStack, Policy};
+use boxcar_net::{NetStack, Policy, Verdict};
 use boxcar_proto::{NetDhcp, NetDrop, Payload};
 use common::{
     drops, ethernet, harness, harness_with, ipv4, udp, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC,
@@ -712,11 +712,12 @@ fn ipv6_frames_are_dropped_with_an_event() {
 }
 
 /// A DNS message to the gateway too short to hold a header gets no answer;
-/// the rest of UDP has no handler yet; what nothing understands is `other`.
+/// the rest of UDP goes to the relay, where a tuple the policy denied is
+/// recorded once and then dropped; what nothing understands is `other`.
 /// Each is dropped under its own reason.
 #[test]
 fn dns_other_udp_and_unknown_frames_are_dropped_under_their_own_reasons() {
-    let mut h = harness();
+    let mut h = harness_with(Policy::default());
     let guest = SocketAddrV4::new(GUEST, 40000);
     h.stack.push_guest_frame(&udp(
         GATEWAY_MAC,
@@ -724,13 +725,16 @@ fn dns_other_udp_and_unknown_frames_are_dropped_under_their_own_reasons() {
         SocketAddrV4::new(GATEWAY, 53),
         b"\x12\x34query",
     ));
-    // DNS to anyone but the gateway is ordinary UDP.
-    h.stack.push_guest_frame(&udp(
-        GATEWAY_MAC,
-        guest,
-        SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53),
-        b"\x12\x34query",
-    ));
+    // DNS to anyone but the gateway is ordinary UDP, which the policy
+    // decides: recorded the first time, dropped the second.
+    for _ in 0..2 {
+        h.stack.push_guest_frame(&udp(
+            GATEWAY_MAC,
+            guest,
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53),
+            b"\x12\x34query",
+        ));
+    }
     // An LLDP frame.
     h.stack.push_guest_frame(&ethernet(
         GUEST_MAC,
@@ -743,7 +747,13 @@ fn dns_other_udp_and_unknown_frames_are_dropped_under_their_own_reasons() {
     h.stack.poll(Instant::now());
     assert!(h.drain().is_empty());
 
-    let mut got: Vec<(String, u64)> = drops(&h.events())
+    let events = h.events();
+    let decided = events
+        .iter()
+        .filter(|e| matches!(e, Payload::NetUdp(u) if u.verdict == Verdict::Deny))
+        .count();
+    assert_eq!(decided, 1, "{events:?}");
+    let mut got: Vec<(String, u64)> = drops(&events)
         .into_iter()
         .map(|d| (d.reason, d.count))
         .collect();
@@ -753,7 +763,7 @@ fn dns_other_udp_and_unknown_frames_are_dropped_under_their_own_reasons() {
         [
             ("dns".to_owned(), 1),
             ("other".to_owned(), 1),
-            ("udp_unimplemented".to_owned(), 1),
+            ("udp_denied".to_owned(), 1),
         ]
     );
 }

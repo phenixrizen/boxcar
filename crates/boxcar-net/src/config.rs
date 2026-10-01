@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! The guest network's addressing, the DNS upstreams, and the TCP relay's
-//! bounds the stack is built with. The egress policy is in
+//! The guest network's addressing, the DNS upstreams, and the TCP and UDP
+//! relays' bounds the stack is built with. The egress policy is in
 //! [`policy`](crate::policy).
 //!
 //! The addressing is fixed: the guest is `10.0.2.15/24` at
@@ -14,6 +14,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::tcp::TcpLimits;
+use crate::udp::UdpLimits;
 
 /// The guest's address.
 pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -49,6 +50,8 @@ pub struct NetConfig {
     pub dns_upstreams: Vec<SocketAddr>,
     /// The TCP relay's bounds.
     pub tcp: TcpLimits,
+    /// The UDP relay's bounds.
+    pub udp: UdpLimits,
 }
 
 /// The fixed addressing, with [`FALLBACK_DNS`] as the only upstream.
@@ -64,6 +67,7 @@ impl Default for NetConfig {
             hostname: HOSTNAME.to_owned(),
             dns_upstreams: vec![FALLBACK_DNS],
             tcp: TcpLimits::default(),
+            udp: UdpLimits::default(),
         }
     }
 }
@@ -146,6 +150,7 @@ impl NetConfig {
             return Err(ConfigError::NoDnsUpstream);
         }
         self.tcp.check().map_err(ConfigError::TcpLimits)?;
+        self.udp.check().map_err(ConfigError::UdpLimits)?;
         Ok(())
     }
 }
@@ -179,6 +184,8 @@ pub enum ConfigError {
     DnsUpstream(String),
     #[error("{0}")]
     TcpLimits(&'static str),
+    #[error("{0}")]
+    UdpLimits(&'static str),
 }
 
 fn mac_text(mac: [u8; 6]) -> String {
@@ -294,6 +301,10 @@ mod tests {
         assert!(matches!(
             with(|c| c.tcp.flow_cap = 0),
             Err(ConfigError::TcpLimits(_))
+        ));
+        assert!(matches!(
+            with(|c| c.udp.mapping_cap = 0),
+            Err(ConfigError::UdpLimits(_))
         ));
         for bad in ["", "box car", "boxcar.local", &"x".repeat(64)] {
             let cfg = NetConfig {

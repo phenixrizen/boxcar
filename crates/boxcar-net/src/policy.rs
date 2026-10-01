@@ -44,6 +44,12 @@
 //! as SSH) is reset. Allow those by address with a network rule
 //! (`allow 192.0.2.10:22`), which is not gated.
 //!
+//! UDP shows no name at all, so a domain rule admits none: when an
+//! allowing domain rule decides a UDP flow's first datagram, the
+//! [UDP relay](crate::udp) denies it as `builtin:udp-needs-cidr`
+//! ([`BUILTIN_UDP_NEEDS_CIDR`]). Allow UDP by address with a network rule
+//! (`allow 192.0.2.53:53`, `allow 198.51.100.0/24:123`).
+//!
 //! The stack shares one policy through an `Arc<arc_swap::ArcSwap<Policy>>`
 //! and loads it for every decision, so a swapped policy decides the next
 //! query or connection.
@@ -63,6 +69,10 @@ pub const BUILTIN_PRIVATE: &str = "builtin:private";
 pub const BUILTIN_THIS_NET: &str = "builtin:this-net";
 /// The rule text records give for a multicast or reserved destination.
 pub const BUILTIN_RESERVED: &str = "builtin:reserved";
+/// The rule text records give for a UDP flow an allowing domain rule
+/// decided: no name can be checked on a datagram, so only a network rule
+/// admits UDP.
+pub const BUILTIN_UDP_NEEDS_CIDR: &str = "builtin:udp-needs-cidr";
 
 /// "This network" (RFC 1122 §3.2.1.3), never a destination: a host
 /// connect to `0.0.0.0` reaches the host's own loopback, past the

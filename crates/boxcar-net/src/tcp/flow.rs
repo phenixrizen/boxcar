@@ -32,6 +32,22 @@ impl FlowId {
     }
 }
 
+/// The flow ids a stack gives out, counted from 1. TCP connections and
+/// UDP flows (each decided SYN and each first datagram of a 5-tuple) share
+/// the count, so within a session an id names one flow of either kind.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FlowIds {
+    last: u64,
+}
+
+impl FlowIds {
+    /// The next id.
+    pub(crate) fn next(&mut self) -> FlowId {
+        self.last = self.last.saturating_add(1);
+        FlowId(self.last)
+    }
+}
+
 impl fmt::Display for FlowId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
