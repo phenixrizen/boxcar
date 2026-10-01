@@ -44,9 +44,11 @@
 //! as SSH) is reset. Allow those by address with a network rule
 //! (`allow 192.0.2.10:22`), which is not gated.
 //!
-//! UDP shows no name at all, so a domain rule admits none: when an
-//! allowing domain rule decides a UDP flow's first datagram, the
-//! [UDP relay](crate::udp) denies it as `builtin:udp-needs-cidr`
+//! UDP shows no name at all, so a domain rule admits none.
+//! [`Policy::egress_udp`] decides a UDP flow as [`egress`](Policy::egress)
+//! does, but passes over every domain `allow`: domain denials, network
+//! rules and the default still decide. When passing over a domain allow
+//! leaves the flow denied, the rule text is `builtin:udp-needs-cidr`
 //! ([`BUILTIN_UDP_NEEDS_CIDR`]). Allow UDP by address with a network rule
 //! (`allow 192.0.2.53:53`, `allow 198.51.100.0/24:123`).
 //!
@@ -69,9 +71,9 @@ pub const BUILTIN_PRIVATE: &str = "builtin:private";
 pub const BUILTIN_THIS_NET: &str = "builtin:this-net";
 /// The rule text records give for a multicast or reserved destination.
 pub const BUILTIN_RESERVED: &str = "builtin:reserved";
-/// The rule text records give for a UDP flow an allowing domain rule
-/// decided: no name can be checked on a datagram, so only a network rule
-/// admits UDP.
+/// The rule text records give for a UDP flow that is denied because a
+/// domain `allow` that matches it was passed over ([`Policy::egress_udp`]):
+/// no name can be checked on a datagram, so a domain allow admits no UDP.
 pub const BUILTIN_UDP_NEEDS_CIDR: &str = "builtin:udp-needs-cidr";
 
 /// "This network" (RFC 1122 §3.2.1.3), never a destination: a host
@@ -359,24 +361,65 @@ impl Policy {
         })
     }
 
+    /// The verdict on a UDP flow to `dst`, which the guest knows by
+    /// `names`, and the text of the rule that decided, or `None` for the
+    /// default.
+    ///
+    /// As [`egress`](Self::egress), the built-in denials first, but a
+    /// domain `allow` is passed over: nothing in a datagram shows a name
+    /// to check it on. Domain denials, network rules and the default
+    /// decide as for TCP. When a domain allow that matches (on this port,
+    /// and a name in `names`) was passed over and the flow ends up denied,
+    /// by a later rule or the default, the rule text is
+    /// [`BUILTIN_UDP_NEEDS_CIDR`]: passing it over is what denied it.
+    pub fn egress_udp(&self, dst: SocketAddrV4, names: &[String]) -> (Verdict, Option<String>) {
+        if let Some(builtin) = self.builtin_denial(dst) {
+            return (Verdict::Deny, Some(builtin.to_owned()));
+        }
+        let mut passed_over = false;
+        for rule in self
+            .rules
+            .iter()
+            .filter(|rule| rule_matches(rule, dst, names))
+        {
+            if rule.verdict == Verdict::Allow && matches!(rule.target, Target::Domain { .. }) {
+                passed_over = true;
+                continue;
+            }
+            if rule.verdict == Verdict::Deny && passed_over {
+                return (Verdict::Deny, Some(BUILTIN_UDP_NEEDS_CIDR.to_owned()));
+            }
+            return (rule.verdict, Some(rule.text.clone()));
+        }
+        if self.default == Verdict::Deny && passed_over {
+            (Verdict::Deny, Some(BUILTIN_UDP_NEEDS_CIDR.to_owned()))
+        } else {
+            (self.default, None)
+        }
+    }
+
     /// What decides [`egress`](Self::egress), in its order.
     fn decide(&self, dst: SocketAddrV4, names: &[String]) -> Decided<'_> {
-        let (ip, port) = (*dst.ip(), dst.port());
-        if let Some(builtin) = never_reachable(ip) {
+        if let Some(builtin) = self.builtin_denial(dst) {
             return Decided::Builtin(builtin);
         }
-        if let Some(range) = PRIVATE_RANGES.iter().find(|range| range.contains(ip)) {
-            if !self.allows_exactly(*range, port) {
-                return Decided::Builtin(BUILTIN_PRIVATE);
-            }
-        }
-        let decided = self.rules.iter().find(|rule| match &rule.target {
-            Target::Domain { pattern, port: on } => {
-                on_port(*on, port) && names.iter().any(|name| name_matches(pattern, name))
-            }
-            Target::Cidr { net, port: on } => on_port(*on, port) && net.contains(ip),
-        });
+        let decided = self
+            .rules
+            .iter()
+            .find(|rule| rule_matches(rule, dst, names));
         decided.map_or(Decided::Default, Decided::Rule)
+    }
+
+    /// The built-in denial of `dst`, if any, as rule text: the addresses
+    /// no rule opens, then a private range that no `allow` names exactly
+    /// (on this port).
+    fn builtin_denial(&self, dst: SocketAddrV4) -> Option<&'static str> {
+        let (ip, port) = (*dst.ip(), dst.port());
+        if let Some(builtin) = never_reachable(ip) {
+            return Some(builtin);
+        }
+        let private = PRIVATE_RANGES.iter().find(|range| range.contains(ip))?;
+        (!self.allows_exactly(*private, port)).then_some(BUILTIN_PRIVATE)
     }
 
     /// The gate's verdict on a connection to `port` that showed `name`
@@ -446,6 +489,18 @@ fn never_reachable(ip: Ipv4Addr) -> Option<&'static str> {
         Some(BUILTIN_RESERVED)
     } else {
         None
+    }
+}
+
+/// Whether `rule` matches a flow to `dst` the guest knows by `names`: on
+/// its port, if it has one, and a domain rule when any of `names` matches
+/// it, a network rule when it holds the address.
+fn rule_matches(rule: &Rule, dst: SocketAddrV4, names: &[String]) -> bool {
+    match &rule.target {
+        Target::Domain { pattern, port } => {
+            on_port(*port, dst.port()) && names.iter().any(|name| name_matches(pattern, name))
+        }
+        Target::Cidr { net, port } => on_port(*port, dst.port()) && net.contains(*dst.ip()),
     }
 }
 
@@ -1143,6 +1198,112 @@ mod tests {
         // The lift is not the decision: the first matching rule is.
         let rule = p.egress_rule(at([127, 0, 0, 1], 80), &named).unwrap();
         assert_eq!(rule.text, "allow 127.0.0.0/8");
+    }
+
+    /// UDP passes over domain allows; `builtin:udp-needs-cidr` names a
+    /// denial that passing one over caused.
+    #[test]
+    fn egress_udp_passes_over_domain_allows() {
+        let named = names(&["a.test"]);
+        let dst = at([192, 0, 2, 7], 123);
+        let needs_cidr = (Verdict::Deny, Some(BUILTIN_UDP_NEEDS_CIDR.to_owned()));
+        type Case<'a> = (&'a [&'a str], &'a [String], (Verdict, Option<String>));
+        let cases: [Case; 10] = [
+            (
+                &["allow a.test", "allow 192.0.2.0/24"],
+                &named,
+                (Verdict::Allow, Some("allow 192.0.2.0/24".to_owned())),
+            ),
+            (
+                &["allow a.test", "default allow"],
+                &named,
+                (Verdict::Allow, None),
+            ),
+            (&["allow a.test"], &named, needs_cidr.clone()),
+            (&["allow a.test"], &[], (Verdict::Deny, None)),
+            (
+                &["deny a.test", "allow 192.0.2.0/24"],
+                &named,
+                (Verdict::Deny, Some("deny a.test".to_owned())),
+            ),
+            (
+                &["allow a.test", "deny 192.0.2.0/24"],
+                &named,
+                needs_cidr.clone(),
+            ),
+            (
+                &["allow a.test", "deny 192.0.2.0/24"],
+                &[],
+                (Verdict::Deny, Some("deny 192.0.2.0/24".to_owned())),
+            ),
+            // A domain allow on another port does not match: not passed
+            // over.
+            (&["allow a.test:53"], &named, (Verdict::Deny, None)),
+            (
+                &["allow a.test:53", "default allow"],
+                &named,
+                (Verdict::Allow, None),
+            ),
+            // A domain allow that matches no name is not passed over.
+            (
+                &["allow b.test", "deny 192.0.2.0/24"],
+                &named,
+                (Verdict::Deny, Some("deny 192.0.2.0/24".to_owned())),
+            ),
+        ];
+        for (lines, names, want) in cases {
+            assert_eq!(
+                parse(lines).egress_udp(dst, names),
+                want,
+                "{lines:?} {names:?}"
+            );
+        }
+        // The built-in denials come first, whatever the rules.
+        let open = parse(&["allow a.test", "allow 0.0.0.0/0", "default allow"]);
+        for (ip, builtin) in [
+            ([10, 0, 2, 2], BUILTIN_GUEST_NET),
+            ([0, 0, 0, 0], BUILTIN_THIS_NET),
+            ([224, 0, 0, 251], BUILTIN_RESERVED),
+            ([127, 0, 0, 1], BUILTIN_PRIVATE),
+        ] {
+            assert_eq!(
+                open.egress_udp(at(ip, 5353), &named),
+                (Verdict::Deny, Some(builtin.to_owned())),
+                "{ip:?}"
+            );
+        }
+        // An exact range lifts a private denial for UDP too.
+        assert_eq!(
+            parse(&["allow a.test", "allow 127.0.0.0/8"]).egress_udp(at([127, 0, 0, 1], 9), &named),
+            (Verdict::Allow, Some("allow 127.0.0.0/8".to_owned()))
+        );
+    }
+
+    /// For anything a domain allow does not decide, UDP is decided as TCP
+    /// is.
+    #[test]
+    fn egress_udp_agrees_with_egress_without_domain_allows() {
+        let p = parse(&[
+            "deny evil.example",
+            "allow 127.0.0.0/8",
+            "deny 203.0.113.9",
+            "allow 203.0.113.0/24:53",
+        ]);
+        for (ip, port, named) in [
+            ([1, 2, 3, 4], 80, &["evil.example"][..]),
+            ([127, 0, 0, 1], 9, &[][..]),
+            ([203, 0, 113, 9], 53, &[][..]),
+            ([203, 0, 113, 8], 53, &[][..]),
+            ([203, 0, 113, 8], 54, &[][..]),
+            ([10, 0, 2, 2], 123, &[][..]),
+        ] {
+            let named = names(named);
+            assert_eq!(
+                p.egress_udp(at(ip, port), &named),
+                p.egress(at(ip, port), &named),
+                "{ip:?}:{port}"
+            );
+        }
     }
 
     #[test]

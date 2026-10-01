@@ -109,6 +109,11 @@ pub enum DropReason {
     /// A reply too long for one datagram on the link (over 1472 bytes of
     /// payload): the relay does not fragment.
     UdpOversize,
+    /// A datagram for a new 5-tuple the UDP relay allowed while its table
+    /// was full and the most evicted sockets already waited to close: it
+    /// opens no socket and is not recorded, and the next one is decided
+    /// again.
+    UdpTableFull,
     /// A queue between the guest and the stack was full.
     QueueFull,
     /// A guest SYN the policy allowed while the most host connects were
@@ -124,7 +129,7 @@ pub enum DropReason {
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 12] = [
+    pub const ALL: [DropReason; 13] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
@@ -133,6 +138,7 @@ impl DropReason {
         DropReason::UdpDenied,
         DropReason::UdpSend,
         DropReason::UdpOversize,
+        DropReason::UdpTableFull,
         DropReason::QueueFull,
         DropReason::TcpPendingFull,
         DropReason::SrcSpoof,
@@ -150,6 +156,7 @@ impl DropReason {
             DropReason::UdpDenied => "udp_denied",
             DropReason::UdpSend => "udp_send",
             DropReason::UdpOversize => "udp_oversize",
+            DropReason::UdpTableFull => "udp_table_full",
             DropReason::QueueFull => "queue_full",
             DropReason::TcpPendingFull => "tcp_pending_full",
             DropReason::SrcSpoof => "src_spoof",
@@ -395,6 +402,7 @@ pub(crate) mod tests {
                 "udp_denied",
                 "udp_send",
                 "udp_oversize",
+                "udp_table_full",
                 "queue_full",
                 "tcp_pending_full",
                 "src_spoof",

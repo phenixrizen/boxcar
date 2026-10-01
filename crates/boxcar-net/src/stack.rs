@@ -19,7 +19,7 @@
 //! The stack's host fds are the forwarder's upstream socket (token
 //! [`DNS_TOKEN`], asked for by the first [`poll`](NetStack::poll)), one
 //! socket for each relayed connection (tokens from
-//! [`FLOW_TOKEN_BASE`](crate::FLOW_TOKEN_BASE)), and one for each UDP
+//! [`TCP_TOKEN_BASE`]), and one for each UDP
 //! mapping (tokens from [`UDP_TOKEN_BASE`]). The
 //! stack asks the net thread to start, change and stop watching them
 //! through the [`FdChange`]s each poll returns, and
@@ -62,6 +62,7 @@ use crate::frame::{self, classify, Dispatch, DNS_PORT};
 use crate::policy::{Policy, Verdict};
 use crate::tcp::flow::FlowIds;
 use crate::tcp::relay::Relay;
+use crate::tcp::TCP_TOKEN_BASE;
 use crate::udp::{UdpRelay, UDP_TOKEN_BASE};
 use crate::upstream::HostAddrs;
 use crate::{arp, dhcp, icmp};
@@ -372,16 +373,17 @@ impl NetStack {
     /// guest. Events for tokens the stack no longer uses are ignored.
     pub fn on_host_fd_event(&mut self, token: u64, readable: bool, writable: bool) {
         let now = Instant::now();
-        if token >= UDP_TOKEN_BASE {
-            let Parts { udp, mut cx, .. } = self.split(now);
-            return udp.host_event(&mut cx, token, readable);
-        }
-        if token != DNS_TOKEN {
-            let Parts { tcp, mut cx, .. } = self.split(now);
-            return tcp.host_event(&mut cx, token, readable, writable);
-        }
-        if !readable {
-            return;
+        match owner(token) {
+            Owner::Udp => {
+                let Parts { udp, mut cx, .. } = self.split(now);
+                return udp.host_event(&mut cx, token, readable);
+            }
+            Owner::Tcp => {
+                let Parts { tcp, mut cx, .. } = self.split(now);
+                return tcp.host_event(&mut cx, token, readable, writable);
+            }
+            Owner::Dns if readable => {}
+            Owner::Dns | Owner::Nobody => return,
         }
         for received in self.dns.receive() {
             match received {
@@ -646,6 +648,30 @@ fn dns_record(pending: Pending, rcode: u16, answers: Vec<String>) -> Payload {
     })
 }
 
+/// What a host fd's token is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    Dns,
+    /// A TCP flow's host socket: [`TCP_TOKEN_BASE`](crate::TCP_TOKEN_BASE)
+    /// up to [`UDP_TOKEN_BASE`].
+    Tcp,
+    /// A UDP mapping's host socket: [`UDP_TOKEN_BASE`] on.
+    Udp,
+    Nobody,
+}
+
+fn owner(token: u64) -> Owner {
+    if token == DNS_TOKEN {
+        Owner::Dns
+    } else if token >= UDP_TOKEN_BASE {
+        Owner::Udp
+    } else if token >= TCP_TOKEN_BASE {
+        Owner::Tcp
+    } else {
+        Owner::Nobody
+    }
+}
+
 /// The stack, split for a relay's call.
 struct Parts<'a> {
     tcp: &'a mut Relay,
@@ -693,21 +719,22 @@ impl Ctx<'_> {
         if self.pipe.queue_for_guest(frame) {
             return true;
         }
-        boxcar_virtio::limited!(warn, "net: the guest is not taking frames; dropping");
-        self.drop_frame(DropReason::QueueFull);
-        false
+        self.guest_full()
     }
 
     /// Queues for the guest (by its MAC) a UDP datagram from `src` to
-    /// `dst` carrying `payload`, and says whether it was: a full queue
-    /// drops it as `queue_full`, and a payload too long for one IPv4
-    /// packet is not sent.
+    /// `dst` carrying `payload`, and says whether it was: with the guest's
+    /// queue full it is dropped as `queue_full` before a frame is built,
+    /// and a payload too long for one IPv4 packet is not sent.
     pub(crate) fn udp_to_guest(
         &mut self,
         src: SocketAddrV4,
         dst: SocketAddrV4,
         payload: &[u8],
     ) -> bool {
+        if !self.pipe.has_room() {
+            return self.guest_full();
+        }
         let built = frame::udp_frame(
             EthernetAddress(self.cfg.gateway_mac),
             EthernetAddress(self.cfg.guest_mac),
@@ -716,6 +743,13 @@ impl Ctx<'_> {
             payload,
         );
         built.is_some_and(|built| self.send_to_guest(built))
+    }
+
+    /// Drops a frame for the guest as `queue_full`; always `false`.
+    fn guest_full(&mut self) -> bool {
+        boxcar_virtio::limited!(warn, "net: the guest is not taking frames; dropping");
+        self.drop_frame(DropReason::QueueFull);
+        false
     }
 }
 
@@ -744,11 +778,16 @@ pub(crate) struct Pipe {
 impl Pipe {
     /// Queues `frame` for the guest, unless its queue is full; says which.
     pub(crate) fn queue_for_guest(&mut self, frame: Vec<u8>) -> bool {
-        if self.to_guest.len() >= QUEUE_CAP {
+        if !self.has_room() {
             return false;
         }
         self.to_guest.push_back(frame);
         true
+    }
+
+    /// Whether the guest's queue takes another frame.
+    pub(crate) fn has_room(&self) -> bool {
+        self.to_guest.len() < QUEUE_CAP
     }
 
     /// Makes `frame` the next frame smoltcp receives, ahead of the queue
@@ -862,8 +901,6 @@ mod tests {
         ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, EthernetRepr,
         IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
     };
-
-    use crate::tcp::FLOW_TOKEN_BASE;
 
     /// The guest's ARP request for the gateway, which teaches smoltcp the
     /// guest's MAC.
@@ -997,7 +1034,7 @@ mod tests {
         stack.poll(Instant::now());
         let mut isn = None;
         for _ in 0..2000 {
-            stack.on_host_fd_event(FLOW_TOKEN_BASE + 1, false, true);
+            stack.on_host_fd_event(TCP_TOKEN_BASE + 1, false, true);
             stack.poll(Instant::now());
             while let Some(frame) = stack.pop_host_frame() {
                 isn = isn.or(syn_ack(&frame));
@@ -1058,6 +1095,22 @@ mod tests {
         assert_eq!(got, hello, "and then the hello went on");
         drop(stack);
         writer.close().unwrap();
+    }
+
+    /// Each host fd token goes to the part of the stack that made it. A
+    /// TCP flow whose id is past 2^32 (where the token spaces once met)
+    /// is still TCP's.
+    #[test]
+    fn tokens_route_to_their_owner() {
+        use crate::tcp::{FlowId, FLOW_ID_LIMIT};
+        assert_eq!(owner(DNS_TOKEN), Owner::Dns);
+        assert_eq!(owner(FlowId(1).token()), Owner::Tcp);
+        assert_eq!(owner(FlowId((1 << 32) + 7).token()), Owner::Tcp);
+        assert_eq!(owner(FlowId(FLOW_ID_LIMIT - 1).token()), Owner::Tcp);
+        assert_eq!(owner(UDP_TOKEN_BASE + 7), Owner::Udp);
+        assert_eq!(owner(UDP_TOKEN_BASE + (FLOW_ID_LIMIT - 1)), Owner::Udp);
+        assert_eq!(owner(0), Owner::Nobody);
+        assert_eq!(owner(TCP_TOKEN_BASE - 1), Owner::Nobody);
     }
 
     /// A UDP mapping's `net.udp{allow}` is in the log's channel before its

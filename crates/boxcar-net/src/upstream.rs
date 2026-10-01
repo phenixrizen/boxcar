@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! The relays' host side: how a guest flow is decided ([`decide`], for a
-//! TCP SYN and for the first datagram of a UDP 5-tuple alike), the
-//! non-blocking connect a guest's SYN waits on, and the host's own
-//! addresses, which the guest may not reach unless a rule names one
-//! exactly.
+//! The relays' host side: how a guest flow is decided ([`decide`] for a
+//! TCP SYN, [`decide_udp`] for the first datagram of a UDP 5-tuple, both
+//! denying the host's own addresses first), the non-blocking connect a
+//! guest's SYN waits on, and the host's own addresses, which the guest may
+//! not reach unless a rule names one exactly.
 //!
 //! A guest connection to one of the host's own interface addresses reaches
 //! whatever the host serves on `0.0.0.0`, and no static range covers those
@@ -103,7 +103,7 @@ pub struct Decision {
     /// The text of the rule that decided, or `None` for the default.
     pub rule: Option<String>,
     /// An allowing domain rule decided: the TCP relay gates the flow on
-    /// the name it shows, and the UDP relay, which cannot, denies it.
+    /// the name it shows.
     pub by_domain: bool,
 }
 
@@ -131,6 +131,24 @@ pub fn decide(
         rule,
         by_domain: allowed_by_domain(policy.egress_rule(dst, names)),
     }
+}
+
+/// Decides a guest UDP flow to `dst`, which the guest knows by `names`:
+/// one of the host's own addresses that no rule lifts is denied as
+/// [`BUILTIN_HOST_LOCAL`], as for TCP, and anything else is the policy's
+/// [`egress_udp`](Policy::egress_udp) verdict, which passes over domain
+/// allows.
+pub fn decide_udp(
+    addrs: &mut HostAddrs,
+    policy: &Policy,
+    dst: SocketAddrV4,
+    names: &[String],
+    now: Instant,
+) -> (Verdict, Option<String>) {
+    if host_local(addrs, policy, dst, now) {
+        return (Verdict::Deny, Some(BUILTIN_HOST_LOCAL.to_owned()));
+    }
+    policy.egress_udp(dst, names)
 }
 
 /// Whether `rule`, the rule that decided a flow, is an allowing domain
@@ -400,6 +418,36 @@ mod tests {
                 by_domain: false,
             },
             "the default"
+        );
+    }
+
+    #[test]
+    fn decide_udp_is_host_local_then_egress_udp() {
+        let host = Ipv4Addr::new(203, 0, 113, 7);
+        let mut addrs = HostAddrs::fixed(vec![host]);
+        let now = Instant::now();
+        let policy = Policy::parse(&["allow example.com", "default allow"]).unwrap();
+        let names = vec!["example.com".to_owned()];
+        assert_eq!(
+            decide_udp(
+                &mut addrs,
+                &policy,
+                SocketAddrV4::new(host, 53),
+                &names,
+                now
+            ),
+            (Verdict::Deny, Some(BUILTIN_HOST_LOCAL.to_owned()))
+        );
+        // The domain allow is passed over, and the default decides.
+        let other = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 8), 53);
+        assert_eq!(
+            decide_udp(&mut addrs, &policy, other, &names, now),
+            (Verdict::Allow, None)
+        );
+        let lifted = Policy::parse(&["allow 203.0.113.7:53"]).unwrap();
+        assert_eq!(
+            decide_udp(&mut addrs, &lifted, SocketAddrV4::new(host, 53), &[], now),
+            (Verdict::Allow, Some("allow 203.0.113.7:53".to_owned()))
         );
     }
 

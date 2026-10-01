@@ -52,5 +52,5 @@ pub use config::{ConfigError, NetConfig};
 pub use frame::Dispatch;
 pub use policy::{Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};
-pub use tcp::{TcpLimits, FLOW_TOKEN_BASE};
+pub use tcp::{TcpLimits, TCP_TOKEN_BASE};
 pub use udp::{UdpLimits, UDP_TOKEN_BASE};

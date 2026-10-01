@@ -44,12 +44,14 @@ pub mod relay;
 
 use std::time::Duration;
 
-pub use flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
+pub use flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending, FLOW_ID_LIMIT};
 
 /// The [`FdChange`](crate::FdChange) token of flow 0's host socket; flow
 /// `n`'s is this plus `n`. Below it are the stack's own tokens, such as
-/// [`DNS_TOKEN`](crate::DNS_TOKEN).
-pub const FLOW_TOKEN_BASE: u64 = 1 << 32;
+/// [`DNS_TOKEN`](crate::DNS_TOKEN); from it, [`FLOW_ID_LIMIT`] (2^62)
+/// tokens on, the UDP mappings' ([`UDP_TOKEN_BASE`](crate::UDP_TOKEN_BASE)).
+/// Flow ids stay below 2^62, so the spaces never meet.
+pub const TCP_TOKEN_BASE: u64 = 1 << 62;
 
 /// The size of each smoltcp socket buffer, receive and send.
 ///

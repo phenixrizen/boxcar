@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use boxcar_net::sni::{parse_client_hello, Hello};
 use boxcar_net::tcp::GUEST_TIMEOUT;
 use boxcar_net::upstream::{HostAddrs, BUILTIN_HOST_LOCAL};
-use boxcar_net::{Interest, Policy, Verdict, FLOW_TOKEN_BASE};
+use boxcar_net::{Interest, Policy, Verdict, TCP_TOKEN_BASE};
 use boxcar_proto::{NetClose, NetConnect, NetTls, Payload};
 use common::{
     drops, guest_arp, harness_config, harness_with, resolve, segment, syn, tcp as tcp_segment, udp,
@@ -987,7 +987,7 @@ fn backpressure_when_the_guest_stops_reading() {
     // The guest reads nothing: the host's writes stop, and the stack does
     // not watch a socket it cannot read for (a level-triggered poller
     // would spin).
-    let token = FLOW_TOKEN_BASE + 1;
+    let token = TCP_TOKEN_BASE + 1;
     let mut last = 0;
     let mut still = 0;
     rig.until(
@@ -1971,7 +1971,7 @@ fn syn_retransmits_while_pending_are_dropped_silently() {
         h.drain().is_empty(),
         "nothing for the guest while the host connect is under way"
     );
-    let token = FLOW_TOKEN_BASE + 1;
+    let token = TCP_TOKEN_BASE + 1;
     assert_eq!(
         events.watching(token),
         Some(Interest {

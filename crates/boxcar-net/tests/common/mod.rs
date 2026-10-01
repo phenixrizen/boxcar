@@ -367,7 +367,7 @@ impl FakeEventLoop {
     /// How many relayed TCP connections' fds are watched.
     pub fn flows_watched(&self) -> usize {
         self.watched
-            .range(boxcar_net::FLOW_TOKEN_BASE..boxcar_net::UDP_TOKEN_BASE)
+            .range(boxcar_net::TCP_TOKEN_BASE..boxcar_net::UDP_TOKEN_BASE)
             .count()
     }
 

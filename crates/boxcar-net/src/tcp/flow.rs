@@ -11,24 +11,33 @@ use std::time::{Duration, Instant};
 
 use smoltcp::iface::SocketHandle;
 
-use super::FLOW_TOKEN_BASE;
+use super::TCP_TOKEN_BASE;
 use crate::stack::Interest;
 
-/// A flow's id: unique within a stack, counted from 1 in the order SYNs
-/// are decided. A flow's records carry it, and its host socket's
-/// [`FdChange`](crate::FdChange) token is derived from it.
+/// Flow ids stay below this (2^62), which keeps the TCP and UDP token
+/// spaces apart.
+pub const FLOW_ID_LIMIT: u64 = 1 << 62;
+
+/// A flow's id: unique within a stack, counted from 1 in the order flows
+/// are decided. TCP connections and UDP mappings share the count (each
+/// decided SYN and each first datagram of a UDP 5-tuple takes the next
+/// id), so a protocol's ids have gaps. A flow's records carry it, and its
+/// host socket's [`FdChange`](crate::FdChange) token is derived from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FlowId(pub u64);
 
 impl FlowId {
-    /// The token of this flow's host socket.
+    /// The token of this TCP flow's host socket.
     pub fn token(self) -> u64 {
-        FLOW_TOKEN_BASE.saturating_add(self.0)
+        TCP_TOKEN_BASE.saturating_add(self.0)
     }
 
-    /// The flow a host socket's token is for, if it is a flow's.
+    /// The TCP flow a host socket's token is for, if it is a TCP flow's.
     pub fn from_token(token: u64) -> Option<FlowId> {
-        token.checked_sub(FLOW_TOKEN_BASE).map(FlowId)
+        token
+            .checked_sub(TCP_TOKEN_BASE)
+            .filter(|id| *id < FLOW_ID_LIMIT)
+            .map(FlowId)
     }
 }
 
@@ -44,6 +53,7 @@ impl FlowIds {
     /// The next id.
     pub(crate) fn next(&mut self) -> FlowId {
         self.last = self.last.saturating_add(1);
+        debug_assert!(self.last < FLOW_ID_LIMIT, "flow ids stay below 2^62");
         FlowId(self.last)
     }
 }
@@ -443,9 +453,14 @@ mod tests {
 
     #[test]
     fn tokens_map_to_flows() {
-        assert_eq!(FlowId(1).token(), (1 << 32) + 1);
-        assert_eq!(FlowId::from_token((1 << 32) + 7), Some(FlowId(7)));
+        assert_eq!(FlowId(1).token(), (1 << 62) + 1);
+        assert_eq!(FlowId::from_token((1 << 62) + 7), Some(FlowId(7)));
         assert_eq!(FlowId::from_token(1), None, "the DNS socket's");
+        assert_eq!(
+            FlowId::from_token(crate::UDP_TOKEN_BASE + 7),
+            None,
+            "a UDP mapping's"
+        );
         assert_eq!(FlowId(u64::MAX).token(), u64::MAX);
     }
 

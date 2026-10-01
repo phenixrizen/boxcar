@@ -7,35 +7,47 @@
 //! # Deciding a tuple
 //!
 //! The first datagram of a 5-tuple (the guest's address and port, the
-//! destination's, UDP) is decided as a TCP SYN is
-//! ([`upstream::decide`](crate::upstream)): one of the host's own addresses
-//! is denied (`builtin:host-local`) unless a rule names it exactly, and
-//! then the policy's [`egress`](crate::Policy::egress) decides, on the
-//! names the DNS cache holds for the destination. A domain rule admits no
-//! UDP: nothing in a datagram shows a name to check, as the TCP relay's
-//! gate checks one, so an allow by a domain rule is a denial,
-//! [`BUILTIN_UDP_NEEDS_CIDR`]. DNS to the gateway never comes here (the
-//! [forwarder](crate::dns) answers it); UDP to the gateway's other ports is
-//! denied as `builtin:guest-net`, as is the rest of the guest's network.
+//! destination's, UDP) is decided as a TCP SYN is, but for domain rules
+//! ([`upstream::decide_udp`]): one of the host's own addresses is denied
+//! (`builtin:host-local`) unless a rule names it exactly, and then the
+//! policy's [`egress_udp`](crate::Policy::egress_udp) decides, on the
+//! names the DNS cache holds for the destination. A domain `allow` admits no UDP:
+//! nothing in a datagram shows a name to check, as the TCP relay's gate
+//! checks one, so it is passed over, and domain denials, network rules and
+//! the default decide. When passing it over leaves the flow denied, the
+//! rule text is `builtin:udp-needs-cidr`. DNS to the gateway never comes
+//! here (the [forwarder](crate::dns) answers it); UDP to the gateway's
+//! other ports is denied as `builtin:guest-net`, as is the rest of the
+//! guest's network.
 //!
 //! # Mappings
 //!
 //! An allowed tuple gets a mapping: a host `UdpSocket` bound to
 //! `0.0.0.0:0`, non-blocking, and connected to the destination, so the
-//! host's kernel hands it only what the destination sends. The guest's
-//! datagrams go to that socket as they come; one it does not take is
-//! dropped (`udp_send`), never queued. What the destination sends back is
-//! read when the socket is ready, until it would block, and each datagram
-//! goes to the guest from the destination's address and port, unless it
-//! is too long for one datagram on the link (over [`MAX_PAYLOAD`] bytes:
-//! `udp_oversize`), as nothing here fragments. The host kernel's port
-//! unreachable for an earlier datagram (`ECONNREFUSED` on the socket) is
-//! read and dropped, and the mapping stays.
+//! host's kernel hands it only what the destination sends (what reached it
+//! in the moment between its bind and its connect is thrown away). The
+//! guest's datagrams go to that socket as they come; one it does not take
+//! is dropped (`udp_send`), never queued. What the destination sends back
+//! is read when the socket is ready, at most [`READS_PER_EVENT`] datagrams
+//! at a time (a socket with more stays ready), and each goes to the guest
+//! from the destination's address and port, unless it is too long for one
+//! datagram on the link (over [`MAX_PAYLOAD`] bytes: `udp_oversize`), as
+//! nothing here fragments, or the guest's queue is full (`queue_full`).
+//! The host kernel's port unreachable for an earlier datagram
+//! (`ECONNREFUSED` on the socket) is read and dropped, and the mapping
+//! stays.
 //!
 //! There are at most [`UdpLimits::mapping_cap`] mappings: a new one evicts
 //! the one idle longest (by its last datagram either way). A mapping no
 //! datagram has used either way for [`UdpLimits::idle_timeout`] is closed
-//! by the next poll.
+//! by the next poll. An evicted mapping's socket stays open until the poll
+//! after the next (see below), so while [`UdpLimits::parked_cap`] of them
+//! wait for the next poll, a new tuple that would evict another is dropped
+//! (`udp_table_full`), undecided as far as the log goes. However many
+//! tuples come between two polls, the relay holds at most `mapping_cap +
+//! 2 × parked_cap` host sockets (open, waiting for a poll, closing at the
+//! next), and at most `2 × (mapping_cap + parked_cap)` when a poll also
+//! closed idle mappings.
 //!
 //! # Records
 //!
@@ -68,21 +80,30 @@ use boxcar_proto::{NetUdp, Payload};
 use smoltcp::wire::{IPV4_HEADER_LEN, UDP_HEADER_LEN};
 
 use crate::audit::{close_record, DropReason};
-use crate::policy::{Policy, Verdict, BUILTIN_UDP_NEEDS_CIDR};
+use crate::policy::{Policy, Verdict};
 use crate::stack::{Ctx, FdChange, Interest, IP_MTU};
-use crate::tcp::{FlowId, MAX_TIMEOUT};
-use crate::upstream::{self, Decision};
+use crate::tcp::{FlowId, FLOW_ID_LIMIT, MAX_TIMEOUT, TCP_TOKEN_BASE};
+use crate::upstream;
 
 /// The [`FdChange`] token of flow 0's host socket, were it a UDP mapping;
 /// mapping `n`'s is this plus `n`. TCP flows' tokens are below it, from
-/// [`FLOW_TOKEN_BASE`](crate::FLOW_TOKEN_BASE). The two stay apart while
-/// flow ids stay below 2^32.
-pub const UDP_TOKEN_BASE: u64 = 2 << 32;
-const _: () = assert!(UDP_TOKEN_BASE > crate::tcp::FLOW_TOKEN_BASE);
+/// [`TCP_TOKEN_BASE`], 2^62 below. The two stay apart because flow ids
+/// stay below 2^62 ([`FLOW_ID_LIMIT`]).
+pub const UDP_TOKEN_BASE: u64 = 2 << 62;
+const _: () = assert!(
+    UDP_TOKEN_BASE - TCP_TOKEN_BASE == FLOW_ID_LIMIT
+        && FLOW_ID_LIMIT == 1 << 62
+        && TCP_TOKEN_BASE > crate::stack::DNS_TOKEN
+        && UDP_TOKEN_BASE.checked_add(FLOW_ID_LIMIT).is_some()
+);
 
 /// The longest payload of a datagram to the guest: one IPv4 packet the
 /// size of the link's MTU, less its headers (1472 bytes).
 pub const MAX_PAYLOAD: usize = IP_MTU - IPV4_HEADER_LEN - UDP_HEADER_LEN;
+
+/// The most datagrams one readiness event of a mapping's socket reads;
+/// a socket with more stays ready, and the net thread comes back to it.
+pub const READS_PER_EVENT: usize = 64;
 
 /// How many refused tuples the relay remembers.
 pub const REFUSALS: usize = 1024;
@@ -99,6 +120,10 @@ pub struct UdpLimits {
     /// How long a mapping may go without a datagram either way before it
     /// is closed.
     pub idle_timeout: Duration,
+    /// Evicted mappings' sockets that may wait for the next poll to close
+    /// them; past it, with the table at its cap, a new tuple's datagram is
+    /// dropped (`udp_table_full`) rather than evict another.
+    pub parked_cap: usize,
 }
 
 impl Default for UdpLimits {
@@ -106,17 +131,21 @@ impl Default for UdpLimits {
         UdpLimits {
             mapping_cap: 1024,
             idle_timeout: Duration::from_secs(60),
+            parked_cap: 256,
         }
     }
 }
 
 impl UdpLimits {
-    /// What is wrong with these bounds, if anything: the cap must be at
+    /// What is wrong with these bounds, if anything: the caps must be at
     /// least one, and the idle timeout more than zero and at most
     /// [`MAX_TIMEOUT`].
     pub fn check(&self) -> Result<(), &'static str> {
         if self.mapping_cap == 0 {
             return Err("udp.mapping_cap must be at least 1");
+        }
+        if self.parked_cap == 0 {
+            return Err("udp.parked_cap must be at least 1");
         }
         if self.idle_timeout.is_zero() || self.idle_timeout > MAX_TIMEOUT {
             return Err("udp.idle_timeout must be more than zero and at most a day");
@@ -220,7 +249,8 @@ impl UdpRelay {
     /// with a mapping sends it on; a tuple refused lately drops it; a new
     /// tuple is decided on the current policy and `names` (the names the
     /// guest knows `dst` by, asked for only then), recorded, and given a
-    /// mapping if allowed.
+    /// mapping if allowed, unless the table is full and the most evicted
+    /// sockets already wait to close (`udp_table_full`, not recorded).
     pub(crate) fn datagram(
         &mut self,
         cx: &mut Ctx,
@@ -237,13 +267,14 @@ impl UdpRelay {
             return cx.drop_frame(reason);
         }
         let names = names();
-        let (verdict, rule) = udp_verdict(upstream::decide(
-            cx.host_addrs,
-            &cx.policy,
-            dst,
-            &names,
-            cx.now,
-        ));
+        let (verdict, rule) = upstream::decide_udp(cx.host_addrs, &cx.policy, dst, &names, cx.now);
+        if verdict == Verdict::Allow
+            && self.mappings.len() >= self.limits.mapping_cap
+            && self.graveyard.len() >= self.limits.parked_cap
+        {
+            // Not decided as far as the log goes: the next datagram is.
+            return cx.drop_frame(DropReason::UdpTableFull);
+        }
         let id = cx.ids.next();
         cx.record(Payload::NetUdp(NetUdp {
             flow: id.0,
@@ -304,7 +335,7 @@ impl UdpRelay {
             return;
         }
         let mut heard = false;
-        loop {
+        for _ in 0..READS_PER_EVENT {
             let n = match mapping.socket.recv(&mut self.scratch) {
                 Ok(n) => n,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
@@ -402,23 +433,35 @@ impl UdpRelay {
     }
 }
 
-/// The verdict on a UDP tuple, and its rule text, from the decision a TCP
-/// SYN would get: an allow by a domain rule is a denial, as no name can be
-/// checked on a datagram.
-fn udp_verdict(decision: Decision) -> (Verdict, Option<String>) {
-    if decision.verdict == Verdict::Allow && decision.by_domain {
-        (Verdict::Deny, Some(BUILTIN_UDP_NEEDS_CIDR.to_owned()))
-    } else {
-        (decision.verdict, decision.rule)
-    }
-}
-
-/// A non-blocking host socket on an ephemeral port, connected to `dst`.
+/// A non-blocking host socket on an ephemeral port, connected to `dst`
+/// and holding nothing from anyone else.
 fn open(dst: SocketAddrV4) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_nonblocking(true)?;
+    connect_only_to(socket, dst)
+}
+
+/// The most datagrams [`connect_only_to`] throws away before it gives up
+/// on a socket.
+const STALE_LIMIT: usize = 1024;
+
+/// Connects the non-blocking `socket` to `dst`, then throws away whatever
+/// is queued on it. From the connect on, the kernel hands the socket only
+/// what `dst` sends; what reached it while it was bound and not yet
+/// connected (anyone's) stays queued, and would read as a reply from
+/// `dst`. Nothing has been sent from it yet, so nothing queued is one.
+fn connect_only_to(socket: UdpSocket, dst: SocketAddrV4) -> io::Result<UdpSocket> {
     socket.connect(dst)?;
-    Ok(socket)
+    let mut sink = [0; 1];
+    for _ in 0..STALE_LIMIT {
+        match socket.recv(&mut sink) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(socket),
+            Err(error) if is_icmp_error(&error) || error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("flooded before its first datagram"))
 }
 
 /// Sends one datagram. An ICMP error the host had for an earlier datagram
@@ -454,7 +497,10 @@ fn token(id: FlowId) -> u64 {
 
 /// The mapping a host socket's token is for, if it is a mapping's.
 fn from_token(token: u64) -> Option<FlowId> {
-    token.checked_sub(UDP_TOKEN_BASE).map(FlowId)
+    token
+        .checked_sub(UDP_TOKEN_BASE)
+        .filter(|id| *id < FLOW_ID_LIMIT)
+        .map(FlowId)
 }
 
 fn count(n: usize) -> u64 {
@@ -563,11 +609,14 @@ mod tests {
         let limits = UdpLimits::default();
         assert_eq!(limits.mapping_cap, 1024);
         assert_eq!(limits.idle_timeout, Duration::from_secs(60));
+        assert_eq!(limits.parked_cap, 256);
+        assert_eq!(READS_PER_EVENT, 64);
         assert_eq!(limits.check(), Ok(()));
         assert_eq!(MAX_PAYLOAD, 1472);
         assert_eq!(REFUSALS, 1024);
         assert_eq!(REFUSAL_MEMORY, Duration::from_secs(60));
-        assert_eq!(UDP_TOKEN_BASE, 2 << 32);
+        assert_eq!(UDP_TOKEN_BASE, 2 << 62);
+        assert_eq!(TCP_TOKEN_BASE, 1 << 62);
         for broken in [
             UdpLimits {
                 mapping_cap: 0,
@@ -575,6 +624,10 @@ mod tests {
             },
             UdpLimits {
                 idle_timeout: Duration::ZERO,
+                ..UdpLimits::default()
+            },
+            UdpLimits {
+                parked_cap: 0,
                 ..UdpLimits::default()
             },
             UdpLimits {
@@ -590,34 +643,52 @@ mod tests {
     fn tokens_name_their_mapping() {
         assert_eq!(token(FlowId(7)), UDP_TOKEN_BASE + 7);
         assert_eq!(from_token(UDP_TOKEN_BASE + 7), Some(FlowId(7)));
-        assert_eq!(from_token(crate::FLOW_TOKEN_BASE + 7), None);
+        assert_eq!(from_token(TCP_TOKEN_BASE + 7), None);
+        // The last id there can be: the spaces do not meet, and nothing
+        // saturates.
+        let last = FlowId(FLOW_ID_LIMIT - 1);
+        assert!(last.token() < UDP_TOKEN_BASE);
+        assert_eq!(from_token(last.token()), None);
+        assert_eq!(FlowId::from_token(last.token()), Some(last));
+        assert_eq!(token(last), UDP_TOKEN_BASE + (FLOW_ID_LIMIT - 1));
+        assert!(token(last) < u64::MAX);
+        assert_eq!(FlowId::from_token(token(FlowId(7))), None);
         assert_eq!(from_token(crate::DNS_TOKEN), None);
     }
 
+    /// What reached a socket between its bind and its connect is thrown
+    /// away; what the destination sends after comes through.
     #[test]
-    fn a_domain_rules_allow_is_a_denial() {
-        let decision = |verdict, rule: Option<&str>, by_domain| Decision {
-            verdict,
-            rule: rule.map(str::to_owned),
-            by_domain,
+    fn what_reached_a_socket_before_its_connect_is_thrown_away() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let at = socket.local_addr().unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        stranger.send_to(b"forged", at).unwrap();
+        stranger.send_to(b"forged too", at).unwrap();
+        // Both are queued before the connect.
+        let mut byte = [0; 1];
+        let start = Instant::now();
+        while socket.peek(&mut byte).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(5), "nothing queued");
+        }
+        let dst = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(dst_at) = dst.local_addr().unwrap() else {
+            panic!("not IPv4");
         };
-        assert_eq!(
-            udp_verdict(decision(Verdict::Allow, Some("allow example.com"), true)),
-            (Verdict::Deny, Some(BUILTIN_UDP_NEEDS_CIDR.to_owned()))
+        let socket = connect_only_to(socket, dst_at).unwrap();
+        let mut buf = [0; 16];
+        assert!(
+            matches!(socket.recv(&mut buf), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "the stranger's datagrams are gone"
         );
-        assert_eq!(
-            udp_verdict(decision(Verdict::Allow, Some("allow 192.0.2.0/24"), false)),
-            (Verdict::Allow, Some("allow 192.0.2.0/24".to_owned()))
-        );
-        assert_eq!(
-            udp_verdict(decision(Verdict::Allow, None, false)),
-            (Verdict::Allow, None),
-            "the default"
-        );
-        assert_eq!(
-            udp_verdict(decision(Verdict::Deny, Some("deny example.com"), false)),
-            (Verdict::Deny, Some("deny example.com".to_owned()))
-        );
+        dst.send_to(b"reply", at).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket.set_nonblocking(false).unwrap();
+        let n = socket.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"reply");
     }
 
     #[test]
