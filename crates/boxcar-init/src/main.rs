@@ -16,26 +16,46 @@
 //!   session command (`boxcar.cmd`, or a login shell) in the foreground of
 //!   it as `boxcar.uid` and `boxcar.gid`, reaps until no child is left,
 //!   reports how the session ended and reboots.
+//! - `vsock` runs the session the VMM configures over the guest control
+//!   channel: the same mounts and settings as `console`, then it connects
+//!   the control channel (vsock port 1024, from port 1023) and says
+//!   `hello`, takes the session's config (command, user, environment,
+//!   working directory, hostname, terminal size, extra settings), connects
+//!   the terminal stream (port 1025, from port 1022), and runs the session
+//!   on a PTY of its own whose master it relays to the stream, serving the
+//!   host's requests meanwhile ([`ctl::supervise`]). When the session has
+//!   ended it drains the PTY, reports the end over the channel, sweeps the
+//!   processes left, waits for the host to take both, writes how the
+//!   session ended on the console and reboots. The serial console carries
+//!   only init's and the kernel's lines; `/dev/ttyS0` stays nobody's
+//!   terminal.
 //!
 //! Every fatal step reports `boxcar-init: <step>: <error>` on the console
 //! and reboots; PID 1 never exits on its own.
 
 mod cmdline;
 mod console;
+mod ctl;
 mod mounts;
+mod pty;
 mod reaper;
 mod resolver;
 mod search;
 mod session;
 mod shutdown;
 mod sysctl;
+mod vsock;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::panic;
 
+use std::ffi::CString;
+use std::time::Instant;
+
+use boxcar_proto::guest::GuestMsg;
 use console::{die, warn, write_console, write_to, Failed, StackLine, Step};
-use nix::unistd::sethostname;
+use nix::unistd::{sethostname, Gid, Uid};
 use reaper::{Ended, Reaper};
 use session::{Exec, Session, Terminal};
 use shutdown::reboot_now;
@@ -58,6 +78,7 @@ fn main() {
     match args.get("mode").map(String::as_str) {
         Some("hello") => hello(),
         Some("console") => console(&args),
+        Some("vsock") => vsock_mode(&args),
         Some(mode) => die(&format!("unknown mode {mode:?}")),
         None => die("unknown mode (boxcar.mode is not set)"),
     }
@@ -106,6 +127,105 @@ fn run_session(args: &BTreeMap<String, String>) -> Result<Ended, Failed> {
     let reaper = Reaper::new()?;
     let pid = session::spawn(&session, &exec, &terminal, join_cgroup)?;
     reaper.wait(pid, &terminal)
+}
+
+/// `vsock` mode: the session the VMM configures, then how it ended on the
+/// console and a reboot. Without a config from the host there is no
+/// session: a console line, and the reboot.
+fn vsock_mode(args: &BTreeMap<String, String>) -> ! {
+    match run_vsock_session(args) {
+        Ok(ended) => shutdown::finish(ended),
+        Err(VsockFailure::NoConfig(failed)) => {
+            let _ = write_console(format!("boxcar-init: ctl: {failed}\n").as_bytes());
+            shutdown::finish(Ended::Exited(1))
+        }
+        Err(VsockFailure::Failed(failed)) => die(&failed.to_string()),
+    }
+}
+
+/// Why `vsock` mode stopped before the session ended.
+enum VsockFailure {
+    /// The host sent no config.
+    NoConfig(Failed),
+    /// A step failed.
+    Failed(Failed),
+}
+
+impl From<Failed> for VsockFailure {
+    fn from(failed: Failed) -> Self {
+        VsockFailure::Failed(failed)
+    }
+}
+
+/// The steps of `vsock` mode after the early mounts, up to the session's
+/// end, its report and the sweep.
+fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Ended, VsockFailure> {
+    mounts::mount_shares()?;
+    let mounted = mounts::mount_api()?;
+    mounts::switch_root()?;
+    if cmdline::net_enabled(args) {
+        // The session can run without it: a warning, not a reboot.
+        if let Err(failed) = resolver::set_up() {
+            warn(&format!("resolver: {failed}"));
+        }
+    }
+    sysctl::apply();
+    let join_cgroup = session::create_cgroups(mounted.cgroup2)?;
+
+    let mut ctl = ctl::Ctl::connect()?;
+    let config = ctl
+        .receive_config(Instant::now() + ctl::CONFIG_DEADLINE)
+        .map_err(VsockFailure::NoConfig)?;
+    ctl::check_config(&config)?;
+    sethostname(&config.hostname).step(&format!("sethostname {}", config.hostname))?;
+    sysctl::apply_config(&config.sysctls);
+
+    // Everything the child needs, before the fork.
+    let env = pty::session_env(&config);
+    let path = pty::search_path(&env).to_owned();
+    let exec = Exec::with_env(&config.argv, env, &path)?;
+    let cwd = CString::new(config.cwd.as_str()).step("config cwd")?;
+    let user = Session {
+        uid: Uid::from_raw(config.uid),
+        gid: Gid::from_raw(config.gid),
+        argv: config.argv.clone(),
+    };
+
+    // The session runs without its terminal reaching the host when the
+    // host does not take it: its output is dropped.
+    let stream = match vsock::connect(vsock::PTY_SOURCE_PORT, vsock::PTY_PORT) {
+        Ok(stream) => {
+            let header = pty::header_line(config.rows, config.cols);
+            match nix::unistd::write(&stream, &header) {
+                Ok(n) if n == header.len() => Some(stream),
+                Ok(_) => {
+                    warn("pty: the header line went out short; no terminal for the host");
+                    None
+                }
+                Err(errno) => {
+                    warn(&format!("pty: header: {errno}; no terminal for the host"));
+                    None
+                }
+            }
+        }
+        Err(failed) => {
+            warn(&format!("pty: {failed}; no terminal for the host"));
+            None
+        }
+    };
+    let terminal = pty::open(config.rows, config.cols, config.uid)?;
+    let reaper = Reaper::new()?;
+    let pid = pty::spawn(&user, &exec, &cwd, &terminal, join_cgroup)?;
+    let pty::Pty { master, slave } = terminal;
+    // Only the session holds the slave now: once it and what it started
+    // are gone, the master reads EIO.
+    drop(slave);
+    ctl.report(&GuestMsg::SessionStarted {
+        pid: u32::try_from(pid.as_raw()).unwrap_or(0),
+    });
+    let mut relay = pty::Relay::new(master, stream);
+    let how = ctl::supervise(&mut ctl, &mut relay, &reaper, pid)?;
+    Ok(ctl::finish(&mut ctl, &mut relay, &reaper, pid, how)?)
 }
 
 /// Sends a panic to `/dev/kmsg` and `/dev/console`, then aborts.

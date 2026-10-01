@@ -5,7 +5,15 @@
 //! ... -- CMD` on KVM with the guest kernel, the initramfs and the Alpine
 //! rootfs, the console in a file, a fresh audit directory and a fresh
 //! workspace, and the tests read what it leaves behind: its exit code, the
-//! console, the workspace and the session's audit log.
+//! console, its stdout, the workspace and the session's audit log.
+//!
+//! `boxcar run` with shares now has the vsock device, and runs the session
+//! in vsock mode: the session's terminal goes to stdout, the serial console
+//! to `--console-log`, and the run exits with the session's code. The
+//! tests about M1's console session itself (the exit code shown on the
+//! console with the run exiting 0, init's exec failure on the console, the
+//! serial console's last line) run with `--no-vsock`, which keeps it; each
+//! has a vsock counterpart.
 //!
 //! Skips with a printed reason unless `BOXCAR_TEST_KERNEL`,
 //! `BOXCAR_TEST_INITRAMFS` and `BOXCAR_TEST_ROOTFS` are set and `/dev/kvm`
@@ -99,6 +107,8 @@ struct Run {
     status: ExitStatus,
     elapsed: Duration,
     console: String,
+    /// The session's terminal, in vsock mode.
+    stdout: String,
     stderr: String,
 }
 
@@ -121,26 +131,34 @@ impl Run {
             .collect()
     }
 
-    /// Both outputs, for a failed assertion.
+    /// Every output, for a failed assertion.
     fn describe(&self) -> String {
         format!(
-            "{}; after {:?}\nstderr:\n{}\nconsole:\n{}",
-            self.status, self.elapsed, self.stderr, self.console
+            "{}; after {:?}\nstderr:\n{}\nstdout:\n{}\nconsole:\n{}",
+            self.status, self.elapsed, self.stderr, self.stdout, self.console
         )
     }
 }
 
 /// `boxcar run ... -- <command>` in `scratch`, with stdin at /dev/null, the
-/// console in `console.log`, the audit log under `audit/` and `workspace/`
-/// as the workspace. A run past [`LIMIT`] is killed and fails the test.
+/// console in `console.log`, stdout in `stdout.log`, the audit log under
+/// `audit/` and `workspace/` as the workspace. A run past [`LIMIT`] is
+/// killed and fails the test.
 fn boxcar_run(guest: &Guest, scratch: &Scratch, command: &[&str]) -> Run {
-    boxcar_run_with(guest, scratch, command, &[])
+    boxcar_run_with(guest, scratch, &[], command, &[])
 }
 
-/// [`boxcar_run`] with the variables `env` set for boxcar.
+/// [`boxcar_run`] in M1's console mode: `--no-vsock`.
+fn boxcar_run_console(guest: &Guest, scratch: &Scratch, command: &[&str]) -> Run {
+    boxcar_run_with(guest, scratch, &["--no-vsock"], command, &[])
+}
+
+/// [`boxcar_run`] with the flags `flags` before the `--`, and the
+/// variables `env` set for boxcar.
 fn boxcar_run_with(
     guest: &Guest,
     scratch: &Scratch,
+    flags: &[&str],
     command: &[&str],
     env: &[(&str, String)],
 ) -> Run {
@@ -161,6 +179,7 @@ fn boxcar_run_with(
         .arg(scratch.path("audit"))
         .arg("--console-log")
         .arg(&console)
+        .args(flags)
         .arg("--")
         .args(command)
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -187,6 +206,7 @@ fn boxcar_run_with(
         status,
         elapsed: start.elapsed(),
         console: read_lossy(&console),
+        stdout: read_lossy(&scratch.path("stdout.log")),
         stderr: read_lossy(&stderr),
     }
 }
@@ -255,15 +275,16 @@ fn a_command_writes_a_file_the_audit_log_hashes() {
     assert!(subject.pid > 1, "{subject:?}");
 }
 
-/// (b) M1 does not pass the command's exit code on: boxcar exits 0, and
-/// the console says how the session ended.
+/// (b) M1's console session does not pass the command's exit code on:
+/// boxcar exits 0, and the console says how the session ended
+/// (`--no-vsock`).
 #[test]
 fn the_exit_code_shows_on_the_console_and_boxcar_exits_0() {
     let Some(guest) = guest_or_skip("kvm_m1 exit") else {
         return;
     };
     let scratch = Scratch::new();
-    let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "exit 7"]);
+    let run = boxcar_run_console(&guest, &scratch, &["/bin/sh", "-c", "exit 7"]);
     eprintln!("kvm_m1 exit: {} after {:?}", run.status, run.elapsed);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     assert!(
@@ -272,6 +293,28 @@ fn the_exit_code_shows_on_the_console_and_boxcar_exits_0() {
         run.describe()
     );
     run.records();
+}
+
+/// With the vsock device the session's exit code is the run's, and its
+/// output is on stdout, not on the console.
+#[test]
+fn the_sessions_exit_code_is_the_runs() {
+    let Some(guest) = guest_or_skip("kvm_m1 vsock exit") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo hi; exit 7"]);
+    eprintln!("kvm_m1 vsock exit: {} after {:?}", run.status, run.elapsed);
+    assert_eq!(run.status.code(), Some(7), "{}", run.describe());
+    assert_eq!(run.stdout.trim_end(), "hi", "{}", run.describe());
+    assert!(!run.console.contains("hi\r"), "{}", run.describe());
+    let records = run.records();
+    let exit: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.kind == "session.exit")
+        .collect();
+    assert_eq!(exit.len(), 1, "{exit:?}");
+    assert_eq!(exit[0].data["code"], 7, "{exit:?}");
 }
 
 /// (c) Reading a file of the root share is recorded, whatever the answer,
@@ -284,7 +327,12 @@ fn reading_etc_shadow_is_recorded_with_its_guest_pid() {
     let scratch = Scratch::new();
     let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "cat /etc/shadow"]);
     eprintln!("kvm_m1 shadow: {} after {:?}", run.status, run.elapsed);
-    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    // The run exits with cat's code: 1 when the session may not read it.
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "{}",
+        run.describe()
+    );
 
     let records = run.records();
     let opens = about(&records, "fs.open", "root", "/etc/shadow");
@@ -307,7 +355,7 @@ fn a_command_is_found_through_path() {
     let run = boxcar_run(&guest, &scratch, &["ls", "/workspace"]);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     assert!(
-        run.console.contains("from-the-host.txt"),
+        run.stdout.contains("from-the-host.txt"),
         "{}",
         run.describe()
     );
@@ -318,15 +366,17 @@ fn a_command_is_found_through_path() {
     );
 }
 
-/// A command found nowhere: the console says so, and the session exits
-/// 127 as a shell's would.
+/// A command found nowhere: init says so, and the session exits 127 as a
+/// shell's would. On M1's console (`--no-vsock`) both show on the console
+/// and the run exits 0; in vsock mode the failure is on the session's
+/// terminal (stdout) and the run exits 127.
 #[test]
 fn a_missing_command_exits_127() {
     let Some(guest) = guest_or_skip("kvm_m1 missing") else {
         return;
     };
     let scratch = Scratch::new();
-    let run = boxcar_run(&guest, &scratch, &["boxcar-no-such-command", "arg"]);
+    let run = boxcar_run_console(&guest, &scratch, &["boxcar-no-such-command", "arg"]);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     for line in [
         "boxcar-init: exec: boxcar-no-such-command: ENOENT",
@@ -334,10 +384,26 @@ fn a_missing_command_exits_127() {
     ] {
         assert!(run.console.contains(line), "{line}: {}", run.describe());
     }
+
+    let scratch = Scratch::new();
+    let run = boxcar_run(&guest, &scratch, &["boxcar-no-such-command", "arg"]);
+    assert_eq!(run.status.code(), Some(127), "{}", run.describe());
+    assert!(
+        run.stdout
+            .contains("boxcar-init: exec: boxcar-no-such-command: ENOENT"),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        run.console.contains("boxcar: session exited 127"),
+        "{}",
+        run.describe()
+    );
 }
 
 /// The command's last line reaches the console every time: the session's
-/// exit must not hang up the terminal before the serial port has sent it.
+/// exit must not hang up the terminal before the serial port has sent it
+/// (M1's console session, `--no-vsock`).
 #[test]
 fn the_last_line_of_a_command_is_never_lost() {
     let Some(guest) = guest_or_skip("kvm_m1 mark") else {
@@ -346,7 +412,7 @@ fn the_last_line_of_a_command_is_never_lost() {
     let mut lost = Vec::new();
     for run_no in 1..=MARK_RUNS {
         let scratch = Scratch::new();
-        let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
+        let run = boxcar_run_console(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
         assert_eq!(run.status.code(), Some(0), "{}", run.describe());
         if !run.console.contains("MARK_END") {
             eprintln!("kvm_m1 mark: run {run_no} lost it:\n{}", run.console);
@@ -356,6 +422,34 @@ fn the_last_line_of_a_command_is_never_lost() {
     eprintln!(
         "kvm_m1 mark: MARK_END in {} of {MARK_RUNS} runs",
         MARK_RUNS - lost.len()
+    );
+    assert!(lost.is_empty(), "lost in runs {lost:?}");
+}
+
+/// How many times the relay's last-line test runs its command.
+const RELAY_MARK_RUNS: usize = 20;
+
+/// The same in vsock mode: init drains the session's PTY to the terminal
+/// stream and waits for the relay to have written it out before it
+/// reboots, so the last line is on stdout every time.
+#[test]
+fn the_last_line_reaches_stdout_through_the_relay() {
+    let Some(guest) = guest_or_skip("kvm_m1 relay mark") else {
+        return;
+    };
+    let mut lost = Vec::new();
+    for run_no in 1..=RELAY_MARK_RUNS {
+        let scratch = Scratch::new();
+        let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
+        assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+        if run.stdout != "MARK_END\r\n" {
+            eprintln!("kvm_m1 relay mark: run {run_no} got {:?}", run.stdout);
+            lost.push(run_no);
+        }
+    }
+    eprintln!(
+        "kvm_m1 relay mark: MARK_END in {} of {RELAY_MARK_RUNS} runs",
+        RELAY_MARK_RUNS - lost.len()
     );
     assert!(lost.is_empty(), "lost in runs {lost:?}");
 }
@@ -391,7 +485,7 @@ fn an_audit_log_failure_stops_the_vm_and_exits_3() {
     let scratch = Scratch::new();
     let clean = boxcar_run(&guest, &scratch, &WRITE_LOOP);
     assert_eq!(clean.status.code(), Some(0), "{}", clean.describe());
-    assert!(clean.console.contains("AFTER"), "{}", clean.describe());
+    assert!(clean.stdout.contains("AFTER"), "{}", clean.describe());
     assert_eq!(workspace_files(&scratch), 200);
     let boot = clean
         .records()
@@ -403,13 +497,13 @@ fn an_audit_log_failure_stops_the_vm_and_exits_3() {
     let ok_syncs = boot + 20;
     let scratch = Scratch::new();
     let env = [("BOXCAR_TEST_FAIL_AUDIT_AFTER", ok_syncs.to_string())];
-    let run = boxcar_run_with(&guest, &scratch, &WRITE_LOOP, &env);
+    let run = boxcar_run_with(&guest, &scratch, &[], &WRITE_LOOP, &env);
     eprintln!(
         "kvm_m1 audit failure: {} after {:?}; the boot makes {boot} records",
         run.status, run.elapsed
     );
     assert_eq!(run.status.code(), Some(3), "{}", run.describe());
-    assert!(!run.console.contains("AFTER"), "{}", run.describe());
+    assert!(!run.stdout.contains("AFTER"), "{}", run.describe());
 
     // Every record is followed by its checkpoint, so sync n + 1 is the one
     // after record n + 1, the checkpoint at seq 2n + 2.

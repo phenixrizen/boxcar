@@ -12,7 +12,7 @@
 //! [`KILL_WAIT`] with `boxcar-init: reaper: stragglers remain, rebooting` on
 //! the console.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
@@ -67,14 +67,60 @@ impl Reaper {
     /// init takes the foreground of `terminal` back, before it writes a
     /// line of its own.
     pub fn wait(&self, session: Pid, terminal: &Terminal) -> Result<Ended, Failed> {
-        let mut ended = None;
+        self.wait_from(session, None, || terminal.take_foreground())
+    }
+
+    /// The sweep after a session init saw end (`ended`) in its own loop
+    /// (`vsock` mode): the processes it left behind get `SIGTERM`, then
+    /// `SIGKILL`, as in [`Reaper::wait`], until none is left or init gives
+    /// up on them.
+    pub fn sweep(&self, session: Pid, ended: Ended) -> Result<Ended, Failed> {
+        self.wait_from(session, Some(ended), || {})
+    }
+
+    /// The signalfd, for a poll loop of init's own; [`Reaper::drain`] it
+    /// when it is readable, then [`Reaper::reap`].
+    pub fn fd(&self) -> RawFd {
+        self.signals.as_raw_fd()
+    }
+
+    /// Empties the signalfd: SIGCHLDs coalesce, so their count means
+    /// nothing, and the next reap takes every child that ended.
+    pub fn drain(&self) -> Result<(), Failed> {
+        loop {
+            match self.signals.read_signal() {
+                Ok(Some(_)) | Err(Errno::EINTR) => {}
+                Ok(None) => return Ok(()),
+                Err(errno) => return Err(Failed::new("read signalfd", errno)),
+            }
+        }
+    }
+
+    /// Reaps every child that has ended, and records in `ended` how
+    /// `session` ended when it is among them.
+    pub fn reap(&self, session: Pid, ended: &mut Option<Ended>) -> Result<(), Failed> {
+        reap_ready(session, ended, wait_any).step("waitpid")?;
+        Ok(())
+    }
+
+    /// [`Reaper::wait`] from `ended`, with `on_end` run once, as soon as the
+    /// session is seen ended.
+    fn wait_from(
+        &self,
+        session: Pid,
+        mut ended: Option<Ended>,
+        on_end: impl FnOnce(),
+    ) -> Result<Ended, Failed> {
+        let mut on_end = Some(on_end);
         let mut phase = Phase::Session;
         loop {
             let left = reap_ready(session, &mut ended, wait_any).step("waitpid")?;
             // The phase moves on from Session at the first reap that saw
             // the session end, so this runs once.
             if ended.is_some() && phase == Phase::Session {
-                terminal.take_foreground();
+                if let Some(on_end) = on_end.take() {
+                    on_end();
+                }
             }
             if left == Left::None {
                 return ended.ok_or_else(|| {
@@ -98,15 +144,7 @@ impl Reaper {
                 Ok(_) | Err(Errno::EINTR) => {}
                 Err(errno) => return Err(Failed::new("poll", errno)),
             }
-            // SIGCHLDs coalesce, so their count means nothing: empty the
-            // signalfd and let the next reap take every child that ended.
-            loop {
-                match self.signals.read_signal() {
-                    Ok(Some(_)) | Err(Errno::EINTR) => {}
-                    Ok(None) => break,
-                    Err(errno) => return Err(Failed::new("read signalfd", errno)),
-                }
-            }
+            self.drain()?;
         }
     }
 }

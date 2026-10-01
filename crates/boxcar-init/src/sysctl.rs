@@ -41,6 +41,40 @@ fn apply_under(base: &Path, mut report: impl FnMut(&str)) {
     }
 }
 
+/// Writes the settings a session's config asks for, `[name, value]` with
+/// dotted names, after [`SYSCTLS`]. Best effort, as [`apply`]: a name that
+/// is not one ([`config_path`]), a missing file or a refused value gets a
+/// warning.
+pub fn apply_config(settings: &[(String, String)]) {
+    for (name, value) in settings {
+        let Some(path) = config_path(name) else {
+            warn(&format!("sysctl {name:?}: not a setting's name"));
+            continue;
+        };
+        if let Err(e) = write(&Path::new(PROC_SYS).join(&path), value) {
+            warn(&format!("sysctl {name}={value}: {e}"));
+        }
+    }
+}
+
+/// The path under `/proc/sys` of the dotted setting `name`: its parts,
+/// each letters, digits, `_` or `-`, joined by `/`. `None` for anything
+/// else, which could name a file outside `/proc/sys` or none.
+pub fn config_path(name: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in name.split('.') {
+        let ok = !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !ok {
+            return None;
+        }
+        parts.push(part);
+    }
+    Some(parts.join("/"))
+}
+
 /// Writes `value` to the existing file `path`.
 fn write(path: &Path, value: &str) -> io::Result<()> {
     OpenOptions::new()
@@ -104,5 +138,24 @@ mod tests {
         // Missing files are not created.
         assert!(!base.join("kernel/dmesg_restrict").exists());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A dotted name from the config is a path under `/proc/sys`; one
+    /// that could leave it, or names nothing, is refused.
+    #[test]
+    fn a_config_sysctl_names_a_file_under_proc_sys() {
+        assert_eq!(
+            config_path("vm.overcommit_memory").as_deref(),
+            Some("vm/overcommit_memory")
+        );
+        assert_eq!(
+            config_path("net.ipv4.ip_forward").as_deref(),
+            Some("net/ipv4/ip_forward")
+        );
+        for bad in [
+            "", ".", "vm.", ".vm", "vm..x", "../etc", "vm/x", "a b", "vm.\0",
+        ] {
+            assert_eq!(config_path(bad), None, "{bad:?}");
+        }
     }
 }

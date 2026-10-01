@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! The session: the command init runs on the serial console, as the host
-//! user, in a process group of its own in the foreground of `/dev/ttyS0`.
+//! The session: the command init runs as the host user. In `console` mode
+//! (M1's) it runs on the serial console, in a process group of its own in
+//! the foreground of `/dev/ttyS0`; in `vsock` mode on a PTY of its own
+//! ([`crate::pty`]), as the leader of a session whose controlling terminal
+//! is the PTY's slave. Either way the child drops to the session's user the
+//! same way ([`spawn_child`]).
 //!
 //! The terminal belongs to init ([`Terminal`]): PID 1 is the leader of the
 //! session `/dev/ttyS0` is the controlling terminal of, and the session
@@ -110,10 +114,14 @@ fn id(args: &BTreeMap<String, String>, key: &str) -> Result<u32, Failed> {
 
 /// The session's command, ready for `execve` without allocating: the
 /// argument strings, the files it may be and the NULL-terminated pointer
-/// arrays of the arguments and of [`ENV`] are all built before the fork.
+/// arrays of the arguments and of the environment ([`ENV`], or the
+/// config's) are all built before the fork.
 pub struct Exec {
     argv: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
+    /// The environment's strings when they are not [`ENV`]'s, kept for
+    /// `env_ptrs`.
+    _env: Vec<CString>,
     env_ptrs: Vec<*const libc::c_char>,
     /// Where the program may be, in the order they are tried
     /// ([`search::candidates`] of the first argument on the session's
@@ -131,6 +139,17 @@ impl Exec {
 
     /// [`Exec::new`] with the program looked for on `path`.
     fn new_in(argv: &[String], path: &str) -> Result<Exec, Failed> {
+        Exec::build(argv, Vec::new(), path)
+    }
+
+    /// `argv` with the environment `env`, its program looked for on
+    /// `path`: for a session the control channel configured.
+    pub fn with_env(argv: &[String], env: Vec<CString>, path: &str) -> Result<Exec, Failed> {
+        Exec::build(argv, env, path)
+    }
+
+    /// `argv`, with `env` or, when it is empty, [`ENV`].
+    fn build(argv: &[String], env: Vec<CString>, path: &str) -> Result<Exec, Failed> {
         if argv.is_empty() {
             return Err(Failed::new("session command", "empty"));
         }
@@ -145,9 +164,15 @@ impl Exec {
             .map(CString::new)
             .collect::<Result<Vec<_>, _>>()
             .step("session command")?;
+        let env_ptrs = if env.is_empty() {
+            pointers(ENV.into_iter())
+        } else {
+            pointers(env.iter().map(CString::as_c_str))
+        };
         Ok(Exec {
             argv_ptrs: pointers(argv.iter().map(CString::as_c_str)),
-            env_ptrs: pointers(ENV.into_iter()),
+            _env: env,
+            env_ptrs,
             candidates,
             argv,
         })
@@ -272,6 +297,31 @@ impl Terminal {
     }
 }
 
+/// How the session child gets its terminal.
+#[derive(Clone, Copy)]
+pub enum ChildTty<'a> {
+    /// `console` mode: init's `/dev/ttyS0`, with the child a process group
+    /// of its own in its foreground.
+    Console(BorrowedFd<'a>),
+    /// `vsock` mode: a PTY, whose slave becomes the controlling terminal of
+    /// a session the child leads; the child closes the master.
+    Pty {
+        slave: BorrowedFd<'a>,
+        master: BorrowedFd<'a>,
+    },
+}
+
+/// Everything the child needs, prepared before the fork.
+pub struct ChildPlan<'a> {
+    pub session: &'a Session,
+    pub exec: &'a Exec,
+    pub tty: ChildTty<'a>,
+    /// Where the session starts, and the step that names a failure there.
+    pub cwd: &'a CStr,
+    pub cwd_step: &'static str,
+    pub join_cgroup: bool,
+}
+
 /// Step 6: creates [`CGROUPS`]. Returns whether the session can join its
 /// cgroup: without `cgroup2` mounted there is none, which gets a warning.
 pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
@@ -285,15 +335,29 @@ pub fn create_cgroups(cgroup2: bool) -> Result<bool, Failed> {
     Ok(true)
 }
 
-/// Step 7: forks the session child and returns its pid. The child sets
-/// itself up ([`setup`]) and execs the command; if it cannot, it says why
-/// on the console ([`failure_line`]) and exits with [`SPAWN_FAILED`].
+/// Step 7: forks the session child on the serial console and returns its
+/// pid; see [`spawn_child`].
 pub fn spawn(
     session: &Session,
     exec: &Exec,
     terminal: &Terminal,
     join_cgroup: bool,
 ) -> Result<Pid, Failed> {
+    spawn_child(&ChildPlan {
+        session,
+        exec,
+        tty: ChildTty::Console(terminal.as_fd()),
+        cwd: WORKDIR,
+        cwd_step: "chdir /workspace",
+        join_cgroup,
+    })
+}
+
+/// Forks the session child of `plan` and returns its pid. The child sets
+/// itself up ([`setup`]) and execs the command; if it cannot, it says why
+/// ([`failure_line`]) on the console, or on its terminal once that is its
+/// stderr, and exits with [`SPAWN_FAILED`].
+pub fn spawn_child(plan: &ChildPlan<'_>) -> Result<Pid, Failed> {
     let signals = CleanSignals {
         unblocked: SigSet::empty(),
         sigrtmax: libc::SIGRTMAX(),
@@ -303,7 +367,7 @@ pub fn spawn(
     // system calls on memory prepared before the fork, then execs or exits.
     match unsafe { fork() }.step("fork")? {
         ForkResult::Parent { child } => Ok(child),
-        ForkResult::Child => child(session, exec, terminal.as_fd(), join_cgroup, &signals),
+        ForkResult::Child => child(plan, &signals),
     }
 }
 
@@ -331,22 +395,16 @@ struct ChildFailure {
 }
 
 /// The session child, from `fork` to `execve`. Never returns.
-fn child(
-    session: &Session,
-    exec: &Exec,
-    tty: BorrowedFd<'_>,
-    join_cgroup: bool,
-    signals: &CleanSignals,
-) -> ! {
-    let failure = match setup(session, tty, join_cgroup, signals) {
+fn child(plan: &ChildPlan<'_>, signals: &CleanSignals) -> ! {
+    let failure = match setup(plan, signals) {
         Ok(()) => ChildFailure {
             step: EXEC_STEP,
-            errno: exec.exec(),
+            errno: plan.exec.exec(),
             on_tty: true,
         },
         Err(failure) => failure,
     };
-    let mut line = failure_line(&failure, exec);
+    let mut line = failure_line(&failure, plan.exec);
     let bytes = line.finish();
     if failure.on_tty {
         let _ = nix::unistd::write(std::io::stderr(), bytes);
@@ -381,20 +439,17 @@ fn failure_line(failure: &ChildFailure, exec: &Exec) -> StackLine {
     line
 }
 
-/// The child's setup, in order: a process group of its own, in the
-/// foreground of the terminal `tty` (init's `/dev/ttyS0`), which becomes
-/// stdin, stdout and stderr; the `session` cgroup; an empty capability
-/// bounding set and ambient set; no supplementary groups; the session's gid
-/// and uid, real, effective and saved; no new privileges; `/workspace`; then
-/// every signal back at its default action and unblocked, since an ignored
-/// signal and the mask both survive exec (Rust ignores SIGPIPE in init, init
-/// ignores SIGTTOU and blocks SIGCHLD for its signalfd).
-fn setup(
-    session: &Session,
-    tty: BorrowedFd<'_>,
-    join_cgroup: bool,
-    signals: &CleanSignals,
-) -> Result<(), ChildFailure> {
+/// The child's setup, in order: its terminal, which becomes stdin, stdout
+/// and stderr (in `console` mode a process group of its own in the
+/// foreground of init's `/dev/ttyS0`; in `vsock` mode a session of its own
+/// whose controlling terminal is the PTY's slave, and the master closed);
+/// the `session` cgroup; an empty capability bounding set and ambient set;
+/// no supplementary groups; the session's gid and uid, real, effective and
+/// saved; no new privileges; the working directory; then every signal back
+/// at its default action and unblocked, since an ignored signal and the
+/// mask both survive exec (Rust ignores SIGPIPE in init, init ignores
+/// SIGTTOU and blocks SIGCHLD for its signalfd).
+fn setup(plan: &ChildPlan<'_>, signals: &CleanSignals) -> Result<(), ChildFailure> {
     let fail = |step: &'static str, on_tty: bool| {
         move |errno: Errno| ChildFailure {
             step,
@@ -402,12 +457,30 @@ fn setup(
             on_tty,
         }
     };
-    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(fail("setpgid", false))?;
-    foreground(tty).map_err(fail("tcsetpgrp /dev/ttyS0", false))?;
+    let tty = match plan.tty {
+        ChildTty::Console(tty) => {
+            setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(fail("setpgid", false))?;
+            foreground(tty).map_err(fail("tcsetpgrp /dev/ttyS0", false))?;
+            tty
+        }
+        ChildTty::Pty { slave, .. } => {
+            setsid().map_err(fail("setsid", false))?;
+            controlling(slave).map_err(fail("TIOCSCTTY", false))?;
+            slave
+        }
+    };
     onto(tty, libc::STDIN_FILENO).map_err(fail("dup2 stdin", false))?;
     onto(tty, libc::STDOUT_FILENO).map_err(fail("dup2 stdout", false))?;
     onto(tty, libc::STDERR_FILENO).map_err(fail("dup2 stderr", false))?;
-    if join_cgroup {
+    if let ChildTty::Pty { master, .. } = plan.tty {
+        // SAFETY: close takes an integer; the master is this child's copy,
+        // which nothing in it uses (it is close-on-exec as well).
+        if unsafe { libc::close(master.as_raw_fd()) } != 0 {
+            return Err(fail("close the PTY master", true)(Errno::last()));
+        }
+    }
+    let session = plan.session;
+    if plan.join_cgroup {
         join_session_cgroup().map_err(fail("join the session cgroup", true))?;
     }
     // While still root (dropping needs CAP_SETPCAP). With both sets empty
@@ -419,7 +492,7 @@ fn setup(
     setresgid(session.gid, session.gid, session.gid).map_err(fail("setresgid", true))?;
     setresuid(session.uid, session.uid, session.uid).map_err(fail("setresuid", true))?;
     prctl::set_no_new_privs().map_err(fail("PR_SET_NO_NEW_PRIVS", true))?;
-    chdir(WORKDIR).map_err(fail("chdir /workspace", true))?;
+    chdir(plan.cwd).map_err(fail(plan.cwd_step, true))?;
     reset_signals(signals.sigrtmax).map_err(fail("reset signal actions", true))?;
     signals
         .unblocked
@@ -440,6 +513,17 @@ fn foreground(tty: BorrowedFd<'_>) -> Result<(), Errno> {
     // SAFETY: as above.
     unsafe { libc::signal(libc::SIGTTOU, libc::SIG_DFL) };
     result
+}
+
+/// Makes `slave` the controlling terminal of this process's session, which
+/// it leads and which has none (`TIOCSCTTY`, 0: never taken from another
+/// session). The terminal's foreground is then this process's group.
+fn controlling(slave: BorrowedFd<'_>) -> Result<(), Errno> {
+    // SAFETY: TIOCSCTTY takes an int by value.
+    if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) } != 0 {
+        return Err(Errno::last());
+    }
+    Ok(())
 }
 
 /// Makes `target` a copy of `tty` that stays open across exec. `tty` is
@@ -670,6 +754,22 @@ mod tests {
             let mut old: libc::sigaction = std::mem::zeroed();
             libc::sigaction(signal, ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_DFL
         }
+    }
+
+    /// A configured environment replaces [`ENV`]: the pointers are to its
+    /// strings, which the `Exec` keeps.
+    #[test]
+    fn a_configured_environment_is_the_one_passed() {
+        let env = vec![c"PATH=/bin".to_owned(), c"LANG=C.UTF-8".to_owned()];
+        let wanted: Vec<*const libc::c_char> = env.iter().map(|s| s.as_ptr()).collect();
+        let exec = Exec::with_env(&strings(&["ls"]), env, "/bin").unwrap();
+        assert_eq!(exec.env_ptrs.len(), 3);
+        assert_eq!(exec.env_ptrs[..2], wanted[..]);
+        assert!(exec.env_ptrs[2].is_null());
+        assert_eq!(candidates(&exec), ["/bin/ls"]);
+        // SAFETY: the pointers are the Exec's own strings.
+        let first = unsafe { CStr::from_ptr(exec.env_ptrs[0]) };
+        assert_eq!(first, c"PATH=/bin");
     }
 
     /// Rust ignores SIGPIPE in every program, init included, and an ignored
