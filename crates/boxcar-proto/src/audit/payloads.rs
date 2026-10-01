@@ -7,6 +7,8 @@
 //! skip-if-none are omitted from the JSON when unset; every other `Option` is
 //! written as an explicit `null`.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 use serde::{Deserialize, Serialize};
 
 use super::errno::name as errno_name;
@@ -358,4 +360,106 @@ pub struct ControlStop {
     /// The client's process id.
     pub by_pid: u32,
     pub mode: StopMode,
+}
+
+/// `net.dhcp`: the network stack answered a guest DHCP message with the
+/// session's static lease.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetDhcp {
+    /// `offer`, the answer to a DISCOVER, or `ack`, the answer to a REQUEST.
+    pub op: String,
+    /// The address the reply leases to the guest.
+    pub yiaddr: Ipv4Addr,
+}
+
+/// `net.dns`: a guest DNS query, the policy's verdict on its name, and the
+/// answer the guest got.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetDns {
+    /// The transaction id the guest gave the query.
+    pub txid: u16,
+    /// The name asked for.
+    pub qname: String,
+    /// The query type, by its DNS number: 1 is A, 28 is AAAA.
+    pub qtype: u16,
+    /// The response code the guest got, by its DNS number: 0 is NOERROR,
+    /// 2 SERVFAIL, 3 NXDOMAIN.
+    pub rcode: u16,
+    /// The addresses the answer gave, as text.
+    pub answers: Vec<String>,
+    pub verdict: Verdict,
+    /// The policy rule that decided, as written; `null` when the policy's
+    /// default did.
+    pub rule: Option<String>,
+}
+
+/// `net.connect`: a guest connection attempt and the policy's verdict on it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetConnect {
+    /// The flow's id, unique within the session. The flow's `net.tls` and
+    /// `net.close` carry it too.
+    pub flow: u64,
+    /// The transport, such as `tcp`.
+    pub proto: String,
+    /// The guest's address and source port.
+    pub src: SocketAddrV4,
+    /// The address and port the guest asked for.
+    pub dst: SocketAddrV4,
+    /// The names the guest's DNS answers gave `dst`'s address, newest first.
+    pub names: Vec<String>,
+    pub verdict: Verdict,
+    /// The policy rule that decided, as written; `null` when the policy's
+    /// default did.
+    pub rule: Option<String>,
+}
+
+/// `net.tls`: what a flow's TLS ClientHello asked for, and whether the flow
+/// was let through on it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetTls {
+    /// The `flow` of the flow's `net.connect`.
+    pub flow: u64,
+    /// The server name the ClientHello named; `null` when it named none.
+    pub sni: Option<String>,
+    /// The ALPN protocols the ClientHello offered, in its order.
+    pub alpn: Vec<String>,
+    pub verdict: Verdict,
+}
+
+/// `net.close`: a flow ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetClose {
+    /// The `flow` of the flow's `net.connect` or `net.udp`.
+    pub flow: u64,
+    /// Payload bytes the guest sent.
+    pub tx: u64,
+    /// Payload bytes the guest received.
+    pub rx: u64,
+    /// How long the flow lasted, in milliseconds.
+    pub dur_ms: u64,
+    /// Why it ended, such as `fin`, `rst`, `timeout`, `evicted` or `idle`.
+    pub reason: String,
+}
+
+/// `net.drop`: the network stack dropped guest frames. Made at most once a
+/// second for each reason, counting every drop since the last.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetDrop {
+    /// Why, such as `ipv6` or `icmp`.
+    pub reason: String,
+    /// Frames dropped for this reason since the last `net.drop` for it.
+    pub count: u64,
+}
+
+/// `net.udp`: the first datagram of a guest UDP flow, and the policy's
+/// verdict on it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetUdp {
+    /// The flow's id, unique within the session; its `net.close` carries it.
+    pub flow: u64,
+    /// The guest's address and source port.
+    pub src: SocketAddrV4,
+    /// The address and port the guest sent to.
+    pub dst: SocketAddrV4,
+    pub verdict: Verdict,
 }

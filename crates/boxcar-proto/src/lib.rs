@@ -30,8 +30,9 @@ pub use audit::genesis_prev;
 pub use audit::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
-    FsSymlink, FsXattr, Hash, HashStatus, OpResult, ParseHashError, Payload, Record, Ring, SetAttr,
-    ShareRef, Source, SpanRef, Subject, Verdict, VmmStart, VmmStop, SCHEMA_VERSION,
+    FsSymlink, FsXattr, Hash, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls,
+    NetUdp, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, ShareRef, Source, SpanRef,
+    Subject, Verdict, VmmStart, VmmStop, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

@@ -43,7 +43,8 @@ mod payloads;
 pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
-    FsSymlink, FsXattr, HashStatus, OpResult, SetAttr, ShareRef, Verdict, VmmStart, VmmStop,
+    FsSymlink, FsXattr, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp,
+    OpResult, SetAttr, ShareRef, Verdict, VmmStart, VmmStop,
 };
 
 /// The value of a record's `v` field.
@@ -98,13 +99,15 @@ pub enum Source {
 impl Source {
     /// The source of an event kind this crate defines a payload for:
     /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
-    /// device, `control.*` from the control socket. `None` for every other
-    /// kind; later milestones add theirs.
+    /// device, `net.*` from the network stack, `control.*` from the control
+    /// socket. `None` for every other kind; later milestones add theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
         if kind == "checkpoint" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
         } else if kind.starts_with("fs.") {
             Some(Source::Fs)
+        } else if kind.starts_with("net.") {
+            Some(Source::Net)
         } else if kind.starts_with("control.") {
             Some(Source::Control)
         } else {
@@ -357,6 +360,20 @@ pub enum Payload {
     ControlConnect(ControlConnect),
     #[serde(rename = "control.stop")]
     ControlStop(ControlStop),
+    #[serde(rename = "net.dhcp")]
+    NetDhcp(NetDhcp),
+    #[serde(rename = "net.dns")]
+    NetDns(NetDns),
+    #[serde(rename = "net.connect")]
+    NetConnect(NetConnect),
+    #[serde(rename = "net.tls")]
+    NetTls(NetTls),
+    #[serde(rename = "net.close")]
+    NetClose(NetClose),
+    #[serde(rename = "net.drop")]
+    NetDrop(NetDrop),
+    #[serde(rename = "net.udp")]
+    NetUdp(NetUdp),
 }
 
 impl Payload {
@@ -387,12 +404,20 @@ impl Payload {
             Payload::Checkpoint(_) => "checkpoint",
             Payload::ControlConnect(_) => "control.connect",
             Payload::ControlStop(_) => "control.stop",
+            Payload::NetDhcp(_) => "net.dhcp",
+            Payload::NetDns(_) => "net.dns",
+            Payload::NetConnect(_) => "net.connect",
+            Payload::NetTls(_) => "net.tls",
+            Payload::NetClose(_) => "net.close",
+            Payload::NetDrop(_) => "net.drop",
+            Payload::NetUdp(_) => "net.udp",
         }
     }
 
     /// The source of the record that carries this payload: the VMM for
     /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, the
-    /// control socket for `control.*`, as [`Source::from_kind`] says. A new variant does not compile until it
+    /// network stack for `net.*`, the control socket for `control.*`, as
+    /// [`Source::from_kind`] says. A new variant does not compile until it
     /// is given one.
     pub fn source(&self) -> Source {
         match self {
@@ -416,6 +441,13 @@ impl Payload {
             | Payload::FsDenied(_)
             | Payload::FsReaddir(_) => Source::Fs,
             Payload::ControlConnect(_) | Payload::ControlStop(_) => Source::Control,
+            Payload::NetDhcp(_)
+            | Payload::NetDns(_)
+            | Payload::NetConnect(_)
+            | Payload::NetTls(_)
+            | Payload::NetClose(_)
+            | Payload::NetDrop(_)
+            | Payload::NetUdp(_) => Source::Net,
         }
     }
 
@@ -441,14 +473,16 @@ impl Payload {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
     use super::*;
     use crate::control::StopMode;
     use serde_json::json;
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 23 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 23] = [
+    /// The 30 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 30] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -472,6 +506,13 @@ mod tests {
         "checkpoint",
         "control.connect",
         "control.stop",
+        "net.dhcp",
+        "net.dns",
+        "net.connect",
+        "net.tls",
+        "net.close",
+        "net.drop",
+        "net.udp",
     ];
 
     fn session() -> SessionId {
@@ -862,6 +903,98 @@ mod tests {
                 }),
                 json!({"by_pid": 4242, "mode": "graceful"}),
             ),
+            (
+                Payload::NetDhcp(NetDhcp {
+                    op: "offer".into(),
+                    yiaddr: Ipv4Addr::new(10, 0, 2, 15),
+                }),
+                json!({"op": "offer", "yiaddr": "10.0.2.15"}),
+            ),
+            (
+                Payload::NetDns(NetDns {
+                    txid: 0xbeef,
+                    qname: "example.com".into(),
+                    qtype: 1,
+                    rcode: 0,
+                    answers: vec!["93.184.215.14".into(), "93.184.215.15".into()],
+                    verdict: Verdict::Allow,
+                    rule: Some("allow example.com".into()),
+                }),
+                json!({
+                    "txid": 48879,
+                    "qname": "example.com",
+                    "qtype": 1,
+                    "rcode": 0,
+                    "answers": ["93.184.215.14", "93.184.215.15"],
+                    "verdict": "allow",
+                    "rule": "allow example.com",
+                }),
+            ),
+            (
+                Payload::NetConnect(NetConnect {
+                    flow: 7,
+                    proto: "tcp".into(),
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 43210),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(93, 184, 215, 14), 443),
+                    names: vec!["example.com".into()],
+                    verdict: Verdict::Allow,
+                    rule: Some("allow example.com:443".into()),
+                }),
+                json!({
+                    "flow": 7,
+                    "proto": "tcp",
+                    "src": "10.0.2.15:43210",
+                    "dst": "93.184.215.14:443",
+                    "names": ["example.com"],
+                    "verdict": "allow",
+                    "rule": "allow example.com:443",
+                }),
+            ),
+            (
+                Payload::NetTls(NetTls {
+                    flow: 7,
+                    sni: Some("example.com".into()),
+                    alpn: vec!["h2".into(), "http/1.1".into()],
+                    verdict: Verdict::Allow,
+                }),
+                json!({
+                    "flow": 7,
+                    "sni": "example.com",
+                    "alpn": ["h2", "http/1.1"],
+                    "verdict": "allow",
+                }),
+            ),
+            (
+                Payload::NetClose(NetClose {
+                    flow: 7,
+                    tx: 517,
+                    rx: 10_485_760,
+                    dur_ms: 1250,
+                    reason: "fin".into(),
+                }),
+                json!({"flow": 7, "tx": 517, "rx": 10485760, "dur_ms": 1250, "reason": "fin"}),
+            ),
+            (
+                Payload::NetDrop(NetDrop {
+                    reason: "ipv6".into(),
+                    count: 12,
+                }),
+                json!({"reason": "ipv6", "count": 12}),
+            ),
+            (
+                Payload::NetUdp(NetUdp {
+                    flow: 8,
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 5353),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 123),
+                    verdict: Verdict::Deny,
+                }),
+                json!({
+                    "flow": 8,
+                    "src": "10.0.2.15:5353",
+                    "dst": "192.0.2.1:123",
+                    "verdict": "deny",
+                }),
+            ),
         ]
     }
 
@@ -970,6 +1103,55 @@ mod tests {
                     "result": {"ok": false, "errno": 1, "err": "EPERM"},
                 }),
             ),
+            (
+                Payload::NetDns(NetDns {
+                    txid: 1,
+                    qname: "blocked.example".into(),
+                    qtype: 28,
+                    rcode: 3,
+                    answers: Vec::new(),
+                    verdict: Verdict::Deny,
+                    rule: None,
+                }),
+                json!({
+                    "txid": 1,
+                    "qname": "blocked.example",
+                    "qtype": 28,
+                    "rcode": 3,
+                    "answers": [],
+                    "verdict": "deny",
+                    "rule": null,
+                }),
+            ),
+            (
+                Payload::NetConnect(NetConnect {
+                    flow: 9,
+                    proto: "tcp".into(),
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40000),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 22),
+                    names: Vec::new(),
+                    verdict: Verdict::Deny,
+                    rule: None,
+                }),
+                json!({
+                    "flow": 9,
+                    "proto": "tcp",
+                    "src": "10.0.2.15:40000",
+                    "dst": "10.1.2.3:22",
+                    "names": [],
+                    "verdict": "deny",
+                    "rule": null,
+                }),
+            ),
+            (
+                Payload::NetTls(NetTls {
+                    flow: 9,
+                    sni: None,
+                    alpn: Vec::new(),
+                    verdict: Verdict::Deny,
+                }),
+                json!({"flow": 9, "sni": null, "alpn": [], "verdict": "deny"}),
+            ),
         ]
     }
 
@@ -1053,6 +1235,8 @@ mod tests {
         for (payload, _) in cases() {
             let expected = if payload.kind().starts_with("fs.") {
                 Source::Fs
+            } else if payload.kind().starts_with("net.") {
+                Source::Net
             } else if payload.kind().starts_with("control.") {
                 Source::Control
             } else {
@@ -1065,8 +1249,8 @@ mod tests {
         assert_eq!(Source::from_kind("fs.open"), Some(Source::Fs));
         assert_eq!(Source::from_kind("checkpoint"), Some(Source::Vmm));
         assert_eq!(Source::from_kind("control.stop"), Some(Source::Control));
+        assert_eq!(Source::from_kind("net.drop"), Some(Source::Net));
         for other in [
-            "net.connect",
             "vsock.open",
             "proc.exec",
             "finding",
@@ -1077,6 +1261,8 @@ mod tests {
             "checkpoints",
             "control",
             "controls.stop",
+            "net",
+            "network.drop",
         ] {
             assert_eq!(Source::from_kind(other), None, "{other:?}");
         }
@@ -1084,7 +1270,7 @@ mod tests {
 
     #[test]
     fn from_record_rejects_unknown_kinds_and_malformed_data() {
-        let unknown = record("net.connect", Source::Net, json!({}));
+        let unknown = record("proc.exec", Source::Guest, json!({}));
         assert!(Payload::from_record(&unknown).is_err());
         let missing_fields = record("fs.open", Source::Fs, json!({"mount": "root"}));
         assert!(Payload::from_record(&missing_fields).is_err());
