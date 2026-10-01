@@ -33,6 +33,17 @@
 //! [`egress`](Policy::egress)'s business and does not stop the name
 //! resolving. Else the default.
 //!
+//! A domain rule admits only clients that say the name. A connection a
+//! domain rule allowed is held at the TCP relay's gate until its first
+//! bytes show the name it is for: the server name of a TLS ClientHello, or
+//! the `Host` of a plain HTTP request. [`Policy::gate_allows`] then decides
+//! on that name and the port: the first domain rule that matches both
+//! decides, and a name no domain rule matches is denied (never the
+//! default). A connection that shows no name (a protocol where the server
+//! speaks first, such as SMTP, or one that is neither TLS nor HTTP, such
+//! as SSH) is reset. Allow those by address with a network rule
+//! (`allow 192.0.2.10:22`), which is not gated.
+//!
 //! The stack shares one policy through an `Arc<arc_swap::ArcSwap<Policy>>`
 //! and loads it for every decision, so a swapped policy decides the next
 //! query or connection.
@@ -356,6 +367,25 @@ impl Policy {
             Target::Cidr { net, port: on } => on_port(*on, port) && net.contains(ip),
         });
         decided.map_or(Decided::Default, Decided::Rule)
+    }
+
+    /// The gate's verdict on a connection to `port` that showed `name`
+    /// (its TLS server name or HTTP `Host`), and the text of the rule that
+    /// decided: walking the rules in order, the first domain rule whose
+    /// pattern matches the name and whose port, if it has one, is `port`.
+    /// No such rule denies, with no rule text: the gate never falls back
+    /// to the default, so `default allow` admits no name by itself.
+    pub fn gate_allows(&self, name: &str, port: u16) -> (Verdict, Option<String>) {
+        let decided = self.rules.iter().find(|rule| match &rule.target {
+            Target::Domain { pattern, port: on } => {
+                on_port(*on, port) && name_matches(pattern, name)
+            }
+            Target::Cidr { .. } => false,
+        });
+        match decided {
+            Some(rule) => (rule.verdict, Some(rule.text.clone())),
+            None => (Verdict::Deny, None),
+        }
     }
 
     /// The verdict on resolving `qname`: a denied name gets NXDOMAIN.
@@ -1124,5 +1154,45 @@ mod tests {
         );
         assert!(p.allows_exactly(Ipv4Net::masked(Ipv4Addr::new(10, 0, 0, 0), 8), 80));
         assert!(!p.allows_exactly(host([203, 0, 113, 7]), 80), "a deny");
+    }
+
+    #[test]
+    fn the_gate_passes_a_name_any_domain_rule_allows() {
+        let p = parse(&["allow a.example", "allow b.example"]);
+        assert_eq!(p.gate_allows("b.example", 443), allow("allow b.example"));
+        assert_eq!(p.gate_allows("A.Example.", 80), allow("allow a.example"));
+        assert_eq!(p.gate_allows("c.example", 443), (Verdict::Deny, None));
+    }
+
+    #[test]
+    fn the_gate_honors_an_earlier_deny() {
+        let p = parse(&["deny evil.example", "allow *.example"]);
+        assert_eq!(
+            p.gate_allows("evil.example", 443),
+            deny("deny evil.example")
+        );
+        assert_eq!(p.gate_allows("good.example", 443), allow("allow *.example"));
+        // A deny on one port denies only there.
+        let p = parse(&["deny evil.example:443", "allow *.example"]);
+        assert_eq!(
+            p.gate_allows("evil.example", 443),
+            deny("deny evil.example:443")
+        );
+        assert_eq!(p.gate_allows("evil.example", 80), allow("allow *.example"));
+    }
+
+    #[test]
+    fn the_gate_needs_a_rule_on_the_port() {
+        let p = parse(&["allow b.example:80"]);
+        assert_eq!(p.gate_allows("b.example", 80), allow("allow b.example:80"));
+        assert_eq!(p.gate_allows("b.example", 443), (Verdict::Deny, None));
+    }
+
+    #[test]
+    fn a_network_rule_or_the_default_never_passes_a_name() {
+        let p = parse(&["allow 0.0.0.0/0", "allow 127.0.0.1", "default allow"]);
+        for name in ["example.com", "127.0.0.1", "0.0.0.0"] {
+            assert_eq!(p.gate_allows(name, 443), (Verdict::Deny, None), "{name}");
+        }
     }
 }

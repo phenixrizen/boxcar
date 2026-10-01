@@ -51,18 +51,31 @@ pub enum FlowState {
     Ending(&'static str),
 }
 
-/// What a gated flow must show, and by when.
+/// A gated flow's first bytes, and by when they must show a name.
 #[derive(Debug)]
 pub struct GateBuf {
-    /// The pattern of the domain rule that allowed the flow: the server
-    /// name or `Host` must match it.
-    pub pattern: String,
     /// When a flow that has shown no name is denied.
     pub deadline: Instant,
-    /// The guest's first bytes as last looked at. They are copied: the
-    /// smoltcp socket keeps them until the gate opens, and then they are
-    /// forwarded like any others.
+    /// The guest's first bytes, taken out of the smoltcp socket as they
+    /// come (up to the gate's limit), and not forwarded: a pass moves them
+    /// to the flow's [`tail`](Flow::tail), ahead of what follows.
     pub seen: Vec<u8>,
+    /// How many of them have been read for a name: they are read again
+    /// only when more have come.
+    pub parsed: usize,
+    /// What they were last read as: `tls` or `http`.
+    pub kind: &'static str,
+}
+
+impl GateBuf {
+    pub(crate) fn new(deadline: Instant) -> GateBuf {
+        GateBuf {
+            deadline,
+            seen: Vec::new(),
+            parsed: 0,
+            kind: "tls",
+        }
+    }
 }
 
 /// A connection the guest made, carried by a host socket.
@@ -83,8 +96,14 @@ pub struct Flow {
     pub rx: u64,
     /// When the guest's SYN was decided.
     pub opened: Instant,
-    /// What the gate waits for, while the flow is [`FlowState::Gating`].
+    /// What the gate holds, while the flow is [`FlowState::Gating`].
     pub gate: Option<GateBuf>,
+    /// Guest bytes taken out of the smoltcp socket and not yet written to
+    /// the host, written ahead of what the socket still holds: the gated
+    /// bytes after a pass, and what the guest sent before its FIN (taken
+    /// out at once, so that the end of smoltcp's TIME-WAIT, which empties
+    /// its buffer, cannot lose them).
+    pub tail: Vec<u8>,
     /// The smoltcp socket that is the guest's far end.
     pub(crate) socket: SocketHandle,
     /// When the last byte moved, either way.
@@ -103,6 +122,9 @@ pub struct Flow {
     pub(crate) host_shut: bool,
     /// The guest sent its FIN.
     pub(crate) guest_fin: bool,
+    /// The guest sent a reset for this connection: a socket that closes
+    /// without both FINs was reset, not timed out.
+    pub(crate) guest_rst: bool,
 }
 
 impl Flow {
@@ -113,11 +135,9 @@ impl Flow {
         now: Instant,
         gate_timeout: Duration,
     ) -> Flow {
-        let gate = pending.gate.map(|pattern| GateBuf {
-            pattern,
-            deadline: now + gate_timeout,
-            seen: Vec::new(),
-        });
+        // `TcpLimits::check` keeps the timeout to a day.
+        let deadline = now.checked_add(gate_timeout).unwrap_or(now);
+        let gate = pending.gated.then(|| GateBuf::new(deadline));
         Flow {
             id: pending.id,
             guest: pending.guest,
@@ -133,6 +153,7 @@ impl Flow {
             rx: 0,
             opened: pending.opened,
             gate,
+            tail: Vec::new(),
             socket,
             last_active: now,
             watched: pending.watched,
@@ -141,6 +162,7 @@ impl Flow {
             host_eof: false,
             host_shut: false,
             guest_fin: false,
+            guest_rst: false,
         }
     }
 
@@ -175,9 +197,8 @@ pub struct Pending {
     pub syn: Vec<u8>,
     /// When the SYN was decided.
     pub opened: Instant,
-    /// The pattern of the domain rule that allowed it, if one did: the
-    /// flow will be gated on it.
-    pub gate: Option<String>,
+    /// Whether a domain rule allowed it: the flow will be gated.
+    pub gated: bool,
     /// What the net thread watches the host socket for.
     pub(crate) watched: Interest,
 }
@@ -232,6 +253,11 @@ impl FlowTable {
     /// Whether a flow or a connect holds the guest's `guest` → `dst`.
     pub fn knows(&self, guest: SocketAddrV4, dst: SocketAddrV4) -> bool {
         self.by_pair.contains_key(&(guest, dst))
+    }
+
+    /// The flow or connect that holds the guest's `guest` → `dst`.
+    pub fn id_of(&self, guest: SocketAddrV4, dst: SocketAddrV4) -> Option<FlowId> {
+        self.by_pair.get(&(guest, dst)).copied()
     }
 
     /// Whether a new flow needs another evicted first.
@@ -362,7 +388,7 @@ mod tests {
             host: stream(),
             syn: Vec::new(),
             opened,
-            gate: None,
+            gated: false,
             watched: Interest::default(),
         }
     }

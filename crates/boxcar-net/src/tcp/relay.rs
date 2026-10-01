@@ -34,11 +34,27 @@
 //! what the relay waits on, and not at all while a flow is gated.
 //!
 //! The guest's FIN, once the bytes before it have been written, is a
-//! `shutdown(Write)` on the host socket; the host's EOF closes the smoltcp
-//! socket, which sends its FIN after the bytes before it. A flow ends
-//! (`fin`) when both have gone and smoltcp is done. A reset from the guest
-//! resets the host socket (`reset`); a reset or error from the host aborts
-//! the smoltcp socket, which resets the guest (`reset`, `error`).
+//! `shutdown(Write)` on the host socket. Those bytes are taken out of the
+//! smoltcp socket as soon as the FIN is seen (into the flow's
+//! [`tail`](Flow::tail), written first), because the end of smoltcp's
+//! TIME-WAIT empties its receive buffer; the flow stays until the host has
+//! taken them. The host's EOF closes the smoltcp socket, which sends its
+//! FIN after the bytes before it. A flow ends (`fin`) when both have gone
+//! and smoltcp is done. A reset from the guest resets the host socket
+//! (`reset`), as does a guest that goes silent for
+//! [`GUEST_TIMEOUT`] while waited on (`timeout`;
+//! smoltcp probes an idle guest every [`KEEP_ALIVE`]);
+//! a reset or error from the host aborts the smoltcp socket, which resets
+//! the guest (`reset`, `error`).
+//!
+//! # The gate
+//!
+//! A gated flow's first bytes are taken out of the smoltcp socket as they
+//! come, up to the gate's limit, and read for a name only when more have
+//! come. The name decides through
+//! [`Policy::gate_allows`](crate::Policy::gate_allows) with the current
+//! policy. The `net.tls` record is made before any of the held bytes go
+//! to the host.
 //!
 //! # Closing host sockets
 //!
@@ -51,6 +67,7 @@
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddrV4, TcpStream};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::time::Instant;
 
 use boxcar_audit::AuditSink;
@@ -61,12 +78,12 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::EthernetAddress;
 
 use super::flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
-use super::{TcpLimits, SOCKET_BUFFER};
+use super::{TcpLimits, GUEST_TIMEOUT, KEEP_ALIVE, SOCKET_BUFFER};
 use crate::audit::{self, DropReason, Drops};
 use crate::config::NetConfig;
 use crate::frame;
 use crate::http_host::{self, Request};
-use crate::policy::{self, Policy, Rule, Target, Verdict};
+use crate::policy::{Policy, Rule, Target, Verdict};
 use crate::sni::{self, Hello};
 use crate::stack::{FdChange, Interest, Pipe};
 use crate::upstream::{self, ConnectTarget, HostAddrs, Progress, BUILTIN_HOST_LOCAL};
@@ -75,6 +92,8 @@ use crate::upstream::{self, ConnectTarget, HostAddrs, Progress, BUILTIN_HOST_LOC
 pub(crate) struct Ctx<'a> {
     pub(crate) cfg: &'a NetConfig,
     pub(crate) sink: &'a AuditSink,
+    /// The policy as it stands now.
+    pub(crate) policy: Arc<Policy>,
     pub(crate) iface: &'a mut Interface,
     pub(crate) pipe: &'a mut Pipe,
     pub(crate) sockets: &'a mut SocketSet<'static>,
@@ -147,6 +166,15 @@ pub(crate) struct Relay {
     gate_due: Option<Instant>,
 }
 
+/// What a look at a flow reads: the current policy (for the gate), where
+/// records go, the gate's byte limit, and now.
+struct Env<'a> {
+    policy: &'a Policy,
+    sink: &'a AuditSink,
+    gate_limit: usize,
+    now: Instant,
+}
+
 /// What one look at a flow came to.
 enum Step {
     /// Still open.
@@ -158,7 +186,8 @@ enum Step {
     Abort(&'static str),
 }
 
-/// What the gate made of a flow's first bytes.
+/// What the gate made of a flow's first bytes: its `net.tls` record when
+/// it decided.
 enum GateStep {
     Wait,
     Pass(Payload),
@@ -219,28 +248,28 @@ impl Relay {
     }
 
     /// Decides the guest's SYN `frame`, from `guest` to `dst`, which the
-    /// guest knows by `names`: a retransmit of one being handled is
-    /// dropped; a denied one is reset at once; an allowed one waits on a
-    /// host connect.
+    /// guest knows by `names`, on the current policy: a retransmit of one
+    /// being handled is dropped; a denied one is reset at once; an allowed
+    /// one waits on a host connect.
     pub(crate) fn syn(
         &mut self,
         cx: &mut Ctx,
         frame: &[u8],
         guest: SocketAddrV4,
         dst: SocketAddrV4,
-        policy: &Policy,
         names: Vec<String>,
     ) {
         // A retransmit: the first is waiting on its connect or answered.
         if self.table.knows(guest, dst) {
             return;
         }
-        let (verdict, rule, gate) =
-            if upstream::host_local(&mut self.host_addrs, policy, dst, cx.now) {
-                (Verdict::Deny, Some(BUILTIN_HOST_LOCAL.to_owned()), None)
+        let policy = Arc::clone(&cx.policy);
+        let (verdict, rule, gated) =
+            if upstream::host_local(&mut self.host_addrs, &policy, dst, cx.now) {
+                (Verdict::Deny, Some(BUILTIN_HOST_LOCAL.to_owned()), false)
             } else {
                 let (verdict, rule) = policy.egress(dst, &names);
-                (verdict, rule, gate_pattern(policy.egress_rule(dst, &names)))
+                (verdict, rule, gated_by(policy.egress_rule(dst, &names)))
             };
         if verdict == Verdict::Allow && self.table.pending_full() {
             // Not decided as far as the log goes: the guest sends it again.
@@ -285,7 +314,7 @@ impl Relay {
             host,
             syn: frame.to_vec(),
             opened: cx.now,
-            gate,
+            gated,
             watched,
         };
         if let Err(mut pending) = self.table.add_pending(pending) {
@@ -313,6 +342,31 @@ impl Relay {
         self.pump_one(cx, id);
     }
 
+    /// The guest reset its side of `guest` → `dst`. A host connect still
+    /// under way for it is given up (`net.close{reset}`, the host socket
+    /// reset), and the segment goes no further; a flow notes it, so that
+    /// its socket's close counts as a reset rather than a timeout, and the
+    /// segment goes on to smoltcp. Says whether it went no further.
+    pub(crate) fn guest_rst(
+        &mut self,
+        cx: &mut Ctx,
+        guest: SocketAddrV4,
+        dst: SocketAddrV4,
+    ) -> bool {
+        let Some(id) = self.table.id_of(guest, dst) else {
+            return false;
+        };
+        if let Some(mut pending) = self.table.take_pending(id) {
+            cx.record(close_record(id, 0, 0, pending.opened, cx.now, "reset"));
+            self.discard(id, pending.host, &mut pending.watched, true);
+            return true;
+        }
+        if let Some(flow) = self.table.get_mut(id) {
+            flow.guest_rst = true;
+        }
+        false
+    }
+
     /// Resets the guest for every connect that has taken too long.
     pub(crate) fn expire(&mut self, cx: &mut Ctx) {
         for id in self.table.timed_out(cx.now, self.limits.connect_timeout) {
@@ -328,12 +382,17 @@ impl Relay {
     /// and lets go of the flows that are over. Runs after smoltcp has
     /// taken the guest's frames.
     pub(crate) fn relay(&mut self, cx: &mut Ctx) {
-        let mut records = Vec::new();
         let mut over = Vec::new();
         let mut gate_due: Option<Instant> = None;
+        let env = Env {
+            policy: &cx.policy,
+            sink: cx.sink,
+            gate_limit: self.limits.gate_limit,
+            now: cx.now,
+        };
         for flow in self.table.flows_mut() {
             let socket = cx.sockets.get_mut::<tcp::Socket>(flow.socket);
-            match pump(flow, socket, self.limits.gate_limit, cx.now, &mut records) {
+            match pump(flow, socket, &env) {
                 Step::Open => {
                     watch(&mut self.fd_changes, flow, socket);
                     if let Some(gate) = &flow.gate {
@@ -344,9 +403,6 @@ impl Relay {
             }
         }
         self.gate_due = gate_due;
-        for record in records {
-            cx.record(record);
-        }
         for (id, step) in over {
             self.end(cx, id, step);
         }
@@ -474,17 +530,19 @@ impl Relay {
 
     /// Moves what can move on one flow, and ends it if it is over.
     fn pump_one(&mut self, cx: &mut Ctx, id: FlowId) {
-        let mut records = Vec::new();
         let Some(flow) = self.table.get_mut(id) else {
             return;
         };
+        let env = Env {
+            policy: &cx.policy,
+            sink: cx.sink,
+            gate_limit: self.limits.gate_limit,
+            now: cx.now,
+        };
         let socket = cx.sockets.get_mut::<tcp::Socket>(flow.socket);
-        let step = pump(flow, socket, self.limits.gate_limit, cx.now, &mut records);
+        let step = pump(flow, socket, &env);
         if let Step::Open = step {
             watch(&mut self.fd_changes, flow, socket);
-        }
-        for record in records {
-            cx.record(record);
         }
         self.end(cx, id, step);
     }
@@ -577,17 +635,16 @@ impl Relay {
     }
 }
 
-/// The pattern a flow allowed by `rule` is gated on: that of an allowing
-/// domain rule.
-fn gate_pattern(rule: Option<&Rule>) -> Option<String> {
-    match rule {
+/// Whether a flow `rule` decided is gated: an allowing domain rule did.
+fn gated_by(rule: Option<&Rule>) -> bool {
+    matches!(
+        rule,
         Some(Rule {
             verdict: Verdict::Allow,
-            target: Target::Domain { pattern, .. },
+            target: Target::Domain { .. },
             ..
-        }) => Some(pattern.clone()),
-        _ => None,
-    }
+        })
+    )
 }
 
 /// A smoltcp socket that has taken `pending`'s SYN: listening on the
@@ -600,6 +657,10 @@ fn take_syn(cx: &mut Ctx, pending: &Pending) -> Option<tcp::Socket<'static>> {
     );
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
+    // A guest that vanishes cannot hold the flow: smoltcp gives up on one
+    // silent this long while waited on, and probes an idle one.
+    socket.set_timeout(Some(GUEST_TIMEOUT.into()));
+    socket.set_keep_alive(Some(KEEP_ALIVE.into()));
     socket.listen(pending.dst).ok()?;
     let mut alone = SocketSet::new(Vec::with_capacity(1));
     let handle = alone.add(socket);
@@ -644,7 +705,7 @@ fn watch(fd_changes: &mut Vec<FdChange>, flow: &mut Flow, socket: &tcp::Socket) 
             // Data the guest's socket has room for.
             readable: !flow.host_eof && !flow.host_readable && socket.may_send(),
             // Room for the guest's data that waits.
-            writable: !flow.host_writable && socket.can_recv(),
+            writable: !flow.host_writable && (socket.can_recv() || !flow.tail.is_empty()),
         },
         _ => Interest::default(),
     };
@@ -661,14 +722,9 @@ fn watch(fd_changes: &mut Vec<FdChange>, flow: &mut Flow, socket: &tcp::Socket) 
 }
 
 /// Looks at one flow: what smoltcp says of the guest's side, the gate,
-/// and the bytes that can move each way. Records made go in `records`.
-fn pump(
-    flow: &mut Flow,
-    socket: &mut tcp::Socket,
-    gate_limit: usize,
-    now: Instant,
-    records: &mut Vec<Payload>,
-) -> Step {
+/// and the bytes that can move each way. The gate's records are made here,
+/// before any byte they let through moves.
+fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
     use tcp::State;
     if flow.ending() {
         return Step::Open;
@@ -681,25 +737,32 @@ fn pump(
         flow.guest_fin = true;
     }
     // A reset from the guest closes the socket, or in SYN-RECEIVED sends
-    // it back to listening. (Closed after both FINs is the end of a
-    // graceful close.)
-    if state == State::Listen || (state == State::Closed && !(flow.guest_fin && flow.host_eof)) {
+    // it back to listening. smoltcp closes it on its own only when the
+    // guest has been silent too long. (Closed after both FINs is the end
+    // of a graceful close, or of the TIME-WAIT after it.)
+    if state == State::Listen {
         return Step::Done("reset");
+    }
+    if state == State::Closed && !(flow.guest_fin && flow.host_eof) {
+        return Step::Done(if flow.guest_rst { "reset" } else { "timeout" });
     }
     if flow.state == FlowState::Gating {
         let Some(held) = flow.gate.as_mut() else {
             // Not reached: a gated flow has its gate.
             return Step::Abort("error");
         };
-        match gate(flow.id, held, flow.guest_fin, socket, gate_limit, now) {
+        match gate(flow.id, flow.dst.port(), held, flow.guest_fin, socket, env) {
             GateStep::Wait => return Step::Open,
             GateStep::Pass(record) => {
-                records.push(record);
+                audit::record(env.sink, record);
                 flow.state = FlowState::Relaying;
-                flow.gate = None;
+                if let Some(mut held) = flow.gate.take() {
+                    held.seen.append(&mut flow.tail);
+                    flow.tail = held.seen;
+                }
             }
             GateStep::Deny(record) => {
-                records.push(record);
+                audit::record(env.sink, record);
                 return Step::Abort("gate");
             }
         }
@@ -707,22 +770,43 @@ fn pump(
     let Some(host) = flow.host.as_mut() else {
         return Step::Open;
     };
-    // Guest to host, as far as the host takes it: what it refuses stays in
-    // the socket, whose window closes as it fills.
-    while flow.host_writable && socket.can_recv() {
+    // Once the guest has sent its FIN nothing more comes: what the socket
+    // holds is taken out now, before the end of TIME-WAIT can empty it.
+    if flow.guest_fin {
+        take_all(socket, &mut flow.tail);
+    }
+    // Guest to host, as far as the host takes it: first what was taken
+    // out of the socket, then what it holds (dequeued only as far as each
+    // write took it, so what the host refuses stays, and the guest's
+    // window closes as it fills).
+    while flow.host_writable && !flow.tail.is_empty() {
+        match io_retry(host.write(&flow.tail)) {
+            Ok(None) => {}
+            Ok(Some(0)) => break,
+            Ok(Some(n)) => {
+                flow.tail.drain(..n.min(flow.tail.len()));
+                flow.tx = flow.tx.saturating_add(n as u64);
+                flow.last_active = env.now;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => flow.host_writable = false,
+            Err(error) => return Step::Abort(host_failure(&error)),
+        }
+    }
+    while flow.tail.is_empty() && flow.host_writable && socket.can_recv() {
         match socket.recv(|data| io_step(host.write(data))) {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
                 flow.tx = flow.tx.saturating_add(n as u64);
-                flow.last_active = now;
+                flow.last_active = env.now;
             }
             Ok(Err(error)) if error.kind() == ErrorKind::WouldBlock => flow.host_writable = false,
             Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
             Ok(Err(error)) => return Step::Abort(host_failure(&error)),
         }
     }
-    // The guest's FIN, after what it sent before it.
-    if flow.guest_fin && !flow.host_shut && socket.recv_queue() == 0 {
+    // The guest's FIN, after every byte it sent before it.
+    let delivered = flow.tail.is_empty() && socket.recv_queue() == 0;
+    if flow.guest_fin && !flow.host_shut && delivered {
         flow.host_shut = true;
         // A host that has reset already says so on the next read.
         let _ = host.shutdown(Shutdown::Write);
@@ -737,7 +821,7 @@ fn pump(
             }
             Ok(Ok(n)) => {
                 flow.rx = flow.rx.saturating_add(n as u64);
-                flow.last_active = now;
+                flow.last_active = env.now;
             }
             Ok(Err(error)) if error.kind() == ErrorKind::WouldBlock => flow.host_readable = false,
             Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
@@ -746,10 +830,32 @@ fn pump(
         }
     }
     let done = matches!(socket.state(), State::TimeWait | State::Closed);
-    if flow.guest_fin && flow.host_eof && flow.host_shut && done {
+    if flow.guest_fin && flow.host_eof && flow.host_shut && flow.tail.is_empty() && done {
         return Step::Done("fin");
     }
     Step::Open
+}
+
+/// Takes everything the socket has received into `into`.
+fn take_all(socket: &mut tcp::Socket, into: &mut Vec<u8>) {
+    while socket.can_recv() {
+        let taken = socket.recv(|data| {
+            into.extend_from_slice(data);
+            (data.len(), ())
+        });
+        if taken.is_err() {
+            break;
+        }
+    }
+}
+
+/// An I/O result with `Interrupted` as `Ok(None)`, to try again.
+fn io_retry(result: io::Result<usize>) -> io::Result<Option<usize>> {
+    match result {
+        Ok(n) => Ok(Some(n)),
+        Err(error) if error.kind() == ErrorKind::Interrupted => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// An I/O result as smoltcp's buffer closures take it: how many bytes to
@@ -771,28 +877,36 @@ fn host_failure(error: &io::Error) -> &'static str {
     }
 }
 
-/// Reads the name a gated flow's first bytes show and decides on it: a
-/// name that matches the allowing rule's pattern passes; one that does
-/// not, or none, is denied. Bytes that may yet show a name wait, until
-/// they reach `limit`, the guest sends its FIN, or the gate's time is up.
+/// Takes a gated flow's new bytes out of its socket (up to the limit),
+/// reads them for a name if more have come, and decides: a name the
+/// policy's domain rules allow on `port` passes; another, or none, is
+/// denied. Bytes that may yet show a name wait, until they reach the
+/// limit, the guest sends its FIN, or the gate's time is up.
 fn gate(
     id: FlowId,
-    gate: &mut GateBuf,
+    port: u16,
+    held: &mut GateBuf,
     guest_fin: bool,
     socket: &mut tcp::Socket,
-    limit: usize,
-    now: Instant,
+    env: &Env,
 ) -> GateStep {
-    let held = socket.recv_queue().min(limit);
-    gate.seen.resize(held, 0);
-    let read = socket.peek_slice(&mut gate.seen).unwrap_or(0);
-    gate.seen.truncate(read);
-    let (kind, shown) = read_name(&gate.seen);
+    while held.seen.len() < env.gate_limit && socket.can_recv() {
+        let room = env.gate_limit - held.seen.len();
+        let taken = socket.recv(|data| {
+            let part = data.get(..room).unwrap_or(data);
+            held.seen.extend_from_slice(part);
+            (part.len(), part.len())
+        });
+        if !matches!(taken, Ok(n) if n > 0) {
+            break;
+        }
+    }
+    let shown = read_new(held).flatten();
     let Shown { name, alpn } = match shown {
         Some(shown) => shown,
         None => {
-            let stuck = read >= limit || guest_fin || now >= gate.deadline;
-            if !stuck {
+            let full = held.seen.len() >= env.gate_limit;
+            if !(full || guest_fin || env.now >= held.deadline) {
                 return GateStep::Wait;
             }
             Shown {
@@ -801,16 +915,29 @@ fn gate(
             }
         }
     };
-    let pass = name
-        .as_deref()
-        .is_some_and(|name| policy::name_matches(&gate.pattern, name));
-    let verdict = if pass { Verdict::Allow } else { Verdict::Deny };
-    let record = tls_record(id, kind, name, alpn, verdict);
-    if pass {
+    let verdict = match name.as_deref() {
+        Some(name) => env.policy.gate_allows(name, port).0,
+        None => Verdict::Deny,
+    };
+    let record = tls_record(id, held.kind, name, alpn, verdict);
+    if verdict == Verdict::Allow {
         GateStep::Pass(record)
     } else {
         GateStep::Deny(record)
     }
+}
+
+/// Reads a gated flow's bytes for a name, if more have come since they
+/// were last read (`None` if not): what they show, or `Some(None)` while
+/// more may show it. Notes their kind.
+fn read_new(held: &mut GateBuf) -> Option<Option<Shown>> {
+    if held.seen.len() <= held.parsed {
+        return None;
+    }
+    held.parsed = held.seen.len();
+    let (kind, shown) = read_name(&held.seen);
+    held.kind = kind;
+    Some(shown)
 }
 
 /// What a gated flow's first bytes showed: the name they ask for, if any,
@@ -931,11 +1058,28 @@ mod tests {
             "allow 192.0.2.0/24",
         ])
         .unwrap();
-        let pattern = |i: usize| gate_pattern(policy.rules.get(i));
-        assert_eq!(pattern(0).as_deref(), Some("example.com"));
-        assert_eq!(pattern(1), None);
-        assert_eq!(pattern(2), None);
-        assert_eq!(gate_pattern(None), None);
+        let gated = |i: usize| gated_by(policy.rules.get(i));
+        assert!(gated(0));
+        assert!(!gated(1));
+        assert!(!gated(2));
+        assert!(!gated_by(None));
+    }
+
+    #[test]
+    fn held_bytes_are_read_again_only_when_more_come() {
+        let mut held = GateBuf::new(Instant::now());
+        assert_eq!(read_new(&mut held), None, "nothing yet");
+        held.seen.extend_from_slice(b"GET / HTTP/1.1\r\nHo");
+        assert_eq!(read_new(&mut held), Some(None), "read: not enough");
+        assert_eq!(held.kind, "http");
+        assert_eq!(read_new(&mut held), None, "nothing new: not read again");
+        assert_eq!(read_new(&mut held), None);
+        held.seen.extend_from_slice(b"st: a.example\r\n\r\n");
+        assert_eq!(
+            read_new(&mut held),
+            Some(Shown::name(Some("a.example".into())))
+        );
+        assert_eq!(held.parsed, held.seen.len());
     }
 
     #[test]

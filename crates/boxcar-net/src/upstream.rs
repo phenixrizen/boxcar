@@ -243,6 +243,7 @@ mod tests {
         let addrs = interface_addrs().unwrap();
         assert!(addrs.iter().all(|ip| !ip.is_loopback()), "{addrs:?}");
         let mut unique = addrs.clone();
+        unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), addrs.len());
     }

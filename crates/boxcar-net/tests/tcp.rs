@@ -20,12 +20,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use boxcar_net::sni::{parse_client_hello, Hello};
+use boxcar_net::tcp::GUEST_TIMEOUT;
 use boxcar_net::upstream::{HostAddrs, BUILTIN_HOST_LOCAL};
 use boxcar_net::{Interest, Policy, Verdict, FLOW_TOKEN_BASE};
 use boxcar_proto::{NetClose, NetConnect, NetTls, Payload};
 use common::{
-    drops, guest_arp, harness_config, harness_with, resolve, segment, syn, FakeEventLoop, Harness,
-    Segment, GATEWAY, GUEST, GUEST_MAC,
+    drops, guest_arp, harness_config, harness_with, resolve, segment, syn, tcp as tcp_segment, udp,
+    FakeEventLoop, Harness, Segment, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -33,7 +34,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, TcpControl, TcpPacket};
 use socket2::{Domain, Socket, Type};
 
 /// A ClientHello `openssl s_client -connect 127.0.0.1:<port> -servername
@@ -140,6 +141,16 @@ struct Rig {
     sockets: SocketSet<'static>,
     epoch: Instant,
     next_port: u16,
+    /// Added to the stack's clock (not the guest's): time passing for the
+    /// stack alone.
+    skew: Duration,
+    /// The guest has vanished: it sends nothing, and what the stack sends
+    /// it is lost.
+    gone: bool,
+    /// The window field of the last segment (not a SYN) the stack sent the
+    /// guest, and the largest.
+    last_window: Option<u16>,
+    max_window: u16,
 }
 
 impl Rig {
@@ -158,11 +169,16 @@ impl Rig {
             sockets: SocketSet::new(Vec::new()),
             epoch: Instant::now(),
             next_port: 40_000,
+            skew: Duration::ZERO,
+            gone: false,
+            last_window: None,
+            max_window: 0,
         }
     }
 
+    /// The guest's clock, skewed as the stack's is.
     fn clock(&self) -> SmolInstant {
-        SmolInstant::from_micros(self.epoch.elapsed().as_micros() as i64)
+        SmolInstant::from_micros((self.epoch.elapsed() + self.skew).as_micros() as i64)
     }
 
     /// A guest socket connecting to `dst`, and the guest's end of it.
@@ -191,21 +207,34 @@ impl Rig {
     /// guest reads, and the host fds that are ready are handed over
     /// (waiting a little for one when nothing else moved).
     fn step(&mut self) {
-        self.iface
-            .poll(self.clock(), &mut self.wire, &mut self.sockets);
+        if !self.gone {
+            self.iface
+                .poll(self.clock(), &mut self.wire, &mut self.sockets);
+        }
         let mut moved = false;
         while let Some(frame) = self.wire.to_stack.pop_front() {
             self.h.stack.push_guest_frame(&frame);
             moved = true;
         }
-        let outcome = self.h.stack.poll(Instant::now());
+        let outcome = self.h.stack.poll(Instant::now() + self.skew);
         self.events.apply(&outcome.fd_changes);
         while let Some(frame) = self.h.stack.pop_host_frame() {
-            self.wire.to_guest.push_back(frame);
+            if let Some(seg) = segment(&frame) {
+                // A SYN-ACK's window is never scaled: it is left out.
+                if seg.ack && !seg.rst && !seg.syn {
+                    self.last_window = Some(seg.window);
+                    self.max_window = self.max_window.max(seg.window);
+                }
+            }
+            if !self.gone {
+                self.wire.to_guest.push_back(frame);
+            }
             moved = true;
         }
-        self.iface
-            .poll(self.clock(), &mut self.wire, &mut self.sockets);
+        if !self.gone {
+            self.iface
+                .poll(self.clock(), &mut self.wire, &mut self.sockets);
+        }
         let wait = if moved || !self.wire.to_stack.is_empty() {
             Duration::ZERO
         } else {
@@ -385,12 +414,22 @@ fn black_hole() -> (SocketAddrV4, Vec<Socket>) {
 /// A TLS 1.3-shaped ClientHello in one record, naming `sni` (if any) and
 /// offering `alpn`.
 fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
+    padded_hello(sni, alpn, None)
+}
+
+/// [`client_hello`] with a padding extension (type 21) of `padding` bytes
+/// first, when given.
+fn padded_hello(sni: Option<&str>, alpn: &[&str], padding: Option<usize>) -> Vec<u8> {
     fn with_len16(body: Vec<u8>) -> Vec<u8> {
         let mut out = (body.len() as u16).to_be_bytes().to_vec();
         out.extend(body);
         out
     }
     let mut extensions = Vec::new();
+    if let Some(padding) = padding {
+        extensions.extend(21_u16.to_be_bytes());
+        extensions.extend(with_len16(vec![0; padding]));
+    }
     if let Some(name) = sni {
         let mut entry = vec![0];
         entry.extend(with_len16(name.as_bytes().to_vec()));
@@ -1145,6 +1184,390 @@ fn a_refused_connect_resets_the_guest() {
     let events = rig.events();
     assert_eq!(connects(&events).len(), 1);
     assert_eq!(close_summary(&events), [(1, 0, 0, "refused".into())]);
+}
+
+#[test]
+fn time_wait_expiry_loses_no_guest_bytes() {
+    // A host peer that half-closes at once and then reads nothing until
+    // told, with a small receive buffer.
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener.set_recv_buffer_size(4096).unwrap();
+    listener
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    listener.listen(1).unwrap();
+    let server = listener.local_addr().unwrap().as_socket_ipv4().unwrap();
+    let (go, read_now) = mpsc::channel::<()>();
+    let (report, received) = mpsc::channel();
+    thread::spawn(move || {
+        let (conn, _) = listener.accept().unwrap();
+        let mut conn = std::net::TcpStream::from(conn);
+        conn.shutdown(Shutdown::Write).unwrap();
+        read_now.recv().unwrap();
+        let mut buf = vec![0; 64 * 1024];
+        let mut n = 0_u64;
+        let end = loop {
+            match conn.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(k) => {
+                    for (i, b) in buf[..k].iter().enumerate() {
+                        assert_eq!(*b, pattern(n + i as u64), "byte {}", n + i as u64);
+                    }
+                    n += k as u64;
+                }
+                Err(e) => break Err(e.kind()),
+            }
+        };
+        report.send((n, end)).unwrap();
+    });
+
+    let mut rig = Rig::new(harness_with(policy(&["allow 127.0.0.0/8"])));
+    let (s, _) = rig.connect(server);
+    rig.until(Duration::from_secs(10), "the host's FIN", |rig| {
+        rig.socket(s).state() == tcp::State::CloseWait
+    });
+    // The guest sends 4 KiB at a time until the stack's window is under
+    // half its largest: the host's kernel is full, and the stack holds the
+    // rest.
+    let mut sent = 0_u64;
+    let mut buf = vec![0; 4096];
+    rig.until(
+        Duration::from_secs(60),
+        "the stack's window to close",
+        |rig| {
+            let window = rig.last_window.unwrap_or(0);
+            let socket = rig.socket(s);
+            if socket.send_queue() != 0 {
+                return false;
+            }
+            if rig.max_window > 0 && window < rig.max_window / 2 {
+                return true;
+            }
+            let socket = rig.socket(s);
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = pattern(sent + i as u64);
+            }
+            sent += socket.send_slice(&buf).unwrap() as u64;
+            false
+        },
+    );
+    // The guest's FIN takes the stack's socket to TIME-WAIT, and past it:
+    // smoltcp forgets the connection and empties its buffer.
+    rig.socket(s).close();
+    rig.until(Duration::from_secs(10), "the guest to close", |rig| {
+        rig.socket(s).state() == tcp::State::Closed
+    });
+    rig.skew = Duration::from_secs(11);
+    for _ in 0..20 {
+        rig.step();
+    }
+    assert_eq!(
+        rig.h.stack.open_flows(),
+        1,
+        "the flow waits until the host has every byte"
+    );
+    go.send(()).unwrap();
+    let mut got = None;
+    rig.until(Duration::from_secs(10), "the host to read it all", |_| {
+        got = received.try_recv().ok();
+        got.is_some()
+    });
+    assert_eq!(got, Some((sent, Ok(()))), "every byte, then a clean EOF");
+    rig.settle();
+    let events = rig.events();
+    assert_eq!(close_summary(&events), [(1, sent, 0, "fin".into())]);
+}
+
+#[test]
+fn the_gate_passes_a_name_any_domain_rule_allows() {
+    // Two names behind one address: the SYN is decided by the first rule
+    // that matches either, and a hello for the other name passes too.
+    let mut h = harness_with(policy(&[
+        "allow a.example",
+        "allow b.example",
+        "allow 127.0.0.0/8",
+    ]));
+    resolve(&mut h, "a.example", Ipv4Addr::LOCALHOST);
+    resolve(&mut h, "b.example", Ipv4Addr::LOCALHOST);
+    let hello = client_hello(Some("b.example"), &[]);
+    let (server, seen) = host_peer(hello.len(), b"ok");
+    let mut rig = Rig::new(h);
+    let (s, _) = rig.connect(server);
+    rig.send(s, &hello);
+    assert_eq!(rig.recv(s, 2), b"ok");
+    rig.socket(s).close();
+    rig.settle();
+    assert_eq!(rig.seen(&seen).bytes, hello);
+    let events = rig.events();
+    assert_eq!(
+        connects(&events)[0].rule.as_deref(),
+        Some("allow a.example")
+    );
+    assert_eq!(
+        tls(&events),
+        [tls_record(1, "tls", Some("b.example"), &[], Verdict::Allow)]
+    );
+}
+
+#[test]
+fn the_gate_honors_an_earlier_deny() {
+    let mut h = harness_with(policy(&[
+        "deny evil.example",
+        "allow *.example",
+        "allow 127.0.0.0/8",
+    ]));
+    resolve(&mut h, "good.example", Ipv4Addr::LOCALHOST);
+    let (server, seen) = host_peer(1, b"never");
+    let mut rig = Rig::new(h);
+    let (s, _) = rig.connect(server);
+    rig.send(s, &client_hello(Some("evil.example"), &[]));
+    rig.wait_reset(s);
+    assert!(rig.seen(&seen).bytes.is_empty());
+    rig.settle();
+    let events = rig.events();
+    assert_eq!(
+        connects(&events)[0].rule.as_deref(),
+        Some("allow *.example")
+    );
+    assert_eq!(
+        tls(&events),
+        [tls_record(
+            1,
+            "tls",
+            Some("evil.example"),
+            &[],
+            Verdict::Deny
+        )]
+    );
+}
+
+#[test]
+fn a_full_size_client_hello_passes_the_gate() {
+    // Padding that makes the record exactly 16384 bytes.
+    let base = padded_hello(Some("example.com"), &[], Some(0)).len() - 5;
+    let hello = padded_hello(Some("example.com"), &[], Some(16384 - base));
+    assert_eq!(hello.len(), 16384 + 5);
+    let (server, seen) = host_peer(hello.len(), b"ok");
+    let mut rig = gated_rig();
+    let (s, _) = rig.connect(server);
+    rig.send(s, &hello);
+    assert_eq!(rig.recv(s, 2), b"ok");
+    rig.socket(s).close();
+    rig.settle();
+    assert_eq!(rig.seen(&seen).bytes, hello, "byte for byte");
+    let events = rig.events();
+    assert_eq!(
+        tls(&events),
+        [tls_record(
+            1,
+            "tls",
+            Some("example.com"),
+            &[],
+            Verdict::Allow
+        )]
+    );
+}
+
+#[test]
+fn a_guest_reset_while_pending_gives_up_the_connect() {
+    let (server, _held) = black_hole();
+    let mut h = harness_with(policy(&["allow 127.0.0.0/8"]));
+    let mut events = FakeEventLoop::new();
+    events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    h.stack.push_guest_frame(&guest_arp());
+    h.drain();
+    let guest = SocketAddrV4::new(GUEST, 40_000);
+    h.stack.push_guest_frame(&syn(guest, server, 7000));
+    events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    assert_eq!(events.flows_watched(), 1, "the connect is watched");
+    // The guest gives up.
+    h.stack
+        .push_guest_frame(&tcp_segment(guest, server, TcpControl::Rst, 7001));
+    events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    assert_eq!(h.stack.open_flows(), 0);
+    assert_eq!(events.flows_watched(), 0, "and unwatched");
+    for _ in 0..5 {
+        events.dispatch(&mut h.stack, Duration::from_millis(5));
+        events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    }
+    assert!(h.drain().is_empty(), "no SYN-ACK, no reset");
+    let events = h.events();
+    assert_eq!(connects(&events).len(), 1);
+    assert_eq!(close_summary(&events), [(1, 0, 0, "reset".into())]);
+}
+
+#[test]
+fn a_guest_silent_after_its_syn_times_out() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = v4(listener.local_addr().unwrap());
+    let mut h = harness_with(policy(&["allow 127.0.0.0/8"]));
+    let mut events = FakeEventLoop::new();
+    events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    h.stack.push_guest_frame(&guest_arp());
+    h.drain();
+    let guest = SocketAddrV4::new(GUEST, 40_000);
+    h.stack.push_guest_frame(&syn(guest, server, 7000));
+    let start = Instant::now();
+    let mut answered = false;
+    while !answered {
+        assert!(start.elapsed() < Duration::from_secs(5), "no SYN-ACK");
+        events.dispatch(&mut h.stack, Duration::from_millis(20));
+        events.apply(&h.stack.poll(Instant::now()).fd_changes);
+        answered = h
+            .drain()
+            .iter()
+            .filter_map(|f| segment(f))
+            .any(|s| s.syn && s.ack);
+    }
+    // The guest never answers the SYN-ACK; a minute on, it is given up.
+    // (It still answers ARP, as a guest does: smoltcp's entry for it has
+    // expired by then.)
+    let later = Instant::now() + GUEST_TIMEOUT + Duration::from_secs(1);
+    h.stack.push_guest_frame(&guest_arp());
+    h.drain();
+    events.apply(&h.stack.poll(later).fd_changes);
+    let resets = h
+        .drain()
+        .iter()
+        .filter_map(|f| segment(f))
+        .filter(|s| s.rst)
+        .count();
+    assert_eq!(resets, 1, "the guest is reset");
+    assert_eq!(h.stack.open_flows(), 0);
+    let events = h.events();
+    assert_eq!(close_summary(&events), [(1, 0, 0, "timeout".into())]);
+    drop(listener);
+}
+
+#[test]
+fn a_vanished_guest_times_out() {
+    let (server, seen) = host_peer(5, b"");
+    let mut rig = Rig::new(harness_with(policy(&["allow 127.0.0.0/8"])));
+    let (s, _) = rig.connect(server);
+    rig.send(s, b"hello");
+    rig.until(Duration::from_secs(10), "the bytes to arrive", |rig| {
+        rig.socket(s).send_queue() == 0
+    });
+    // The guest goes away, and a minute passes.
+    rig.gone = true;
+    rig.skew = GUEST_TIMEOUT + Duration::from_secs(1);
+    rig.until(Duration::from_secs(10), "the flow to time out", |rig| {
+        rig.h.stack.open_flows() == 0
+    });
+    let seen = rig.seen(&seen);
+    assert_eq!(seen.bytes, b"hello");
+    assert_eq!(
+        seen.end,
+        Err(ErrorKind::ConnectionReset),
+        "the host is reset"
+    );
+    let events = rig.events();
+    assert_eq!(close_summary(&events), [(1, 5, 0, "timeout".into())]);
+}
+
+#[test]
+fn an_idle_guest_that_answers_keeps_its_connection() {
+    let server = echo_server();
+    let mut rig = Rig::new(harness_with(policy(&["allow 127.0.0.0/8"])));
+    let (s, _) = rig.connect(server);
+    rig.ping(s, b"before");
+    // Two minutes with nothing to say, five seconds at a time: the
+    // stack's keep-alives get the guest's answers (one may be lost while
+    // the guest refreshes its ARP entry; the next is in time), so the
+    // timeout never comes.
+    for _ in 0..24 {
+        rig.skew += Duration::from_secs(5);
+        for _ in 0..5 {
+            rig.step();
+        }
+        assert_eq!(rig.socket(s).state(), tcp::State::Established);
+    }
+    assert_eq!(rig.h.stack.open_flows(), 1);
+    rig.ping(s, b"after");
+}
+
+#[test]
+fn a_syn_with_fin_or_rst_is_no_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = v4(listener.local_addr().unwrap());
+    let mut h = harness_with(policy(&["allow 127.0.0.0/8"]));
+    let mut events = FakeEventLoop::new();
+    events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    h.stack.push_guest_frame(&guest_arp());
+    h.drain();
+    for (port, flag) in [(40_000, "fin"), (40_001, "rst")] {
+        let guest = SocketAddrV4::new(GUEST, port);
+        let mut frame = syn(guest, server, 7000);
+        let mut tcp = TcpPacket::new_unchecked(&mut frame[14 + 20..]);
+        if flag == "fin" {
+            tcp.set_fin(true);
+        } else {
+            tcp.set_rst(true);
+        }
+        tcp.fill_checksum(&GUEST.into(), &(*server.ip()).into());
+        h.stack.push_guest_frame(&frame);
+        events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    }
+    for _ in 0..10 {
+        events.dispatch(&mut h.stack, Duration::from_millis(5));
+        events.apply(&h.stack.poll(Instant::now()).fd_changes);
+    }
+    assert_eq!(h.stack.open_flows(), 0);
+    let accepted = listener.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == ErrorKind::WouldBlock),
+        "no host connect: {accepted:?}"
+    );
+    let events = h.events();
+    assert!(connects(&events).is_empty(), "nothing decided");
+}
+
+#[test]
+fn frames_from_another_source_are_dropped_as_spoofed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = v4(listener.local_addr().unwrap());
+    let mut h = harness_with(policy(&["allow 127.0.0.0/8", "default allow"]));
+    h.stack.poll(Instant::now());
+    let spoof = Ipv4Addr::new(10, 0, 2, 99);
+    let from = SocketAddrV4::new(spoof, 40_000);
+    h.stack.push_guest_frame(&syn(from, server, 7000));
+    h.stack.push_guest_frame(&udp(
+        GATEWAY_MAC,
+        from,
+        SocketAddrV4::new(GATEWAY, 53),
+        b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01",
+    ));
+    h.stack.push_guest_frame(&udp(
+        GATEWAY_MAC,
+        from,
+        SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 123),
+        b"ntp",
+    ));
+    h.stack.poll(Instant::now());
+    assert!(h.drain().is_empty(), "nothing answers");
+    assert_eq!(h.stack.open_flows(), 0);
+    let accepted = listener.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == ErrorKind::WouldBlock),
+        "no host connect: {accepted:?}"
+    );
+    h.stack.shutdown();
+    let events = h.events();
+    assert!(connects(&events).is_empty());
+    assert!(
+        !events.iter().any(|e| matches!(e, Payload::NetDns(_))),
+        "the query was not asked"
+    );
+    let spoofed: u64 = drops(&events)
+        .iter()
+        .map(|d| {
+            assert_eq!(d.reason, "src_spoof");
+            d.count
+        })
+        .sum();
+    assert_eq!(spoofed, 3);
 }
 
 #[test]

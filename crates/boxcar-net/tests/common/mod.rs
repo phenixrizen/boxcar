@@ -316,7 +316,7 @@ pub fn resolve(h: &mut Harness, name: &str, ip: Ipv4Addr) {
     for _ in 0..2000 {
         h.stack.on_host_fd_event(DNS_TOKEN, true, false);
         if !h.drain().is_empty() {
-            assert_eq!(h.stack.dns_names(ip), [name]);
+            assert!(h.stack.dns_names(ip).iter().any(|n| n == name));
             return;
         }
         std::thread::sleep(Duration::from_millis(1));

@@ -1037,18 +1037,22 @@ fn classify_sorts_each_kind_of_frame() {
         assert_eq!(classify(&frame, GATEWAY), want);
     }
 
-    // A segment that is not a bare SYN is plain TCP.
-    let mut ack = tcp_syn(guest, web, 1);
+    // A segment that is not a bare SYN is plain TCP: an ACK, and a SYN
+    // with FIN or RST, which is no connection.
     let tcp_at = 14 + 20;
-    ack[tcp_at + 13] = 0x10; // flags: ACK only
-    fix_tcp_checksum(&mut ack);
-    assert_eq!(
-        classify(&ack, GATEWAY),
-        Dispatch::Tcp {
-            src: guest,
-            dst: web,
-        }
-    );
+    for flags in [0x10, 0x03, 0x06] {
+        let mut segment = tcp_syn(guest, web, 1);
+        segment[tcp_at + 13] = flags;
+        fix_tcp_checksum(&mut segment);
+        assert_eq!(
+            classify(&segment, GATEWAY),
+            Dispatch::Tcp {
+                src: guest,
+                dst: web,
+            },
+            "flags {flags:#04x}"
+        );
+    }
 
     // A bad checksum, a fragment, and a truncated packet are not trusted.
     let mut corrupt = udp(GATEWAY_MAC, guest, gateway_dns, b"q");
@@ -1161,13 +1165,11 @@ proptest! {
 }
 
 /// The whole stack, not just the dispatcher, takes anything the guest
-/// sends without panicking. (The shaped frames' TCP goes to 192.0.2.1,
-/// which the policy denies, so no fuzzed SYN makes a host connect.)
+/// sends without panicking. (Under `default deny`, no fuzzed SYN makes a
+/// host connect.)
 #[test]
 fn the_stack_never_panics_on_arbitrary_frames() {
-    let h = RefCell::new(harness_with(
-        Policy::parse(&["deny 192.0.2.0/24", "default allow"]).unwrap(),
-    ));
+    let h = RefCell::new(harness_with(Policy::default()));
     TestRunner::default()
         .run(&frames(), |frame| {
             let mut h = h.borrow_mut();

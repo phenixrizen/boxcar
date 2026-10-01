@@ -198,9 +198,19 @@ impl NetStack {
     }
 
     /// Takes one Ethernet frame the guest sent.
+    ///
+    /// TCP, UDP and ICMP (DNS included) must come from the guest's own
+    /// address, or they are dropped as `src_spoof` before anything handles
+    /// them; DHCP, which the gateway answers itself, may come from any
+    /// address (a client starts from `0.0.0.0`, and one that asks for an
+    /// address it no longer has is told so).
     pub fn push_guest_frame(&mut self, frame: &[u8]) {
         let now = Instant::now();
-        match classify(frame, self.cfg.gateway) {
+        let dispatch = classify(frame, self.cfg.gateway);
+        if self.spoofed(&dispatch) {
+            return self.drop_frame(DropReason::SrcSpoof, now);
+        }
+        match dispatch {
             Dispatch::Arp => {
                 if let Some(reply) = arp::reply(&self.cfg, frame) {
                     self.send_to_guest(reply, now);
@@ -232,7 +242,16 @@ impl NetStack {
             },
             Dispatch::TcpSyn { src, dst } => self.tcp_syn(frame, src, dst, now),
             // Segments of the relay's connections; smoltcp resets any other.
-            Dispatch::Tcp { .. } => self.send_to_smoltcp(frame.to_vec(), now),
+            // A reset for a connect still under way goes no further.
+            Dispatch::Tcp { src, dst } => {
+                if frame::tcp_reset_flag(frame) {
+                    let (tcp, mut cx) = self.split(now);
+                    if tcp.guest_rst(&mut cx, src, dst) {
+                        return;
+                    }
+                }
+                self.send_to_smoltcp(frame.to_vec(), now)
+            }
             Dispatch::Ipv6 => self.drop_frame(DropReason::Ipv6, now),
             Dispatch::Other => self.drop_frame(DropReason::Other, now),
         }
@@ -362,9 +381,22 @@ impl NetStack {
     /// policy and the names the DNS cache has for `dst`.
     fn tcp_syn(&mut self, frame: &[u8], guest: SocketAddrV4, dst: SocketAddrV4, now: Instant) {
         let names = self.dns_cache.names_for_at(*dst.ip(), now);
-        let policy = self.policy.load();
         let (tcp, mut cx) = self.split(now);
-        tcp.syn(&mut cx, frame, guest, dst, &policy, names);
+        tcp.syn(&mut cx, frame, guest, dst, names);
+    }
+
+    /// Whether `dispatch` is IP traffic the stack carries or answers (DHCP
+    /// aside) from a source other than the guest's address.
+    fn spoofed(&self, dispatch: &Dispatch) -> bool {
+        let src = match dispatch {
+            Dispatch::Dns { src, .. }
+            | Dispatch::Udp { src, .. }
+            | Dispatch::TcpSyn { src, .. }
+            | Dispatch::Tcp { src, .. } => *src.ip(),
+            Dispatch::Icmp { src, .. } => *src,
+            Dispatch::Arp | Dispatch::Dhcp | Dispatch::Ipv6 | Dispatch::Other => return false,
+        };
+        src != self.cfg.guest_ip
     }
 
     /// The relay, and what it borrows from the rest of the stack.
@@ -372,6 +404,7 @@ impl NetStack {
         let cx = Ctx {
             cfg: &self.cfg,
             sink: &self.sink,
+            policy: self.policy.load_full(),
             iface: &mut self.iface,
             pipe: &mut self.pipe,
             sockets: &mut self.sockets,
@@ -672,5 +705,220 @@ impl phy::TxToken for TxToken<'_> {
             *self.refused = self.refused.saturating_add(1);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::{ErrorKind, Read};
+    use std::net::{SocketAddr, TcpListener, UdpSocket};
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use boxcar_audit::WriterConfig;
+    use boxcar_proto::SessionId;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, EthernetRepr,
+        IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    };
+
+    use crate::tcp::FLOW_TOKEN_BASE;
+
+    /// The guest's ARP request for the gateway, which teaches smoltcp the
+    /// guest's MAC.
+    fn arp(cfg: &NetConfig) -> Vec<u8> {
+        let repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: EthernetAddress(cfg.guest_mac),
+            source_protocol_addr: cfg.guest_ip,
+            target_hardware_addr: EthernetAddress([0; 6]),
+            target_protocol_addr: cfg.gateway,
+        };
+        let eth = EthernetRepr {
+            src_addr: EthernetAddress(cfg.guest_mac),
+            dst_addr: EthernetAddress::BROADCAST,
+            ethertype: EthernetProtocol::Arp,
+        };
+        let mut buf = vec![0; eth.buffer_len() + repr.buffer_len()];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth.emit(&mut frame);
+        repr.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+        buf
+    }
+
+    /// A guest TCP segment.
+    fn segment(
+        cfg: &NetConfig,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        control: TcpControl,
+        (seq, ack): (u32, Option<u32>),
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: src.port(),
+            dst_port: dst.port(),
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: ack.map(|ack| TcpSeqNumber(ack as i32)),
+            window_len: 65_535,
+            window_scale: None,
+            max_seg_size: (control == TcpControl::Syn).then_some(1460),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        let ip = Ipv4Repr {
+            src_addr: *src.ip(),
+            dst_addr: *dst.ip(),
+            next_header: IpProtocol::Tcp,
+            payload_len: repr.buffer_len(),
+            hop_limit: 64,
+        };
+        frame::ipv4_frame(
+            EthernetAddress(cfg.guest_mac),
+            EthernetAddress(cfg.gateway_mac),
+            &ip,
+            |buf| {
+                repr.emit(
+                    &mut TcpPacket::new_unchecked(buf),
+                    &(*src.ip()).into(),
+                    &(*dst.ip()).into(),
+                    &ChecksumCapabilities::default(),
+                )
+            },
+        )
+    }
+
+    /// The sequence number of a SYN-ACK the stack sent, if `frame` is one.
+    fn syn_ack(frame: &[u8]) -> Option<u32> {
+        let eth = EthernetFrame::new_checked(frame).ok()?;
+        let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        (tcp.syn() && tcp.ack()).then_some(tcp.seq_number().0 as u32)
+    }
+
+    /// A ClientHello naming `name`, in one record.
+    fn hello(name: &str) -> Vec<u8> {
+        let with_len = |body: Vec<u8>| {
+            let mut out = (body.len() as u16).to_be_bytes().to_vec();
+            out.extend(body);
+            out
+        };
+        let mut entry = vec![0];
+        entry.extend(with_len(name.as_bytes().to_vec()));
+        let mut extension = 0_u16.to_be_bytes().to_vec();
+        extension.extend(with_len(with_len(entry)));
+        let mut body = vec![3, 3];
+        body.extend([0; 32]);
+        body.extend([0, 0, 2, 0x13, 0x01, 1, 0]);
+        body.extend(with_len(extension));
+        let mut handshake = vec![1, 0];
+        handshake.extend(with_len(body));
+        let mut record = vec![22, 3, 1];
+        record.extend(with_len(handshake));
+        record
+    }
+
+    /// The gate's `net.tls{allow}` is in the log's channel before the
+    /// first held byte is written to the host: when the record is made,
+    /// the host has received nothing.
+    #[test]
+    fn the_gate_records_its_pass_before_any_byte_goes_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(dir.path().join("data"), SessionId::new()))
+                .unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cfg = NetConfig {
+            dns_upstreams: vec![upstream.local_addr().unwrap()],
+            ..NetConfig::default()
+        };
+        let policy = Policy::parse(&["allow example.com", "allow 127.0.0.0/8"]).unwrap();
+        let mut stack =
+            NetStack::new(cfg.clone(), sink, Arc::new(ArcSwap::from_pointee(policy))).unwrap();
+        stack
+            .dns_cache
+            .insert(Ipv4Addr::LOCALHOST, "example.com", 60);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let SocketAddr::V4(server) = listener.local_addr().unwrap() else {
+            panic!("not IPv4");
+        };
+        let guest = SocketAddrV4::new(cfg.guest_ip, 40_000);
+        stack.poll(Instant::now());
+        stack.push_guest_frame(&arp(&cfg));
+        while stack.pop_host_frame().is_some() {}
+
+        // The SYN, the host connect, the SYN-ACK.
+        let syn = segment(&cfg, guest, server, TcpControl::Syn, (1000, None), &[]);
+        stack.push_guest_frame(&syn);
+        stack.poll(Instant::now());
+        let mut isn = None;
+        for _ in 0..2000 {
+            stack.on_host_fd_event(FLOW_TOKEN_BASE + 1, false, true);
+            stack.poll(Instant::now());
+            while let Some(frame) = stack.pop_host_frame() {
+                isn = isn.or(syn_ack(&frame));
+            }
+            if isn.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ack = isn.expect("a SYN-ACK").wrapping_add(1);
+        let (mut peer, _) = listener.accept().unwrap();
+        let ack_frame = segment(
+            &cfg,
+            guest,
+            server,
+            TcpControl::None,
+            (1001, Some(ack)),
+            &[],
+        );
+        stack.push_guest_frame(&ack_frame);
+        stack.poll(Instant::now());
+
+        // The hello: the gate passes it, recording first.
+        let at_record: Rc<Cell<Option<bool>>> = Rc::default();
+        let seen = Rc::clone(&at_record);
+        let probe = peer.try_clone().unwrap();
+        probe.set_nonblocking(true).unwrap();
+        crate::audit::tests::RECORDED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |payload| {
+                if matches!(payload, Payload::NetTls(_)) {
+                    let mut byte = [0];
+                    let empty = matches!(probe.peek(&mut byte),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock);
+                    seen.set(Some(empty));
+                }
+            }));
+        });
+        let hello = hello("example.com");
+        let data = segment(
+            &cfg,
+            guest,
+            server,
+            TcpControl::Psh,
+            (1001, Some(ack)),
+            &hello,
+        );
+        stack.push_guest_frame(&data);
+        stack.poll(Instant::now());
+        crate::audit::tests::RECORDED.with(|hook| hook.borrow_mut().take());
+        assert_eq!(
+            at_record.get(),
+            Some(true),
+            "net.tls was recorded, with nothing at the host yet"
+        );
+        let mut got = vec![0; hello.len()];
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(got, hello, "and then the hello went on");
+        drop(stack);
+        writer.close().unwrap();
     }
 }

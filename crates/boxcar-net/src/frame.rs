@@ -43,12 +43,13 @@ pub enum Dispatch {
     },
     /// ICMP: echo to the gateway is answered, the rest dropped.
     Icmp { src: Ipv4Addr, dst: Ipv4Addr },
-    /// A TCP segment with SYN and without ACK: a new connection.
+    /// A TCP segment with SYN and with none of ACK, FIN and RST: a new
+    /// connection.
     TcpSyn {
         src: SocketAddrV4,
         dst: SocketAddrV4,
     },
-    /// Any other TCP segment.
+    /// Any other TCP segment, a SYN with FIN or RST among them.
     Tcp {
         src: SocketAddrV4,
         dst: SocketAddrV4,
@@ -123,7 +124,8 @@ fn classify_ipv4(payload: &[u8], gateway: Ipv4Addr) -> Dispatch {
             }
             let src = SocketAddrV4::new(src, tcp.src_port());
             let dst = SocketAddrV4::new(dst, tcp.dst_port());
-            if tcp.syn() && !tcp.ack() {
+            // SYN with FIN or RST is no connection: smoltcp drops it.
+            if tcp.syn() && !tcp.ack() && !tcp.fin() && !tcp.rst() {
                 Dispatch::TcpSyn { src, dst }
             } else {
                 Dispatch::Tcp { src, dst }
@@ -183,6 +185,18 @@ pub(crate) fn udp_frame(
             &ChecksumCapabilities::default(),
         )
     }))
+}
+
+/// Whether a guest frame [`classify`] sorted as TCP is a reset (RST
+/// without SYN).
+pub(crate) fn tcp_reset_flag(frame: &[u8]) -> bool {
+    let Ok(eth) = EthernetFrame::new_checked(frame) else {
+        return false;
+    };
+    let Ok(packet) = Ipv4Packet::new_checked(eth.payload()) else {
+        return false;
+    };
+    TcpPacket::new_checked(packet.payload()).is_ok_and(|tcp| tcp.rst() && !tcp.syn())
 }
 
 /// The RST+ACK that refuses a guest's TCP segment `segment` (a SYN, for

@@ -19,15 +19,17 @@
 //! next hop has no room: guest bytes stay in the smoltcp socket's receive
 //! buffer while the host socket refuses them, which closes the guest's
 //! window, and the host socket is not read while the smoltcp send buffer
-//! is full. A FIN from either side is passed on as a FIN, a reset as a
-//! reset.
+//! is full. A FIN from either side is passed on as a FIN, after every byte
+//! before it, a reset as a reset. A guest that stays silent for
+//! [`GUEST_TIMEOUT`] while it is waited on ends its flow (`timeout`).
 //!
 //! A flow a domain rule allowed is gated first ([`relay`]): its first
 //! bytes are held, unforwarded, until they show a TLS ClientHello server
 //! name ([`sni`](crate::sni)) or a plain HTTP `Host`
-//! ([`http_host`](crate::http_host)) that matches the rule, within
-//! [`TcpLimits::gate_limit`] bytes and [`TcpLimits::gate_timeout`]; else
-//! both sides are reset.
+//! ([`http_host`](crate::http_host)) that the policy's domain rules allow
+//! on this port ([`Policy::gate_allows`](crate::Policy::gate_allows)),
+//! within [`TcpLimits::gate_limit`] bytes and [`TcpLimits::gate_timeout`];
+//! else both sides are reset.
 //!
 //! Every table is bounded: [`TcpLimits::flow_cap`] flows, the idlest
 //! evicted to make room, and [`TcpLimits::pending_cap`] connects under way,
@@ -49,8 +51,27 @@ pub use flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
 /// [`DNS_TOKEN`](crate::DNS_TOKEN).
 pub const FLOW_TOKEN_BASE: u64 = 1 << 32;
 
-/// The size of each smoltcp socket buffer, receive and send.
-pub const SOCKET_BUFFER: usize = 256 * 1024;
+/// The size of each smoltcp socket buffer, receive and send: at the flow
+/// cap, 4096 × 128 KiB = 512 MiB that a guest could fill.
+pub const SOCKET_BUFFER: usize = 64 * 1024;
+
+/// The gate's default byte limit: one TLS record of the largest size, with
+/// its header, so a ClientHello that fills its record still passes.
+pub const GATE_LIMIT: usize = crate::sni::MAX_RECORD + crate::sni::RECORD_HEADER;
+
+/// How long a relayed connection's guest may stay silent while the relay
+/// waits on it (to answer a SYN-ACK, acknowledge data or a FIN, or answer
+/// a keep-alive) before smoltcp gives up on it: the flow ends `timeout`
+/// and the host side is reset.
+pub const GUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often an idle relayed connection probes the guest, so a guest that
+/// is there answers well within [`GUEST_TIMEOUT`] and an idle connection
+/// is not taken for a vanished one.
+pub const KEEP_ALIVE: Duration = Duration::from_secs(20);
+
+/// The longest connect or gate timeout a config may ask for.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The relay's bounds. The defaults are production's; tests lower them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,15 +97,19 @@ impl Default for TcpLimits {
             pending_cap: 256,
             connect_timeout: Duration::from_secs(10),
             gate_timeout: Duration::from_secs(5),
-            gate_limit: 16 * 1024,
+            gate_limit: GATE_LIMIT,
         }
     }
 }
 
 impl TcpLimits {
     /// What is wrong with these bounds, if anything: every cap must be at
-    /// least one, and the gate's byte limit must fit a socket buffer.
+    /// least one, the gate's byte limit must fit a socket buffer, and no
+    /// timeout may pass [`MAX_TIMEOUT`].
     pub fn check(&self) -> Result<(), &'static str> {
+        if self.connect_timeout > MAX_TIMEOUT || self.gate_timeout > MAX_TIMEOUT {
+            return Err("tcp timeouts must be at most a day");
+        }
         if self.flow_cap == 0 {
             return Err("tcp.flow_cap must be at least 1");
         }
@@ -109,8 +134,10 @@ mod tests {
         assert_eq!(limits.pending_cap, 256);
         assert_eq!(limits.connect_timeout, Duration::from_secs(10));
         assert_eq!(limits.gate_timeout, Duration::from_secs(5));
-        assert_eq!(limits.gate_limit, 16 * 1024);
-        assert_eq!(SOCKET_BUFFER, 256 * 1024);
+        assert_eq!(limits.gate_limit, 16384 + 5);
+        assert_eq!(SOCKET_BUFFER, 64 * 1024);
+        assert_eq!(GUEST_TIMEOUT, Duration::from_secs(60));
+        assert!(KEEP_ALIVE * 2 < GUEST_TIMEOUT, "two probes before it");
         assert_eq!(limits.check(), Ok(()));
         for broken in [
             TcpLimits {
@@ -127,6 +154,14 @@ mod tests {
             },
             TcpLimits {
                 gate_limit: SOCKET_BUFFER + 1,
+                ..TcpLimits::default()
+            },
+            TcpLimits {
+                gate_timeout: Duration::MAX,
+                ..TcpLimits::default()
+            },
+            TcpLimits {
+                connect_timeout: MAX_TIMEOUT + Duration::from_secs(1),
                 ..TcpLimits::default()
             },
         ] {

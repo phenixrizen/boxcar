@@ -27,6 +27,12 @@ pub fn emit(sink: &AuditSink, payload: Payload) -> Result<(), EmitError> {
 /// log. A log that is closed (the session is ending) or has failed (the
 /// VMM stops on that) records nothing more.
 pub(crate) fn record(sink: &AuditSink, payload: Payload) {
+    #[cfg(test)]
+    tests::RECORDED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&payload);
+        }
+    });
     match emit(sink, payload) {
         Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
         Err(error @ EmitError::Checkpoint) => {
@@ -78,13 +84,17 @@ pub enum DropReason {
     /// A guest SYN the policy allowed while the most host connects were
     /// under way: the guest sends it again, and it is decided then.
     TcpPendingFull,
+    /// TCP, UDP or ICMP (DNS included) from an IPv4 source that is not the
+    /// guest's address. (DHCP, answered by the gateway itself, may come
+    /// from any address.)
+    SrcSpoof,
     /// Anything else: an unknown protocol, or a malformed frame.
     Other,
 }
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 9] = [
+    pub const ALL: [DropReason; 10] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
@@ -93,6 +103,7 @@ impl DropReason {
         DropReason::UdpUnimplemented,
         DropReason::QueueFull,
         DropReason::TcpPendingFull,
+        DropReason::SrcSpoof,
         DropReason::Other,
     ];
 
@@ -107,6 +118,7 @@ impl DropReason {
             DropReason::UdpUnimplemented => "udp_unimplemented",
             DropReason::QueueFull => "queue_full",
             DropReason::TcpPendingFull => "tcp_pending_full",
+            DropReason::SrcSpoof => "src_spoof",
             DropReason::Other => "other",
         }
     }
@@ -207,8 +219,17 @@ impl Drops {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// What a test runs on every record [`record`] makes on its thread, at
+    /// the moment it makes it (before it reaches the log).
+    pub(crate) type Hook = Box<dyn FnMut(&Payload)>;
+
+    thread_local! {
+        pub(crate) static RECORDED: RefCell<Option<Hook>> = RefCell::new(None);
+    }
 
     fn drop_of(reason: &str, count: u64) -> NetDrop {
         NetDrop {
@@ -320,6 +341,7 @@ mod tests {
                 "udp_unimplemented",
                 "queue_full",
                 "tcp_pending_full",
+                "src_spoof",
                 "other"
             ]
         );

@@ -41,7 +41,8 @@ pub const CONTENT_HANDSHAKE: u8 = 22;
 /// The longest TLS plaintext record (RFC 8446 §5.1).
 pub const MAX_RECORD: usize = 1 << 14;
 
-const RECORD_HEADER: usize = 5;
+/// The size of a TLS record header.
+pub const RECORD_HEADER: usize = 5;
 const HANDSHAKE_HEADER: usize = 4;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const EXTENSION_SERVER_NAME: u16 = 0;
