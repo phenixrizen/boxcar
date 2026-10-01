@@ -24,6 +24,7 @@ mod cmdline;
 mod console;
 mod mounts;
 mod reaper;
+mod resolver;
 mod search;
 mod session;
 mod shutdown;
@@ -92,7 +93,7 @@ fn run_session(args: &BTreeMap<String, String>) -> Result<Ended, Failed> {
     mounts::switch_root()?;
     if cmdline::net_enabled(args) {
         // The session can run without it: a warning, not a reboot.
-        if let Err(failed) = mounts::set_up_resolver() {
+        if let Err(failed) = resolver::set_up() {
             warn(&format!("resolver: {failed}"));
         }
     }

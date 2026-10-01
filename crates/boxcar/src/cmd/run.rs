@@ -45,9 +45,18 @@ const USAGE_EXIT: u8 = 2;
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     init_tracing();
     // Everything that can be refused is checked before the session exists,
-    // so that a typo does not leave an empty session behind: the policy,
-    // the ready descriptor, the shares, where the audit log and the control
-    // socket go, and the kernel command line.
+    // so that a typo does not leave an empty session behind: the network
+    // flags, the policy, the ready descriptor, the shares, where the audit
+    // log and the control socket go, and the kernel command line.
+    // clap requires --rootfs unless --no-fs, so the shares are known here.
+    let net = net_enabled(args.rootfs.is_some(), args.net, args.no_net);
+    if !net && policy_flags_given(&args) {
+        tell(
+            "error: network policy flags need --net: without shares (--no-fs) the VM has no \
+             network, and --allow, --deny, --policy-file and --dns would go unused",
+        );
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
     let policy = match load_policy(&args)? {
         Ok(policy) => policy,
         Err(message) => {
@@ -89,7 +98,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => (GuestMode::Hello, 0),
     };
     let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command);
-    let net = net_enabled(share_count > 0, args.net, args.no_net);
     // The devices the VM will have, derived as `Vmm::new` derives them.
     let devices = DeviceSet::new(share_count, net, false);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
@@ -376,6 +384,15 @@ fn build_policy(
         };
         format!("{source}: {}", error.kind)
     })
+}
+
+/// Whether any of the flags that set the network's policy or its DNS was
+/// given: `--allow`, `--deny`, `--policy-file`, `--dns`.
+fn policy_flags_given(args: &RunArgs) -> bool {
+    !args.allow.is_empty()
+        || !args.deny.is_empty()
+        || args.policy_file.is_some()
+        || !args.dns.is_empty()
 }
 
 /// Whether the VM gets a network card: with shares unless `--no-net`, and

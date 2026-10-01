@@ -140,6 +140,17 @@ impl NetStack {
         sink: AuditSink,
         policy: Arc<ArcSwap<Policy>>,
     ) -> Result<NetStack, ConfigError> {
+        NetStack::with_flow_ids(cfg, sink, policy, FlowIds::default())
+    }
+
+    /// [`NetStack::new`], giving out flow ids from `ids`, whose clones share
+    /// one count: the device hands every stack it builds the same one.
+    pub(crate) fn with_flow_ids(
+        cfg: NetConfig,
+        sink: AuditSink,
+        policy: Arc<ArcSwap<Policy>>,
+        ids: FlowIds,
+    ) -> Result<NetStack, ConfigError> {
         cfg.validate()?;
         let dns = Forwarder::connect(&cfg.dns_upstreams)
             .map_err(|error| ConfigError::DnsUpstream(error.to_string()))?;
@@ -181,7 +192,7 @@ impl NetStack {
             dns_watched: false,
             tcp,
             udp,
-            ids: FlowIds::default(),
+            ids,
             host_addrs: HostAddrs::system(),
             epoch,
         })

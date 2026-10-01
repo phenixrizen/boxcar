@@ -61,19 +61,27 @@
 //! it gets one.
 //!
 //! [`VirtioDevice::reset`], on the driver's status-0 write and when the VMM
-//! stops the VM, fires the kill eventfd. The thread then calls
-//! [`NetStack::shutdown`], which records the end of every flow, drops the
-//! stack, which closes its host sockets, and exits; the reset waits for it
-//! at most [`JOIN_LIMIT`]. The VMM must therefore reset the device before
-//! it closes the audit writer. A thread that has not stopped by then (its
-//! audit records wait on a log that does not drain) is left behind with a
-//! warning.
+//! stops the VM, sets the thread's stop flag and fires the kill eventfd.
+//! The thread then calls [`NetStack::shutdown`], which records the end of
+//! every flow, drops the stack, which closes its host sockets, and exits;
+//! the reset waits for it at most [`JOIN_LIMIT`]. The VMM must therefore
+//! reset the device before it closes the audit writer. A thread that has
+//! not stopped by then (its audit records wait on a log that does not
+//! drain) is left behind with a warning, and the stop flag keeps it from
+//! the rings and the interrupt: it checks the flag before every write to a
+//! ring and before every interrupt, and once it is set does nothing but
+//! shut the stack down.
+//!
+//! Flow ids come from one count the device keeps for its whole life
+//! (shared with every stack it builds, a left-behind thread's included),
+//! so they stay unique in the session's log across a guest's driver reset
+//! and re-activation.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -82,7 +90,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
 use boxcar_virtio::features::{EVENT_IDX, VERSION_1};
-use boxcar_virtio::{drain_queue, ActivateError, ActivatedQueue, IrqTrigger, VirtioDevice};
+use boxcar_virtio::{ActivateError, ActivatedQueue, IrqTrigger, VirtioDevice};
 use event_manager::{
     EventManager, EventOps, EventSet, Events, MutEventSubscriber, SubscriberId, SubscriberOps,
 };
@@ -95,6 +103,7 @@ use vmm_sys_util::timerfd::TimerFd;
 use crate::config::{ConfigError, NetConfig};
 use crate::policy::Policy;
 use crate::stack::{FdChange, Interest, NetStack, QUEUE_CAP};
+use crate::tcp::flow::FlowIds;
 
 /// The virtio device ID of a network card.
 pub const DEVICE_TYPE: u32 = virtio_bindings::virtio_ids::VIRTIO_ID_NET;
@@ -196,6 +205,9 @@ pub struct VirtioNet {
     /// stack refuses fails [`VirtioNet::new`]. Each activation after a
     /// reset builds a new one.
     spare: Option<NetStack>,
+    /// The flow ids of every stack the device builds: one count for the
+    /// device's life.
+    ids: FlowIds,
     counters: Arc<NetCounters>,
     /// The net thread; `None` when the device is not activated.
     worker: Option<WorkerHandle>,
@@ -211,13 +223,16 @@ impl VirtioNet {
         sink: AuditSink,
         policy: Arc<ArcSwap<Policy>>,
     ) -> Result<VirtioNet, ConfigError> {
-        let spare = NetStack::new(cfg.clone(), sink.clone(), Arc::clone(&policy))?;
+        let ids = FlowIds::default();
+        let spare =
+            NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?;
         Ok(VirtioNet {
             mac: cfg.guest_mac,
             cfg,
             sink,
             policy,
             spare: Some(spare),
+            ids,
             counters: Arc::new(NetCounters::default()),
             worker: None,
         })
@@ -228,14 +243,16 @@ impl VirtioNet {
         self.counters.snapshot()
     }
 
-    /// The stack for the next activation.
+    /// The stack for the next activation, counting flow ids on from the
+    /// last.
     fn take_stack(&mut self) -> Result<NetStack, ConfigError> {
         match self.spare.take() {
             Some(stack) => Ok(stack),
-            None => NetStack::new(
+            None => NetStack::with_flow_ids(
                 self.cfg.clone(),
                 self.sink.clone(),
                 Arc::clone(&self.policy),
+                self.ids.clone(),
             ),
         }
     }
@@ -323,6 +340,7 @@ impl VirtioDevice for VirtioNet {
             kill: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
             timer: TimerFd::new().map_err(io::Error::from)?,
             counters: Arc::clone(&self.counters),
+            stop: StopFlag::default(),
             watched: HashMap::new(),
             tokens: HashMap::new(),
         };
@@ -353,46 +371,100 @@ fn device_error(message: String) -> ActivateError {
 /// Hands every chain the driver made available on the TX `queue` to
 /// `stack`, each frame without its header, and returns each to the used
 /// ring with nothing written. Returns whether the driver wants an
-/// interrupt; an `Err` means the ring is unusable (see [`drain_queue`]).
+/// interrupt.
+///
+/// It drains as [`boxcar_virtio::drain_queue`] does (notifications off
+/// while it pops, then on again, and a chain offered meanwhile is taken),
+/// but checks `stop` before every write to the ring: handing a frame to
+/// the stack can wait on the audit log, and a reset may come meanwhile.
+/// Once `stop` is set it returns at once, touching the ring no more.
+///
+/// An `Err` means the ring is unusable: it announces chains that cannot be
+/// popped, or its used ring or notification fields cannot be written.
 pub(crate) fn transmit(
     queue: &mut Queue,
     mem: &GuestMemoryMmap,
     stack: &mut NetStack,
     counters: &NetCounters,
+    stop: &StopFlag,
 ) -> Result<bool, virtio_queue::Error> {
     let mut frame = Vec::with_capacity(MAX_FRAME_LEN);
-    drain_queue(queue, mem, |chain| {
-        match read_tx(mem, chain, &mut frame) {
-            Ok(()) => {
-                count(&counters.tx_frames);
-                stack.push_guest_frame(&frame);
-            }
-            Err(TxDrop::Runt(len)) => {
-                count(&counters.tx_runt);
-                boxcar_virtio::limited!(
-                    warn,
-                    "virtio-net: the guest sent a {len}-byte frame, shorter than an Ethernet \
-                     header; dropped"
-                );
-            }
-            Err(TxDrop::Oversize(len)) => {
-                count(&counters.tx_oversize);
-                boxcar_virtio::limited!(
-                    warn,
-                    "virtio-net: the guest sent a {len}-byte frame, longer than \
-                     {MAX_FRAME_LEN}; dropped"
-                );
-            }
-            Err(TxDrop::Unreadable(error)) => {
-                count(&counters.tx_chain_bad);
-                boxcar_virtio::limited!(
-                    warn,
-                    "virtio-net: cannot read a frame the guest sent: {error}; dropped"
-                );
-            }
+    // Consecutive passes that popped nothing though the ring said there was
+    // more: once is a race with the driver, twice a broken ring.
+    let mut idle_passes = 0;
+    loop {
+        if stop.is_set() {
+            return Ok(false);
         }
-        Ok::<u32, virtio_queue::Error>(0)
-    })
+        queue.disable_notification(mem)?;
+        let mut used_any = false;
+        loop {
+            if stop.is_set() {
+                return Ok(false);
+            }
+            let Some(chain) = queue.pop_descriptor_chain(mem) else {
+                break;
+            };
+            let head = chain.head_index();
+            hand_over(mem, chain, &mut frame, stack, counters);
+            if stop.is_set() {
+                return Ok(false);
+            }
+            queue.add_used(mem, head, 0)?;
+            used_any = true;
+        }
+        if stop.is_set() {
+            return Ok(false);
+        }
+        if !queue.enable_notification(mem)? {
+            break;
+        }
+        idle_passes = if used_any { 0 } else { idle_passes + 1 };
+        if idle_passes == 2 {
+            return Err(virtio_queue::Error::InvalidAvailRingIndex);
+        }
+    }
+    queue.needs_notification(mem)
+}
+
+/// Gives `stack` the frame in a TX `chain`, or counts and logs why not.
+/// `frame` is scratch space.
+fn hand_over(
+    mem: &GuestMemoryMmap,
+    chain: DescriptorChain<&GuestMemoryMmap>,
+    frame: &mut Vec<u8>,
+    stack: &mut NetStack,
+    counters: &NetCounters,
+) {
+    match read_tx(mem, chain, frame) {
+        Ok(()) => {
+            count(&counters.tx_frames);
+            stack.push_guest_frame(frame);
+        }
+        Err(TxDrop::Runt(len)) => {
+            count(&counters.tx_runt);
+            boxcar_virtio::limited!(
+                warn,
+                "virtio-net: the guest sent a {len}-byte frame, shorter than an Ethernet \
+                 header; dropped"
+            );
+        }
+        Err(TxDrop::Oversize(len)) => {
+            count(&counters.tx_oversize);
+            boxcar_virtio::limited!(
+                warn,
+                "virtio-net: the guest sent a {len}-byte frame, longer than \
+                 {MAX_FRAME_LEN}; dropped"
+            );
+        }
+        Err(TxDrop::Unreadable(error)) => {
+            count(&counters.tx_chain_bad);
+            boxcar_virtio::limited!(
+                warn,
+                "virtio-net: cannot read a frame the guest sent: {error}; dropped"
+            );
+        }
+    }
 }
 
 /// Why a guest frame was dropped.
@@ -434,20 +506,21 @@ fn read_tx(
 /// the RX `queue`. With frames left and no chain, the driver is asked to
 /// notify the queue when it adds a buffer, and the frames stay in the
 /// stack's queue. Returns how many chains were used, including any given
-/// back empty because the frame did not fit. An `Err` means the ring is
-/// unusable: it announces chains that cannot be popped, or its used ring
-/// cannot be written.
+/// back empty because the frame did not fit. Once `stop` is set it touches
+/// the ring no more. An `Err` means the ring is unusable: it announces
+/// chains that cannot be popped, or its used ring cannot be written.
 pub(crate) fn deliver(
     queue: &mut Queue,
     mem: &GuestMemoryMmap,
     stack: &mut NetStack,
     counters: &NetCounters,
+    stop: &StopFlag,
 ) -> Result<usize, virtio_queue::Error> {
     let mut used = 0;
     // Consecutive times the ring announced a buffer that could not be
     // popped: once is a race with the driver, twice a broken ring.
     let mut idle = 0;
-    while stack.host_frames() > 0 {
+    while !stop.is_set() && stack.host_frames() > 0 {
         let Some(chain) = queue.pop_descriptor_chain(mem) else {
             // Re-enabling notifications reports a buffer added since the
             // pop; take it now, as no kick may come for it.
@@ -553,8 +626,8 @@ impl Ring {
     }
 
     /// Stops serving the queue after `error`, and asks the driver for a
-    /// reset.
-    fn fail(&mut self, irq: &IrqTrigger, error: virtio_queue::Error) {
+    /// reset, unless the device is being reset already (`stop`).
+    fn fail(&mut self, irq: &IrqTrigger, stop: &StopFlag, error: virtio_queue::Error) {
         boxcar_virtio::limited!(
             error,
             "virtio-net: queue {} cannot be served: {error}; asking the driver to reset the \
@@ -562,12 +635,32 @@ impl Ring {
             self.index
         );
         self.failed = true;
+        if stop.is_set() {
+            return;
+        }
         if let Err(error) = irq.signal_needs_reset() {
             boxcar_virtio::limited!(
                 error,
                 "virtio-net: cannot signal the reset request: {error}"
             );
         }
+    }
+}
+
+/// Set by [`VirtioDevice::reset`] before it waits for the net thread. From
+/// then on the thread writes to neither ring and raises no interrupt: the
+/// queues and the interrupt are the driver's again, whether or not the
+/// reset waited long enough to join the thread.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StopFlag(Arc<AtomicBool>);
+
+impl StopFlag {
+    fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -598,6 +691,8 @@ struct Worker {
     /// does not block.
     timer: TimerFd,
     counters: Arc<NetCounters>,
+    /// Set when the device is reset: see [`StopFlag`].
+    stop: StopFlag,
     /// The host fd watched for each of the stack's tokens.
     watched: HashMap<u64, RawFd>,
     /// The token of each watched host fd.
@@ -605,8 +700,9 @@ struct Worker {
 }
 
 impl Worker {
-    /// Handles what one wait found. Returns `false` when the kill eventfd
-    /// fired and the thread is to stop.
+    /// Handles what one wait found. Returns `false` when the device is
+    /// being reset (the kill eventfd fired, or the stop flag is set) and
+    /// the thread is to stop.
     fn wakeup(
         &mut self,
         manager: &mut EventManager<Ready>,
@@ -614,7 +710,7 @@ impl Worker {
         ready: &[(RawFd, EventSet)],
     ) -> bool {
         let kill = self.kill.as_raw_fd();
-        if ready.iter().any(|&(fd, _)| fd == kill) {
+        if self.stop.is_set() || ready.iter().any(|&(fd, _)| fd == kill) {
             return false;
         }
         let mut tx_kicked = false;
@@ -638,18 +734,20 @@ impl Worker {
                 host.push((token, readable, writable));
             }
         }
-        self.cycle(manager, id, tx_kicked, &host);
-        true
+        self.cycle(manager, id, tx_kicked, &host)
     }
 
-    /// One turn of the loop: the steps of the module docs.
+    /// One turn of the loop: the steps of the module docs. Returns `false`,
+    /// having stopped short, when the stop flag was set meanwhile: handing
+    /// frames and fd events to the stack, and polling it, can wait on the
+    /// audit log.
     fn cycle(
         &mut self,
         manager: &mut EventManager<Ready>,
         id: SubscriberId,
         tx_kicked: bool,
         host: &[(u64, bool, bool)],
-    ) {
+    ) -> bool {
         let mut interrupt = false;
         if tx_kicked && !self.tx.failed {
             match transmit(
@@ -657,9 +755,10 @@ impl Worker {
                 &self.mem,
                 &mut self.stack,
                 &self.counters,
+                &self.stop,
             ) {
                 Ok(notify) => interrupt |= notify,
-                Err(error) => self.tx.fail(&self.irq, error),
+                Err(error) => self.tx.fail(&self.irq, &self.stop, error),
             }
         }
         for &(token, readable, writable) in host {
@@ -668,6 +767,9 @@ impl Worker {
         let now = Instant::now();
         let outcome = self.stack.poll(now);
         let mut deadline = outcome.next_deadline;
+        if self.stop.is_set() {
+            return false;
+        }
         if !self.rx.failed {
             let was_full = self.stack.host_frames() >= QUEUE_CAP;
             match deliver(
@@ -675,17 +777,21 @@ impl Worker {
                 &self.mem,
                 &mut self.stack,
                 &self.counters,
+                &self.stop,
             ) {
                 Ok(0) => {}
                 Ok(_) => {
                     deadline = after_delivery(deadline, was_full, now);
                     match self.rx.queue.needs_notification(&*self.mem) {
                         Ok(notify) => interrupt |= notify,
-                        Err(error) => self.rx.fail(&self.irq, error),
+                        Err(error) => self.rx.fail(&self.irq, &self.stop, error),
                     }
                 }
-                Err(error) => self.rx.fail(&self.irq, error),
+                Err(error) => self.rx.fail(&self.irq, &self.stop, error),
             }
+        }
+        if self.stop.is_set() {
+            return false;
         }
         if interrupt {
             if let Err(error) = self.irq.signal_used_queue() {
@@ -702,13 +808,17 @@ impl Worker {
             }
         }
         self.arm(deadline);
+        true
     }
 
     /// Starts, changes and stops watching host fds as `changes` say. A
     /// change with no interest stops watching its token's fd, if it was
     /// watched; the first change with interest for a token starts watching
     /// it; a later one changes what it is watched for. The stack asks to
-    /// stop watching an fd before it closes it.
+    /// stop watching an fd before it closes it, and this relies on that:
+    /// event-manager 0.4.2 keeps an fd it failed to remove (one already
+    /// closed) in its table, and would refuse to watch that fd number
+    /// again.
     fn watch(&mut self, ops: &mut EventOps, changes: &[FdChange]) {
         for change in changes {
             let FdChange {
@@ -819,6 +929,7 @@ fn event_set(interest: Interest) -> Option<EventSet> {
 fn spawn(worker: Worker) -> Result<WorkerHandle, ActivateError> {
     let manager_error = |error: event_manager::Error| ActivateError::Device(error.into());
     let kill = worker.kill.try_clone()?;
+    let stop = worker.stop.clone();
     let mut manager = EventManager::new().map_err(manager_error)?;
     let id = manager.add_subscriber(Ready::default());
     let mut ops = manager.event_ops(id).map_err(manager_error)?;
@@ -838,29 +949,40 @@ fn spawn(worker: Worker) -> Result<WorkerHandle, ActivateError> {
         let _stopped = stopped;
         run(manager, id, worker);
     })?;
-    Ok(WorkerHandle { kill, done, thread })
+    Ok(WorkerHandle {
+        kill,
+        stop,
+        done,
+        thread,
+    })
 }
 
 /// The net thread: waits and handles what it finds until the kill eventfd
 /// fires, then shuts the stack down.
 fn run(mut manager: EventManager<Ready>, id: SubscriberId, mut worker: Worker) {
     let irq = Arc::clone(&worker.irq);
-    let _panic = PanicGuard { irq: &irq };
+    let stop = worker.stop.clone();
+    let _panic = PanicGuard {
+        irq: &irq,
+        stop: &stop,
+    };
     // Chains the driver queued before the thread started, and the first
     // poll, which asks for the DNS socket to be watched.
-    worker.cycle(&mut manager, id, true, &[]);
-    loop {
+    let mut running = worker.cycle(&mut manager, id, true, &[]);
+    while running {
         if let Err(error) = manager.run() {
             boxcar_virtio::limited!(
                 error,
                 "virtio-net: the net thread cannot wait for events: {error}; asking the driver \
                  to reset the device"
             );
-            if let Err(error) = irq.signal_needs_reset() {
-                boxcar_virtio::limited!(
-                    error,
-                    "virtio-net: cannot signal the reset request: {error}"
-                );
+            if !stop.is_set() {
+                if let Err(error) = irq.signal_needs_reset() {
+                    boxcar_virtio::limited!(
+                        error,
+                        "virtio-net: cannot signal the reset request: {error}"
+                    );
+                }
             }
             break;
         }
@@ -868,9 +990,7 @@ fn run(mut manager: EventManager<Ready>, id: SubscriberId, mut worker: Worker) {
             Ok(ready) => mem::take(&mut ready.0),
             Err(_) => break,
         };
-        if !worker.wakeup(&mut manager, id, &ready) {
-            break;
-        }
+        running = worker.wakeup(&mut manager, id, &ready);
     }
     // Every flow's end is recorded; dropping the worker closes the sockets.
     worker.stack.shutdown();
@@ -880,11 +1000,12 @@ fn run(mut manager: EventManager<Ready>, id: SubscriberId, mut worker: Worker) {
 /// learns that its queues are no longer served.
 struct PanicGuard<'a> {
     irq: &'a IrqTrigger,
+    stop: &'a StopFlag,
 }
 
 impl Drop for PanicGuard<'_> {
     fn drop(&mut self) {
-        if thread::panicking() {
+        if thread::panicking() && !self.stop.is_set() {
             boxcar_virtio::limited!(
                 error,
                 "virtio-net: the net thread panicked; asking the driver to reset the device"
@@ -903,6 +1024,8 @@ impl Drop for PanicGuard<'_> {
 struct WorkerHandle {
     /// The device's end of the kill eventfd.
     kill: EventFd,
+    /// The thread's stop flag.
+    stop: StopFlag,
     /// Disconnected when the thread ends.
     done: Receiver<()>,
     thread: JoinHandle<()>,
@@ -910,9 +1033,10 @@ struct WorkerHandle {
 
 impl WorkerHandle {
     /// Stops the thread and joins it, waiting at most [`JOIN_LIMIT`]. After
-    /// this the thread touches neither guest memory nor the interrupt,
-    /// unless it was left behind.
+    /// this the thread writes to neither ring and raises no interrupt, even
+    /// if it was left behind: the stop flag is set first.
     fn stop(self) {
+        self.stop.set();
         // A fresh eventfd written once cannot overflow.
         if let Err(error) = self.kill.write(1) {
             boxcar_virtio::limited!(error, "virtio-net: cannot stop the net thread: {error}");
@@ -946,9 +1070,14 @@ mod tests {
     use boxcar_virtio::status::{ACKNOWLEDGE, DRIVER, DRIVER_OK, FEATURES_OK};
     use boxcar_virtio::testing::{guest_memory, read_u32, write_u32, TEST_SLOT};
     use boxcar_virtio::{DeviceContext, MmioTransport};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use boxcar_audit::LogReader;
+    use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-        EthernetRepr,
+        EthernetRepr, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
+        TcpSeqNumber,
     };
     use tempfile::TempDir;
     use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
@@ -1023,6 +1152,73 @@ mod tests {
             drop(self.sink);
             self.writer.close().unwrap();
         }
+
+        /// Closes the log and returns its records.
+        fn records(self) -> Vec<boxcar_proto::Record> {
+            let Session {
+                _dir: dir,
+                sink,
+                writer,
+                ..
+            } = self;
+            let session = writer.session_dir().to_owned();
+            drop(sink);
+            writer.close().unwrap();
+            let records = LogReader::open(&session)
+                .unwrap()
+                .records()
+                .map(Result::unwrap)
+                .collect();
+            drop(dir);
+            records
+        }
+    }
+
+    /// A stop flag that is not set: the thread goes on.
+    fn going() -> StopFlag {
+        StopFlag::default()
+    }
+
+    /// The guest's SYN from its `port` to `dst`, through the gateway.
+    fn syn(port: u16, dst: SocketAddrV4) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port: port,
+            dst_port: dst.port(),
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(1000),
+            ack_number: None,
+            window_len: 65_535,
+            window_scale: None,
+            max_seg_size: Some(1460),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv4Repr {
+            src_addr: GUEST_IP,
+            dst_addr: *dst.ip(),
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let mut buf = vec![0; eth.buffer_len() + ip.buffer_len() + tcp.buffer_len()];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth.emit(&mut frame);
+        let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+        ip.emit(&mut packet, &ChecksumCapabilities::default());
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(packet.payload_mut()),
+            &GUEST_IP.into(),
+            &(*dst.ip()).into(),
+            &ChecksumCapabilities::default(),
+        );
+        buf
     }
 
     /// The guest asking who has the gateway's address, padded with zeros
@@ -1165,6 +1361,43 @@ mod tests {
         bytes
     }
 
+    /// Offers one RX chain of device-writable descriptors of `lens` bytes,
+    /// from descriptor and buffer `head` on, each filled with 0xaa.
+    fn offer_rx_chain(
+        mem: &GuestMemoryMmap,
+        mock: &MockSplitQueue<'_, GuestMemoryMmap>,
+        head: u16,
+        lens: &[u32],
+    ) {
+        let descs: Vec<RawDescriptor> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let n = head + i as u16;
+                mem.write_slice(&vec![0xaa; len as usize], buffer(n))
+                    .unwrap();
+                let last = i + 1 == lens.len();
+                let next = if last { 0 } else { VRING_DESC_F_NEXT as u16 };
+                RawDescriptor::from(SplitDescriptor::new(
+                    buffer(n).0,
+                    len,
+                    VRING_DESC_F_WRITE as u16 | next,
+                    if last { 0 } else { n + 1 },
+                ))
+            })
+            .collect();
+        mock.add_desc_chains(&descs, head).unwrap();
+    }
+
+    /// The bytes of the RX chain `offer_rx_chain(head, lens)` made, end to
+    /// end.
+    fn rx_chain_bytes(mem: &GuestMemoryMmap, head: u16, lens: &[u32]) -> Vec<u8> {
+        lens.iter()
+            .enumerate()
+            .flat_map(|(i, &len)| rx_bytes(mem, head + i as u16, len))
+            .collect()
+    }
+
     /// The header the device puts before every frame it gives the guest:
     /// zeros, but `num_buffers` (the last two bytes) 1.
     const RX_HEADER: [u8; NET_HDR_LEN] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
@@ -1237,7 +1470,7 @@ mod tests {
         let whole = [&tx_header()[..], &request[..]].concat();
         offer_tx(&mem, &mock, 0, &[&whole]);
         offer_tx(&mem, &mock, 2, &[&tx_header(), &request]);
-        let notify = transmit(&mut queue, &mem, &mut stack, &counters).unwrap();
+        let notify = transmit(&mut queue, &mem, &mut stack, &counters, &going()).unwrap();
         assert!(notify, "without EVENT_IDX every drain wants an interrupt");
 
         assert_eq!(used_idx(&mem, &mock), 2, "both chains are given back");
@@ -1271,7 +1504,7 @@ mod tests {
         stack.push_guest_frame(&arp_request(0));
         assert_eq!(stack.host_frames(), 1);
         offer_rx(&mem, &mock, 0, RX_BUF_LEN);
-        let delivered = deliver(&mut queue, &mem, &mut stack, &counters).unwrap();
+        let delivered = deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap();
         assert_eq!(delivered, 1);
         assert_eq!(stack.host_frames(), 0);
 
@@ -1309,25 +1542,37 @@ mod tests {
         for _ in 0..3 {
             stack.push_guest_frame(&arp_request(0));
         }
-        assert_eq!(deliver(&mut queue, &mem, &mut stack, &counters).unwrap(), 0);
+        assert_eq!(
+            deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap(),
+            0
+        );
         assert_eq!(stack.host_frames(), 3);
         assert_eq!(used_idx(&mem, &mock), 0);
         let avail_event = GuestAddress(used_ring(&mock).0 + 4 + 8 * u64::from(QUEUE_LEN));
         mem.write_obj(0xffffu16, avail_event).unwrap();
-        assert_eq!(deliver(&mut queue, &mem, &mut stack, &counters).unwrap(), 0);
+        assert_eq!(
+            deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap(),
+            0
+        );
         assert_eq!(u16::from_le(mem.read_obj(avail_event).unwrap()), 0);
 
         // Two buffers: two frames, in order; the third waits.
         offer_rx(&mem, &mock, 0, RX_BUF_LEN);
         offer_rx(&mem, &mock, 1, RX_BUF_LEN);
-        assert_eq!(deliver(&mut queue, &mem, &mut stack, &counters).unwrap(), 2);
+        assert_eq!(
+            deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap(),
+            2
+        );
         assert_eq!(stack.host_frames(), 1);
         assert_eq!(used_idx(&mem, &mock), 2);
         assert_eq!(u16::from_le(mem.read_obj(avail_event).unwrap()), 2);
 
         // One more: the last frame.
         offer_rx(&mem, &mock, 2, RX_BUF_LEN);
-        assert_eq!(deliver(&mut queue, &mem, &mut stack, &counters).unwrap(), 1);
+        assert_eq!(
+            deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap(),
+            1
+        );
         assert_eq!(stack.host_frames(), 0);
         for n in 0..3u16 {
             let used = used_elem(&mem, &mock, u64::from(n));
@@ -1355,7 +1600,10 @@ mod tests {
         // 12 bytes of header and 41 of the 42-byte reply.
         offer_rx(&mem, &mock, 0, (NET_HDR_LEN + 41) as u32);
         offer_rx(&mem, &mock, 1, RX_BUF_LEN);
-        assert_eq!(deliver(&mut queue, &mem, &mut stack, &counters).unwrap(), 2);
+        assert_eq!(
+            deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap(),
+            2
+        );
         assert_eq!(stack.host_frames(), 0);
         let short = used_elem(&mem, &mock, 0);
         assert_eq!((short.id(), short.len()), (0, 0), "given back empty");
@@ -1397,7 +1645,7 @@ mod tests {
         offer_tx(&mem, &mock, 3, &[&tx_header(), &header_only]);
         offer_tx(&mem, &mock, 5, &[&tx_header(), &oversize]);
         offer_tx(&mem, &mock, 7, &[&tx_header(), &largest]);
-        transmit(&mut queue, &mem, &mut stack, &counters).unwrap();
+        transmit(&mut queue, &mem, &mut stack, &counters, &going()).unwrap();
 
         assert_eq!(used_idx(&mem, &mock), 5, "every chain is given back");
         let counts = counters.snapshot();
@@ -1408,6 +1656,116 @@ mod tests {
         let replies: Vec<Vec<u8>> = std::iter::from_fn(|| stack.pop_host_frame()).collect();
         assert_eq!(replies.len(), 1, "{replies:?}");
         assert!(is_gateway_arp_reply(&replies[0]));
+        drop(stack);
+        session.close();
+    }
+
+    /// The header may straddle RX descriptors and the frame span several:
+    /// the guest's buffers are one byte stream. Chains of 5 + 10 + 20 + 200
+    /// bytes (the header across the first two, the 42-byte frame across the
+    /// last three) and 12 + 30 + 200.
+    #[test]
+    fn an_rx_header_and_frame_may_straddle_descriptors() {
+        let session = Session::new();
+        let mut stack = session.stack();
+        let counters = NetCounters::default();
+        let mem = new_mem();
+        let mock = MockSplitQueue::new(&mem, QUEUE_LEN);
+        let mut queue = device_queue(&mock);
+
+        stack.push_guest_frame(&arp_request(0));
+        stack.push_guest_frame(&arp_request(0));
+        let chains: [(u16, &[u32]); 2] = [(0, &[5, 10, 20, 200]), (4, &[12, 30, 200])];
+        for (head, lens) in chains {
+            offer_rx_chain(&mem, &mock, head, lens);
+        }
+        assert_eq!(
+            deliver(&mut queue, &mem, &mut stack, &counters, &going()).unwrap(),
+            2
+        );
+        for (index, (head, lens)) in chains.into_iter().enumerate() {
+            let used = used_elem(&mem, &mock, index as u64);
+            assert_eq!(used.id(), u32::from(head));
+            let len = used.len() as usize;
+            assert_eq!(len, NET_HDR_LEN + 42, "chain {head}");
+            let bytes = rx_chain_bytes(&mem, head, lens);
+            assert_eq!(bytes[..NET_HDR_LEN], RX_HEADER, "chain {head}");
+            assert!(
+                is_gateway_arp_reply(&bytes[NET_HDR_LEN..len]),
+                "chain {head}"
+            );
+            assert!(
+                bytes[len..].iter().all(|&b| b == 0xaa),
+                "chain {head}: nothing past the frame"
+            );
+        }
+        drop(stack);
+        session.close();
+    }
+
+    /// The TX header may be split anywhere: 5 + 7 then the frame, or the
+    /// header and the frame's first 3 bytes then the rest. Eight bytes in
+    /// two descriptors, less than a header, is a runt.
+    #[test]
+    fn a_tx_header_may_be_split_mid_header() {
+        let session = Session::new();
+        let mut stack = session.stack();
+        let counters = NetCounters::default();
+        let mem = new_mem();
+        let mock = MockSplitQueue::new(&mem, QUEUE_LEN);
+        let mut queue = device_queue(&mock);
+
+        let request = arp_request(0);
+        let header = tx_header();
+        offer_tx(&mem, &mock, 0, &[&header[..5], &header[5..], &request]);
+        offer_tx(&mem, &mock, 3, &[&[0; 4], &[0; 4]]);
+        let first = [&header[..], &request[..3]].concat();
+        offer_tx(&mem, &mock, 5, &[&first, &request[3..]]);
+        transmit(&mut queue, &mem, &mut stack, &counters, &going()).unwrap();
+
+        assert_eq!(used_idx(&mem, &mock), 3);
+        for index in 0..3 {
+            assert_eq!(used_elem(&mem, &mock, index).len(), 0);
+        }
+        let counts = counters.snapshot();
+        assert_eq!((counts.tx_frames, counts.tx_runt), (2, 1), "{counts:?}");
+        let replies: Vec<Vec<u8>> = std::iter::from_fn(|| stack.pop_host_frame()).collect();
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(replies.iter().all(|r| is_gateway_arp_reply(r)));
+        drop(stack);
+        session.close();
+    }
+
+    /// Once the device is being reset, the thread's last steps leave both
+    /// rings alone: no chain is popped or used, and the frames for the
+    /// guest stay in the stack.
+    #[test]
+    fn with_the_stop_flag_set_no_ring_is_touched() {
+        let session = Session::new();
+        let mut stack = session.stack();
+        let counters = NetCounters::default();
+        let mem = new_mem();
+        let tx = MockSplitQueue::create(&mem, GuestAddress(0x1_0000), QUEUE_LEN);
+        let rx = MockSplitQueue::create(&mem, GuestAddress(0x2_0000), QUEUE_LEN);
+        let (mut tx_queue, mut rx_queue) = (device_queue(&tx), device_queue(&rx));
+        let stopped = StopFlag::default();
+        stopped.set();
+
+        offer_tx(&mem, &tx, 0, &[&tx_header(), &arp_request(0)]);
+        assert!(!transmit(&mut tx_queue, &mem, &mut stack, &counters, &stopped).unwrap());
+        assert_eq!(used_idx(&mem, &tx), 0);
+        assert_eq!(tx_queue.next_avail(), 0, "not even popped");
+        assert_eq!(stack.host_frames(), 0, "the stack got nothing");
+
+        stack.push_guest_frame(&arp_request(0));
+        offer_rx(&mem, &rx, 8, RX_BUF_LEN);
+        assert_eq!(
+            deliver(&mut rx_queue, &mem, &mut stack, &counters, &stopped).unwrap(),
+            0
+        );
+        assert_eq!(used_idx(&mem, &rx), 0);
+        assert_eq!(stack.host_frames(), 1);
+        assert!(rx_bytes(&mem, 8, RX_BUF_LEN).iter().all(|&b| b == 0xaa));
         drop(stack);
         session.close();
     }
@@ -1665,5 +2023,49 @@ mod tests {
         driver.set_status(0);
         drop(driver);
         session.close();
+    }
+
+    /// Each activation builds a new stack, but flow ids count on across a
+    /// driver reset: two denied SYNs, one per activation, are flows 1
+    /// and 2. (The Task 9 review's probe.)
+    #[test]
+    fn flow_ids_count_on_across_a_reset_and_reactivation() {
+        let session = Session::new();
+        let mut driver = Driver::new(session.device());
+        let dst = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 80);
+        for port in [40_000, 40_001] {
+            let mem = driver.mem.clone();
+            // The driver sets its rings up afresh, used rings included.
+            for q in [RX_QUEUE, TX_QUEUE] {
+                let used = queue_start(q as u32).0 + USED_RING_OFFSET;
+                mem.write_obj(0u32, GuestAddress(used)).unwrap();
+            }
+            driver.handshake();
+            let tx = queue_mock(&mem, TX_QUEUE as u32);
+            offer_tx(&mem, &tx, 0, &[&tx_header(), &syn(port, dst)]);
+            driver.kicks[TX_QUEUE].write(1).unwrap();
+            // The SYN is decided, and recorded, before its chain is used.
+            driver.wait_used(TX_QUEUE as u32, 1);
+            driver.set_status(0);
+        }
+        drop(driver);
+        let flows: Vec<(u64, String)> = session
+            .records()
+            .into_iter()
+            .filter(|r| r.kind == "net.connect")
+            .map(|r| {
+                (
+                    r.data["flow"].as_u64().unwrap(),
+                    r.data["src"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flows,
+            [
+                (1, "10.0.2.15:40000".to_owned()),
+                (2, "10.0.2.15:40001".to_owned())
+            ]
+        );
     }
 }

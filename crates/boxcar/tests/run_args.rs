@@ -385,3 +385,67 @@ fn a_bad_policy_file_line_exits_2_naming_the_file_and_line() {
     );
     assert!(!audit.exists(), "no session was started");
 }
+
+/// Without shares the VM has no network unless `--net` asks for one: the
+/// policy and DNS flags are then refused as a usage error, not ignored.
+#[test]
+fn network_policy_flags_without_a_network_exit_2() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let policy = scratch.path().join("team.policy");
+    std::fs::write(&policy, "allow example.com\n").unwrap();
+    for flag in [
+        ["--allow", "example.com"],
+        ["--deny", "example.com"],
+        ["--policy-file", policy.to_str().unwrap()],
+        ["--dns", "9.9.9.9"],
+    ] {
+        let output = boxcar(&[
+            "run",
+            "--kernel",
+            "/nonexistent/vmlinux",
+            "--no-fs",
+            "--audit-dir",
+            audit.to_str().unwrap(),
+            flag[0],
+            flag[1],
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("error: network policy flags need --net"),
+            "{flag:?}: {}",
+            stderr(&output)
+        );
+        assert!(!audit.exists(), "{flag:?}: no session was started");
+    }
+
+    // With --net they are the network's: the run gets past them and fails
+    // only for want of a kernel.
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--no-fs",
+        "--net",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--allow",
+        "example.com",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("need --net"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("/nonexistent/vmlinux"),
+        "{}",
+        stderr(&output)
+    );
+}

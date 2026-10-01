@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::{SocketAddrV4, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smoltcp::iface::SocketHandle;
@@ -44,17 +46,23 @@ impl FlowId {
 /// The flow ids a stack gives out, counted from 1. TCP connections and
 /// UDP flows (each decided SYN and each first datagram of a 5-tuple) share
 /// the count, so within a session an id names one flow of either kind.
+///
+/// Clones share one count. The virtio-net device keeps one for its whole
+/// life and hands it to every stack it builds, so the ids go on rising
+/// across a guest's driver reset (each activation builds a new stack), and
+/// even past a net thread the device had to leave behind.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FlowIds {
-    last: u64,
+    last: Arc<AtomicU64>,
 }
 
 impl FlowIds {
     /// The next id.
-    pub(crate) fn next(&mut self) -> FlowId {
-        self.last = self.last.saturating_add(1);
-        debug_assert!(self.last < FLOW_ID_LIMIT, "flow ids stay below 2^62");
-        FlowId(self.last)
+    pub(crate) fn next(&self) -> FlowId {
+        // 2^62 ids are never given out, so the count cannot wrap.
+        let id = self.last.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        debug_assert!(id < FLOW_ID_LIMIT, "flow ids stay below 2^62");
+        FlowId(id)
     }
 }
 
@@ -410,6 +418,20 @@ impl FlowTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clones_of_the_ids_share_one_count() {
+        let ids = FlowIds::default();
+        let other = ids.clone();
+        assert_eq!(ids.next(), FlowId(1));
+        assert_eq!(other.next(), FlowId(2));
+        assert_eq!(ids.next(), FlowId(3));
+        assert_eq!(
+            FlowIds::default().next(),
+            FlowId(1),
+            "a new count starts at 1"
+        );
+    }
     use std::net::{Ipv4Addr, TcpListener};
 
     fn addr(port: u16) -> SocketAddrV4 {

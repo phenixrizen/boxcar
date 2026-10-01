@@ -9,16 +9,8 @@
 //! ([`shares`]); `/dev`, `/proc` and `/sys` moved into the new root and the
 //! rest of the API filesystems mounted there ([`api`], [`optional`]); then
 //! the new root made `/`. Everything else, `/tmp` included, is the root
-//! share, which the host audits.
-//!
-//! With the network (`boxcar.net=1`), init then gives the guest its
-//! resolver configuration ([`resolver`]): written on the `/run` tmpfs and
-//! bound over `/etc/resolv.conf`, so the root share keeps its own.
-
-use std::fs::{OpenOptions, Permissions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+//! share, which the host audits. With the network, the guest's resolver
+//! configuration follows (`crate::resolver`).
 
 use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
@@ -231,104 +223,6 @@ pub fn switch_root() -> Result<(), Failed> {
     chdir("/").step("chdir /")
 }
 
-/// One step of giving the guest its resolver configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResolverStep {
-    /// Create the directory `path` with `mode` unless something is there.
-    Mkdir { path: &'static str, mode: u32 },
-    /// Write `text` as the whole of the file `path`, with `mode`.
-    Write {
-        path: &'static str,
-        text: &'static str,
-        mode: u32,
-    },
-    /// Create `path` empty, with `mode`, unless something is there.
-    Touch { path: &'static str, mode: u32 },
-    /// Bind-mount `source` over `target`.
-    Bind {
-        source: &'static str,
-        target: &'static str,
-    },
-}
-
-/// Step 5, with the network, in the new root: the gateway is the guest's
-/// DNS server. The file is written in `/run/boxcar` on the `/run` tmpfs and
-/// bound over `/etc/resolv.conf`. A root filesystem with no
-/// `/etc/resolv.conf` gets an empty one to mount over, which is a change to
-/// the root share, and so is recorded by the host like any other.
-pub fn resolver() -> [ResolverStep; 4] {
-    const FILE: &str = "/run/boxcar/resolv.conf";
-    [
-        ResolverStep::Mkdir {
-            path: "/run/boxcar",
-            mode: 0o755,
-        },
-        ResolverStep::Write {
-            path: FILE,
-            text: "nameserver 10.0.2.2\n",
-            mode: 0o644,
-        },
-        ResolverStep::Touch {
-            path: "/etc/resolv.conf",
-            mode: 0o644,
-        },
-        ResolverStep::Bind {
-            source: FILE,
-            target: "/etc/resolv.conf",
-        },
-    ]
-}
-
-/// Step 5: the steps of [`resolver`], in order, up to the first that fails.
-pub fn set_up_resolver() -> Result<(), Failed> {
-    resolver().iter().try_for_each(|step| match *step {
-        ResolverStep::Mkdir { path, mode } => ensure_dir(path, mode),
-        ResolverStep::Write { path, text, mode } => {
-            write_file(Path::new(path), text, mode).step(&format!("write {path}"))
-        }
-        ResolverStep::Touch { path, mode } => touch(Path::new(path), mode),
-        ResolverStep::Bind { source, target } => mount(
-            Some(source),
-            target,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .step(&format!("bind {source} over {target}")),
-    })
-}
-
-/// Writes `text` as the whole of the file at `path`, created if missing,
-/// with `mode` whatever the umask. A link at `path` is not followed.
-fn write_file(path: &Path, text: &str, mode: u32) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    file.set_permissions(Permissions::from_mode(mode))?;
-    file.write_all(text.as_bytes())
-}
-
-/// Creates an empty file at `path` with `mode`, unless something (a link
-/// included, which is not followed) is there already.
-fn touch(path: &Path, mode: u32) -> Result<(), Failed> {
-    let created = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(path)
-        .and_then(|file| file.set_permissions(Permissions::from_mode(mode)));
-    match created {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(Failed::new(&format!("create {}", path.display()), error)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,75 +311,6 @@ mod tests {
             assert!(!m.target.ends_with("/tmp"), "{m:?}");
             assert!(!m.target.contains("/tmp/"), "{m:?}");
         }
-    }
-
-    /// With the network, `/etc/resolv.conf` names the gateway: init
-    /// writes the file on the `/run` tmpfs, makes sure the root share has
-    /// a file to mount over, and binds it there, so the root share keeps
-    /// its own.
-    #[test]
-    fn the_resolver_is_written_on_run_and_bound_over_etc_resolv_conf() {
-        assert_eq!(
-            resolver(),
-            [
-                ResolverStep::Mkdir {
-                    path: "/run/boxcar",
-                    mode: 0o755
-                },
-                ResolverStep::Write {
-                    path: "/run/boxcar/resolv.conf",
-                    text: "nameserver 10.0.2.2\n",
-                    mode: 0o644
-                },
-                ResolverStep::Touch {
-                    path: "/etc/resolv.conf",
-                    mode: 0o644
-                },
-                ResolverStep::Bind {
-                    source: "/run/boxcar/resolv.conf",
-                    target: "/etc/resolv.conf"
-                },
-            ]
-        );
-    }
-
-    fn mode(path: &std::path::Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-    }
-
-    #[test]
-    fn write_replaces_the_file_with_its_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("resolv.conf");
-        std::fs::write(&path, "nameserver 192.0.2.1\nsearch old.example\n").unwrap();
-        write_file(&path, "nameserver 10.0.2.2\n", 0o644).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "nameserver 10.0.2.2\n"
-        );
-        assert_eq!(mode(&path), 0o644);
-    }
-
-    #[test]
-    fn touch_creates_an_empty_file_and_leaves_one_that_is_there() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("resolv.conf");
-        touch(&path, 0o644).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"");
-        assert_eq!(mode(&path), 0o644);
-        std::fs::write(&path, "kept\n").unwrap();
-        touch(&path, 0o600).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"kept\n");
-        assert_eq!(mode(&path), 0o644);
-        // A link is not followed: there is something there.
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
-        touch(&link, 0o644).unwrap();
-        assert!(!dir.path().join("nowhere").exists());
-        // A directory that is not there is an error, named.
-        let error = touch(&dir.path().join("no/such"), 0o644).unwrap_err();
-        assert!(error.to_string().starts_with("create "), "{error}");
     }
 
     #[test]

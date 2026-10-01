@@ -235,7 +235,8 @@ pub struct RunArgs {
     /// Give the guest a network card. The network is played on the host,
     /// with no TAP device and no privileges: the guest is 10.0.2.15/24,
     /// and 10.0.2.2 is its gateway and DNS server. Default: on with shares,
-    /// off with `--no-fs`. The last of `--net` and `--no-net` wins.
+    /// off with `--no-fs` (where `--allow`, `--deny`, `--policy-file` and
+    /// `--dns` need it). The last of `--net` and `--no-net` wins.
     #[arg(long, overrides_with = "no_net")]
     pub net: bool,
     /// No network card: the guest has no network at all.
