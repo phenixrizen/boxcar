@@ -140,6 +140,8 @@ fn a_command_conflicts_with_no_fs() {
     );
 }
 
+/// With `--no-vsock` the command travels on the kernel command line, which
+/// takes 2048 bytes.
 #[test]
 fn a_command_line_too_long_is_refused_before_a_session_starts() {
     let scratch = tempfile::tempdir().unwrap();
@@ -155,6 +157,7 @@ fn a_command_line_too_long_is_refused_before_a_session_starts() {
         rootfs.to_str().unwrap(),
         "--audit-dir",
         audit.to_str().unwrap(),
+        "--no-vsock",
         "--",
         "/bin/sh",
         "-c",
@@ -165,6 +168,58 @@ fn a_command_line_too_long_is_refused_before_a_session_starts() {
     assert!(text.contains("error: command line too long ("), "{text}");
     assert!(text.contains(" bytes > 2048)"), "{text}");
     assert!(!audit.exists(), "no session was started");
+}
+
+/// With the vsock device the command travels in the control channel's
+/// config: a command the kernel command line could not hold is fine, one
+/// over the channel's 64 KiB is refused before a session starts.
+#[test]
+fn a_command_over_the_control_channels_limit_is_refused_before_a_session_starts() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let script = "echo x; ".repeat(9000);
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("error: the session's config is ") && text.contains("65536"),
+        "{text}"
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// `--console-log` and `--console-stdout` say different things.
+#[test]
+fn console_log_conflicts_with_console_stdout() {
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--no-fs",
+        "--console-log",
+        "/tmp/c.log",
+        "--console-stdout",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("cannot be used with"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

@@ -965,7 +965,7 @@ mod tests {
     use super::*;
     use crate::defs::uapi;
     use crate::rules::port_socket_path;
-    use crate::services::ConnMeta;
+    use crate::services::{ConnMeta, Deny};
 
     /// Guest RAM for every test: 1 MiB at guest physical address 0.
     const GUEST_MEM_SIZE: usize = 0x10_0000;
@@ -988,8 +988,8 @@ mod tests {
     struct NoServices;
 
     impl InternalServices for NoServices {
-        fn connect(&self, _port: u32, _meta: ConnMeta) -> Option<UnixStream> {
-            None
+        fn connect(&self, _port: u32, _meta: ConnMeta) -> Result<UnixStream, Deny> {
+            Err(Deny::NoService)
         }
     }
 
@@ -1638,6 +1638,70 @@ mod tests {
             &(
                 "vsock.close".to_owned(),
                 serde_json::json!({"port": 5000, "dir": "guest", "tx": 13, "rx": 0})
+            )
+        );
+    }
+
+    /// A split TX chain whose descriptors hold more than the largest
+    /// payload a packet carries: copied only as far as the header's `len`
+    /// when that is at most 64 KiB (the rest of the chain is ignored), and
+    /// dropped, without reading it, when `len` is over. The connection goes
+    /// on.
+    #[test]
+    fn a_split_tx_chain_over_64_kib_is_read_only_to_its_bound() {
+        let session = Session::new();
+        let host = UnixListener::bind(port_socket_path(&session.uds_path(), 5000)).unwrap();
+        let mut driver = Driver::new(session.device(&[5000]));
+        let mem = driver.mem.clone();
+        let rx = queue_mock(&mem, RX_QUEUE);
+        let tx = queue_mock(&mem, TX_QUEUE);
+        let mut stream = established(&mut driver, &rx, &tx, &host);
+
+        // Nine 8 KiB descriptors: 72 KiB of payload, 8 KiB past the bound,
+        // in buffers 2 to 10 behind the header in buffer 1.
+        let chunk = |i: u8| vec![b'a' + i; 0x2000];
+        let chunks: Vec<Vec<u8>> = (0..9).map(chunk).collect();
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        assert!(total > MAX_PKT_BUF_SIZE, "{total}");
+        // The header asks for exactly the bound: the first 64 KiB go to
+        // the host, the last 8 KiB descriptor is never read.
+        let max = header(5000, GUEST_PORT, uapi::VSOCK_OP_RW, MAX_DATA_SIZE);
+        let mut parts: Vec<&[u8]> = vec![&max];
+        parts.extend(chunks.iter().map(Vec::as_slice));
+        offer_tx_parts(&mem, &tx, 1, &parts);
+        driver.kicks[TX_QUEUE].write(1).unwrap();
+        driver.wait_used(TX_QUEUE, 2);
+
+        let mut got = vec![0u8; MAX_PKT_BUF_SIZE];
+        stream.read_exact(&mut got).unwrap();
+        let want: Vec<u8> = chunks.concat()[..MAX_PKT_BUF_SIZE].to_vec();
+        assert!(got == want, "the first 64 KiB of the chain, in order");
+
+        // The header, split, asks for one byte more, over the same 72 KiB
+        // (descriptors 1 to 11, used and free again): dropped.
+        let over = header(5000, GUEST_PORT, uapi::VSOCK_OP_RW, MAX_DATA_SIZE + 1);
+        let mut parts: Vec<&[u8]> = vec![&over[..20], &over[20..]];
+        parts.extend(chunks.iter().map(Vec::as_slice));
+        offer_tx_parts(&mem, &tx, 1, &parts);
+        driver.kicks[TX_QUEUE].write(1).unwrap();
+        driver.wait_used(TX_QUEUE, 3);
+        // And the connection carries the next packet.
+        let bang = header(5000, GUEST_PORT, uapi::VSOCK_OP_RW, 1);
+        offer_tx_parts(&mem, &tx, 12, &[&bang[..30], &bang[30..], b"!"]);
+        driver.kicks[TX_QUEUE].write(1).unwrap();
+        driver.wait_used(TX_QUEUE, 4);
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).unwrap();
+        assert_eq!(&one, b"!");
+        driver.set_status(0);
+        drop(driver);
+        let records = session.vsock_records();
+        assert_eq!(
+            records.last().unwrap(),
+            &(
+                "vsock.close".to_owned(),
+                serde_json::json!({"port": 5000, "dir": "guest",
+                                   "tx": MAX_PKT_BUF_SIZE as u64 + 1, "rx": 0})
             )
         );
     }

@@ -10,7 +10,8 @@
 //! (the legacy PIO devices, then one virtio-fs device per share, the network
 //! card and the vsock device, each in its fixed slot of
 //! [`crate::devices::slots`], the vsock device with the VMM's
-//! [`ServiceRegistry`], empty, behind its internal ports), write
+//! [`ServiceRegistry`] behind its internal ports, and in it the guest
+//! control channel ([`GuestCtl`]) at port 1024), write
 //! the command line with the network's arguments ([`NET_CMDLINE`]) when
 //! there is a network card and a `virtio_mmio.device=` entry for each slot
 //! of the [`DeviceSet`], write the zero page and MP table, create and set up
@@ -56,6 +57,7 @@ use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
 use crate::devices::{DeviceError, FsDevices, LegacyDevices, NetDevice, VsockDevice};
+use crate::guest_ctl::{check_session, GuestCtl, SessionConfig, CLOSE_DEADLINE};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
@@ -178,10 +180,12 @@ pub struct VmConfig {
     /// a TTY on stdin and [`VmConfig::stdin`], stdin is forwarded to the
     /// guest.
     pub console: ConsoleOut,
-    /// Whether the guest may read the host's stdin: when it is a TTY and the
-    /// console is on stdout, the terminal goes into raw mode and what is
-    /// typed goes to the guest. Off for a run that needs no input, which
-    /// leaves the terminal as it is.
+    /// Whether the guest's serial console may read the host's stdin: when
+    /// it is a TTY and the console is on stdout, the terminal goes into raw
+    /// mode and what is typed goes to the guest. Off for a run that needs
+    /// no input, which leaves the terminal as it is, and in init's vsock
+    /// mode, where the session's terminal takes the input instead (see
+    /// [`crate::pty_relay`]).
     pub stdin: bool,
     /// Receives `vmm.start` and `vmm.stop`, and every share's records.
     pub audit: AuditSink,
@@ -203,6 +207,10 @@ pub struct VmConfig {
     /// beside the control socket), and the host ports a guest connection
     /// may reach besides the internal ones. See `boxcar_vsock`.
     pub vsock: Option<VsockConfig>,
+    /// The session the guest control channel sends init when it connects
+    /// (init's `vsock` mode, which needs the vsock device): the command,
+    /// its user, environment and terminal. Unused without the vsock device.
+    pub session: SessionConfig,
     /// The control socket, if any: see [`ControlConfig`].
     pub control: Option<ControlConfig>,
 }
@@ -222,9 +230,15 @@ impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
     /// boot, the console on stdio with stdin, no shares, no network card (and
-    /// a policy that denies everything), no vsock device, and no control
-    /// socket.
+    /// a policy that denies everything), no vsock device, a login shell as
+    /// this process's user for the session ([`SessionConfig::for_user`]),
+    /// and no control socket.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
+        // SAFETY: getuid and getgid take no arguments and cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let shell = boxcar_proto::guest::DEFAULT_ARGV
+            .map(str::to_owned)
+            .to_vec();
         VmConfig {
             kernel: kernel.into(),
             initramfs: None,
@@ -240,6 +254,7 @@ impl VmConfig {
             net: None,
             policy: Arc::new(ArcSwap::from_pointee(Policy::default())),
             vsock: None,
+            session: SessionConfig::for_user(shell, uid, gid),
             control: None,
         }
     }
@@ -348,6 +363,9 @@ pub struct Vmm {
     audit: AuditSink,
     /// Forward stdin to the console and put the terminal in raw mode.
     interactive: bool,
+    /// A terminal in raw mode that the caller handed over
+    /// ([`Vmm::restore_terminal_on_stop`]), restored by the stop sequence.
+    terminal: Option<RawModeGuard>,
 }
 
 impl Vmm {
@@ -406,6 +424,9 @@ impl Vmm {
                 .map_err(kvm_ioctl("register_irqfd"))?;
         }
         let set = DeviceSet::from_config(&cfg);
+        if cfg.vsock.is_some() {
+            check_session(&cfg.session).map_err(VmmError::Config)?;
+        }
         let mut mmio = Bus::new();
         let mut slots = SlotAllocator::new()?;
         let fs = FsDevices::attach(
@@ -426,8 +447,10 @@ impl Vmm {
             &cfg.audit,
             &cfg.policy,
         )?;
-        // Empty: the guest control channel and the PTY hub register theirs.
+        // The guest control channel's service, when there is a vsock
+        // device; the terminal's (port 1025) is registered by the caller.
         let services = Arc::new(ServiceRegistry::new());
+        let guest = GuestCtl::new(cfg.session.clone(), cfg.audit.clone());
         let vsock = VsockDevice::attach(
             &vm,
             &mem,
@@ -437,6 +460,11 @@ impl Vmm {
             &cfg.audit,
             &services,
         )?;
+        if vsock.is_attached() {
+            services
+                .register(boxcar_vsock::services::CTL_PORT, guest.service())
+                .map_err(|error| VmmError::Config(error.to_string()))?;
+        }
         // What was attached is what the command line and `status` say.
         debug_assert_eq!(
             set,
@@ -477,6 +505,7 @@ impl Vmm {
                 .collect(),
             audit: cfg.audit.clone(),
             services,
+            guest,
         });
 
         let start = VmmStart {
@@ -546,8 +575,16 @@ impl Vmm {
             control,
             control_path,
             interactive: cfg.stdin && matches!(cfg.console, ConsoleOut::Stdio) && stdin_is_tty(),
+            terminal: None,
             audit: cfg.audit,
         })
+    }
+
+    /// Hands over a terminal the caller put in raw mode (the PTY relay's,
+    /// in `boxcar run`): the stop sequence restores it where it restores
+    /// its own, before anything it logs.
+    pub fn restore_terminal_on_stop(&mut self, terminal: RawModeGuard) {
+        self.terminal = Some(terminal);
     }
 
     /// A handle that can stop the VM from another thread.
@@ -582,6 +619,7 @@ impl Vmm {
                 self.fs.close();
                 self.net.close();
                 self.vsock.close();
+                self.info.guest.close(CLOSE_DEADLINE);
                 let console = self.console.flush_and_join(CONSOLE_DEADLINE);
                 self.latch.mark_stopped();
                 if let Some(control) = self.control.take() {
@@ -605,6 +643,7 @@ impl Vmm {
             fs: &self.fs,
             net: &self.net,
             vsock: &self.vsock,
+            guest: &self.info.guest,
             console: self.console,
             // The main loop is done: this is the final count.
             stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),
@@ -617,9 +656,10 @@ impl Vmm {
         outcome
     }
 
-    /// Sets up the main loop, enters raw mode when interactive, and starts
-    /// the vCPU threads, last, so that nothing fallible follows them.
-    fn start(&self, vcpus: Vec<VcpuFd>) -> Result<Started, VmmError> {
+    /// Sets up the main loop, enters raw mode when interactive (or takes
+    /// the terminal the caller handed over), and starts the vCPU threads,
+    /// last, so that nothing fallible follows them.
+    fn start(&mut self, vcpus: Vec<VcpuFd>) -> Result<Started, VmmError> {
         register_kick_handler().map_err(setup("vCPU kick signal handler"))?;
         block_stop_signals().map_err(setup("signal mask"))?;
         let signals = SignalFd::new().map_err(setup("signalfd"))?;
@@ -645,6 +685,7 @@ impl Vmm {
             exited_watch,
             exits,
             self.audit.clone(),
+            Arc::clone(&self.info.guest),
         );
         let fds = control.fds();
         add_subscriber(&mut main_loop, Box::new(control), &fds)?;
@@ -660,7 +701,7 @@ impl Vmm {
             add_subscriber(&mut main_loop, Box::new(subscriber), &fds)?;
             RawModeGuard::enter().map_err(setup("raw terminal"))?
         } else {
-            None
+            self.terminal.take()
         };
 
         let vcpus = VcpuSet::spawn(vcpus, &self.pio, &self.mmio, &exits_tx, exited)

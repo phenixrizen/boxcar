@@ -47,16 +47,29 @@ pub struct ConnMeta {
     pub guest_port: u32,
 }
 
+/// Why a service did not take a guest connection: the `reason` of the
+/// `vsock.connect` that records the refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deny {
+    /// Nothing serves the port, or the service could not take the
+    /// connection: `no_service`.
+    NoService,
+    /// The service turned the connection down, for this reason, such as
+    /// `reactivated` (a word of lowercase letters and underscores).
+    Refused(&'static str),
+}
+
 /// The VMM's services on the [`INTERNAL_PORTS`].
 pub trait InternalServices: Send + Sync {
     /// A guest connection to the internal `port`, already found privileged
     /// and first, from the vsock thread. A service takes it by returning
     /// its end of a stream (one end of a `UnixStream::pair`, typically,
     /// whose other end it keeps): the guest's bytes are written to it and
-    /// what the service writes to its own end reaches the guest. `None`
+    /// what the service writes to its own end reaches the guest. An error
     /// when nothing serves `port` or the service will not take the
-    /// connection: the guest's request is reset. It must not block.
-    fn connect(&self, port: u32, meta: ConnMeta) -> Option<UnixStream>;
+    /// connection: the guest's request is reset and the refusal recorded
+    /// with the [`Deny`]'s reason. It must not block.
+    fn connect(&self, port: u32, meta: ConnMeta) -> Result<UnixStream, Deny>;
 }
 
 #[cfg(test)]

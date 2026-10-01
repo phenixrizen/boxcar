@@ -12,6 +12,15 @@
 //! decides the [`VmExit`]; the VM is then `Stopping` and later triggers are
 //! ignored.
 //!
+//! A guest reset carries how the session ended when the guest's init
+//! reported it over the control channel ([`crate::guest_ctl`]), which init
+//! does, and waits for the VMM to take, before it reboots. A graceful stop
+//! ([`VmmHandle::request_graceful_stop`], the control socket's `stop`)
+//! comes before any trigger: it asks init to end the session
+//! (`shutdown{grace_ms}`), which makes the VM `Stopping`; the guest's reset
+//! is then the requested stop, and when none comes within the grace and
+//! [`GRACEFUL_STOP_MARGIN`], the VMM stops the VM itself.
+//!
 //! The stop sequence, run on the main thread: tell the control clients the
 //! VM is `stopping`, kick and join every vCPU, close the devices (reset
 //! every virtio-fs device through its transport, which joins its workers
@@ -19,7 +28,8 @@
 //! card, whose net thread records the end of every flow before it is
 //! joined, and the vsock device, whose vsock thread records the end of
 //! every connection before it is joined, and whose host socket is then
-//! unlinked), let the
+//! unlinked), wait at most [`CLOSE_DEADLINE`] for the guest control
+//! channel's threads (so a report init sent last is recorded), let the
 //! console writer drain what it can for at most [`CONSOLE_DEADLINE`]
 //! (it counts what it could not deliver), mark the VM `stopped` and shut
 //! the control server down (each client hears `stopped` and is
@@ -48,7 +58,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
-use boxcar_proto::control::{AuditStatus, GuestStatus, Status};
+use boxcar_proto::control::{AuditStatus, Status};
+use boxcar_proto::guest::HostMsg;
 use boxcar_proto::{Payload, Ring, VmmStop};
 use event_manager::{EventManager, EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
@@ -57,6 +68,7 @@ use vmm_sys_util::signal::create_sigset;
 use crate::console::ConsoleWriter;
 use crate::control::ControlServer;
 use crate::devices::{FsDevices, NetDevice, VsockDevice};
+use crate::guest_ctl::{GuestCtl, GuestCtlHandle, CLOSE_DEADLINE};
 use crate::services::ServiceRegistry;
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
@@ -65,6 +77,10 @@ pub use boxcar_proto::control::{SessionOutcome, VmState};
 
 /// The exit code of a run whose audit log failed.
 pub const AUDIT_FAILED_EXIT: i32 = 3;
+
+/// How much longer than the grace a graceful stop waits for the guest to
+/// reset before the VMM stops the VM itself.
+pub const GRACEFUL_STOP_MARGIN: Duration = Duration::from_secs(3);
 
 /// How long the stop sequence waits for the console writer to drain what
 /// the guest printed last. A host stdout that has stalled (a paused pipe
@@ -104,36 +120,56 @@ pub enum VmExit {
 /// The process exit code `boxcar run` uses for `exit`, and the one
 /// `vmm.stop` records:
 ///
-/// - a guest reset that carries the session's exit code: that code;
+/// - a guest reset that carries the session's exit code: that code,
+///   clamped to 0..=255 (init reports it; the code wins when a report
+///   somehow has a signal too);
 /// - one that carries the signal that killed the session: 128 plus the
-///   signal number (137 for `SIGKILL`);
+///   signal number (137 for `SIGKILL`), at most 255;
 /// - a guest reset with no session report, and a guest shutdown: 0;
 /// - a vCPU error: 1;
 /// - a failed audit log: [`AUDIT_FAILED_EXIT`] (3);
 /// - a stop by a host signal: 128 plus the signal number (130 for Ctrl-C,
 ///   129 for a hangup), and 130 for the console escape;
-/// - a stop asked for through [`VmmHandle::request_stop`] (the control
-///   socket's `stop`): 0.
+/// - a stop asked for through [`VmmHandle::request_stop`] or
+///   [`VmmHandle::request_graceful_stop`] (the control socket's `stop`): 0,
+///   whatever the session did.
 pub fn exit_code_for(exit: &VmExit) -> i32 {
     match exit {
         VmExit::GuestReset {
             session: Some(SessionOutcome {
                 code: Some(code), ..
             }),
-        } => *code,
+        } => (*code).clamp(0, 255),
         VmExit::GuestReset {
             session:
                 Some(SessionOutcome {
                     signal: Some(signal),
                     ..
                 }),
-        } => 128 + signal,
+        } => signal_exit_code(*signal),
         VmExit::GuestReset { .. } | VmExit::GuestShutdown => 0,
         VmExit::VcpuError(_) => 1,
         VmExit::AuditFailed(_) => AUDIT_FAILED_EXIT,
-        VmExit::StopRequested(StopReason::Signal(signo)) => 128 + signo,
+        VmExit::StopRequested(StopReason::Signal(signo)) => signal_exit_code(*signo),
         VmExit::StopRequested(StopReason::ConsoleEscape) => 130,
         VmExit::StopRequested(StopReason::Requested) => 0,
+    }
+}
+
+/// 128 plus `signal`, as a shell reports a process the signal killed;
+/// saturating at 255, and 128 for a signal number below 0.
+fn signal_exit_code(signal: i32) -> i32 {
+    128_i32.saturating_add(signal.max(0)).min(255)
+}
+
+/// What a guest reset means: the stop that was asked for when a graceful
+/// stop is under way, else the reset with how the session ended, when init
+/// reported it.
+pub(crate) fn reset_exit(graceful: bool, session: Option<SessionOutcome>) -> VmExit {
+    if graceful {
+        VmExit::StopRequested(StopReason::Requested)
+    } else {
+        VmExit::GuestReset { session }
     }
 }
 
@@ -155,6 +191,19 @@ impl VmExit {
 impl fmt::Display for VmExit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            VmExit::GuestReset {
+                session:
+                    Some(SessionOutcome {
+                        code: Some(code), ..
+                    }),
+            } => write!(f, "guest reset; the session exited {code}"),
+            VmExit::GuestReset {
+                session:
+                    Some(SessionOutcome {
+                        signal: Some(signal),
+                        ..
+                    }),
+            } => write!(f, "guest reset; the session was killed by signal {signal}"),
             VmExit::GuestReset { .. } => f.write_str("guest reset"),
             VmExit::GuestShutdown => f.write_str("guest shutdown"),
             VmExit::StopRequested(StopReason::Signal(signo)) => {
@@ -173,14 +222,16 @@ impl fmt::Display for VmExit {
 /// Records the first stop trigger and wakes the main loop. Shared by the
 /// main loop's subscribers and every [`VmmHandle`]. Also keeps where the VM
 /// is in its life, [`VmState`]: `Booting` until the vCPUs start, `Running`,
-/// `Stopping` from the first trigger, `Stopped` once the stop sequence has
-/// stopped the vCPUs and closed the devices.
+/// `Stopping` from the first trigger or a graceful stop, `Stopped` once the
+/// stop sequence has stopped the vCPUs and closed the devices.
 pub(crate) struct StopLatch {
     exit: Mutex<Option<VmExit>>,
     /// Written on every trigger so the main loop's epoll returns.
     wake: EventFd,
     running: AtomicBool,
     stopped: AtomicBool,
+    /// A graceful stop is under way: init was asked to end the session.
+    graceful: AtomicBool,
 }
 
 impl StopLatch {
@@ -190,7 +241,18 @@ impl StopLatch {
             wake: EventFd::new(EFD_NONBLOCK)?,
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            graceful: AtomicBool::new(false),
         })
+    }
+
+    /// Marks a graceful stop under way. Returns whether this call did.
+    pub(crate) fn begin_graceful(&self) -> bool {
+        !self.graceful.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether a graceful stop is under way.
+    pub(crate) fn graceful(&self) -> bool {
+        self.graceful.load(Ordering::Acquire)
     }
 
     /// The vCPU threads have started.
@@ -226,7 +288,7 @@ impl StopLatch {
     pub(crate) fn state(&self) -> VmState {
         if self.stopped.load(Ordering::Acquire) {
             VmState::Stopped
-        } else if self.lock().is_some() {
+        } else if self.lock().is_some() || self.graceful() {
             VmState::Stopping
         } else if self.running.load(Ordering::Acquire) {
             VmState::Running
@@ -258,6 +320,8 @@ pub(crate) struct VmInfo {
     pub(crate) audit: AuditSink,
     /// The services on the internal vsock ports.
     pub(crate) services: Arc<ServiceRegistry>,
+    /// The guest control channel: what init reported, and a way to tell it.
+    pub(crate) guest: Arc<GuestCtl>,
 }
 
 /// Stops a VM from another thread, and reports its status. Cheap to clone.
@@ -284,9 +348,48 @@ impl VmmHandle {
         self.latch.state()
     }
 
-    /// The VM's status, as the control socket's `status` reports it. What
-    /// the guest's init reports is not known yet: `guest` says not ready,
-    /// no session.
+    /// Asks the guest's init to end the session, giving it `grace_ms`
+    /// between `SIGTERM` and `SIGKILL`, when a session runs: see the module
+    /// docs. Returns at once, with whether it did; when it did not (no
+    /// session runs, or init cannot be told), the caller stops the VM with
+    /// [`VmmHandle::request_stop`]. The VM is `Stopping` from here; when it
+    /// has not stopped `grace_ms` plus `margin` later, it is stopped as
+    /// [`VmmHandle::request_stop`] would. Logs nothing.
+    pub fn request_graceful_stop(&self, grace_ms: u64, margin: Duration) -> bool {
+        if self.latch.graceful() || self.latch.outcome().is_some() {
+            // Under way already.
+            return true;
+        }
+        let guest = &self.info.guest;
+        if !guest.session_running() {
+            return false;
+        }
+        if guest.handle().send(HostMsg::Shutdown { grace_ms }).is_err() {
+            return false;
+        }
+        if !self.latch.begin_graceful() {
+            return true;
+        }
+        let wait = Duration::from_millis(grace_ms).saturating_add(margin);
+        let latch = Arc::clone(&self.latch);
+        let spawned = std::thread::Builder::new()
+            .name("graceful-stop".into())
+            .spawn(move || fall_back_after(&latch, wait));
+        if spawned.is_err() {
+            // Nothing would stop a guest that does not reset.
+            self.latch
+                .trigger(VmExit::StopRequested(StopReason::Requested));
+        }
+        true
+    }
+
+    /// The guest control channel's sending side.
+    pub fn guest_ctl(&self) -> GuestCtlHandle {
+        self.info.guest.handle()
+    }
+
+    /// The VM's status, as the control socket's `status` reports it, with
+    /// what the guest's init reported over the control channel.
     pub fn status(&self) -> Status {
         let info = &self.info;
         Status {
@@ -296,11 +399,7 @@ impl VmmHandle {
             uptime_ms: u64::try_from(info.built.elapsed().as_millis()).unwrap_or(u64::MAX),
             vcpus: info.vcpus,
             mem_mib: info.mem_mib,
-            guest: GuestStatus {
-                init_ready: false,
-                session_pid: None,
-                exit: None,
-            },
+            guest: info.guest.status(),
             audit: AuditStatus {
                 next_seq: info.audit.next_seq(),
                 failed: info.audit.has_failed(),
@@ -325,6 +424,23 @@ impl VmmHandle {
     /// to an internal port that its rules let through.
     pub fn services(&self) -> Arc<ServiceRegistry> {
         Arc::clone(&self.info.services)
+    }
+}
+
+/// Stops the VM as requested unless it has stopped (a trigger fired) by
+/// `wait` from now: a graceful stop's fallback.
+fn fall_back_after(latch: &StopLatch, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        if latch.outcome().is_some() {
+            return;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            latch.trigger(VmExit::StopRequested(StopReason::Requested));
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(20)));
     }
 }
 
@@ -406,7 +522,8 @@ pub(crate) type MainLoop = EventManager<Box<dyn MutEventSubscriber>>;
 /// Turns the main loop's stop events into [`StopLatch::trigger`] calls: the
 /// latch's own wake-up, the i8042 reset, the stop signals, each vCPU's
 /// "exited" eventfd (the vCPU sends its `VmExit` over `exits` before writing
-/// it), and the audit writer's failure eventfd.
+/// it), and the audit writer's failure eventfd. A guest reset carries what
+/// `guest` holds of the session's end ([`reset_exit`]).
 pub(crate) struct ControlSubscriber {
     latch: Arc<StopLatch>,
     reset_evt: EventFd,
@@ -414,6 +531,7 @@ pub(crate) struct ControlSubscriber {
     vcpu_exited: Vec<EventFd>,
     exits: Receiver<VmExit>,
     audit: AuditSink,
+    guest: Arc<GuestCtl>,
 }
 
 impl ControlSubscriber {
@@ -424,6 +542,7 @@ impl ControlSubscriber {
         vcpu_exited: Vec<EventFd>,
         exits: Receiver<VmExit>,
         audit: AuditSink,
+        guest: Arc<GuestCtl>,
     ) -> Self {
         ControlSubscriber {
             latch,
@@ -432,7 +551,13 @@ impl ControlSubscriber {
             vcpu_exited,
             exits,
             audit,
+            guest,
         }
+    }
+
+    /// The outcome of a guest reset, now.
+    fn guest_reset(&self) -> VmExit {
+        reset_exit(self.latch.graceful(), self.guest.exit())
     }
 
     /// Every descriptor to watch for input. The caller registers them, so a
@@ -482,6 +607,10 @@ impl ControlSubscriber {
     fn on_vcpu_exited(&self, evt: &EventFd) {
         let _ = evt.read();
         while let Ok(exit) = self.exits.try_recv() {
+            let exit = match exit {
+                VmExit::GuestReset { .. } => self.guest_reset(),
+                exit => exit,
+            };
             self.latch.trigger(exit);
         }
     }
@@ -496,7 +625,7 @@ impl MutEventSubscriber for ControlSubscriber {
             let _ = self.latch.wake.read();
         } else if fd == self.reset_evt.as_raw_fd() {
             if self.reset_evt.read().is_ok() {
-                self.latch.trigger(VmExit::GuestReset { session: None });
+                self.latch.trigger(self.guest_reset());
             }
         } else if fd == self.signals.as_raw_fd() {
             self.on_signal();
@@ -528,6 +657,9 @@ pub(crate) struct Teardown<'a> {
     pub(crate) fs: &'a FsDevices,
     pub(crate) net: &'a NetDevice,
     pub(crate) vsock: &'a VsockDevice,
+    /// The guest control channel, whose threads end once the vsock device
+    /// is closed.
+    pub(crate) guest: &'a GuestCtl,
     pub(crate) console: ConsoleWriter,
     /// Console input bytes the stdin subscriber dropped, read once the main
     /// loop is done.
@@ -549,6 +681,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
         fs,
         net,
         vsock,
+        guest,
         console,
         stdin_dropped_bytes,
         control,
@@ -563,6 +696,8 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     fs.close();
     net.close();
     vsock.close();
+    // What init sent last is recorded before `vmm.stop`.
+    guest.close(CLOSE_DEADLINE);
     let console = console.flush_and_join(CONSOLE_DEADLINE);
     latch.mark_stopped();
     if let Some(control) = control {
@@ -621,13 +756,21 @@ fn emit_stop(
 }
 
 /// A handle on a VM that was never built: a fresh latch, 2 vCPUs, 256 MiB,
-/// both virtio-fs devices, and an audit log under `dir`.
+/// both virtio-fs devices, an audit log under `dir`, and the guest control
+/// channel at port 1024 for a login shell as uid 1000.
 #[cfg(test)]
 pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::WriterHandle) {
     let session_id = boxcar_proto::SessionId::new();
     let (sink, writer) =
         boxcar_audit::spawn(boxcar_audit::WriterConfig::new(dir, session_id.clone()))
             .expect("audit writer");
+    let session =
+        crate::guest_ctl::SessionConfig::for_user(vec!["/bin/sh".into(), "-l".into()], 1000, 1000);
+    let guest = GuestCtl::new(session, sink.clone());
+    let services = Arc::new(ServiceRegistry::new());
+    services
+        .register(boxcar_vsock::services::CTL_PORT, guest.service())
+        .expect("register the control channel");
     let info = VmInfo {
         session_id: session_id.to_string(),
         built: Instant::now(),
@@ -635,7 +778,8 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         mem_mib: 256,
         devices: vec!["fs:root".into(), "fs:workspace".into()],
         audit: sink,
-        services: Arc::new(ServiceRegistry::new()),
+        services,
+        guest,
     };
     let latch = Arc::new(StopLatch::new().expect("stop latch"));
     (VmmHandle::new(latch, Arc::new(info)), writer)
@@ -739,6 +883,159 @@ mod tests {
         for (exit, code) in cases {
             assert_eq!(exit_code_for(&exit), code, "{exit:?}");
         }
+        assert_eq!(
+            reset(outcome(Some(7), None)).to_string(),
+            "guest reset; the session exited 7"
+        );
+        assert_eq!(
+            reset(outcome(None, Some(9))).to_string(),
+            "guest reset; the session was killed by signal 9"
+        );
+        assert_eq!(reset(outcome(None, None)).to_string(), "guest reset");
+    }
+
+    /// Guest-supplied values cannot leave 0..=255: a code is clamped, and
+    /// 128 plus a signal saturates; a code wins over a signal when both
+    /// are somehow set.
+    #[test]
+    fn exit_codes_are_clamped_and_signals_saturate() {
+        let reset = |code, signal| VmExit::GuestReset {
+            session: Some(SessionOutcome { code, signal }),
+        };
+        let cases = [
+            (reset(Some(255), None), 255),
+            (reset(Some(256), None), 255),
+            (reset(Some(300), None), 255),
+            (reset(Some(i32::MAX), None), 255),
+            (reset(Some(-1), None), 0),
+            (reset(Some(i32::MIN), None), 0),
+            (reset(None, Some(15)), 143),
+            (reset(None, Some(127)), 255),
+            (reset(None, Some(128)), 255),
+            (reset(None, Some(200)), 255),
+            (reset(None, Some(i32::MAX)), 255),
+            (reset(None, Some(-5)), 128),
+            (reset(Some(3), Some(9)), 3),
+            (reset(Some(0), Some(9)), 0),
+            (VmExit::StopRequested(StopReason::Signal(200)), 255),
+            (VmExit::StopRequested(StopReason::Signal(i32::MAX)), 255),
+        ];
+        for (exit, code) in cases {
+            assert_eq!(exit_code_for(&exit), code, "{exit:?}");
+        }
+    }
+
+    /// The reset carries the session init reported; after a graceful stop
+    /// it is that stop, which exits 0 whatever the session did.
+    #[test]
+    fn a_reset_carries_the_reported_session_unless_a_stop_was_asked_for() {
+        let outcome = SessionOutcome {
+            code: None,
+            signal: Some(15),
+        };
+        assert_eq!(
+            reset_exit(false, None),
+            VmExit::GuestReset { session: None }
+        );
+        assert_eq!(
+            reset_exit(false, Some(outcome)),
+            VmExit::GuestReset {
+                session: Some(outcome)
+            }
+        );
+        let stopped = reset_exit(true, Some(outcome));
+        assert_eq!(stopped, VmExit::StopRequested(StopReason::Requested));
+        assert_eq!(exit_code_for(&stopped), 0);
+        assert_eq!(
+            reset_exit(true, None),
+            VmExit::StopRequested(StopReason::Requested)
+        );
+    }
+
+    /// A fake init on the handle's control channel, with its session
+    /// started.
+    fn fake_session(handle: &VmmHandle) -> std::io::BufReader<std::os::unix::net::UnixStream> {
+        use boxcar_proto::guest::{decode, encode, GuestMsg, HostMsg};
+        use boxcar_vsock::InternalServices;
+        use std::io::{BufRead, Write};
+
+        let mut stream = handle
+            .services()
+            .connect(1024, boxcar_vsock::ConnMeta { guest_port: 1023 })
+            .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let hello = GuestMsg::Hello {
+            init_version: "0".into(),
+            guest_mono_ns: 0,
+            guest_real_ns: 0,
+        };
+        stream.write_all(&encode(&hello)).unwrap();
+        let mut lines = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = Vec::new();
+        lines.read_until(b'\n', &mut line).unwrap();
+        assert!(matches!(decode(&line).unwrap(), HostMsg::Config(_)));
+        stream
+            .write_all(&encode(&GuestMsg::SessionStarted { pid: 9 }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.status().guest.session_pid.is_none() {
+            assert!(Instant::now() < deadline, "no session");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        lines
+    }
+
+    /// Without a session to end, a graceful stop is not taken: the caller
+    /// stops at once.
+    #[test]
+    fn a_graceful_stop_needs_a_running_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        handle.latch.mark_running();
+        assert!(!handle.request_graceful_stop(1000, Duration::from_secs(1)));
+        assert_eq!(handle.state(), VmState::Running);
+        writer.close().unwrap();
+    }
+
+    /// With a session, init is asked to end it; the VM is `stopping`, and
+    /// stops by itself when the guest never resets.
+    #[test]
+    fn a_graceful_stop_asks_init_then_falls_back() {
+        use boxcar_proto::guest::{decode, HostMsg};
+        use std::io::BufRead;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        handle.latch.mark_running();
+        let mut init = fake_session(&handle);
+        let asked = Instant::now();
+        assert!(handle.request_graceful_stop(100, Duration::from_millis(100)));
+        let mut line = Vec::new();
+        init.read_until(b'\n', &mut line).unwrap();
+        assert_eq!(
+            decode::<HostMsg>(&line).unwrap(),
+            HostMsg::Shutdown { grace_ms: 100 }
+        );
+        assert_eq!(handle.state(), VmState::Stopping);
+        // A second graceful stop changes nothing.
+        assert!(handle.request_graceful_stop(100, Duration::from_millis(100)));
+        let deadline = asked + Duration::from_secs(5);
+        let exit = loop {
+            if let Some(exit) = handle.latch.outcome() {
+                break exit;
+            }
+            assert!(Instant::now() < deadline, "no fallback stop");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            asked.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(exit, VmExit::StopRequested(StopReason::Requested));
+        writer.close().unwrap();
     }
 
     #[test]
@@ -773,14 +1070,7 @@ mod tests {
         assert_eq!(status.pid, std::process::id());
         assert_eq!((status.vcpus, status.mem_mib), (2, 256));
         assert_eq!(status.devices, ["fs:root", "fs:workspace"]);
-        assert_eq!(
-            status.guest,
-            GuestStatus {
-                init_ready: false,
-                session_pid: None,
-                exit: None
-            }
-        );
+        assert_eq!(status.guest, boxcar_proto::control::GuestStatus::default());
         assert_eq!(
             status.audit,
             AuditStatus {
@@ -838,6 +1128,10 @@ mod tests {
             Vec::new(),
             exits,
             sink.clone(),
+            GuestCtl::new(
+                crate::guest_ctl::SessionConfig::for_user(vec!["sh".into()], 1, 1),
+                sink.clone(),
+            ),
         );
         let fds = control.fds();
         let mut main_loop: MainLoop = EventManager::new().unwrap();

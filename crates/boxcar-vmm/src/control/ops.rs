@@ -12,10 +12,10 @@
 use std::fmt;
 use std::os::unix::net::UnixStream;
 
-use boxcar_proto::control::{ErrorBody, Request, Status, StopParams};
+use boxcar_proto::control::{ErrorBody, Request, Status, StopMode, StopParams};
 use serde_json::{json, Value};
 
-use crate::lifecycle::{StopReason, VmmHandle};
+use crate::lifecycle::{StopReason, VmmHandle, GRACEFUL_STOP_MARGIN};
 
 /// The ops a control connection serves.
 pub trait Ops: Send + Sync {
@@ -94,10 +94,20 @@ impl Ops for VmmOps {
         self.handle.status()
     }
 
-    /// Both modes stop the VM at once for now: a graceful stop through the
-    /// guest needs the guest control channel.
-    fn stop(&self, _params: StopParams) -> Result<Value, ErrorBody> {
-        self.handle.request_stop(StopReason::Requested);
+    /// `graceful` (the default), while a session runs: init is asked to
+    /// end it, with `timeout_ms` (5000 by default) between `SIGTERM` and
+    /// `SIGKILL`, and the VM stops when the guest resets, or
+    /// [`GRACEFUL_STOP_MARGIN`] after that at the latest (see
+    /// [`VmmHandle::request_graceful_stop`]). `force`, or no session to end:
+    /// the VM stops at once. Either way the run exits 0.
+    fn stop(&self, params: StopParams) -> Result<Value, ErrorBody> {
+        let graceful = params.mode == StopMode::Graceful
+            && self
+                .handle
+                .request_graceful_stop(params.effective_timeout_ms(), GRACEFUL_STOP_MARGIN);
+        if !graceful {
+            self.handle.request_stop(StopReason::Requested);
+        }
         Ok(json!({"accepted": true}))
     }
 
@@ -108,7 +118,7 @@ impl Ops for VmmOps {
 
 #[cfg(test)]
 mod tests {
-    use boxcar_proto::control::{ErrorCode, StopMode, VmState};
+    use boxcar_proto::control::{ErrorCode, VmState};
 
     use super::*;
 

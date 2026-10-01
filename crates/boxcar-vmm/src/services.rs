@@ -8,9 +8,9 @@
 //! `boxcar.sensor`) that its rules let through: from a privileged guest
 //! source port, and the first to the port since the device was activated.
 //! The registry hands it to the service registered at the port, which
-//! returns its end of a stream, or turns it down; a port with no service
-//! turns every connection down, and the guest's request is reset and
-//! recorded as `no_service`.
+//! returns its end of a stream, or turns it down with a reason; a port with
+//! no service turns every connection down, and the guest's request is reset
+//! and recorded as `no_service`.
 //!
 //! [`Vmm::new`](crate::vmm::Vmm::new) creates the registry, empty, and
 //! hands it to the device; services are registered through
@@ -22,12 +22,12 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use boxcar_vsock::services::is_internal;
-use boxcar_vsock::{ConnMeta, InternalServices};
+use boxcar_vsock::{ConnMeta, Deny, InternalServices};
 
-/// A service: given a guest connection, its end of a stream, or `None` to
-/// turn the connection down. It runs on the vsock thread and must not
+/// A service: given a guest connection, its end of a stream, or why it
+/// turns the connection down. It runs on the vsock thread and must not
 /// block.
-pub type Service = Arc<dyn Fn(ConnMeta) -> Option<UnixStream> + Send + Sync>;
+pub type Service = Arc<dyn Fn(ConnMeta) -> Result<UnixStream, Deny> + Send + Sync>;
 
 /// Why a service could not be registered.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -81,14 +81,15 @@ impl ServiceRegistry {
 }
 
 impl InternalServices for ServiceRegistry {
-    fn connect(&self, port: u32, meta: ConnMeta) -> Option<UnixStream> {
+    fn connect(&self, port: u32, meta: ConnMeta) -> Result<UnixStream, Deny> {
         // The service runs without the lock held: it may register another.
         let service = self
             .services
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&port)
-            .cloned()?;
+            .cloned()
+            .ok_or(Deny::NoService)?;
         service(meta)
     }
 }
@@ -105,9 +106,10 @@ mod tests {
         let registry = ServiceRegistry::new();
         assert!(registry.ports().is_empty());
         for port in [1024, 1025, 1026] {
-            assert!(registry
-                .connect(port, ConnMeta { guest_port: 1023 })
-                .is_none());
+            assert_eq!(
+                registry.connect(port, ConnMeta { guest_port: 1023 }).err(),
+                Some(Deny::NoService)
+            );
         }
     }
 
@@ -122,9 +124,9 @@ mod tests {
                 1024,
                 Arc::new(move |meta| {
                     seen2.lock().unwrap().push(meta);
-                    let (ours, theirs) = UnixStream::pair().ok()?;
+                    let (ours, theirs) = UnixStream::pair().map_err(|_| Deny::NoService)?;
                     kept2.lock().unwrap().push(theirs);
-                    Some(ours)
+                    Ok(ours)
                 }),
             )
             .unwrap();
@@ -139,15 +141,16 @@ mod tests {
         kept.lock().unwrap()[0].read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello");
         // Another port is still not served.
-        assert!(registry
-            .connect(1025, ConnMeta { guest_port: 1022 })
-            .is_none());
+        assert_eq!(
+            registry.connect(1025, ConnMeta { guest_port: 1022 }).err(),
+            Some(Deny::NoService)
+        );
     }
 
     #[test]
     fn only_internal_ports_take_a_service_and_each_only_one() {
         let registry = ServiceRegistry::new();
-        let none: Service = Arc::new(|_| None);
+        let none: Service = Arc::new(|_| Err(Deny::Refused("busy")));
         for port in [0, 1023, 1027, 5000] {
             assert_eq!(
                 registry.register(port, none.clone()),
@@ -159,10 +162,11 @@ mod tests {
             registry.register(1025, none.clone()),
             Err(RegisterError::Taken(1025))
         );
-        // A service may turn a connection down.
-        assert!(registry
-            .connect(1025, ConnMeta { guest_port: 1022 })
-            .is_none());
+        // A service may turn a connection down, with its reason.
+        assert_eq!(
+            registry.connect(1025, ConnMeta { guest_port: 1022 }).err(),
+            Some(Deny::Refused("busy"))
+        );
     }
 
     /// The registry is called without its lock held: a service may
@@ -175,14 +179,14 @@ mod tests {
             .register(
                 1024,
                 Arc::new(move |_| {
-                    let _ = inner.register(1026, Arc::new(|_| None));
-                    None
+                    let _ = inner.register(1026, Arc::new(|_| Err(Deny::NoService)));
+                    Err(Deny::NoService)
                 }),
             )
             .unwrap();
         assert!(registry
             .connect(1024, ConnMeta { guest_port: 1023 })
-            .is_none());
+            .is_err());
         assert_eq!(registry.ports(), [1024, 1026]);
     }
 }

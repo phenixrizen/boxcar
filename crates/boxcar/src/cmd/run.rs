@@ -4,10 +4,11 @@
 //! `boxcar run`: boots a microVM and records its session.
 
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -19,10 +20,14 @@ use boxcar_audit::{AuditSink, WriterConfig, WriterHandle};
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_net::{NetConfig, Policy};
 use boxcar_proto::control::{to_line, Ready};
+use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
+use boxcar_vmm::guest_ctl::check_session;
 use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
+use boxcar_vmm::pty_relay::{self, RelayInput};
+use boxcar_vmm::stdin::RawModeGuard;
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
 };
@@ -99,18 +104,27 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .collect();
     let audit_dir = check_audit_dir(&audit_dir, &named)?;
 
-    let (mode, share_count) = match &rootfs {
-        Some(_) => {
-            let (uid, gid) = invoking_user();
-            (GuestMode::Console { uid, gid }, SHARE_COUNT)
-        }
-        // clap requires --rootfs unless --no-fs.
-        None => (GuestMode::Hello, 0),
-    };
+    let session_id = SessionId::new();
+    let user = invoking_user();
+    // clap requires --rootfs unless --no-fs.
+    let has_shares = rootfs.is_some();
+    let share_count = if has_shares { SHARE_COUNT } else { 0 };
+    let mode = guest_mode(has_shares, vsock, user.0, user.1);
     let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command);
     // The devices the VM will have, derived as `Vmm::new` derives them.
     let devices = DeviceSet::new(share_count, net, vsock);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
+    // In vsock mode the command travels in the control channel's config.
+    let session = session_config(
+        &args.command,
+        user,
+        &session_id,
+        has_shares,
+        terminal_size(stdin_terminal_size()),
+    );
+    if mode == GuestMode::Vsock {
+        check_session(&session).map_err(anyhow::Error::msg)?;
+    }
     if net {
         // Every relayed connection is a host socket.
         match nofile::raise() {
@@ -129,7 +143,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // the signals reach only the VMM's signalfd.
     block_stop_signals().context("cannot block the stop signals")?;
 
-    let session_id = SessionId::new();
     let (sink, writer) = start_audit_log(WriterConfig::new(&audit_dir, session_id.clone()))
         .with_context(|| format!("cannot start the audit log under {}", audit_dir.display()))?;
     // Outlives the writer, to ask it afterwards whether it failed.
@@ -150,6 +163,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
 
     let state_dir = sessions_root.join(session_id.as_str());
+    let relayed = mode == GuestMode::Vsock;
+    let console = console_out(args.console_log, args.console_stdout, relayed, &state_dir);
+    // The console's file in the state directory, which this run made.
+    let mut console_log = None;
+    if relayed {
+        if let ConsoleOut::File(path) = &console {
+            if path.starts_with(&state_dir) {
+                create_console_log(&state_dir, path)?;
+                eprintln!("console: {}", path.display());
+                console_log = Some(path.clone());
+            }
+        }
+    }
+    // A command needs no input: the terminal stays as it is.
+    let interactive = args.command.is_empty();
     let cfg = VmConfig {
         kernel: args.kernel,
         initramfs: args.initramfs,
@@ -157,19 +185,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         vcpus: args.vcpus,
         cmdline_extra,
         debug_boot: args.debug_boot,
-        console: match args.console_log {
-            Some(path) => ConsoleOut::File(path),
-            None => ConsoleOut::Stdio,
-        },
-        // A command needs no input: the terminal stays as it is.
-        stdin: args.command.is_empty(),
+        console,
+        // In vsock mode the session's terminal takes the input, not the
+        // serial console.
+        stdin: interactive && !relayed,
         audit: sink,
         fs_shares,
         net: net.then(|| net_config(&args.dns)),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
         vsock: vsock.then(|| vsock_config(&state_dir, &args.vsock_allow)),
+        session,
         control: Some(ControlConfig {
-            state_dir,
+            state_dir: state_dir.clone(),
             session_id: session_id.clone(),
         }),
         fs_audit: AuditFsOptions {
@@ -182,15 +209,36 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     // The VM's stop sequence resets the virtio-fs devices, which records
     // the closes of files the guest left open, before `run` returns.
-    let outcome = Vmm::new(cfg).and_then(|vmm| {
-        if let Some(path) = vmm.control_path() {
-            eprintln!("control: {}", path.display());
-            if let Some(ready) = ready {
-                ready.announce(path, &session_id);
+    let outcome = match Vmm::new(cfg) {
+        Ok(mut vmm) => {
+            if let Some(path) = vmm.control_path() {
+                eprintln!("control: {}", path.display());
+                if let Some(ready) = ready {
+                    ready.announce(path, &session_id);
+                }
             }
+            if relayed {
+                if let Err(error) = relay_session(&mut vmm, interactive) {
+                    // The VM was built, and its stop records vmm.stop: run
+                    // it to a stop at once rather than leave the log
+                    // without one.
+                    tell(&format!("error: {error:#}"));
+                    vmm.handle()
+                        .request_stop(boxcar_vmm::vmm::StopReason::Requested);
+                }
+            }
+            vmm.run()
         }
-        vmm.run()
-    });
+        Err(error) => {
+            // No guest ran: the empty console file and the state directory
+            // made for it go, as the VMM's own files there did.
+            if let Some(path) = console_log {
+                let _ = fs::remove_file(path);
+                let _ = fs::remove_dir(&state_dir);
+            }
+            Err(error)
+        }
+    };
     // Drains every accepted record (vmm.stop included), checkpoints, syncs.
     let closed = writer.close();
     // What follows is said with `tell`: the VM is stopped, and a stderr that
@@ -598,6 +646,117 @@ fn check_cmdline_size(
     Ok(())
 }
 
+/// Registers the transitional PTY relay (until Task 12's hub) on `vmm`:
+/// the session's terminal to stdout and, for an interactive run, stdin to
+/// the session, with the terminal in raw mode when stdin is one, restored
+/// by the VM's stop sequence.
+fn relay_session(vmm: &mut Vmm, interactive: bool) -> anyhow::Result<()> {
+    let input = if interactive {
+        Some(RelayInput::stdin().context("cannot read stdin")?)
+    } else {
+        None
+    };
+    let tty = input.as_ref().is_some_and(|input| input.tty);
+    let out = pty_relay::stdout().context("cannot write to stdout")?;
+    pty_relay::register(&vmm.handle().services(), out, input, vmm.handle())
+        .context("cannot serve the session's terminal")?;
+    if tty {
+        if let Some(guard) = RawModeGuard::enter().context("cannot put the terminal in raw mode")? {
+            vmm.restore_terminal_on_stop(guard);
+        }
+    }
+    Ok(())
+}
+
+/// The name of the serial console's file in the state directory, in vsock
+/// mode.
+const CONSOLE_LOG: &str = "console.log";
+
+/// Where the serial console goes: `--console-log` when given; else, in
+/// vsock mode (`relayed`), where stdout carries the session's terminal,
+/// `console.log` in the state directory, unless `--console-stdout`; else
+/// (M1's console session) stdout.
+fn console_out(
+    console_log: Option<PathBuf>,
+    console_stdout: bool,
+    relayed: bool,
+    state_dir: &Path,
+) -> ConsoleOut {
+    match console_log {
+        Some(path) => ConsoleOut::File(path),
+        None if relayed && !console_stdout => ConsoleOut::File(state_dir.join(CONSOLE_LOG)),
+        None => ConsoleOut::Stdio,
+    }
+}
+
+/// Creates the state directory (mode 0700, if it is not there yet) and the
+/// console's file `path` in it, mode 0600, before the VMM opens it: the
+/// VMM would create it with the process's umask.
+fn create_console_log(state_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    match DirBuilder::new().mode(0o700).create(state_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot create {}", state_dir.display())),
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    Ok(())
+}
+
+/// The size of the terminal on stdin (`TIOCGWINSZ`), rows then columns,
+/// when stdin is a terminal.
+fn stdin_terminal_size() -> Option<(u16, u16)> {
+    if !boxcar_vmm::stdin::stdin_is_tty() {
+        return None;
+    }
+    // SAFETY: winsize is plain data; all zeroes is valid.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ stores one winsize through its argument, which
+    // points at `size`, alive for the call.
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut size) };
+    (rc == 0).then_some((size.ws_row, size.ws_col))
+}
+
+/// The session's terminal size: the host's, when it has one with neither
+/// side 0, else 24 by 80.
+fn terminal_size(host: Option<(u16, u16)>) -> (u16, u16) {
+    match host {
+        Some((rows, cols)) if rows > 0 && cols > 0 => (rows, cols),
+        _ => (24, 80),
+    }
+}
+
+/// The session the guest control channel sends init in vsock mode: the
+/// command (`-- CMD`, or a login shell) as the invoking `user`, with the
+/// default environment ([`SessionConfig::for_user`]) and
+/// `BOXCAR_SESSION_ID`; in `/workspace` when the workspace share is there
+/// (`shares`), else `/`; on a terminal of `size`.
+fn session_config(
+    command: &[String],
+    user: (u32, u32),
+    session_id: &SessionId,
+    shares: bool,
+    size: (u16, u16),
+) -> SessionConfig {
+    let argv = if command.is_empty() {
+        DEFAULT_ARGV.map(str::to_owned).to_vec()
+    } else {
+        command.to_vec()
+    };
+    let mut cfg = SessionConfig::for_user(argv, user.0, user.1);
+    cfg.env
+        .push(("BOXCAR_SESSION_ID".to_owned(), session_id.to_string()));
+    if !shares {
+        "/".clone_into(&mut cfg.cwd);
+    }
+    (cfg.rows, cfg.cols) = size;
+    cfg
+}
+
 /// Logs to stderr, at `warn` unless `RUST_LOG` says otherwise.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -611,19 +770,34 @@ fn init_tracing() {
 /// What the guest init is told to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuestMode {
+    /// Mount the shares, get the session from the guest control channel,
+    /// and run it on a terminal of its own relayed over vsock.
+    Vsock,
     /// Mount the shares and run the session on the serial console as this
-    /// user and group.
+    /// user and group (M1's, with `--no-vsock`).
     Console { uid: u32, gid: u32 },
     /// Print a marker and reboot: a boot without shares has nothing to run.
     Hello,
 }
 
+/// The mode of a VM with `shares` and the `vsock` device, whose session
+/// runs as `uid` and `gid`.
+fn guest_mode(shares: bool, vsock: bool, uid: u32, gid: u32) -> GuestMode {
+    match (shares, vsock) {
+        (true, true) => GuestMode::Vsock,
+        (true, false) => GuestMode::Console { uid, gid },
+        (false, _) => GuestMode::Hello,
+    }
+}
+
 /// The `boxcar.*` keys for `mode`, then `extra` (`--cmdline-extra`), in
-/// order, then `command` (`-- CMD`), if any, as `boxcar.cmd`. The user's
-/// values come after boxcar's so they win: init keeps the last of a
-/// repeated key.
+/// order, then, in console mode, `command` (`-- CMD`), if any, as
+/// `boxcar.cmd`. The user's values come after boxcar's so they win: init
+/// keeps the last of a repeated key. In vsock mode the command, the user
+/// and the rest travel in the control channel's config instead.
 fn guest_cmdline(mode: GuestMode, extra: &[String], command: &[String]) -> Vec<String> {
     let mut cmdline = match mode {
+        GuestMode::Vsock => vec!["boxcar.mode=vsock".to_owned()],
         GuestMode::Console { uid, gid } => vec![
             "boxcar.mode=console".to_owned(),
             format!("boxcar.uid={uid}"),
@@ -632,7 +806,7 @@ fn guest_cmdline(mode: GuestMode, extra: &[String], command: &[String]) -> Vec<S
         GuestMode::Hello => vec!["boxcar.mode=hello".to_owned()],
     };
     cmdline.extend_from_slice(extra);
-    if !command.is_empty() {
+    if !command.is_empty() && matches!(mode, GuestMode::Console { .. }) {
         cmdline.push(format!("boxcar.cmd={}", guestcmd::encode(command)));
     }
     cmdline
@@ -716,6 +890,102 @@ mod tests {
         assert_eq!(cmdline.len(), 5);
         let value = cmdline[4].strip_prefix("boxcar.cmd=").unwrap();
         assert_eq!(guestcmd::decode(value).unwrap(), command);
+    }
+
+    /// With a vsock device the guest runs the vsock init: the command, the
+    /// user and the rest travel in the control channel's config, so the
+    /// command line says only the mode; the extras still follow it.
+    #[test]
+    fn with_vsock_the_command_line_says_only_the_mode() {
+        let command = strings(&["/bin/sh", "-c", "exit 7"]);
+        assert_eq!(
+            guest_cmdline(GuestMode::Vsock, &[], &command),
+            ["boxcar.mode=vsock"]
+        );
+        assert_eq!(
+            guest_cmdline(GuestMode::Vsock, &strings(&["loglevel=7"]), &[]),
+            ["boxcar.mode=vsock", "loglevel=7"]
+        );
+    }
+
+    /// The mode follows the devices: vsock with shares and the vsock
+    /// device, M1's console with shares alone (`--no-vsock`), hello
+    /// without shares.
+    #[test]
+    fn the_guest_mode_follows_the_devices() {
+        assert_eq!(guest_mode(true, true, 1000, 1001), GuestMode::Vsock);
+        assert_eq!(
+            guest_mode(true, false, 1000, 1001),
+            GuestMode::Console {
+                uid: 1000,
+                gid: 1001
+            }
+        );
+        assert_eq!(guest_mode(false, true, 1000, 1001), GuestMode::Hello);
+        assert_eq!(guest_mode(false, false, 1000, 1001), GuestMode::Hello);
+    }
+
+    #[test]
+    fn the_session_config_of_a_run() {
+        let id: SessionId = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f".parse().unwrap();
+        let command = strings(&["/bin/sh", "-c", "exit 7"]);
+        let cfg = session_config(&command, (1000, 1001), &id, true, (30, 100));
+        assert_eq!(cfg.argv, command);
+        assert_eq!((cfg.uid, cfg.gid), (1000, 1001));
+        assert_eq!(cfg.cwd, "/workspace");
+        assert_eq!(cfg.hostname, "boxcar");
+        assert_eq!(cfg.term, "xterm-256color");
+        assert_eq!((cfg.rows, cfg.cols), (30, 100));
+        assert!(cfg.sysctls.is_empty());
+        let env: Vec<String> = cfg.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        assert_eq!(
+            env,
+            [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME=/workspace",
+                "TERM=xterm-256color",
+                "LANG=C.UTF-8",
+                "BOXCAR_SESSION_ID=017f22e2-79b0-7cc3-98c4-dc0c0c07398f",
+            ]
+        );
+
+        // No command: a login shell. Root's home is /root; without the
+        // workspace share the session starts in /.
+        let cfg = session_config(&[], (0, 0), &id, false, (24, 80));
+        assert_eq!(cfg.argv, ["/bin/sh", "-l"]);
+        assert!(cfg.env.contains(&("HOME".to_owned(), "/root".to_owned())));
+        assert_eq!(cfg.cwd, "/");
+    }
+
+    #[test]
+    fn the_terminal_size_is_the_hosts_or_24_by_80() {
+        assert_eq!(terminal_size(None), (24, 80));
+        assert_eq!(terminal_size(Some((0, 0))), (24, 80));
+        assert_eq!(terminal_size(Some((50, 0))), (24, 80));
+        assert_eq!(terminal_size(Some((50, 132))), (50, 132));
+    }
+
+    /// With a vsock device, stdout carries the session and the serial
+    /// console goes to the state directory, unless asked otherwise; without
+    /// one, M1's console on stdout.
+    #[test]
+    fn the_console_goes_to_the_state_directory_with_vsock() {
+        let state = Path::new("/run/user/1000/boxcar/s1");
+        assert_eq!(
+            console_out(None, false, true, state),
+            ConsoleOut::File(state.join("console.log"))
+        );
+        assert_eq!(console_out(None, true, true, state), ConsoleOut::Stdio);
+        let log = PathBuf::from("/tmp/c.log");
+        assert_eq!(
+            console_out(Some(log.clone()), false, true, state),
+            ConsoleOut::File(log.clone())
+        );
+        assert_eq!(console_out(None, false, false, state), ConsoleOut::Stdio);
+        assert_eq!(
+            console_out(Some(log.clone()), false, false, state),
+            ConsoleOut::File(log)
+        );
     }
 
     /// The devices of a run with `--rootfs`: the shares and the network.

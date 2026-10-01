@@ -44,7 +44,8 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
     FsSymlink, FsXattr, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp,
-    OpResult, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    OpResult, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose,
+    VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -94,14 +95,18 @@ pub enum Source {
     Reconciler,
     Gateway,
     Control,
+    /// The guest's session, as its init reports it over the control
+    /// channel.
+    Session,
 }
 
 impl Source {
     /// The source of an event kind this crate defines a payload for:
     /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
     /// device, `net.*` from the network stack, `vsock.*` from the vsock
-    /// device, `control.*` from the control socket. `None` for every other
-    /// kind; later milestones add theirs.
+    /// device, `control.*` from the control socket, `session.*` from the
+    /// guest's session. `None` for every other kind; later milestones add
+    /// theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
         if kind == "checkpoint" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
@@ -113,6 +118,8 @@ impl Source {
             Some(Source::Vsock)
         } else if kind.starts_with("control.") {
             Some(Source::Control)
+        } else if kind.starts_with("session.") {
+            Some(Source::Session)
         } else {
             None
         }
@@ -381,6 +388,10 @@ pub enum Payload {
     VsockConnect(VsockConnect),
     #[serde(rename = "vsock.close")]
     VsockClose(VsockClose),
+    #[serde(rename = "session.start")]
+    SessionStart(SessionStart),
+    #[serde(rename = "session.exit")]
+    SessionExit(SessionExit),
 }
 
 impl Payload {
@@ -420,14 +431,17 @@ impl Payload {
             Payload::NetUdp(_) => "net.udp",
             Payload::VsockConnect(_) => "vsock.connect",
             Payload::VsockClose(_) => "vsock.close",
+            Payload::SessionStart(_) => "session.start",
+            Payload::SessionExit(_) => "session.exit",
         }
     }
 
     /// The source of the record that carries this payload: the VMM for
     /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, the
     /// network stack for `net.*`, the vsock device for `vsock.*`, the
-    /// control socket for `control.*`, as [`Source::from_kind`] says. A new
-    /// variant does not compile until it is given one.
+    /// control socket for `control.*`, the guest's session for `session.*`,
+    /// as [`Source::from_kind`] says. A new variant does not compile until
+    /// it is given one.
     pub fn source(&self) -> Source {
         match self {
             Payload::VmmStart(_) | Payload::VmmStop(_) | Payload::Checkpoint(_) => Source::Vmm,
@@ -458,6 +472,7 @@ impl Payload {
             | Payload::NetDrop(_)
             | Payload::NetUdp(_) => Source::Net,
             Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
+            Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
         }
     }
 
@@ -491,8 +506,8 @@ mod tests {
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 32 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 32] = [
+    /// The 34 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 34] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -525,6 +540,8 @@ mod tests {
         "net.udp",
         "vsock.connect",
         "vsock.close",
+        "session.start",
+        "session.exit",
     ];
 
     fn session() -> SessionId {
@@ -1042,6 +1059,30 @@ mod tests {
                 }),
                 json!({"port": 1024, "dir": "guest", "tx": 4096, "rx": 10485760}),
             ),
+            (
+                // What init started, as the VMM asked, and its pid.
+                Payload::SessionStart(SessionStart {
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                    cwd: "/workspace".into(),
+                    uid: 1000,
+                    gid: 1000,
+                    pid: 212,
+                }),
+                json!({
+                    "argv": ["/bin/sh", "-c", "exit 7"],
+                    "cwd": "/workspace",
+                    "uid": 1000,
+                    "gid": 1000,
+                    "pid": 212,
+                }),
+            ),
+            (
+                Payload::SessionExit(SessionExit {
+                    code: Some(7),
+                    signal: None,
+                }),
+                json!({"code": 7, "signal": null}),
+            ),
         ]
     }
 
@@ -1268,6 +1309,14 @@ mod tests {
                 }),
                 json!({"port": 5000, "dir": "host", "tx": 0, "rx": 0}),
             ),
+            (
+                // Killed by a signal: no code.
+                Payload::SessionExit(SessionExit {
+                    code: None,
+                    signal: Some(15),
+                }),
+                json!({"code": null, "signal": 15}),
+            ),
         ]
     }
 
@@ -1357,6 +1406,8 @@ mod tests {
                 Source::Vsock
             } else if payload.kind().starts_with("control.") {
                 Source::Control
+            } else if payload.kind().starts_with("session.") {
+                Source::Session
             } else {
                 Source::Vmm
             };
@@ -1369,6 +1420,7 @@ mod tests {
         assert_eq!(Source::from_kind("control.stop"), Some(Source::Control));
         assert_eq!(Source::from_kind("net.drop"), Some(Source::Net));
         assert_eq!(Source::from_kind("vsock.close"), Some(Source::Vsock));
+        assert_eq!(Source::from_kind("session.exit"), Some(Source::Session));
         for other in [
             "proc.exec",
             "finding",
@@ -1383,6 +1435,8 @@ mod tests {
             "network.drop",
             "vsock",
             "vsocks.close",
+            "session",
+            "sessions.exit",
         ] {
             assert_eq!(Source::from_kind(other), None, "{other:?}");
         }
@@ -1766,6 +1820,7 @@ mod tests {
             (Source::Reconciler, "reconciler"),
             (Source::Gateway, "gateway"),
             (Source::Control, "control"),
+            (Source::Session, "session"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), json!(name));
             assert_eq!(

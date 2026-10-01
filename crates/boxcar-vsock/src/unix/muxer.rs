@@ -439,12 +439,19 @@ impl VsockMuxer {
             killq: MuxerKillQ::new(),
             local_port_last: (1u32 << 30) - 1,
             local_port_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
+            // boxcar: the rules that decide a guest's connection requests.
             rules: Rules::new(&cfg.uds_path, &cfg.allow_ports, services),
+            // boxcar: where `vsock.connect` and `vsock.close` go.
             audit,
+            // boxcar: the connections a `vsock.connect` let through, whose end is recorded.
             audited: HashMap::new(),
+            // boxcar: when each host client must have sent its whole `CONNECT` line.
             command_deadlines: HashMap::new(),
+            // boxcar: armed for the earliest of those deadlines.
             command_timer: TimerFd::new().map_err(|e| Error::CommandTimer(e.into()))?,
+            // boxcar: `CONNECT_TIMEOUT`, shorter in tests.
             command_timeout: CONNECT_TIMEOUT,
+            // boxcar: connections and host clients still sending their line, together.
             max_connections: defs::MAX_CONNECTIONS,
         };
 
@@ -1094,7 +1101,7 @@ mod tests {
     use super::super::super::csm::defs as csm_defs;
     use super::super::super::packet_ext::testing::PacketBuf;
     use super::super::super::packet_ext::PacketExt;
-    use super::super::super::services::ConnMeta;
+    use super::super::super::services::{ConnMeta, Deny};
     use super::*;
 
     impl PartiallyReadCommand {
@@ -1122,8 +1129,8 @@ mod tests {
     struct NoServices;
 
     impl InternalServices for NoServices {
-        fn connect(&self, _port: u32, _meta: ConnMeta) -> Option<UnixStream> {
-            None
+        fn connect(&self, _port: u32, _meta: ConnMeta) -> std::result::Result<UnixStream, Deny> {
+            Err(Deny::NoService)
         }
     }
 

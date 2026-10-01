@@ -5,6 +5,7 @@
 //!
 //! - [`audit`]: the record envelope, its hash chain, and the typed payloads.
 //! - [`control`]: the control protocol, v1: requests, responses, events.
+//! - [`guest`]: the guest control channel between init and the VMM.
 //! - [`guestcmd`]: the session command on the kernel command line.
 //! - [`ids`]: session identifiers.
 //! - [`limits`]: size limits for record fields, and the cut that enforces them.
@@ -20,6 +21,7 @@
 
 pub mod audit;
 pub mod control;
+pub mod guest;
 pub mod guestcmd;
 pub mod ids;
 pub mod limits;
@@ -31,8 +33,9 @@ pub use audit::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
     FsSymlink, FsXattr, Hash, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls,
-    NetUdp, OpResult, ParseHashError, Payload, Record, Ring, SetAttr, ShareRef, Source, SpanRef,
-    Subject, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
+    NetUdp, OpResult, ParseHashError, Payload, Record, Ring, SessionExit, SessionStart, SetAttr,
+    ShareRef, Source, SpanRef, Subject, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

@@ -66,20 +66,36 @@ pub enum Command {
     ///
     /// Shares `--rootfs` with the guest as its root filesystem and
     /// `--workspace` at /workspace, both over virtio-fs, and records what
-    /// the guest does to them. The guest runs a login shell on its serial
-    /// console as the invoking user's uid and gid, or, after `--`, the
-    /// command given. Prints the session id, its audit log directory, the
-    /// workspace and the control socket (see `boxcar status`) on stderr,
-    /// runs the guest with its serial console on stdout (or in
-    /// `--console-log`), and exits when it stops: 0 when the guest reset or
-    /// shut down (whatever the session's own exit status, which the console
-    /// shows as `boxcar: session exited <code>`) and after `boxcar stop`, 1
-    /// after a vCPU error, 3 when the audit log could not be written (the
-    /// VM is stopped and stderr says `audit log failed: <why>`), 130 after
-    /// SIGINT (Ctrl-C) or the console escape, 143 after SIGTERM, 129 after
-    /// SIGHUP and 131 after SIGQUIT. When stdin is a terminal, the console
-    /// is on stdout and no command is given, every key goes to the guest,
-    /// Ctrl-C included; press Ctrl-] twice within a second to stop the VM.
+    /// the guest does to them. The guest runs a login shell as the invoking
+    /// user's uid and gid, or, after `--`, the command given. Prints the
+    /// session id, its audit log directory, the workspace and the control
+    /// socket (see `boxcar status`) on stderr.
+    ///
+    /// With the vsock device (the default with shares), the session runs on
+    /// a terminal of its own in the guest, which `boxcar run` relays: what
+    /// the session prints goes to stdout, and only that; the guest's serial
+    /// console (the kernel's and init's messages) goes to `console.log` in
+    /// the session's state directory, beside the control socket (see
+    /// `--console-log` and `--console-stdout`). The run exits with the
+    /// session's own exit code, 128 plus the signal that killed it (137
+    /// for SIGKILL), or 0 after `boxcar stop`, which asks the guest to end
+    /// the session first (SIGTERM, then SIGKILL after its timeout).
+    ///
+    /// With `--no-vsock`, M1's console session: the session runs on the
+    /// serial console, which goes to stdout (or `--console-log`), and the
+    /// run exits 0 whatever the session's exit status, which the console
+    /// shows as `boxcar: session exited <code>`.
+    ///
+    /// Either way the run exits 0 when the guest reset with no session to
+    /// report and after `boxcar stop`, 1 after a vCPU error, 3 when the
+    /// audit log could not be written (the VM is stopped and stderr says
+    /// `audit log failed: <why>`), 130 after SIGINT (Ctrl-C) or the console
+    /// escape, 143 after SIGTERM, 129 after SIGHUP and 131 after SIGQUIT.
+    /// When stdin is a terminal and no command is given, the terminal is
+    /// the session's: every key goes to the guest, Ctrl-C included; press
+    /// Ctrl-] twice within a second to stop the VM. With the vsock device,
+    /// input from a pipe or a file goes to the session too, and its end is
+    /// an end-of-file there.
     ///
     /// With shares the guest also gets a network card (see `--net`): it
     /// reaches only what the policy allows (`--policy-file`, `--deny`,
@@ -207,9 +223,10 @@ pub struct RunArgs {
     #[arg(long, value_enum, value_name = "LEVEL", default_value_t = AuditLevelArg::Normal)]
     pub audit_level: AuditLevelArg,
     /// An extra kernel command line argument. Repeatable. These follow the
-    /// `boxcar.mode`, `boxcar.uid` and `boxcar.gid` keys boxcar sets, so
-    /// they can override them; `boxcar.cmd` from `-- CMD` comes after them.
-    /// The whole command line may not exceed 2048 bytes.
+    /// `boxcar.mode` key boxcar sets (and, with `--no-vsock`, `boxcar.uid`
+    /// and `boxcar.gid`), so they can override them; with `--no-vsock`,
+    /// `boxcar.cmd` from `-- CMD` comes after them. The whole command line
+    /// may not exceed 2048 bytes.
     #[arg(long, value_name = "STR")]
     pub cmdline_extra: Vec<String>,
     /// Early printk on the serial console and every kernel message.
@@ -222,15 +239,24 @@ pub struct RunArgs {
     /// directory deeper in a session, such as its workspace, may be shared.
     #[arg(long, value_name = "DIR")]
     pub audit_dir: Option<PathBuf>,
-    /// Write the serial console to PATH instead of stdout. Stdin is then not
-    /// forwarded to the guest.
-    #[arg(long, value_name = "PATH")]
+    /// Write the serial console to PATH. Default: with the vsock device,
+    /// `console.log` in the session's state directory (mode 0600), which
+    /// stays there after the run; with `--no-vsock`, stdout (and when PATH
+    /// is given instead, stdin is not forwarded to the guest).
+    #[arg(long, value_name = "PATH", conflicts_with = "console_stdout")]
     pub console_log: Option<PathBuf>,
+    /// With the vsock device, write the serial console to stdout as well as
+    /// the session's terminal, as M1 did: for debugging a boot. The two
+    /// interleave.
+    #[arg(long)]
+    pub console_stdout: bool,
     /// The command the guest runs instead of a login shell, and its
     /// arguments, after `--`: an argv, run without a shell, with CMD looked
     /// up in the guest's PATH unless it holds a `/`. A `--` must be
     /// followed by one. The run is not interactive: stdin is not forwarded
-    /// and the terminal is left as it is.
+    /// and the terminal is left as it is. With the vsock device the
+    /// command and its environment may take up to 64 KiB; with
+    /// `--no-vsock` it travels on the kernel command line.
     #[arg(last = true, value_name = "CMD", conflicts_with = "no_fs")]
     pub command: Vec<String>,
     /// Once the control socket is ready, write one line to file descriptor
@@ -278,7 +304,8 @@ pub struct RunArgs {
     )]
     pub dns: Vec<SocketAddr>,
     /// Give the guest a vsock device (CID 3): the VMM's own channels to the
-    /// guest, and connections between guest and host ports. Its host
+    /// guest (the session's control channel and its terminal), and
+    /// connections between guest and host ports. Its host
     /// socket is `vsock.sock` in the session's state directory, mode 0600:
     /// a host process reaches guest port P by connecting to it and sending
     /// `CONNECT P` and a newline; once the guest accepts, it reads `OK
@@ -288,7 +315,7 @@ pub struct RunArgs {
     /// wins.
     #[arg(long, overrides_with = "no_vsock")]
     pub vsock: bool,
-    /// No vsock device.
+    /// No vsock device: the guest runs M1's console session (see `run`).
     #[arg(long, overrides_with = "vsock")]
     pub no_vsock: bool,
     /// Let the guest connect to host vsock port PORT, which reaches the

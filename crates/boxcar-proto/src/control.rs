@@ -289,8 +289,8 @@ pub struct Status {
     pub devices: Vec<String>,
 }
 
-/// What the guest's init has reported.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What the guest's init has reported. The default is nothing yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestStatus {
     /// Whether init has said hello over the guest control channel.
     pub init_ready: bool,

@@ -506,8 +506,11 @@ pub struct VsockConnect {
     /// Why a connection was refused: `unprivileged` (an internal port from
     /// a guest source port of 1024 or more), `duplicate` (an internal port
     /// that was already connected), `no_service` (an internal port nothing
-    /// serves) or `port` (a port that is not allowlisted). `null` when it
-    /// was let through.
+    /// serves), `port` (a port that is not allowlisted), or the reason the
+    /// service at an internal port gave, such as `reactivated` (the guest
+    /// control channel takes one connection in the VMM's life, and this is
+    /// a later one, after the guest re-activated its vsock driver). `null`
+    /// when it was let through.
     pub reason: Option<String>,
 }
 
@@ -523,4 +526,29 @@ pub struct VsockClose {
     pub tx: u64,
     /// Payload bytes the guest received.
     pub rx: u64,
+}
+
+/// `session.start`: the guest's init started the session the VMM's config
+/// asked for. Reported by init (ring 1); the record's subject is the
+/// session's process.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionStart {
+    /// The command, as the config gave it.
+    pub argv: Vec<String>,
+    /// Where it started.
+    pub cwd: String,
+    /// Who it runs as.
+    pub uid: u32,
+    pub gid: u32,
+    /// Its process id in the guest.
+    pub pid: u32,
+}
+
+/// `session.exit`: the session's process ended, as init reported it: its
+/// exit code, or the signal that killed it. Both are `null` only when init
+/// could not tell.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
 }

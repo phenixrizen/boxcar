@@ -56,7 +56,7 @@ use vmm_sys_util::epoll::EventSet;
 pub use device::{VirtioVsock, VsockConfig};
 pub use packet_ext::VsockPacket;
 pub use rules::port_socket_path;
-pub use services::{ConnMeta, InternalServices};
+pub use services::{ConnMeta, Deny, InternalServices};
 pub use unix::{bind_listener, VsockMuxer, VsockUnixError};
 
 /// The vsock protocol's numbers.

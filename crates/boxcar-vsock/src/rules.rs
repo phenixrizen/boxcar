@@ -11,8 +11,9 @@
 //! - to an internal port ([`INTERNAL_PORTS`](crate::services::INTERNAL_PORTS)):
 //!   refused as `unprivileged` from a guest source port of 1024 or more, as
 //!   `duplicate` once a connection to that port was served in this
-//!   activation, as `no_service` when [`InternalServices::connect`] does
-//!   not take it; otherwise served by the service, and the port is taken
+//!   activation, as `no_service` when nothing serves it, or with the
+//!   service's own reason when [`InternalServices::connect`] turns it down
+//!   (`Deny::Refused`); otherwise served by the service, and the port is taken
 //!   once the muxer has added the connection (`Rules::served`): a
 //!   connection the muxer could not add leaves the port free;
 //! - to an allowlisted port: connected to the host socket `<uds>_<port>`,
@@ -41,7 +42,7 @@ use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_proto::{Payload, Ring, Verdict, VsockClose, VsockConnect};
 use socket2::{Domain, SockAddr, Socket, Type};
 
-use crate::services::{ConnMeta, InternalServices, PRIVILEGED_PORT_LIMIT};
+use crate::services::{ConnMeta, Deny, InternalServices, PRIVILEGED_PORT_LIMIT};
 
 /// Who opened a connection: the `dir` of its records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +92,9 @@ pub(crate) enum Refusal {
     Duplicate,
     /// An internal port no service took.
     NoService,
+    /// An internal port whose service turned the connection down, for this
+    /// reason.
+    Refused(&'static str),
     /// A port that is not allowlisted.
     Port,
 }
@@ -101,6 +105,7 @@ impl Refusal {
             Refusal::Unprivileged => "unprivileged",
             Refusal::Duplicate => "duplicate",
             Refusal::NoService => "no_service",
+            Refusal::Refused(reason) => reason,
             Refusal::Port => "port",
         }
     }
@@ -155,8 +160,11 @@ impl Rules {
                 guest_port: src_port,
             };
             return match self.services.connect(port, meta) {
-                Some(stream) => Decision::Internal(stream),
-                None => Decision::Deny(Peer::Internal, Refusal::NoService),
+                Ok(stream) => Decision::Internal(stream),
+                Err(Deny::NoService) => Decision::Deny(Peer::Internal, Refusal::NoService),
+                Err(Deny::Refused(reason)) => {
+                    Decision::Deny(Peer::Internal, Refusal::Refused(reason))
+                }
             };
         }
         if self.allow_ports.contains(&port) {
@@ -269,9 +277,11 @@ mod tests {
     }
 
     impl InternalServices for Everything {
-        fn connect(&self, port: u32, meta: ConnMeta) -> Option<UnixStream> {
+        fn connect(&self, port: u32, meta: ConnMeta) -> Result<UnixStream, Deny> {
             self.taken.lock().unwrap().push((port, meta));
-            UnixStream::pair().ok().map(|(ours, _theirs)| ours)
+            UnixStream::pair()
+                .map(|(ours, _theirs)| ours)
+                .map_err(|_| Deny::NoService)
         }
     }
 
@@ -279,9 +289,33 @@ mod tests {
     struct Nothing;
 
     impl InternalServices for Nothing {
-        fn connect(&self, _port: u32, _meta: ConnMeta) -> Option<UnixStream> {
-            None
+        fn connect(&self, _port: u32, _meta: ConnMeta) -> Result<UnixStream, Deny> {
+            Err(Deny::NoService)
         }
+    }
+
+    /// Serves 1024 and refuses it, as the control channel refuses a
+    /// connection after the first of the VMM's life.
+    struct Refusing;
+
+    impl InternalServices for Refusing {
+        fn connect(&self, _port: u32, _meta: ConnMeta) -> Result<UnixStream, Deny> {
+            Err(Deny::Refused("reactivated"))
+        }
+    }
+
+    /// A service's own refusal is recorded with the reason it gave, and,
+    /// like `no_service`, leaves the port free.
+    #[test]
+    fn a_service_refusal_carries_its_reason() {
+        let mut rules = Rules::new(Path::new("/s/vsock.sock"), &[], Arc::new(Refusing));
+        let refused = refusal(rules.decide(1024, 1023));
+        assert_eq!(
+            refused,
+            Some((Peer::Internal, Refusal::Refused("reactivated")))
+        );
+        assert_eq!(Refusal::Refused("reactivated").as_str(), "reactivated");
+        assert!(rules.served.is_empty());
     }
 
     fn refusal(decision: Decision) -> Option<(Peer, Refusal)> {

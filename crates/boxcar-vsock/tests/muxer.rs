@@ -25,7 +25,7 @@ use boxcar_audit::{LogReader, WriterConfig, WriterHandle};
 use boxcar_proto::{Record, SessionId};
 use boxcar_vsock::defs::uapi;
 use boxcar_vsock::{
-    bind_listener, port_socket_path, ConnMeta, InternalServices, VsockChannel, VsockConfig,
+    bind_listener, port_socket_path, ConnMeta, Deny, InternalServices, VsockChannel, VsockConfig,
     VsockEpollListener, VsockMuxer, VsockPacket,
 };
 use serde_json::{json, Value};
@@ -132,14 +132,42 @@ impl FakeServices {
 }
 
 impl InternalServices for FakeServices {
-    fn connect(&self, port: u32, meta: ConnMeta) -> Option<UnixStream> {
+    fn connect(&self, port: u32, meta: ConnMeta) -> Result<UnixStream, Deny> {
         if !self.ports.contains(&port) {
-            return None;
+            return Err(Deny::NoService);
         }
-        let (ours, theirs) = UnixStream::pair().ok()?;
+        let (ours, theirs) = UnixStream::pair().map_err(|_| Deny::NoService)?;
         self.taken.lock().unwrap().push((port, meta, theirs));
-        Some(ours)
+        Ok(ours)
     }
+}
+
+/// Refuses every connection with the control channel's reason for a second
+/// activation's.
+struct ReactivatedServices;
+
+impl InternalServices for ReactivatedServices {
+    fn connect(&self, _port: u32, _meta: ConnMeta) -> Result<UnixStream, Deny> {
+        Err(Deny::Refused("reactivated"))
+    }
+}
+
+/// A connection the service itself turns down is reset and recorded with
+/// the service's reason.
+#[test]
+fn a_service_refusal_is_reset_and_recorded_with_its_reason() {
+    let mut fx = Fixture::new(&[], Arc::new(ReactivatedServices));
+    assert_eq!(fx.request(1024, 1023), (uapi::VSOCK_OP_RST, 1024, 1023));
+    assert_eq!(
+        fx.vsock_records(),
+        [connect_record(
+            1024,
+            "guest",
+            "internal",
+            1023,
+            Some("reactivated")
+        )]
+    );
 }
 
 /// A muxer with its host socket and audit log in a temporary directory.
@@ -685,12 +713,15 @@ struct FlakyServices {
 }
 
 impl InternalServices for FlakyServices {
-    fn connect(&self, _port: u32, _meta: ConnMeta) -> Option<UnixStream> {
+    fn connect(&self, _port: u32, _meta: ConnMeta) -> Result<UnixStream, Deny> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            let file = fs::File::create(self.dir.join("not-a-socket")).ok()?;
-            return Some(UnixStream::from(OwnedFd::from(file)));
+            let file =
+                fs::File::create(self.dir.join("not-a-socket")).map_err(|_| Deny::NoService)?;
+            return Ok(UnixStream::from(OwnedFd::from(file)));
         }
-        UnixStream::pair().ok().map(|(ours, _theirs)| ours)
+        UnixStream::pair()
+            .map(|(ours, _theirs)| ours)
+            .map_err(|_| Deny::NoService)
     }
 }
 
