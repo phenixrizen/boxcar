@@ -1,0 +1,24 @@
+[package]
+name = "boxcar-net"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxcar-proto = { workspace = true, features = ["hash"] }
+boxcar-audit = { workspace = true }
+# For `boxcar_virtio::limited!`, which keeps guest-triggerable log lines to
+# one a second.
+boxcar-virtio = { workspace = true }
+smoltcp = { workspace = true }
+socket2 = { workspace = true }
+arc-swap = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

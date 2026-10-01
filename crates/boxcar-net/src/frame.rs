@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The boxcar Authors
+
+//! The dispatcher's sort: what one guest Ethernet frame is, and so where it
+//! goes. [`classify`] reads only; every length is checked before it is used,
+//! and a frame it cannot make sense of is [`Dispatch::Other`], never a
+//! panic.
+//!
+//! Classification trusts nothing it has not checked: an IPv4 packet must
+//! have a correct header checksum and must not be a fragment (the guest's
+//! TCP never fragments, and nothing here reassembles), and a UDP, ICMP or
+//! TCP header must fit and carry a correct checksum (UDP's may be absent).
+//! The handlers behind it can rely on that.
+
+use std::net::{Ipv4Addr, SocketAddrV4};
+
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{
+    ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr,
+    Icmpv4Packet, IpProtocol, Ipv4Packet, Ipv4Repr, TcpPacket, UdpPacket, UdpRepr,
+    DHCP_SERVER_PORT,
+};
+
+/// The DNS port.
+pub const DNS_PORT: u16 = 53;
+
+/// Where a guest frame goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dispatch {
+    /// An Ethernet/IPv4 ARP packet: proxy ARP, and smoltcp's neighbor cache.
+    Arp,
+    /// UDP to port 67, any address: the static DHCP lease.
+    Dhcp,
+    /// UDP to port 53 at the gateway: the DNS forwarder.
+    Dns {
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+    },
+    /// Any other UDP: the UDP relay.
+    Udp {
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+    },
+    /// ICMP: echo to the gateway is answered, the rest dropped.
+    Icmp { src: Ipv4Addr, dst: Ipv4Addr },
+    /// A TCP segment with SYN and without ACK: a new connection.
+    TcpSyn {
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+    },
+    /// Any other TCP segment.
+    Tcp {
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+    },
+    /// IPv6, which the guest network does not carry.
+    Ipv6,
+    /// Anything else, including every frame that is malformed, truncated,
+    /// fragmented, or fails a checksum.
+    Other,
+}
+
+/// Sorts one guest frame. `gateway` is the gateway's address, which
+/// decides whether UDP to port 53 is DNS for the forwarder or ordinary UDP.
+pub fn classify(frame: &[u8], gateway: Ipv4Addr) -> Dispatch {
+    let Ok(eth) = EthernetFrame::new_checked(frame) else {
+        return Dispatch::Other;
+    };
+    match eth.ethertype() {
+        EthernetProtocol::Arp => {
+            let parsed = ArpPacket::new_checked(eth.payload()).and_then(|p| ArpRepr::parse(&p));
+            match parsed {
+                Ok(ArpRepr::EthernetIpv4 { .. }) => Dispatch::Arp,
+                _ => Dispatch::Other,
+            }
+        }
+        EthernetProtocol::Ipv4 => classify_ipv4(eth.payload(), gateway),
+        EthernetProtocol::Ipv6 => Dispatch::Ipv6,
+        EthernetProtocol::Unknown(_) => Dispatch::Other,
+    }
+}
+
+fn classify_ipv4(payload: &[u8], gateway: Ipv4Addr) -> Dispatch {
+    let checks = ChecksumCapabilities::default();
+    let Ok(packet) = Ipv4Packet::new_checked(payload) else {
+        return Dispatch::Other;
+    };
+    // Version 4, the header checksum, and no fragment.
+    let Ok(ip) = Ipv4Repr::parse(&packet, &checks) else {
+        return Dispatch::Other;
+    };
+    let (src, dst) = (ip.src_addr, ip.dst_addr);
+    let body = packet.payload();
+    match ip.next_header {
+        IpProtocol::Udp => {
+            let Ok(udp) = UdpPacket::new_checked(body) else {
+                return Dispatch::Other;
+            };
+            // The checksum (or its absence), and a nonzero destination port.
+            let Ok(ports) = UdpRepr::parse(&udp, &src.into(), &dst.into(), &checks) else {
+                return Dispatch::Other;
+            };
+            let src = SocketAddrV4::new(src, ports.src_port);
+            let dst = SocketAddrV4::new(dst, ports.dst_port);
+            if ports.dst_port == DHCP_SERVER_PORT {
+                Dispatch::Dhcp
+            } else if ports.dst_port == DNS_PORT && *dst.ip() == gateway {
+                Dispatch::Dns { src, dst }
+            } else {
+                Dispatch::Udp { src, dst }
+            }
+        }
+        IpProtocol::Icmp => match Icmpv4Packet::new_checked(body) {
+            Ok(icmp) if icmp.verify_checksum() => Dispatch::Icmp { src, dst },
+            _ => Dispatch::Other,
+        },
+        IpProtocol::Tcp => {
+            let Ok(tcp) = TcpPacket::new_checked(body) else {
+                return Dispatch::Other;
+            };
+            if !tcp.verify_checksum(&src.into(), &dst.into()) {
+                return Dispatch::Other;
+            }
+            let src = SocketAddrV4::new(src, tcp.src_port());
+            let dst = SocketAddrV4::new(dst, tcp.dst_port());
+            if tcp.syn() && !tcp.ack() {
+                Dispatch::TcpSyn { src, dst }
+            } else {
+                Dispatch::Tcp { src, dst }
+            }
+        }
+        _ => Dispatch::Other,
+    }
+}
+
+/// An Ethernet frame carrying the IPv4 packet `ip` describes, with its
+/// header checksum filled in; `fill` writes the `ip.payload_len` bytes of
+/// payload. For the replies the dispatcher makes itself.
+pub(crate) fn ipv4_frame(
+    eth_src: EthernetAddress,
+    eth_dst: EthernetAddress,
+    ip: &Ipv4Repr,
+    fill: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
+    let eth = EthernetRepr {
+        src_addr: eth_src,
+        dst_addr: eth_dst,
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let mut buf = vec![0; eth.buffer_len() + ip.buffer_len() + ip.payload_len];
+    let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth.emit(&mut frame);
+    let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+    ip.emit(&mut packet, &ChecksumCapabilities::default());
+    fill(packet.payload_mut());
+    buf
+}

@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The boxcar Authors
+
+//! The network stack's way into the audit log, and the coalescing that
+//! keeps a guest that floods it with junk from flooding the log.
+//!
+//! [`emit`] is for records that must not be lost (verdicts); [`try_emit`]
+//! for records the log may drop when it is busy, which it counts (leases,
+//! drops). Dropped frames are recorded through [`Drops`]: at most one
+//! `net.drop` a second for each [`DropReason`], counting every frame since
+//! the last.
+
+use std::time::{Duration, Instant};
+
+use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
+use boxcar_proto::{NetDrop, Payload, Ring};
+
+/// The shortest time between two `net.drop` records for one reason.
+pub const DROP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Records `payload`, waiting while the log's channel is full.
+pub fn emit(sink: &AuditSink, payload: Payload) -> Result<(), EmitError> {
+    sink.emit(submission(payload))
+}
+
+/// Records `payload` if the log's channel has room, and says whether it
+/// did. The log counts what it drops and reports the count at its next
+/// checkpoint.
+pub fn try_emit(sink: &AuditSink, payload: Payload) -> bool {
+    sink.try_emit(submission(payload))
+}
+
+fn submission(payload: Payload) -> Submission {
+    Submission {
+        ring: Ring::Host,
+        ts_guest_ns: None,
+        subject: None,
+        payload,
+        span: None,
+        priority: Priority::Normal,
+    }
+}
+
+/// Why the stack dropped a guest frame: the `reason` of `net.drop`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// IPv6, which the guest network does not carry.
+    Ipv6,
+    /// ICMP other than an echo request to the gateway.
+    Icmp,
+    /// UDP to the DHCP port that gets no lease: a message other than a
+    /// DISCOVER or a REQUEST, or a malformed one.
+    Dhcp,
+    /// DNS to the gateway, before the forwarder answers it.
+    DnsUnimplemented,
+    /// UDP other than DHCP and DNS, before the relay carries it.
+    UdpUnimplemented,
+    /// A queue between the guest and the stack was full.
+    QueueFull,
+    /// Anything else: an unknown protocol, or a malformed frame.
+    Other,
+}
+
+impl DropReason {
+    /// Every reason, in the order [`Drops`] keeps them.
+    pub const ALL: [DropReason; 7] = [
+        DropReason::Ipv6,
+        DropReason::Icmp,
+        DropReason::Dhcp,
+        DropReason::DnsUnimplemented,
+        DropReason::UdpUnimplemented,
+        DropReason::QueueFull,
+        DropReason::Other,
+    ];
+
+    /// The reason as `net.drop` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::Ipv6 => "ipv6",
+            DropReason::Icmp => "icmp",
+            DropReason::Dhcp => "dhcp",
+            DropReason::DnsUnimplemented => "dns_unimplemented",
+            DropReason::UdpUnimplemented => "udp_unimplemented",
+            DropReason::QueueFull => "queue_full",
+            DropReason::Other => "other",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// One reason's count.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tally {
+    /// When its last `net.drop` was made.
+    last: Option<Instant>,
+    /// Drops since then.
+    held: u64,
+}
+
+impl Tally {
+    /// Whether a record may be made at `now`: none has been, or the last
+    /// was at least [`DROP_INTERVAL`] before. A clock reading older than
+    /// the last record waits.
+    fn due(&self, now: Instant) -> bool {
+        self.last
+            .is_none_or(|last| now.checked_duration_since(last) >= Some(DROP_INTERVAL))
+    }
+
+    fn take(&mut self, reason: DropReason, now: Instant) -> NetDrop {
+        self.last = Some(now);
+        NetDrop {
+            reason: reason.as_str().to_owned(),
+            count: std::mem::take(&mut self.held),
+        }
+    }
+}
+
+/// The dropped-frame counts, by reason, and when each may next be
+/// recorded.
+#[derive(Clone, Debug, Default)]
+pub struct Drops {
+    tallies: [Tally; DropReason::ALL.len()],
+}
+
+impl Drops {
+    pub fn new() -> Self {
+        Drops::default()
+    }
+
+    /// Counts one frame dropped for `reason` at `now`, and returns the
+    /// `net.drop` to record now, if one is due: the first drop for a reason
+    /// is recorded at once, and later ones once [`DROP_INTERVAL`] has passed
+    /// since the last record. Until then they are held, and
+    /// [`flush`](Self::flush) records them.
+    pub fn count(&mut self, reason: DropReason, now: Instant) -> Option<NetDrop> {
+        let tally = &mut self.tallies[reason.index()];
+        tally.held = tally.held.saturating_add(1);
+        tally.due(now).then(|| tally.take(reason, now))
+    }
+
+    /// The `net.drop` records of every held count that is due at `now`.
+    pub fn flush(&mut self, now: Instant) -> Vec<NetDrop> {
+        DropReason::ALL
+            .into_iter()
+            .zip(&mut self.tallies)
+            .filter(|(_, tally)| tally.held > 0 && tally.due(now))
+            .map(|(reason, tally)| tally.take(reason, now))
+            .collect()
+    }
+
+    /// When the earliest held count falls due, if any is held. (A count is
+    /// held only behind a record already made, so each has a `last`.)
+    pub fn next_due(&self) -> Option<Instant> {
+        self.tallies
+            .iter()
+            .filter(|tally| tally.held > 0)
+            .filter_map(|tally| tally.last?.checked_add(DROP_INTERVAL))
+            .min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drop_of(reason: &str, count: u64) -> NetDrop {
+        NetDrop {
+            reason: reason.to_owned(),
+            count,
+        }
+    }
+
+    #[test]
+    fn the_first_drop_is_recorded_at_once_and_the_rest_once_a_second() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut drops = Drops::new();
+
+        assert_eq!(
+            drops.count(DropReason::Icmp, at(0)),
+            Some(drop_of("icmp", 1))
+        );
+        assert_eq!(drops.next_due(), None, "nothing held");
+        assert_eq!(drops.count(DropReason::Icmp, at(100)), None);
+        assert_eq!(drops.count(DropReason::Icmp, at(999)), None);
+        assert_eq!(drops.next_due(), Some(at(1000)));
+        assert!(drops.flush(at(999)).is_empty(), "not due yet");
+
+        assert_eq!(drops.flush(at(1000)), [drop_of("icmp", 2)]);
+        assert_eq!(drops.next_due(), None);
+        assert!(drops.flush(at(5000)).is_empty(), "nothing held");
+
+        // A second after the last record, a drop goes out at once again.
+        assert_eq!(
+            drops.count(DropReason::Icmp, at(2000)),
+            Some(drop_of("icmp", 1))
+        );
+        // A clock reading older than the last record waits.
+        assert_eq!(drops.count(DropReason::Icmp, at(1500)), None);
+        assert_eq!(drops.flush(at(3000)), [drop_of("icmp", 1)]);
+    }
+
+    #[test]
+    fn reasons_are_counted_apart() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut drops = Drops::new();
+
+        assert_eq!(
+            drops.count(DropReason::Ipv6, at(0)),
+            Some(drop_of("ipv6", 1))
+        );
+        assert_eq!(
+            drops.count(DropReason::Other, at(10)),
+            Some(drop_of("other", 1))
+        );
+        for _ in 0..3 {
+            assert_eq!(drops.count(DropReason::Ipv6, at(20)), None);
+        }
+        assert_eq!(drops.count(DropReason::Other, at(500)), None);
+        assert_eq!(drops.next_due(), Some(at(1000)));
+
+        assert_eq!(drops.flush(at(1000)), [drop_of("ipv6", 3)]);
+        assert_eq!(drops.next_due(), Some(at(1010)));
+        assert_eq!(drops.flush(at(1010)), [drop_of("other", 1)]);
+    }
+
+    #[test]
+    fn every_reason_has_its_own_slot_and_name() {
+        for (i, reason) in DropReason::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), i, "{reason:?}");
+        }
+        let names: Vec<&str> = DropReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "ipv6",
+                "icmp",
+                "dhcp",
+                "dns_unimplemented",
+                "udp_unimplemented",
+                "queue_full",
+                "other"
+            ]
+        );
+    }
+}

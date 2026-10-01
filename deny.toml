@@ -1,7 +1,7 @@
 [licenses]
 # The graph's needs and nothing more: every listed license is used by at least
 # one crate. Add a license only after deciding it belongs in a shipped binary.
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "0BSD"]
 
 [bans]
 multiple-versions = "deny"
@@ -16,6 +16,10 @@ skip = [
     { crate = "nix:^0.24", reason = "fuse-backend-rs 0.14.0 requires nix 0.24; boxcar-init (guest only) uses nix 0.31 and the two never link into one binary" },
     { crate = "syn:^2", reason = "tracing-attributes 0.1.31 still uses syn 2 while serde_derive, thiserror-impl and clap_derive use syn 3; proc macros, build time only" },
     { crate = "windows-sys:^0.48", reason = "mio 0.8 (via fuse-backend-rs 0.14.0) requires windows-sys 0.48; Windows is not a target, so it never builds" },
+]
+# The same for a whole subtree: the crate, and the windows-targets set under it.
+skip-tree = [
+    { crate = "windows-sys:^0.52", reason = "socket2 0.5 (boxcar-net) requires windows-sys 0.52 and windows-targets 0.52, beside mio 0.8's 0.48 set; Windows is not a target, so neither builds" },
 ]
 
 [sources]
