@@ -19,6 +19,7 @@ use std::fs::File;
 use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,7 +53,7 @@ use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
     block_stop_signals, exit_code_for, record_stop, stop, wait_for_stop, ControlSubscriber,
-    MainLoop, SignalFd, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
+    MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
@@ -288,6 +289,8 @@ pub struct Vmm {
     /// joined by the stop sequence, after the devices close and before
     /// `vmm.stop`.
     console: ConsoleWriter,
+    /// Console input the stdin subscriber dropped; read for `vmm.stop`.
+    stdin_dropped: Arc<AtomicU64>,
     fs: FsDevices,
     latch: Arc<StopLatch>,
     info: Arc<VmInfo>,
@@ -435,7 +438,11 @@ impl Vmm {
                     Err(source) => {
                         // The guest has not run: nothing was dropped.
                         let console = console.flush_and_join(CONSOLE_DEADLINE);
-                        record_stop(&cfg.audit, "vmm_error", 1, console.dropped_bytes);
+                        let counts = StopCounts {
+                            console_dropped_bytes: console.dropped_bytes,
+                            stdin_dropped_bytes: 0,
+                        };
+                        record_stop(&cfg.audit, "vmm_error", 1, counts);
                         return Err(VmmError::Control {
                             state_dir: control.state_dir.clone(),
                             source,
@@ -454,6 +461,7 @@ impl Vmm {
             mmio: Arc::new(mmio),
             legacy,
             console,
+            stdin_dropped: Arc::new(AtomicU64::new(0)),
             fs,
             latch,
             info,
@@ -493,7 +501,11 @@ impl Vmm {
                 if let Some(control) = self.control.take() {
                     control.shutdown();
                 }
-                record_stop(&self.audit, "vmm_error", 1, console.dropped_bytes);
+                let counts = StopCounts {
+                    console_dropped_bytes: console.dropped_bytes,
+                    stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),
+                };
+                record_stop(&self.audit, "vmm_error", 1, counts);
                 return Err(error);
             }
         };
@@ -506,6 +518,8 @@ impl Vmm {
             vcpus,
             fs: &self.fs,
             console: self.console,
+            // The main loop is done: this is the final count.
+            stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),
             control: self.control.take(),
             latch: &self.latch,
             audit: &self.audit,
@@ -548,8 +562,12 @@ impl Vmm {
         add_subscriber(&mut main_loop, Box::new(control), &fds)?;
 
         let terminal = if self.interactive {
-            let subscriber = StdinSubscriber::new(self.legacy.serial.clone(), self.handle())
-                .map_err(setup("stdin subscriber"))?;
+            let subscriber = StdinSubscriber::new(
+                self.legacy.serial.clone(),
+                self.handle(),
+                self.stdin_dropped.clone(),
+            )
+            .map_err(setup("stdin subscriber"))?;
             let fds = subscriber.fds();
             add_subscriber(&mut main_loop, Box::new(subscriber), &fds)?;
             RawModeGuard::enter().map_err(setup("raw terminal"))?

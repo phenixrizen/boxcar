@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{AuditLevelArg, RunArgs};
 use crate::client;
+use crate::cmd::tell;
 
 /// Starts the session's audit writer, boots the VM, and waits for it to
 /// stop. The exit code is the VM's (see `exit_code_for`), except that
@@ -143,27 +144,30 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     });
     // Drains every accepted record (vmm.stop included), checkpoints, syncs.
     let closed = writer.close();
+    // What follows is said with `tell`: the VM is stopped, and a stderr that
+    // is stalled (shared with a console whose reader stopped) must not keep
+    // the process from exiting.
 
     if let Some(failure) = audit.failure() {
         match outcome {
             // It says the same as the line below.
             Ok(VmExit::AuditFailed(_)) => {}
-            Ok(exit) => eprintln!("{exit}"),
-            Err(error) => eprintln!("error: {:#}", anyhow::Error::from(error)),
+            Ok(exit) => tell(&exit.to_string()),
+            Err(error) => tell(&format!("error: {:#}", anyhow::Error::from(error))),
         }
-        eprintln!("audit log failed: {failure}");
+        tell(&format!("audit log failed: {failure}"));
         return Ok(ExitCode::from(u8::try_from(AUDIT_FAILED_EXIT).unwrap_or(1)));
     }
     let exit = match outcome {
         Ok(exit) => exit,
         Err(error) => {
             if let Err(close_error) = closed {
-                eprintln!("error: cannot close the audit log: {close_error}");
+                tell(&format!("error: cannot close the audit log: {close_error}"));
             }
             return Err(error.into());
         }
     };
-    eprintln!("{exit}");
+    tell(&exit.to_string());
     closed.context("cannot close the audit log")?;
     Ok(ExitCode::from(
         u8::try_from(exit_code_for(&exit)).unwrap_or(1),

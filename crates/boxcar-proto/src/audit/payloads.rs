@@ -92,6 +92,13 @@ pub struct VmmStop {
     /// before it existed, and read as 0.
     #[serde(default)]
     pub console_dropped_bytes: u64,
+    /// Bytes typed at the console that the host dropped because the guest
+    /// was not reading them: the oldest input beyond what the serial FIFO
+    /// and the host's 4 KiB holding buffer could take. 0 for a run with no
+    /// console input. Absent in logs written before it existed, and read
+    /// as 0.
+    #[serde(default)]
+    pub stdin_dropped_bytes: u64,
 }
 
 /// `fs.mount`: a virtio-fs share was attached.

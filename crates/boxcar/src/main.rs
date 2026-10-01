@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     match cmd::run(cli) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("error: {err:#}");
+            cmd::tell(&format!("error: {err:#}"));
             ExitCode::from(1)
         }
     }

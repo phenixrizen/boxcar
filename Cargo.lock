@@ -232,6 +232,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "vm-allocator",
  "vm-memory",
  "vm-superio",

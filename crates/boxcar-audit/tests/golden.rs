@@ -151,6 +151,7 @@ fn golden_records() -> Vec<Record> {
             reason: "guest_reset".into(),
             exit_code: Some(0),
             console_dropped_bytes: 0,
+            stdin_dropped_bytes: 0,
         }),
         None,
         None,

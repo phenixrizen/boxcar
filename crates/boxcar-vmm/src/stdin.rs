@@ -29,12 +29,20 @@
 //! doing: the escape is detected on every byte read, before the serial
 //! FIFO is looked at, so a guest that has stopped reading its console
 //! cannot take the escape away.
+//!
+//! A paste of more than about 4 KiB into the console loses its oldest bytes
+//! when the guest reads slower than the host types, by design (the M2
+//! decision: input waits in a 4 KiB holding buffer behind the 64-byte
+//! FIFO, and the newest wins). The count of dropped bytes goes into
+//! `vmm.stop` as `stdin_dropped_bytes`; it is never logged, because a log
+//! write to a stalled stderr would park the main loop that must hear the
+//! escape.
 
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -168,7 +176,9 @@ const HOLD_CAP: usize = 4096;
 /// stays watched throughout: a guest that has stopped reading, so that the
 /// FIFO is full, must not make Ctrl-] Ctrl-] stop working, which is how a
 /// wedged guest is stopped. When the holding buffer is full too, the oldest
-/// held bytes are dropped (and counted) for the newest.
+/// held bytes are dropped for the newest, and counted in a counter the VMM
+/// reads for `vmm.stop`. The subscriber logs nothing about input: it runs on
+/// the main loop, which a blocked write to a stalled stderr would park.
 pub(crate) struct StdinSubscriber {
     serial: Arc<Mutex<SerialDevice>>,
     buffer_ready: EventFd,
@@ -178,12 +188,18 @@ pub(crate) struct StdinSubscriber {
     handle: VmmHandle,
     /// Input the FIFO had no room for, oldest first.
     held: VecDeque<u8>,
-    /// Input bytes dropped from `held` so far.
-    dropped_input: u64,
+    /// Input bytes dropped from `held` so far; shared with the VMM.
+    dropped_input: Arc<AtomicU64>,
 }
 
 impl StdinSubscriber {
-    pub(crate) fn new(serial: Arc<Mutex<SerialDevice>>, handle: VmmHandle) -> io::Result<Self> {
+    /// A subscriber for `serial` that adds the bytes it has to drop to
+    /// `dropped_input`.
+    pub(crate) fn new(
+        serial: Arc<Mutex<SerialDevice>>,
+        handle: VmmHandle,
+        dropped_input: Arc<AtomicU64>,
+    ) -> io::Result<Self> {
         let buffer_ready = lock(&serial).buffer_ready_evt().try_clone()?;
         Ok(StdinSubscriber {
             serial,
@@ -192,7 +208,7 @@ impl StdinSubscriber {
             escape: EscapeDetector::default(),
             handle,
             held: VecDeque::with_capacity(HOLD_CAP),
-            dropped_input: 0,
+            dropped_input,
         })
     }
 
@@ -249,15 +265,12 @@ impl StdinSubscriber {
         self.held.extend(&bytes[from_bytes..]);
         let dropped = from_bytes + from_held;
         if dropped > 0 {
-            if self.dropped_input == 0 {
-                tracing::warn!(
-                    "the guest is not reading its console input; dropping the oldest of what \
-                     is typed (Ctrl-] Ctrl-] still stops the VM)"
-                );
-            }
-            self.dropped_input = self
-                .dropped_input
-                .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+            // Counted, not logged: see the type's docs. A plain add cannot
+            // wrap in the life of a process (2^64 bytes of typing).
+            self.dropped_input.fetch_add(
+                u64::try_from(dropped).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -381,6 +394,7 @@ mod tests {
     /// A subscriber on a UART whose console goes nowhere, with no real stdin.
     struct Rig {
         subscriber: StdinSubscriber,
+        dropped: Arc<AtomicU64>,
         serial: Arc<Mutex<SerialDevice>>,
         handle: VmmHandle,
         _audit: boxcar_audit::WriterHandle,
@@ -392,9 +406,12 @@ mod tests {
         let (handle, audit) = test_handle(dir.path());
         let (sink, _writer) = ConsoleWriter::spawn_with(std::io::sink()).unwrap();
         let serial = Arc::new(Mutex::new(SerialDevice::new(sink).unwrap()));
-        let subscriber = StdinSubscriber::new(serial.clone(), handle.clone()).unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let subscriber =
+            StdinSubscriber::new(serial.clone(), handle.clone(), dropped.clone()).unwrap();
         Rig {
             subscriber,
+            dropped,
             serial,
             handle,
             _audit: audit,
@@ -455,7 +472,7 @@ mod tests {
         for _ in 0..(HOLD_CAP / READ_CHUNK) * 3 {
             rig.subscriber.on_input(&[b'x'; READ_CHUNK], t0);
         }
-        assert!(rig.subscriber.dropped_input > 0);
+        assert!(rig.dropped.load(Ordering::Relaxed) > 0);
         assert_eq!(rig.handle.state(), VmState::Booting);
         rig.subscriber.on_input(&[ESCAPE_BYTE], t0 + 10 * MS);
         rig.subscriber.on_input(&[ESCAPE_BYTE], t0 + 20 * MS);
@@ -496,7 +513,7 @@ mod tests {
         rig.subscriber.on_buffer_ready();
         assert!(rig.subscriber.held.is_empty());
         assert_eq!(rig.guest_reads(8), b"456789XY");
-        assert_eq!(rig.subscriber.dropped_input, 0);
+        assert_eq!(rig.dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -524,7 +541,7 @@ mod tests {
             rig.subscriber.on_input(chunk, t0);
         }
         assert_eq!(rig.subscriber.held.len(), HOLD_CAP);
-        assert_eq!(rig.subscriber.dropped_input, 100);
+        assert_eq!(rig.dropped.load(Ordering::Relaxed), 100);
         // What is kept is the newest input.
         let kept: Vec<u8> = rig.subscriber.held.iter().copied().collect();
         assert_eq!(kept, input[100..]);

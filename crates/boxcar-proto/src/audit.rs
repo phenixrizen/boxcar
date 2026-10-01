@@ -552,8 +552,14 @@ mod tests {
                     reason: "guest_reset".into(),
                     exit_code: Some(0),
                     console_dropped_bytes: 4096,
+                    stdin_dropped_bytes: 100,
                 }),
-                json!({"reason": "guest_reset", "exit_code": 0, "console_dropped_bytes": 4096}),
+                json!({
+                    "reason": "guest_reset",
+                    "exit_code": 0,
+                    "console_dropped_bytes": 4096,
+                    "stdin_dropped_bytes": 100,
+                }),
             ),
             (
                 Payload::FsMount(FsMount {
@@ -909,8 +915,14 @@ mod tests {
                     reason: "vcpu_error".into(),
                     exit_code: None,
                     console_dropped_bytes: 0,
+                    stdin_dropped_bytes: 0,
                 }),
-                json!({"reason": "vcpu_error", "exit_code": null, "console_dropped_bytes": 0}),
+                json!({
+                    "reason": "vcpu_error",
+                    "exit_code": null,
+                    "console_dropped_bytes": 0,
+                    "stdin_dropped_bytes": 0,
+                }),
             ),
             (
                 Payload::FsClose(FsClose {
@@ -999,17 +1011,20 @@ mod tests {
         }
     }
 
-    /// `console_dropped_bytes` came after the first logs: a `vmm.stop`
-    /// without it reads as no dropped bytes.
+    /// `console_dropped_bytes` and `stdin_dropped_bytes` came after the first
+    /// logs: a `vmm.stop` without them reads as no dropped bytes.
     #[test]
-    fn a_vmm_stop_without_console_dropped_bytes_reads_as_zero() {
+    fn a_vmm_stop_without_the_dropped_byte_counts_reads_as_zero() {
         let rec = record(
             "vmm.stop",
             Source::Vmm,
             json!({"reason": "guest_reset", "exit_code": 0}),
         );
         match Payload::from_record(&rec).unwrap() {
-            Payload::VmmStop(stop) => assert_eq!(stop.console_dropped_bytes, 0),
+            Payload::VmmStop(stop) => {
+                assert_eq!(stop.console_dropped_bytes, 0);
+                assert_eq!(stop.stdin_dropped_bytes, 0);
+            }
             other => panic!("not a vmm.stop: {other:?}"),
         }
     }

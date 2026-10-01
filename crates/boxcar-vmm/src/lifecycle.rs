@@ -20,8 +20,15 @@
 //! (it counts what it could not deliver), mark the VM `stopped` and shut
 //! the control server down (each client hears `stopped` and is
 //! disconnected, with no wait on any of them), emit `vmm.stop` through the
-//! audit sink with that count as `console_dropped_bytes`, restore the
-//! terminal, and return the `VmExit`. The caller (`boxcar run`) then closes
+//! audit sink with that count as `console_dropped_bytes` (and the stdin
+//! subscriber's as `stdin_dropped_bytes`), restore the terminal, and return
+//! the `VmExit`. Nothing the sequence does on purpose is logged before the
+//! terminal is restored: stderr may be the very sink the console is stalled
+//! on (`2>&1 | slow-reader`, a terminal held by XOFF), and a blocked log
+//! write would hold the stop. The only log calls left on that path report
+//! faults (a panicked thread, a failed syscall, a refused audit record), and
+//! `vmm.stop`'s own failure is logged after the terminal is restored. The
+//! caller (`boxcar run`) then closes
 //! the audit writer, which drains, checkpoints and syncs the log, so every
 //! record the devices made is in it. After an audit failure the sequence is
 //! the same; the records it makes are refused, and each refusal is logged.
@@ -36,7 +43,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use boxcar_audit::{AuditSink, Priority, Submission};
+use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_proto::control::{AuditStatus, GuestStatus, Status};
 use boxcar_proto::{Payload, Ring, VmmStop};
 use event_manager::{EventManager, EventOps, Events, MutEventSubscriber};
@@ -505,6 +512,9 @@ pub(crate) struct Teardown<'a> {
     pub(crate) vcpus: VcpuSet,
     pub(crate) fs: &'a FsDevices,
     pub(crate) console: ConsoleWriter,
+    /// Console input bytes the stdin subscriber dropped, read once the main
+    /// loop is done.
+    pub(crate) stdin_dropped_bytes: u64,
     pub(crate) control: Option<ControlServer>,
     pub(crate) latch: &'a StopLatch,
     pub(crate) audit: &'a AuditSink,
@@ -521,6 +531,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
         vcpus,
         fs,
         console,
+        stdin_dropped_bytes,
         control,
         latch,
         audit,
@@ -536,18 +547,42 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     if let Some(control) = control {
         control.shutdown();
     }
-    record_stop(audit, reason, exit_code, console.dropped_bytes);
+    let counts = StopCounts {
+        console_dropped_bytes: console.dropped_bytes,
+        stdin_dropped_bytes,
+    };
+    let recorded = emit_stop(audit, reason, exit_code, counts);
     drop(terminal);
+    // After the terminal is back: this write may block on a stalled stderr.
+    if let Err(error) = recorded {
+        tracing::error!("cannot record vmm.stop: {error}");
+    }
 }
 
-/// Emits `vmm.stop`, synced as soon as it is written. `console_dropped_bytes`
-/// is what the console writer reports (see [`ConsoleWriter::flush_and_join`]).
-pub(crate) fn record_stop(
+/// The byte counts `vmm.stop` carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StopCounts {
+    /// See [`ConsoleWriter::flush_and_join`].
+    pub(crate) console_dropped_bytes: u64,
+    /// Console input the host dropped (see [`crate::stdin`]).
+    pub(crate) stdin_dropped_bytes: u64,
+}
+
+/// Emits `vmm.stop`, synced as soon as it is written, and logs a failure to.
+/// The stop sequence uses [`emit_stop`] and logs later.
+pub(crate) fn record_stop(audit: &AuditSink, reason: &str, exit_code: i32, counts: StopCounts) {
+    if let Err(error) = emit_stop(audit, reason, exit_code, counts) {
+        tracing::error!("cannot record vmm.stop: {error}");
+    }
+}
+
+/// Emits `vmm.stop`, synced as soon as it is written; logs nothing.
+fn emit_stop(
     audit: &AuditSink,
     reason: &str,
     exit_code: i32,
-    console_dropped_bytes: u64,
-) {
+    counts: StopCounts,
+) -> Result<(), EmitError> {
     let record = Submission {
         ring: Ring::Host,
         ts_guest_ns: None,
@@ -555,14 +590,13 @@ pub(crate) fn record_stop(
         payload: Payload::VmmStop(VmmStop {
             reason: reason.to_owned(),
             exit_code: Some(exit_code),
-            console_dropped_bytes,
+            console_dropped_bytes: counts.console_dropped_bytes,
+            stdin_dropped_bytes: counts.stdin_dropped_bytes,
         }),
         span: None,
         priority: Priority::Critical,
     };
-    if let Err(error) = audit.emit(record) {
-        tracing::error!("cannot record vmm.stop: {error}");
-    }
+    audit.emit(record)
 }
 
 /// A handle on a VM that was never built: a fresh latch, 2 vCPUs, 256 MiB,
@@ -793,7 +827,7 @@ mod tests {
         }
 
         // A critical record is synced at once, and the sync fails.
-        record_stop(&sink, "test", 0, 0);
+        record_stop(&sink, "test", 0, StopCounts::default());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let exit = loop {
             if let Some(exit) = latch.outcome() {

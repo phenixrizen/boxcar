@@ -149,6 +149,22 @@ struct Shared {
 }
 
 impl Shared {
+    fn new(capacity: usize) -> Self {
+        Shared {
+            state: Mutex::new(State {
+                ring: Ring::new(capacity),
+                dropped: 0,
+                in_flight: 0,
+                parked: false,
+                stop: false,
+                finished: false,
+            }),
+            wake: Condvar::new(),
+            done: Condvar::new(),
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -223,19 +239,7 @@ impl ConsoleWriter {
         target: impl Write + Send + 'static,
         capacity: usize,
     ) -> io::Result<(ConsoleSink, ConsoleWriter)> {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                ring: Ring::new(capacity),
-                dropped: 0,
-                in_flight: 0,
-                parked: false,
-                stop: false,
-                finished: false,
-            }),
-            wake: Condvar::new(),
-            done: Condvar::new(),
-            abandoned: AtomicBool::new(false),
-        });
+        let shared = Arc::new(Shared::new(capacity));
         let thread = {
             let shared = shared.clone();
             thread::Builder::new()
@@ -259,6 +263,11 @@ impl ConsoleWriter {
     /// with the process, or when its write returns), and everything it
     /// had not delivered is counted as dropped. Returns the count of bytes
     /// that were never written to the target.
+    ///
+    /// It logs nothing, not even a stall or a panicked thread: it runs in
+    /// the stop sequence, and the log's stderr may be the very sink that is
+    /// stalled, which would hold the stop for as long as the stall lasts.
+    /// The count is the report; it goes into `vmm.stop`.
     pub fn flush_and_join(mut self, deadline: Duration) -> ConsoleStats {
         let end = Instant::now().checked_add(deadline);
         let mut state = self.shared.lock();
@@ -288,9 +297,9 @@ impl ConsoleWriter {
             };
             drop(state);
             if let Some(thread) = thread {
-                if thread.join().is_err() {
-                    tracing::error!("console: the writer thread panicked");
-                }
+                // A panic here has already been printed by the panic hook,
+                // on the writer thread; the stop must not log it again.
+                let _ = thread.join();
             }
             return stats;
         }
@@ -308,10 +317,6 @@ impl ConsoleWriter {
             dropped_bytes: state.dropped,
         };
         drop(state);
-        tracing::warn!(
-            "console: the output is stalled; gave up after {deadline:?} with {undelivered} \
-             bytes undelivered"
-        );
         drop(thread);
         stats
     }
@@ -371,10 +376,16 @@ fn drain(shared: &Shared, mut target: impl Write) {
         if shared.abandoned.load(Ordering::SeqCst) {
             return;
         }
-        let mut state = shared.lock();
-        state.in_flight = 0;
-        if let Err(error) = result {
-            Shared::add_dropped(&mut state, chunk.len());
+        let failure = {
+            let mut state = shared.lock();
+            state.in_flight = 0;
+            result
+                .err()
+                .inspect(|_| Shared::add_dropped(&mut state, chunk.len()))
+        };
+        // Outside the lock: the log may be as stalled as the target, and a
+        // vCPU thread pushing into the ring must never wait on that.
+        if let Some(error) = failure {
             if !reported {
                 reported = true;
                 tracing::warn!("console: cannot write the guest's output, dropping it: {error}");
@@ -405,6 +416,9 @@ fn write_out(target: &mut impl Write, mut buf: &[u8], abandoned: &AtomicBool) ->
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -470,12 +484,15 @@ mod tests {
         assert!(stats.dropped_bytes > 0);
         // Every byte is delivered or counted...
         assert_eq!(got.len() as u64 + stats.dropped_bytes, 1 << 20);
-        // ...and what survives is the first chunk, which the thread had
-        // taken before it stalled, then the newest bytes the ring held.
+        // ...and the newest bytes survive: the ring was full at the end, so
+        // the last RING_CAPACITY bytes of the delivery are the last
+        // RING_CAPACITY bytes written. (What came before them depends on
+        // when the thread first took from the ring, so it is not checked.)
         assert!(got.len() >= RING_CAPACITY);
-        let head = got.len() - RING_CAPACITY;
-        assert_eq!(got[..head], data[..head]);
-        assert_eq!(got[head..], data[data.len() - RING_CAPACITY..]);
+        assert_eq!(
+            got[got.len() - RING_CAPACITY..],
+            data[data.len() - RING_CAPACITY..]
+        );
     }
 
     #[test]
@@ -495,6 +512,137 @@ mod tests {
         let stats = writer.flush_and_join(Duration::from_secs(5));
         assert_eq!(stats, ConsoleStats { dropped_bytes: 0 });
         assert_eq!(target.got(), data);
+    }
+
+    /// A pipe nobody reads, full, with a blocking write end: what stderr is
+    /// when it shares a sink with a stalled reader (`2>&1 | slow`), or a
+    /// terminal held by XOFF. A write to it blocks until `read_end` is
+    /// drained. `read_end` must stay open for the test.
+    fn full_pipe() -> (File, File) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe2 writes two descriptors into `fds`.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the descriptors are new and owned here.
+        let (read_end, write_end) =
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        set_nonblocking(&write_end, true);
+        let mut writer = &write_end;
+        loop {
+            match writer.write(&[b'.'; 4096]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        set_nonblocking(&write_end, false);
+        (write_end, read_end)
+    }
+
+    fn set_nonblocking(file: &File, on: bool) {
+        // SAFETY: fcntl on a descriptor `file` owns.
+        unsafe {
+            let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+            let flags = if on {
+                flags | libc::O_NONBLOCK
+            } else {
+                flags & !libc::O_NONBLOCK
+            };
+            assert_eq!(libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags), 0);
+        }
+    }
+
+    /// Reads everything in the pipe, so that a blocked writer goes on.
+    fn drain_pipe(read_end: &File) {
+        set_nonblocking(read_end, true);
+        let mut reader = read_end;
+        let mut buf = [0u8; 8192];
+        while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+    }
+
+    /// A subscriber that logs every event into `log`, as the CLI's does
+    /// into stderr.
+    fn logging_to(log: File) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(Mutex::new(log))
+            .with_ansi(false)
+            .finish()
+    }
+
+    /// The stop sequence logs nothing: with the console target stalled and
+    /// stderr stalled too (a pipe nobody reads), `flush_and_join` still
+    /// returns at its deadline, which a warning about the stall, written to
+    /// that stderr, would have kept it from.
+    #[test]
+    fn a_stalled_console_and_a_stalled_log_do_not_hold_the_stop() {
+        let (log, reader) = full_pipe();
+        let subscriber = logging_to(log);
+        let target = Target::default();
+        let stall = target.gate.lock().unwrap();
+        let (mut sink, writer) = ConsoleWriter::spawn_with(target.clone()).unwrap();
+        sink.write_all(&pattern(1000)).unwrap();
+
+        let (done, finished) = mpsc::channel();
+        let stopper = thread::spawn(move || {
+            tracing::subscriber::with_default(subscriber, || {
+                let start = Instant::now();
+                let stats = writer.flush_and_join(Duration::from_secs(2));
+                let _ = done.send((start.elapsed(), stats));
+            });
+        });
+        let received = finished.recv_timeout(Duration::from_secs(3));
+        // Let a blocked stop, if there is one, go on, so the test ends.
+        drain_pipe(&reader);
+        drop(stall);
+        stopper.join().unwrap();
+        let (elapsed, stats) = received.expect("the stop waited on a write to the log");
+        assert!(elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3));
+        assert_eq!(stats.dropped_bytes, 1000);
+    }
+
+    /// The writer thread reports a failed target outside its lock, so a
+    /// blocked log write cannot hold the vCPU threads that push into the
+    /// ring.
+    #[test]
+    fn a_blocked_log_write_does_not_hold_the_ring() {
+        let (log, reader) = full_pipe();
+        let subscriber = logging_to(log);
+        let shared = Arc::new(Shared::new(RING_CAPACITY));
+        let mut sink = ConsoleSink {
+            shared: shared.clone(),
+        };
+        sink.write_all(b"lost").unwrap();
+        shared.lock().stop = true;
+        // `drain` fails to write, reports it to the blocked log, and so
+        // stays in the logging call.
+        let drainer = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                tracing::subscriber::with_default(subscriber, || drain(&shared, Broken));
+            })
+        };
+        // Wait until it has taken the bytes and counted them dropped.
+        let counted = |shared: &Shared| shared.state.try_lock().is_ok_and(|s| s.dropped >= 4);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !counted(&shared) {
+            // A writer that logs under its lock never lets go of it.
+            assert!(
+                Instant::now() < deadline,
+                "the writer never reported the failed write, or holds the lock while it does"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        let (done, finished) = mpsc::channel();
+        let pusher = thread::spawn(move || {
+            sink.write_all(b"more").unwrap();
+            let _ = done.send(());
+        });
+        let pushed = finished.recv_timeout(Duration::from_secs(3));
+        drain_pipe(&reader);
+        pusher.join().unwrap();
+        drainer.join().unwrap();
+        pushed.expect("a ring write waited for the writer's log call");
     }
 
     #[test]
