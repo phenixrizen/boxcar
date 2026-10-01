@@ -13,11 +13,8 @@ boxcar-audit = { workspace = true }
 # one a second.
 boxcar-virtio = { workspace = true }
 smoltcp = { workspace = true }
-socket2 = { workspace = true }
 arc-swap = { workspace = true }
-libc = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

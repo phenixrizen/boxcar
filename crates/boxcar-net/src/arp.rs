@@ -9,8 +9,15 @@
 //! first asking for it. It is not handed the guest's ARP as sent: with
 //! any-IP on, smoltcp answers a request for any address at all, the guest's
 //! own included, and would claim it. It is handed instead an ARP *reply*
-//! from the guest to the gateway carrying the same sender, which fills its
-//! neighbor cache and draws no answer.
+//! from the guest to the gateway, which fills its neighbor cache and draws
+//! no answer.
+//!
+//! It learns only the guest's own binding, the address and MAC the VMM gave
+//! it, and only from an ARP packet that states exactly that. Proxy ARP
+//! makes the guest the only host on the link, so no other binding is
+//! legitimate, and smoltcp's neighbor cache is small (8 entries): ARP from
+//! made-up senders would evict the guest, and a made-up MAC for the guest's
+//! address would send its TCP elsewhere.
 
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
@@ -57,10 +64,10 @@ pub fn reply(cfg: &NetConfig, frame: &[u8]) -> Option<Vec<u8>> {
     ))
 }
 
-/// The frame that teaches smoltcp the sender of a guest ARP packet: an ARP
-/// reply from that sender to the gateway. Only a unicast sender with an
-/// address on the guest's network other than the gateway's is taught; an
-/// address probe (sender `0.0.0.0`) teaches nothing.
+/// The frame that teaches smoltcp the guest's binding, for a guest ARP
+/// packet (request or reply) whose sender is the guest's address at the
+/// guest's MAC: an ARP reply from the guest to the gateway. Any other
+/// sender, an address probe from `0.0.0.0` included, teaches nothing.
 pub fn learning_frame(cfg: &NetConfig, frame: &[u8]) -> Option<Vec<u8>> {
     let Some(ArpRepr::EthernetIpv4 {
         source_hardware_addr,
@@ -70,10 +77,8 @@ pub fn learning_frame(cfg: &NetConfig, frame: &[u8]) -> Option<Vec<u8>> {
     else {
         return None;
     };
-    let teach = source_hardware_addr.is_unicast()
-        && cfg.on_network(source_protocol_addr)
-        && source_protocol_addr != cfg.gateway;
-    if !teach {
+    let guest_mac = EthernetAddress(cfg.guest_mac);
+    if source_protocol_addr != cfg.guest_ip || source_hardware_addr != guest_mac {
         return None;
     }
     let gateway_mac = EthernetAddress(cfg.gateway_mac);

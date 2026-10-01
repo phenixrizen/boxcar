@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use boxcar_audit::{LogReader, WriterConfig, WriterHandle};
 use boxcar_net::frame::{classify, Dispatch};
+use boxcar_net::stack::QUEUE_CAP;
 use boxcar_net::{NetConfig, NetStack, Policy};
 use boxcar_proto::{NetDhcp, NetDrop, Payload, SessionId, Source};
 use proptest::collection::vec;
@@ -20,10 +21,10 @@ use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    ArpOperation, ArpPacket, ArpRepr, DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress,
-    EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpProtocol,
-    Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
-    DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
+    ArpOperation, ArpPacket, ArpRepr, DhcpFlags, DhcpMessageType, DhcpOpCode, DhcpOption,
+    DhcpPacket, DhcpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr,
+    Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
+    TcpSeqNumber, UdpPacket, UdpRepr, DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
 };
 use tempfile::TempDir;
 
@@ -154,131 +155,251 @@ fn udp(eth_dst: EthernetAddress, src: SocketAddrV4, dst: SocketAddrV4, payload: 
     )
 }
 
-/// A DHCP message from the guest, broadcast from 0.0.0.0 as a client with no
-/// address sends it.
-fn dhcp(message_type: DhcpMessageType, broadcast: bool) -> Vec<u8> {
-    let request = matches!(message_type, DhcpMessageType::Request);
+/// The guest's DHCP client identifier in its Ethernet form: hardware type
+/// 1, then the MAC.
+const CLIENT_ID: [u8; 7] = [1, 0x02, 0x62, 0x6f, 0x78, 0x00, 0x01];
+
+/// A DHCP client message, by the fields the server reads.
+struct Client<'a> {
+    message_type: DhcpMessageType,
+    broadcast: bool,
+    ciaddr: Ipv4Addr,
+    requested_ip: Option<Ipv4Addr>,
+    server_id: Option<Ipv4Addr>,
+    client_id: &'a [u8],
+}
+
+impl Client<'static> {
+    /// A DISCOVER from a client with no address.
+    fn discover() -> Self {
+        Client {
+            message_type: DhcpMessageType::Discover,
+            broadcast: false,
+            ciaddr: Ipv4Addr::UNSPECIFIED,
+            requested_ip: None,
+            server_id: None,
+            client_id: &CLIENT_ID,
+        }
+    }
+
+    /// A REQUEST taking the gateway's offer of the guest's address.
+    fn request() -> Self {
+        Client {
+            message_type: DhcpMessageType::Request,
+            requested_ip: Some(GUEST),
+            server_id: Some(GATEWAY),
+            ..Client::discover()
+        }
+    }
+}
+
+/// The DHCP message `client` describes. The client identifier goes in raw,
+/// whatever its form.
+fn dhcp_payload(client: &Client) -> Vec<u8> {
+    let client_id = [DhcpOption {
+        kind: 61,
+        data: client.client_id,
+    }];
     let repr = DhcpRepr {
-        message_type,
+        message_type: client.message_type,
         transaction_id: XID,
         secs: 0,
         client_hardware_address: GUEST_MAC,
-        client_ip: Ipv4Addr::UNSPECIFIED,
+        client_ip: client.ciaddr,
         your_ip: Ipv4Addr::UNSPECIFIED,
         server_ip: Ipv4Addr::UNSPECIFIED,
         router: None,
         subnet_mask: None,
         relay_agent_ip: Ipv4Addr::UNSPECIFIED,
-        broadcast,
-        requested_ip: request.then_some(GUEST),
-        client_identifier: Some(GUEST_MAC),
-        server_identifier: request.then_some(GATEWAY),
+        broadcast: client.broadcast,
+        requested_ip: client.requested_ip,
+        client_identifier: None,
+        server_identifier: client.server_id,
         parameter_request_list: Some(&[1, 3, 6, 12, 15, 28, 51][..]),
         dns_servers: None,
         max_size: Some(1500),
         lease_duration: None,
         renew_duration: None,
         rebind_duration: None,
-        additional_options: &[],
+        additional_options: if client.client_id.is_empty() {
+            &[]
+        } else {
+            &client_id
+        },
     };
     let mut payload = vec![0; repr.buffer_len()];
     repr.emit(&mut DhcpPacket::new_unchecked(&mut payload[..]))
         .unwrap();
+    payload
+}
+
+/// A DHCP message sent as a client sends it: from 0.0.0.0 by broadcast,
+/// or from `ciaddr` to the gateway once it has an address.
+fn dhcp_frame(ciaddr: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    let (eth_dst, dst) = if ciaddr.is_unspecified() {
+        (EthernetAddress::BROADCAST, Ipv4Addr::BROADCAST)
+    } else {
+        (GATEWAY_MAC, GATEWAY)
+    };
     udp(
-        EthernetAddress::BROADCAST,
-        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DHCP_CLIENT_PORT),
-        SocketAddrV4::new(Ipv4Addr::BROADCAST, DHCP_SERVER_PORT),
-        &payload,
+        eth_dst,
+        SocketAddrV4::new(ciaddr, DHCP_CLIENT_PORT),
+        SocketAddrV4::new(dst, DHCP_SERVER_PORT),
+        payload,
     )
 }
 
-/// What a DHCP reply said, copied out of the frame.
+fn dhcp_from(client: &Client) -> Vec<u8> {
+    dhcp_frame(client.ciaddr, &dhcp_payload(client))
+}
+
+/// A DISCOVER, or a REQUEST taking the gateway's offer.
+fn dhcp(message_type: DhcpMessageType, broadcast: bool) -> Vec<u8> {
+    let client = match message_type {
+        DhcpMessageType::Request => Client::request(),
+        _ => Client::discover(),
+    };
+    dhcp_from(&Client {
+        message_type,
+        broadcast,
+        ..client
+    })
+}
+
+/// What a DHCP reply said, read from the frame with smoltcp's option
+/// iterator (not the server's parser), after checking both checksums.
 #[derive(Debug)]
 struct Lease {
     eth_src: EthernetAddress,
     eth_dst: EthernetAddress,
     ip_src: Ipv4Addr,
     ip_dst: Ipv4Addr,
+    ip_total_len: u16,
     ports: (u16, u16),
-    message_type: DhcpMessageType,
+    udp_len: u16,
+    op: DhcpOpCode,
     transaction_id: u32,
     client_hardware_address: EthernetAddress,
+    client_ip: Ipv4Addr,
     your_ip: Ipv4Addr,
     server_ip: Ipv4Addr,
-    router: Option<Ipv4Addr>,
-    subnet_mask: Option<Ipv4Addr>,
-    dns_servers: Vec<Ipv4Addr>,
-    lease_duration: Option<u32>,
-    server_identifier: Option<Ipv4Addr>,
+    relay_agent_ip: Ipv4Addr,
     broadcast: bool,
-    hostname: Option<String>,
+    options: Vec<(u8, Vec<u8>)>,
+}
+
+impl Lease {
+    fn option(&self, kind: u8) -> Option<&[u8]> {
+        self.options
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, data)| &data[..])
+    }
+
+    fn message_type(&self) -> DhcpMessageType {
+        match self.option(53) {
+            Some(&[t]) => DhcpMessageType::from(t),
+            other => panic!("message type option: {other:?}"),
+        }
+    }
+
+    fn kinds(&self) -> Vec<u8> {
+        let mut kinds: Vec<u8> = self.options.iter().map(|(k, _)| *k).collect();
+        kinds.sort();
+        kinds
+    }
 }
 
 fn lease(frame: &[u8]) -> Lease {
     let eth = EthernetFrame::new_checked(frame).unwrap();
     assert_eq!(eth.ethertype(), EthernetProtocol::Ipv4);
     let ip_packet = Ipv4Packet::new_checked(eth.payload()).unwrap();
+    // Parsing checks the header checksum.
     let ip = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).unwrap();
     assert_eq!(ip.next_header, IpProtocol::Udp);
-    let udp_packet = UdpPacket::new_checked(ip_packet.payload()).unwrap();
-    let udp = UdpRepr::parse(
-        &udp_packet,
-        &ip.src_addr.into(),
-        &ip.dst_addr.into(),
-        &ChecksumCapabilities::default(),
-    )
-    .unwrap();
-    let packet = DhcpPacket::new_checked(udp_packet.payload()).unwrap();
-    let repr = DhcpRepr::parse(&packet).unwrap();
-    let hostname = packet
-        .options()
-        .find(|o| o.kind == 12)
-        .map(|o| String::from_utf8(o.data.to_vec()).unwrap());
+    let udp = UdpPacket::new_checked(ip_packet.payload()).unwrap();
+    // A UDP checksum of zero would mean none was computed: ours always is.
+    assert_ne!(udp.checksum(), 0, "the UDP checksum is computed");
+    assert!(udp.verify_checksum(&ip.src_addr.into(), &ip.dst_addr.into()));
+    let packet = DhcpPacket::new_checked(udp.payload()).unwrap();
+    assert_eq!(packet.magic_number(), 0x6382_5363);
     Lease {
         eth_src: eth.src_addr(),
         eth_dst: eth.dst_addr(),
         ip_src: ip.src_addr,
         ip_dst: ip.dst_addr,
-        ports: (udp.src_port, udp.dst_port),
-        message_type: repr.message_type,
-        transaction_id: repr.transaction_id,
-        client_hardware_address: repr.client_hardware_address,
-        your_ip: repr.your_ip,
-        server_ip: repr.server_ip,
-        router: repr.router,
-        subnet_mask: repr.subnet_mask,
-        dns_servers: repr
-            .dns_servers
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default(),
-        lease_duration: repr.lease_duration,
-        server_identifier: repr.server_identifier,
-        broadcast: repr.broadcast,
-        hostname,
+        ip_total_len: ip_packet.total_len(),
+        ports: (udp.src_port(), udp.dst_port()),
+        udp_len: udp.len(),
+        op: packet.opcode(),
+        transaction_id: packet.transaction_id(),
+        client_hardware_address: packet.client_hardware_address(),
+        client_ip: packet.client_ip(),
+        your_ip: packet.your_ip(),
+        server_ip: packet.server_ip(),
+        relay_agent_ip: packet.relay_agent_ip(),
+        broadcast: packet.flags().contains(DhcpFlags::BROADCAST),
+        options: packet
+            .options()
+            .map(|o| (o.kind, o.data.to_vec()))
+            .collect(),
     }
+}
+
+/// What every reply carries: from the gateway's port 67 to port 68, a
+/// BOOTREPLY for the client's transaction and MAC, no relay agent, the
+/// server identifier, and the client identifier back unaltered.
+fn assert_reply_header(lease: &Lease) {
+    assert_eq!(lease.eth_src, GATEWAY_MAC);
+    assert_eq!(lease.ip_src, GATEWAY);
+    assert_eq!(lease.ports, (DHCP_SERVER_PORT, DHCP_CLIENT_PORT));
+    assert_eq!(lease.op, DhcpOpCode::Reply);
+    assert_eq!(lease.transaction_id, XID);
+    assert_eq!(lease.client_hardware_address, GUEST_MAC);
+    assert_eq!(lease.relay_agent_ip, Ipv4Addr::UNSPECIFIED);
+    assert_eq!(lease.option(54), Some(&GATEWAY.octets()[..]));
+    assert_eq!(lease.option(61), Some(&CLIENT_ID[..]));
+    // Padded to the 300-byte BOOTP minimum.
+    assert_eq!(lease.udp_len, 8 + 300);
+    assert_eq!(lease.ip_total_len, 20 + 8 + 300);
 }
 
 /// The parts of the static lease that every OFFER and ACK carries.
 fn assert_static_lease(lease: &Lease) {
-    assert_eq!(lease.eth_src, GATEWAY_MAC);
-    assert_eq!(lease.ip_src, GATEWAY);
-    assert_eq!(lease.ports, (DHCP_SERVER_PORT, DHCP_CLIENT_PORT));
-    assert_eq!(lease.transaction_id, XID);
-    assert_eq!(lease.client_hardware_address, GUEST_MAC);
+    assert_reply_header(lease);
     assert_eq!(lease.your_ip, GUEST);
     assert_eq!(lease.server_ip, GATEWAY);
-    assert_eq!(lease.router, Some(GATEWAY));
-    assert_eq!(lease.subnet_mask, Some(Ipv4Addr::new(255, 255, 255, 0)));
-    assert_eq!(lease.dns_servers, [GATEWAY]);
-    assert_eq!(lease.lease_duration, Some(86_400));
-    assert_eq!(lease.server_identifier, Some(GATEWAY));
-    assert_eq!(lease.hostname.as_deref(), Some("boxcar"));
+    assert_eq!(lease.option(3), Some(&GATEWAY.octets()[..]), "router");
+    assert_eq!(lease.option(1), Some(&[255, 255, 255, 0][..]), "mask");
+    assert_eq!(lease.option(6), Some(&GATEWAY.octets()[..]), "DNS");
+    assert_eq!(
+        lease.option(51),
+        Some(&86_400u32.to_be_bytes()[..]),
+        "lease"
+    );
+    assert_eq!(lease.option(12), Some(&b"boxcar"[..]), "host name");
+}
+
+fn dhcp_records(events: &[Payload]) -> Vec<NetDhcp> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Payload::NetDhcp(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn arp_request(sender: Ipv4Addr, target: Ipv4Addr) -> Vec<u8> {
+    arp_request_from(GUEST_MAC, sender, target)
+}
+
+/// An ARP request with `mac` as both the Ethernet source and the sender's
+/// hardware address.
+fn arp_request_from(mac: EthernetAddress, sender: Ipv4Addr, target: Ipv4Addr) -> Vec<u8> {
     let repr = ArpRepr::EthernetIpv4 {
         operation: ArpOperation::Request,
-        source_hardware_addr: GUEST_MAC,
+        source_hardware_addr: mac,
         source_protocol_addr: sender,
         target_hardware_addr: EthernetAddress([0; 6]),
         target_protocol_addr: target,
@@ -286,7 +407,7 @@ fn arp_request(sender: Ipv4Addr, target: Ipv4Addr) -> Vec<u8> {
     let mut payload = vec![0; repr.buffer_len()];
     repr.emit(&mut ArpPacket::new_unchecked(&mut payload[..]));
     ethernet(
-        GUEST_MAC,
+        mac,
         EthernetAddress::BROADCAST,
         EthernetProtocol::Arp,
         &payload,
@@ -369,8 +490,9 @@ fn dhcp_discover_gets_an_offer_for_the_guest_ip() {
     let replies = h.drain();
     assert_eq!(replies.len(), 1, "one OFFER");
     let offer = lease(&replies[0]);
-    assert_eq!(offer.message_type, DhcpMessageType::Offer);
+    assert_eq!(offer.message_type(), DhcpMessageType::Offer);
     assert_static_lease(&offer);
+    assert_eq!(offer.client_ip, Ipv4Addr::UNSPECIFIED);
     // No broadcast flag: the reply goes straight to the client.
     assert!(!offer.broadcast);
     assert_eq!(offer.eth_dst, GUEST_MAC);
@@ -393,7 +515,7 @@ fn dhcp_request_gets_an_ack() {
     let replies = h.drain();
     assert_eq!(replies.len(), 1, "one ACK");
     let ack = lease(&replies[0]);
-    assert_eq!(ack.message_type, DhcpMessageType::Ack);
+    assert_eq!(ack.message_type(), DhcpMessageType::Ack);
     assert_static_lease(&ack);
     // The client asked for a broadcast reply and gets one.
     assert!(ack.broadcast);
@@ -407,6 +529,171 @@ fn dhcp_request_gets_an_ack() {
             yiaddr: GUEST,
         })]
     );
+}
+
+/// A renewing client has an address (`ciaddr`), and its ACK goes there by
+/// unicast even when its broadcast flag is set (RFC 2131 §4.1).
+#[test]
+fn a_renewing_client_gets_its_ack_unicast_to_its_address() {
+    let mut h = harness();
+    h.stack.push_guest_frame(&dhcp_from(&Client {
+        message_type: DhcpMessageType::Request,
+        broadcast: true,
+        ciaddr: GUEST,
+        ..Client::discover()
+    }));
+    let replies = h.drain();
+    assert_eq!(replies.len(), 1, "one ACK");
+    let ack = lease(&replies[0]);
+    assert_eq!(ack.message_type(), DhcpMessageType::Ack);
+    assert_static_lease(&ack);
+    assert_eq!(ack.client_ip, GUEST, "ciaddr repeated");
+    assert_eq!((ack.eth_dst, ack.ip_dst), (GUEST_MAC, GUEST));
+    assert_eq!(
+        dhcp_records(&h.events()),
+        [NetDhcp {
+            op: "ack".into(),
+            yiaddr: GUEST,
+        }]
+    );
+}
+
+/// A client asking for an address that is not the guest's, rebooting with
+/// an old lease (option 50) or renewing one (`ciaddr`), is refused with a
+/// NAK, broadcast, carrying nothing but the message type, the server
+/// identifier and the client identifier (RFC 2131 §4.3.2).
+#[test]
+fn a_request_for_another_address_gets_a_broadcast_nak() {
+    let mut h = harness();
+    let elsewhere = Ipv4Addr::new(10, 0, 2, 99);
+    let rebooting = Client {
+        message_type: DhcpMessageType::Request,
+        requested_ip: Some(elsewhere),
+        ..Client::discover()
+    };
+    let renewing = Client {
+        message_type: DhcpMessageType::Request,
+        ciaddr: elsewhere,
+        ..Client::discover()
+    };
+    for client in [rebooting, renewing] {
+        h.stack.push_guest_frame(&dhcp_from(&client));
+        let replies = h.drain();
+        assert_eq!(replies.len(), 1, "one NAK");
+        let nak = lease(&replies[0]);
+        assert_eq!(nak.message_type(), DhcpMessageType::Nak);
+        assert_reply_header(&nak);
+        assert_eq!(nak.kinds(), [53, 54, 61], "no lease options");
+        assert_eq!(
+            (nak.client_ip, nak.your_ip, nak.server_ip),
+            (
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED
+            )
+        );
+        assert!(!nak.broadcast, "the client's flags, echoed");
+        assert_eq!(
+            (nak.eth_dst, nak.ip_dst),
+            (EthernetAddress::BROADCAST, Ipv4Addr::BROADCAST)
+        );
+    }
+    let nak = NetDhcp {
+        op: "nak".into(),
+        yiaddr: Ipv4Addr::UNSPECIFIED,
+    };
+    assert_eq!(
+        h.events(),
+        [Payload::NetDhcp(nak.clone()), Payload::NetDhcp(nak)]
+    );
+}
+
+/// A REQUEST naming another server took that server's offer: the gateway
+/// says nothing, records nothing, and counts nothing.
+#[test]
+fn a_request_choosing_another_server_is_not_answered() {
+    let mut h = harness();
+    h.stack.push_guest_frame(&dhcp_from(&Client {
+        server_id: Some(Ipv4Addr::new(192, 168, 1, 1)),
+        ..Client::request()
+    }));
+    h.stack.poll(Instant::now());
+    assert!(h.drain().is_empty());
+    h.stack.shutdown();
+    assert!(h.events().is_empty());
+}
+
+/// The client identifier comes back unaltered whatever its form (RFC
+/// 6842): an RFC 4361 IAID and DUID as systemd-networkd sends it, a short
+/// one, and a 7-byte one that is not an Ethernet address.
+#[test]
+fn every_client_identifier_is_echoed_unaltered() {
+    let duid: &[u8] = &[
+        255, // RFC 4361: IAID and DUID follow
+        0x8c, 0x2d, 0x5e, 0x11, // IAID
+        0x00, 0x02, 0x00, 0x00, 0xab, 0x11, // DUID-EN, enterprise 43793
+        0x5c, 0x6a, 0x2b, 0x31, 0x9e, 0x0e, 0x3c, 0x77,
+    ];
+    let mut h = harness();
+    for id in [duid, &[0, 0xbe, 0xef], &[0, 1, 2, 3, 4, 5, 6]] {
+        for (client, want) in [
+            (Client::discover(), DhcpMessageType::Offer),
+            (Client::request(), DhcpMessageType::Ack),
+        ] {
+            h.stack.push_guest_frame(&dhcp_from(&Client {
+                client_id: id,
+                ..client
+            }));
+            let replies = h.drain();
+            assert_eq!(replies.len(), 1, "{want:?} for {id:?}");
+            let reply = lease(&replies[0]);
+            assert_eq!(reply.message_type(), want);
+            assert_eq!(reply.option(61), Some(id), "{want:?}");
+            assert!(reply.udp_len >= 8 + 300);
+        }
+    }
+    let records = dhcp_records(&h.events());
+    assert_eq!(records.len(), 6, "{records:?}");
+}
+
+/// What the server does not answer, malformed or not, is a `dhcp` drop:
+/// no message type, options that run past the end, a BOOTREPLY, and the
+/// messages a server answers nothing to.
+#[test]
+fn unanswerable_dhcp_is_a_dhcp_drop() {
+    let mut h = harness();
+    let discover = dhcp_payload(&Client::discover());
+    assert_eq!(discover[240..243], [53, 1, 1], "option 53 comes first");
+
+    let mut untyped = discover.clone();
+    untyped[240..243].fill(0); // three pads
+    let mut truncated = discover[..243].to_vec();
+    truncated.extend_from_slice(&[61, 7, 1, 2]);
+    let mut reply = discover.clone();
+    reply[0] = 2; // BOOTREPLY
+    let mut payloads = vec![untyped, truncated, reply];
+    for message_type in [
+        DhcpMessageType::Release,
+        DhcpMessageType::Decline,
+        DhcpMessageType::Inform,
+    ] {
+        payloads.push(dhcp_payload(&Client {
+            message_type,
+            ..Client::discover()
+        }));
+    }
+    let sent = payloads.len() as u64;
+    for payload in payloads {
+        h.stack
+            .push_guest_frame(&dhcp_frame(Ipv4Addr::UNSPECIFIED, &payload));
+        assert!(h.drain().is_empty());
+    }
+    h.stack.shutdown();
+    let events = h.events();
+    assert!(dhcp_records(&events).is_empty());
+    let drops = drops(&events);
+    assert!(drops.iter().all(|d| d.reason == "dhcp"), "{drops:?}");
+    assert_eq!(drops.iter().map(|d| d.count).sum::<u64>(), sent);
 }
 
 #[test]
@@ -644,6 +931,117 @@ fn a_tcp_syn_reaches_smoltcp_which_knows_the_guest_mac_from_its_arp() {
     assert!(h.events().is_empty());
 }
 
+/// smoltcp learns only the guest's own binding. ARP from more made-up
+/// senders than its neighbor cache holds does not evict the guest, and a
+/// made-up MAC for the guest's address does not redirect its replies: a SYN
+/// afterwards is reset at once, to the guest's MAC.
+#[test]
+fn spoofed_arp_neither_evicts_nor_poisons_the_guest_in_smoltcp() {
+    let mut h = harness();
+    h.stack.push_guest_frame(&arp_request(GUEST, GATEWAY));
+    for i in 100..110u8 {
+        h.stack.push_guest_frame(&arp_request_from(
+            EthernetAddress([0x02, 0, 0, 0, 0, i]),
+            Ipv4Addr::new(10, 0, 2, i),
+            GATEWAY,
+        ));
+    }
+    h.stack.push_guest_frame(&arp_request_from(
+        EthernetAddress([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+        GUEST,
+        GATEWAY,
+    ));
+    assert_eq!(h.drain().len(), 12, "each gets its proxy-ARP reply");
+    h.stack.poll(Instant::now());
+    assert!(h.drain().is_empty());
+
+    let guest = SocketAddrV4::new(GUEST, 40000);
+    let remote = SocketAddrV4::new(Ipv4Addr::new(93, 184, 215, 14), 80);
+    h.stack.push_guest_frame(&tcp_syn(guest, remote, 1000));
+    h.stack.poll(Instant::now());
+    let replies = h.drain();
+    assert_eq!(replies.len(), 1, "one RST");
+    let eth = EthernetFrame::new_checked(&replies[0][..]).unwrap();
+    assert_eq!(
+        eth.ethertype(),
+        EthernetProtocol::Ipv4,
+        "not an ARP request"
+    );
+    assert_eq!(eth.dst_addr(), GUEST_MAC);
+}
+
+/// The TCP destination port of a reset smoltcp sent the guest.
+fn reset_port(frame: &[u8]) -> u16 {
+    let eth = EthernetFrame::new_checked(frame).unwrap();
+    let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
+    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+    assert!(tcp.rst());
+    tcp.dst_port()
+}
+
+/// A guest that sends and never takes frames cannot grow either queue past
+/// its cap. smoltcp answers each SYN with a reset until the guest's queue
+/// is full, then takes no more; SYNs wait for it until theirs is full too,
+/// and after that are dropped as `queue_full`. Nothing that waited is lost:
+/// smoltcp takes it once the guest drains its queue.
+#[test]
+fn queues_are_capped_and_smoltcp_waits_for_the_guest() {
+    let mut h = harness();
+    h.stack.push_guest_frame(&arp_request(GUEST, GATEWAY));
+    assert_eq!(h.drain().len(), 1, "the proxy-ARP reply");
+    h.stack.poll(Instant::now());
+    assert!(h.drain().is_empty());
+
+    let remote = SocketAddrV4::new(Ipv4Addr::new(93, 184, 215, 14), 80);
+    let first_port = 1024u16;
+    let mut port = first_port;
+    // Answered; then waiting for smoltcp; then no room anywhere.
+    for _ in 0..3 {
+        for _ in 0..QUEUE_CAP {
+            h.stack
+                .push_guest_frame(&tcp_syn(SocketAddrV4::new(GUEST, port), remote, 1));
+            port += 1;
+        }
+        h.stack.poll(Instant::now());
+    }
+    let answered = h.drain();
+    assert_eq!(answered.len(), QUEUE_CAP, "the guest's queue is capped");
+    let cap = QUEUE_CAP as u16;
+    assert_eq!(reset_port(&answered[0]), first_port);
+    assert_eq!(reset_port(&answered[QUEUE_CAP - 1]), first_port + cap - 1);
+
+    h.stack.poll(Instant::now());
+    let waited = h.drain();
+    assert_eq!(waited.len(), QUEUE_CAP, "what waited is answered now");
+    assert_eq!(reset_port(&waited[0]), first_port + cap);
+    assert_eq!(reset_port(&waited[QUEUE_CAP - 1]), first_port + 2 * cap - 1);
+    h.stack.poll(Instant::now());
+    assert!(h.drain().is_empty(), "the third round was dropped");
+
+    h.stack.shutdown();
+    let drops = drops(&h.events());
+    assert!(drops.iter().all(|d| d.reason == "queue_full"), "{drops:?}");
+    assert_eq!(drops.iter().map(|d| d.count).sum::<u64>(), QUEUE_CAP as u64);
+}
+
+/// Counts still held when the stack stops are recorded by `shutdown`.
+#[test]
+fn shutdown_records_the_drops_still_held() {
+    let mut h = harness();
+    for _ in 0..5 {
+        h.stack.push_guest_frame(&ipv6_frame());
+    }
+    h.stack.shutdown();
+    let counts: Vec<u64> = drops(&h.events())
+        .into_iter()
+        .map(|d| {
+            assert_eq!(d.reason, "ipv6");
+            d.count
+        })
+        .collect();
+    assert_eq!(counts, [1, 4], "the first at once, the rest at shutdown");
+}
+
 #[test]
 fn the_stack_is_send() {
     fn send<T: Send>() {}
@@ -747,9 +1145,16 @@ fn shaped_ipv4(protocol: u8, dst_port: u16, to_gateway: bool, mut body: Vec<u8>)
         IpProtocol::Udp if body.len() >= 8 => {
             // A BOOTREQUEST over Ethernet with the DHCP magic cookie, so
             // random options reach the DHCP parser.
-            if dst_port == DHCP_SERVER_PORT && body.len() >= 8 + 240 {
+            // A DISCOVER or a REQUEST, half the time with no other option,
+            // so random headers and options also reach the reply builder.
+            if dst_port == DHCP_SERVER_PORT && body.len() >= 8 + 244 {
                 body[8..11].copy_from_slice(&[1, 1, 6]);
                 body[8 + 236..8 + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+                let message_type = if body[12] & 1 == 0 { 1 } else { 3 };
+                body[8 + 240..8 + 243].copy_from_slice(&[53, 1, message_type]);
+                if body[13] & 1 == 0 {
+                    body[8 + 243] = 255;
+                }
             }
             let len = body.len() as u16;
             let mut packet = UdpPacket::new_unchecked(&mut body[..]);

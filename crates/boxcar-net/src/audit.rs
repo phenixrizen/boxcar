@@ -4,11 +4,11 @@
 //! The network stack's way into the audit log, and the coalescing that
 //! keeps a guest that floods it with junk from flooding the log.
 //!
-//! [`emit`] is for records that must not be lost (verdicts); [`try_emit`]
-//! for records the log may drop when it is busy, which it counts (leases,
-//! drops). Dropped frames are recorded through [`Drops`]: at most one
-//! `net.drop` a second for each [`DropReason`], counting every frame since
-//! the last.
+//! [`emit`] is for records that must not be lost (leases, verdicts);
+//! [`try_emit`] for records the log may drop when it is busy, which it
+//! counts (`net.drop`). Dropped frames are recorded through [`Drops`]: at
+//! most one `net.drop` a second for each [`DropReason`], counting every
+//! frame since the last.
 
 use std::time::{Duration, Instant};
 
@@ -136,8 +136,16 @@ impl Drops {
     /// since the last record. Until then they are held, and
     /// [`flush`](Self::flush) records them.
     pub fn count(&mut self, reason: DropReason, now: Instant) -> Option<NetDrop> {
+        self.count_many(reason, 1, now)
+    }
+
+    /// [`count`](Self::count) for `n` frames at once; nothing for none.
+    pub fn count_many(&mut self, reason: DropReason, n: u64, now: Instant) -> Option<NetDrop> {
+        if n == 0 {
+            return None;
+        }
         let tally = &mut self.tallies[reason.index()];
-        tally.held = tally.held.saturating_add(1);
+        tally.held = tally.held.saturating_add(n);
         tally.due(now).then(|| tally.take(reason, now))
     }
 
@@ -147,6 +155,17 @@ impl Drops {
             .into_iter()
             .zip(&mut self.tallies)
             .filter(|(_, tally)| tally.held > 0 && tally.due(now))
+            .map(|(reason, tally)| tally.take(reason, now))
+            .collect()
+    }
+
+    /// The `net.drop` records of every held count, due or not: for when
+    /// the stack stops.
+    pub fn flush_all(&mut self, now: Instant) -> Vec<NetDrop> {
+        DropReason::ALL
+            .into_iter()
+            .zip(&mut self.tallies)
+            .filter(|(_, tally)| tally.held > 0)
             .map(|(reason, tally)| tally.take(reason, now))
             .collect()
     }
@@ -201,6 +220,37 @@ mod tests {
         // A clock reading older than the last record waits.
         assert_eq!(drops.count(DropReason::Icmp, at(1500)), None);
         assert_eq!(drops.flush(at(3000)), [drop_of("icmp", 1)]);
+    }
+
+    #[test]
+    fn counts_of_many_and_of_none() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut drops = Drops::new();
+        assert_eq!(drops.count_many(DropReason::QueueFull, 0, at(0)), None);
+        assert_eq!(drops.next_due(), None, "nothing counted");
+        assert_eq!(
+            drops.count_many(DropReason::QueueFull, 3, at(0)),
+            Some(drop_of("queue_full", 3))
+        );
+        assert_eq!(drops.count_many(DropReason::QueueFull, 4, at(10)), None);
+        assert_eq!(drops.flush(at(1000)), [drop_of("queue_full", 4)]);
+    }
+
+    #[test]
+    fn flush_all_takes_what_is_held_due_or_not() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut drops = Drops::new();
+        assert!(drops.count(DropReason::Ipv6, at(0)).is_some());
+        assert!(drops.count(DropReason::Other, at(0)).is_some());
+        for _ in 0..4 {
+            assert_eq!(drops.count(DropReason::Ipv6, at(1)), None);
+        }
+        assert!(drops.flush(at(2)).is_empty(), "not due");
+        assert_eq!(drops.flush_all(at(2)), [drop_of("ipv6", 4)]);
+        assert!(drops.flush_all(at(3)).is_empty(), "nothing held");
+        assert_eq!(drops.next_due(), None);
     }
 
     #[test]
