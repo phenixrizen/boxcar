@@ -1215,6 +1215,17 @@ pub(crate) mod testing {
         }
     }
 
+    impl Fixture {
+        /// Closes the audit log's writer, as the end of a run does.
+        pub(crate) fn close_audit(&mut self) {
+            self.writer
+                .take()
+                .expect("the audit writer is open")
+                .close()
+                .expect("closing the audit writer");
+        }
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             if let Some(writer) = self.writer.take() {

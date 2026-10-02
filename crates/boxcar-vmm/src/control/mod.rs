@@ -9,10 +9,13 @@
 //!   a thread of its own, and closes every one when the VM stops.
 //! - `conn`: one thread per connection: the hello, line framing with the
 //!   1 MiB cap, the rate limit, and dispatch to [`Ops`].
+//! - `audit`: `audit.subscribe`, and the thread that forwards a
+//!   subscription's records into a connection.
 //! - [`ops`]: [`Ops`], what the ops do, and [`VmmOps`], the VMM's.
 //! - [`peercred`]: the peer's credentials, so that only the VMM's own user
 //!   is served.
 
+mod audit;
 mod conn;
 pub mod ops;
 pub mod peercred;

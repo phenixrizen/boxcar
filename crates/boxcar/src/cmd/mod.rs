@@ -6,6 +6,7 @@
 mod attach;
 mod audit;
 mod doctor;
+mod events;
 mod nofile;
 pub(crate) mod run;
 mod status;
@@ -52,6 +53,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Attach(args) => attach::run(&args),
         Command::Audit(command) => audit::run(command),
         Command::Doctor => doctor::run(),
+        Command::Events(args) => events::run(&args),
         Command::Run(args) => run::run(*args),
         Command::Status(args) => status::run(&args),
         Command::Stop(args) => stop::run(&args),

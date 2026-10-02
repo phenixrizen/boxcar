@@ -310,10 +310,8 @@ impl Accept {
         let session = Session {
             conn: conn.clone(),
             ctx: ConnCtx {
-                peer_pid: pid,
-                peer_uid: uid,
-                raw_upgrade: None,
                 events: Some(ConnEvents::new(&conn)),
+                ..ConnCtx::new(pid, uid)
             },
             ops: self.ops.clone(),
             audit: self.audit.clone(),

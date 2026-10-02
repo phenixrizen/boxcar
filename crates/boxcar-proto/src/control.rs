@@ -31,6 +31,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::audit::Record;
+
 /// The `protocol` of the [`Hello`].
 pub const PROTOCOL: &str = "boxcar.control";
 /// The protocol version this crate speaks: the `v` of every message.
@@ -443,6 +445,120 @@ impl PtyDetached {
     /// The attach `attach_id` fell too far behind: [`PTY_DETACHED_SLOW`].
     pub fn slow(attach_id: &str) -> PtyDetached {
         PtyDetached::new(attach_id, PTY_DETACHED_SLOW)
+    }
+}
+
+/// The most `audit.subscribe` subscriptions one connection holds.
+pub const MAX_AUDIT_SUBSCRIPTIONS: usize = 4;
+/// The most type prefixes an `audit.subscribe` names.
+pub const MAX_AUDIT_TYPES: usize = 32;
+/// The longest type prefix an `audit.subscribe` names, in bytes.
+pub const MAX_AUDIT_TYPE_LEN: usize = 64;
+
+/// The parameters of `audit.subscribe`: `{"from_seq":S,"types":["net."],
+/// "pid":P}`, each optional. The response is [`AuditSubscribed`]; then the
+/// connection hears [`AuditEvent`]s, and [`AuditLagged`] when it falls
+/// behind, until it closes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSubscribeParams {
+    /// The first seq wanted: the records from it on, those in the log and
+    /// then the live ones. 1 when absent; 0 is the same. A seq beyond the
+    /// log's end waits for the live records from it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_seq: Option<u64>,
+    /// Record types, each a prefix (`"net."`, or a whole type such as
+    /// `"fs.write"`). Absent or empty takes every type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+    /// Only the records attributed to this guest process (`subject.pid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+impl AuditSubscribeParams {
+    /// Whether the parameters are within the limits: at most
+    /// [`MAX_AUDIT_TYPES`] prefixes, none empty or over
+    /// [`MAX_AUDIT_TYPE_LEN`] bytes.
+    pub fn check(&self) -> Result<(), String> {
+        if self.types.len() > MAX_AUDIT_TYPES {
+            return Err(format!(
+                "{} types: at most {MAX_AUDIT_TYPES}",
+                self.types.len()
+            ));
+        }
+        for prefix in &self.types {
+            if prefix.is_empty() || prefix.len() > MAX_AUDIT_TYPE_LEN {
+                return Err(format!(
+                    "a type prefix is 1 to {MAX_AUDIT_TYPE_LEN} bytes, not {}",
+                    prefix.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The result of `audit.subscribe`: `{"next_seq":N,"sub":K}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSubscribed {
+    /// The seq the log's next record had when the subscription began: the
+    /// records below it come from the log, the ones from it on are live.
+    pub next_seq: u64,
+    /// The subscription's id on this connection, counting from 1: the `sub`
+    /// of its events. A client that does not hold several can ignore it.
+    /// 0 when a server did not say.
+    #[serde(default)]
+    pub sub: u64,
+}
+
+/// `{"v":1,"event":"audit","sub":K,"rec":{...}}`: a record of the
+/// subscription `sub`, `rec` the record as the log holds it. `R` is
+/// [`Record`], or a reference to one to send it without a copy. Never over
+/// [`MAX_LINE`]: a record is at most [`MAX_RECORD_BYTES`].
+///
+/// [`MAX_RECORD_BYTES`]: crate::limits::MAX_RECORD_BYTES
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuditEvent<R = Record> {
+    pub v: u32,
+    /// `"audit"`.
+    pub event: String,
+    pub sub: u64,
+    pub rec: R,
+}
+
+impl<R> AuditEvent<R> {
+    pub fn new(sub: u64, rec: R) -> AuditEvent<R> {
+        AuditEvent {
+            v: VERSION,
+            event: "audit".to_owned(),
+            sub,
+            rec,
+        }
+    }
+}
+
+/// `{"v":1,"event":"audit.lagged","sub":K,"resume_seq":R}`: the subscription
+/// `sub` fell too far behind for the server to hold its live records, and
+/// was dropped from the live stream. The records from `resume_seq` on follow,
+/// read back from the log and then live again; those before it were
+/// delivered, so nothing is missed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLagged {
+    pub v: u32,
+    /// `"audit.lagged"`.
+    pub event: String,
+    pub sub: u64,
+    pub resume_seq: u64,
+}
+
+impl AuditLagged {
+    pub fn new(sub: u64, resume_seq: u64) -> AuditLagged {
+        AuditLagged {
+            v: VERSION,
+            event: "audit.lagged".to_owned(),
+            sub,
+            resume_seq,
+        }
     }
 }
 
@@ -892,6 +1008,130 @@ mod tests {
             String::from_utf8(to_line(&PtyDetached::slow("00ff")).unwrap()).unwrap(),
             "{\"v\":1,\"event\":\"pty.detached\",\"attach_id\":\"00ff\",\"reason\":\"slow\"}\n"
         );
+    }
+
+    fn record(data: Value) -> Record {
+        serde_json::from_value(json!({
+            "v": 1,
+            "session_id": "01a0fcd4-639d-728e-bb0a-410e6d2c4a3e",
+            "seq": 7,
+            "ring": 0,
+            "src": "net",
+            "type": "net.drop",
+            "ts_host_ns": 1,
+            "ts_mono_ns": 2,
+            "data": data,
+            "prev": format!("b3:{}", "0".repeat(64)),
+            "hash": format!("b3:{}", "1".repeat(64)),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn audit_subscribe_parameters_are_optional_and_limited() {
+        let none: AuditSubscribeParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(none, AuditSubscribeParams::default());
+        assert_eq!(none.check(), Ok(()));
+        assert_eq!(serde_json::to_value(&none).unwrap(), json!({}));
+
+        let all: AuditSubscribeParams = serde_json::from_value(
+            json!({"from_seq": 0, "types": ["net.", "fs.write"], "pid": 42, "extra": 1}),
+        )
+        .unwrap();
+        assert_eq!(
+            (all.from_seq, all.types.as_slice(), all.pid),
+            (
+                Some(0),
+                ["net.".to_owned(), "fs.write".to_owned()].as_slice(),
+                Some(42)
+            )
+        );
+        assert_eq!(all.check(), Ok(()));
+
+        for bad in [
+            json!({"from_seq": -1}),
+            json!({"from_seq": "1"}),
+            json!({"pid": -1}),
+            json!({"pid": 4294967296u64}),
+            json!({"types": "net."}),
+            json!({"types": [1]}),
+        ] {
+            assert!(
+                serde_json::from_value::<AuditSubscribeParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+
+        // The limits: 32 prefixes of 1 to 64 bytes.
+        let types = |types: Vec<String>| AuditSubscribeParams {
+            types,
+            ..AuditSubscribeParams::default()
+        };
+        assert_eq!(types(vec!["a".to_owned(); MAX_AUDIT_TYPES]).check(), Ok(()));
+        assert!(types(vec!["a".to_owned(); MAX_AUDIT_TYPES + 1])
+            .check()
+            .is_err());
+        assert_eq!(types(vec!["x".repeat(MAX_AUDIT_TYPE_LEN)]).check(), Ok(()));
+        assert!(types(vec!["x".repeat(MAX_AUDIT_TYPE_LEN + 1)])
+            .check()
+            .is_err());
+        assert!(types(vec![String::new()]).check().is_err());
+    }
+
+    #[test]
+    fn audit_messages_have_their_documented_shape() {
+        assert_eq!(
+            serde_json::to_value(AuditSubscribed {
+                next_seq: 12,
+                sub: 1
+            })
+            .unwrap(),
+            json!({"next_seq": 12, "sub": 1})
+        );
+        // `sub` is for a client that holds several subscriptions: a result
+        // without it still reads.
+        let bare: AuditSubscribed = serde_json::from_value(json!({"next_seq": 12})).unwrap();
+        assert_eq!((bare.next_seq, bare.sub), (12, 0));
+        assert!(serde_json::from_value::<AuditSubscribed>(json!({"sub": 1})).is_err());
+
+        let rec = record(json!({"reason": "ipv6", "count": 3}));
+        let line = String::from_utf8(to_line(&AuditEvent::new(2, &rec)).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"v": 1, "event": "audit", "sub": 2, "rec": serde_json::to_value(&rec).unwrap()})
+        );
+        assert!(line.starts_with("{\"v\":1,\"event\":\"audit\",\"sub\":2,\"rec\":{"));
+        // The reference and the owned record are the same bytes, and parse
+        // back.
+        assert_eq!(
+            serde_json::to_string(&AuditEvent::new(2, rec.clone())).unwrap() + "\n",
+            line
+        );
+        let back: AuditEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!((back.sub, back.rec), (2, rec));
+
+        assert_eq!(
+            String::from_utf8(to_line(&AuditLagged::new(2, 16385)).unwrap()).unwrap(),
+            "{\"v\":1,\"event\":\"audit.lagged\",\"sub\":2,\"resume_seq\":16385}\n"
+        );
+    }
+
+    /// The largest record the log holds (64 KiB) is nowhere near the line
+    /// cap, so an `audit` event is never refused for its size.
+    #[test]
+    fn an_audit_event_of_the_largest_record_fits_a_line() {
+        let overhead = serde_json::to_vec(&record(json!({"pad": ""})))
+            .unwrap()
+            .len();
+        let rec = record(json!({
+            "pad": "x".repeat(crate::limits::MAX_RECORD_BYTES - overhead)
+        }));
+        assert_eq!(
+            serde_json::to_vec(&rec).unwrap().len(),
+            crate::limits::MAX_RECORD_BYTES
+        );
+        let line = to_line(&AuditEvent::new(u64::MAX, &rec)).unwrap();
+        assert!(line.len() < MAX_LINE / 8, "{}", line.len());
     }
 
     /// Every message leaves as one line under the cap; one over it is

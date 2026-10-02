@@ -34,6 +34,10 @@ use serde_json::Value;
 
 /// How long the client waits for the hello and for each response.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many messages [`Client::request`] keeps for [`Client::next_message`]
+/// while it waits for its response: a server that sends more events than
+/// this before answering is not one to wait for.
+pub const MAX_PENDING: usize = 1024;
 /// The longest socket path `bind` and `connect` take, without the NUL.
 const MAX_SOCKET_PATH: usize = 107;
 /// A session id's length: a hyphenated UUID.
@@ -336,9 +340,37 @@ impl Client {
                 Some(Message::Response(response)) if response.id == id => {
                     return Ok(response.into_result())
                 }
-                Some(other) => self.pending.push_back(other),
+                Some(other) => {
+                    if self.pending.len() >= MAX_PENDING {
+                        bail!(
+                            "{} sent over {MAX_PENDING} messages before answering {op}",
+                            self.path.display()
+                        );
+                    }
+                    self.pending.push_back(other);
+                }
             }
         }
+    }
+
+    /// A handle on the connection's socket, to end it from another thread:
+    /// `shutdown`ing it makes a read in progress return the end of the
+    /// stream.
+    pub fn shutdown_handle(&self) -> io::Result<UnixStream> {
+        self.writer.try_clone()
+    }
+
+    /// What a request read past while it waited for its response, in order,
+    /// and not yet returned by [`next_message`](Self::next_message).
+    pub fn take_pending(&mut self) -> Vec<Message> {
+        self.pending.drain(..).collect()
+    }
+
+    /// The next line the server sent, raw (without its newline), or `None`
+    /// once it closed the connection. Whatever [`request`](Self::request)
+    /// read past is not in it: see [`take_pending`](Self::take_pending).
+    pub fn next_line(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_line()
     }
 
     /// The next message (what a request read past first), or `None` once
@@ -414,6 +446,60 @@ mod tests {
 
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
+    }
+
+    /// A client of a server that answers its first request after `events`
+    /// events, past its hello.
+    fn client_of_a_chatty_server(events: usize) -> Client {
+        use std::io::Read;
+        let (server, client) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut server = server;
+            let hello = Hello::new("boxcar/test", "s", Vec::new());
+            server.write_all(&to_line(&hello).unwrap()).unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while byte[0] != b'\n' {
+                server.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let mut out = Vec::new();
+            for n in 0..events {
+                let event = serde_json::json!({"v": 1, "event": "audit.lagged", "n": n});
+                out.extend_from_slice(&to_line(&event).unwrap());
+            }
+            let ok = Response::success(1, serde_json::json!({"next_seq": 1}));
+            out.extend_from_slice(&to_line(&ok).unwrap());
+            // The client may have given up on it.
+            let _ = server.write_all(&out);
+        });
+        Client::from_stream(client, Path::new("/test")).unwrap()
+    }
+
+    /// A request keeps the events that come before its response, for
+    /// `next_message`, but not without limit: a server that sends more than
+    /// 1024 before answering is an error that names the cap.
+    #[test]
+    fn a_request_keeps_at_most_1024_events_ahead_of_its_response() {
+        let mut client = client_of_a_chatty_server(MAX_PENDING);
+        let result = client.request("audit.subscribe", Value::Null).unwrap();
+        assert_eq!(result.unwrap(), serde_json::json!({"next_seq": 1}));
+        let pending = client.take_pending();
+        assert_eq!(pending.len(), MAX_PENDING);
+        let Message::Event { body, .. } = &pending[1023] else {
+            panic!("not an event")
+        };
+        assert_eq!(body["n"], 1023, "in order");
+
+        let mut client = client_of_a_chatty_server(MAX_PENDING + 1);
+        let error = client
+            .request("audit.subscribe", Value::Null)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("over 1024 messages before answering audit.subscribe"),
+            "{error}"
+        );
     }
 
     #[test]

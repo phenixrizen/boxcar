@@ -88,6 +88,30 @@ pub enum Command {
     /// required check fails; a guest artifact that is not built yet is not a
     /// failure.
     Doctor,
+    /// Stream a running session's audit records.
+    ///
+    /// Prints each record of the session's audit log as one line of
+    /// compact JSON on stdout, exactly as the log holds it: the records
+    /// already in the log from `--from`, then the new ones as they are made,
+    /// in seq order with none missed or repeated, until the VM stops (the
+    /// control socket closes) or Ctrl-C. `--type` (any number) and `--pid`
+    /// choose records by type prefix (`--type net.` takes every `net.*`
+    /// record, `--type fs.write` that type) and by the guest process they
+    /// are attributed to; a record must pass both. The session is the one
+    /// `--control` or SESSION_ID names, or the only one running.
+    ///
+    /// A client that reads slower than the log is written is told on
+    /// stderr, `{"event":"audit.lagged","resume_seq":N}`, and the records
+    /// from N on follow: nothing is lost, they are read back from the log.
+    /// Stdout may be a pipe that closes early (`| head`): that ends the
+    /// command quietly, with exit 0.
+    ///
+    /// Exits 0 when the connection closes and after Ctrl-C (SIGINT), 1
+    /// when the control socket cannot be reached or refuses the
+    /// subscription (at most 4 per connection) or the server sends
+    /// something that is not the protocol, and 128 plus the signal after
+    /// SIGTERM, SIGHUP or SIGQUIT.
+    Events(EventsArgs),
     /// Boot a microVM.
     ///
     /// Shares `--rootfs` with the guest as its root filesystem and
@@ -206,6 +230,25 @@ pub struct AttachArgs {
     /// at most the VMM's 256 KiB scrollback; 0 for none.
     #[arg(long, value_name = "BYTES", default_value_t = 64 * 1024)]
     pub replay: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct EventsArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// The first seq wanted: the records from it on, those in the log and
+    /// then the live ones. Default: 1, the start (0 is the same). A seq
+    /// past the log's end waits for the live records from it on.
+    #[arg(long, value_name = "SEQ")]
+    pub from: Option<u64>,
+    /// Only records whose type starts with PREFIX, such as `net.` or
+    /// `fs.write`. May be given more than once: a record of any of them.
+    /// At most 32, each 1 to 64 bytes.
+    #[arg(long = "type", value_name = "PREFIX")]
+    pub types: Vec<String>,
+    /// Only records attributed to the guest process with this pid.
+    #[arg(long, value_name = "PID")]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Args)]

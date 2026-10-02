@@ -12,6 +12,13 @@
 //! down, without waiting on a client. A client that leaves more than
 //! [`OUTBOX_MAX`] bytes unread is cut off.
 //!
+//! The one thing that waits for the client is a stream the connection
+//! forwards from another thread, the audit subscription: it queues through
+//! [`Conn::send_paced`], which waits while the client has [`PACE_HIGH_WATER`]
+//! bytes or more unread, so that a replay of a long log goes at the pace of
+//! the client and never reaches [`OUTBOX_MAX`]. A client that takes no byte
+//! for the stall limit is cut off instead of waited for for ever.
+//!
 //! Lines are read in chunks into a buffer that grows only as far as the
 //! cap: a line longer than [`MAX_LINE`] is refused with `bad_request` as
 //! soon as the cap is passed, and the connection is closed without reading
@@ -26,7 +33,7 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, Priority, Submission};
@@ -48,6 +55,15 @@ pub(crate) const BURST: f64 = 100.0;
 /// The most bytes a connection may leave unread before it is cut off: room
 /// for two responses of the largest size.
 pub(crate) const OUTBOX_MAX: usize = 2 * (MAX_LINE + 1);
+/// How many unread bytes make [`Conn::send_paced`] wait: half the cap, so
+/// that what other threads queue meanwhile (responses, events) still fits.
+pub(crate) const PACE_HIGH_WATER: usize = OUTBOX_MAX / 2;
+/// How long [`Conn::send_paced`] waits for a client that takes no byte
+/// before it cuts the client off.
+pub(crate) const PACE_STALL: Duration = Duration::from_secs(30);
+/// The longest [`Conn::send_paced`] sleeps between looks at the connection:
+/// a connection that closes wakes no one that waits on the outbox's lock.
+const PACE_TICK: Duration = Duration::from_millis(100);
 /// How much is read from the socket at a time.
 const READ_CHUNK: usize = 64 * 1024;
 /// The longest line over the rate budget whose id is still read for its
@@ -64,6 +80,8 @@ pub(crate) struct Conn {
     /// Wakes the connection's thread: output is waiting, or it must close.
     wake: EventFd,
     out: Mutex<Outbox>,
+    /// Signalled when the client takes bytes, for [`Conn::send_paced`].
+    drained: Condvar,
     closing: AtomicBool,
 }
 
@@ -73,6 +91,8 @@ struct Outbox {
     buf: Vec<u8>,
     /// How much of `buf` is sent.
     sent: usize,
+    /// Every byte the connection has sent, over its whole life.
+    taken: u64,
     /// The last state event queued, so none is sent twice.
     state: Option<VmState>,
     /// The connection is a raw byte stream now: no more lines.
@@ -95,6 +115,7 @@ impl Conn {
             stream,
             wake: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
             out: Mutex::new(Outbox::default()),
+            drained: Condvar::new(),
             closing: AtomicBool::new(false),
         };
         {
@@ -119,16 +140,16 @@ impl Conn {
     /// Queues `message` as a line, unless the connection is raw. A client
     /// that has left [`OUTBOX_MAX`] bytes unread is cut off instead.
     fn queue<T: Serialize>(&self, out: &mut Outbox, message: &T) {
+        match to_line(message) {
+            Ok(line) => self.queue_line(out, &line),
+            Err(error) => tracing::error!("control: cannot send a message: {error}"),
+        }
+    }
+
+    fn queue_line(&self, out: &mut Outbox, line: &[u8]) {
         if out.raw {
             return;
         }
-        let line = match to_line(message) {
-            Ok(line) => line,
-            Err(error) => {
-                tracing::error!("control: cannot send a message: {error}");
-                return;
-            }
-        };
         if out.pending() + line.len() > OUTBOX_MAX {
             tracing::debug!(
                 "control: a client left {} bytes unread; closing",
@@ -137,7 +158,7 @@ impl Conn {
             self.close();
             return;
         }
-        out.buf.extend_from_slice(&line);
+        out.buf.extend_from_slice(line);
     }
 
     /// Queues the state event for `state` unless one for it, or for a later
@@ -164,6 +185,58 @@ impl Conn {
         self.wake();
     }
 
+    /// Queues `message` as a line from outside the connection's thread, as
+    /// [`send_event`](Self::send_event) does, but first waits while the
+    /// client has [`PACE_HIGH_WATER`] bytes or more unread, for a stream
+    /// that is forwarded from another thread and is rather late than lost.
+    /// Returns whether the line was queued: `false` when the connection
+    /// is closing (or raw), or when the client took no byte for `stall` and
+    /// was cut off (it reconnects and asks for what it missed), or the
+    /// message cannot be a line.
+    pub(crate) fn send_paced<T: Serialize>(&self, message: &T, stall: Duration) -> bool {
+        let line = match to_line(message) {
+            Ok(line) => line,
+            Err(error) => {
+                // Dropping it would leave a hole in the stream.
+                tracing::error!("control: cannot send a message: {error}; closing");
+                self.close();
+                return false;
+            }
+        };
+        let mut out = self.lock();
+        let mut progress = (out.taken, Instant::now());
+        loop {
+            if self.is_closing() || out.raw {
+                return false;
+            }
+            // An empty outbox takes any line: they all fit the cap.
+            if out.pending() == 0 || out.pending() + line.len() <= PACE_HIGH_WATER {
+                break;
+            }
+            if out.taken != progress.0 {
+                progress = (out.taken, Instant::now());
+            }
+            let left = stall.saturating_sub(progress.1.elapsed());
+            if left.is_zero() {
+                drop(out);
+                tracing::debug!("control: a client took nothing for {stall:?}; closing");
+                self.close();
+                return false;
+            }
+            out = self
+                .drained
+                .wait_timeout(out, left.min(PACE_TICK))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        self.queue_line(&mut out, &line);
+        self.flush(&mut out);
+        if out.pending() > 0 {
+            self.wake();
+        }
+        true
+    }
+
     fn queue_state(&self, out: &mut Outbox, state: VmState) {
         if out.raw || out.state.is_some_and(|sent| sent >= state) {
             return;
@@ -178,7 +251,11 @@ impl Conn {
     fn flush(&self, out: &mut Outbox) {
         while out.sent < out.buf.len() {
             match send_nowait(self.stream.as_raw_fd(), &out.buf[out.sent..]) {
-                Ok(n) => out.sent += n,
+                Ok(n) => {
+                    out.sent += n;
+                    out.taken += n as u64;
+                    self.drained.notify_all();
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -216,9 +293,10 @@ impl Conn {
         self.closing.store(true, Ordering::Release);
         let _ = self.stream.shutdown(Shutdown::Both);
         self.wake();
+        self.drained.notify_all();
     }
 
-    fn is_closing(&self) -> bool {
+    pub(crate) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
 
@@ -395,7 +473,11 @@ impl Session {
             Flow::Close => self.conn.linger(),
             Flow::Upgrade(upgrade, pending) => self.upgrade(upgrade, pending),
         }
-        let _ = self.conn.stream.shutdown(Shutdown::Both);
+        // Closing, not just shutting the socket down: what forwards a stream
+        // into this connection from another thread (the audit
+        // subscriptions) stops when it sees it, and is joined as `self.ctx`
+        // drops.
+        self.conn.close();
     }
 
     /// Reads what the socket has and handles each complete line. EOF is an
@@ -500,6 +582,9 @@ impl Session {
                     }
                     (result, _) => {
                         self.respond(request.id, result);
+                        // Streams the op started begin only now, so that
+                        // nothing of them comes before the response.
+                        self.ctx.audit.release();
                         Flow::Continue
                     }
                 }
@@ -728,12 +813,7 @@ mod tests {
         let hello = Hello::new("boxcar/test", "s", Vec::new());
         let mut session = Session {
             conn: Arc::new(Conn::new(server, &hello).unwrap()),
-            ctx: ConnCtx {
-                peer_pid: 1,
-                peer_uid: 0,
-                raw_upgrade: None,
-                events: None,
-            },
+            ctx: ConnCtx::new(1, 0),
             ops: Arc::new(Unreached),
             audit: handle.audit().clone(),
         };
@@ -797,12 +877,7 @@ mod tests {
         let hello = Hello::new("boxcar/test", "s", Vec::new());
         let mut session = Session {
             conn: Arc::new(Conn::new(server, &hello).unwrap()),
-            ctx: ConnCtx {
-                peer_pid: 1,
-                peer_uid: 0,
-                raw_upgrade: None,
-                events: None,
-            },
+            ctx: ConnCtx::new(1, 0),
             ops: Arc::new(Upgrading),
             audit: handle.audit().clone(),
         };
@@ -815,6 +890,195 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(got[1]["result"], json!({"raw": true}));
         writer.close().unwrap();
+    }
+
+    /// A connection with its thread serving it (`Unreached` ops: it reads
+    /// no request), and the client's end.
+    struct Served {
+        conn: Arc<Conn>,
+        client: UnixStream,
+        thread: Option<std::thread::JoinHandle<()>>,
+        // Keeps the audit writer the session holds a sink of.
+        _tmp: tempfile::TempDir,
+        writer: Option<boxcar_audit::WriterHandle>,
+    }
+
+    impl Served {
+        fn new() -> Served {
+            let tmp = tempfile::tempdir().unwrap();
+            let (handle, writer) = crate::lifecycle::test_handle(tmp.path());
+            let (server, client) = UnixStream::pair().unwrap();
+            let hello = Hello::new("boxcar/test", "s", Vec::new());
+            let conn = Arc::new(Conn::new(server, &hello).unwrap());
+            let session = Session {
+                conn: conn.clone(),
+                ctx: ConnCtx::new(1, 0),
+                ops: Arc::new(Unreached),
+                audit: handle.audit().clone(),
+            };
+            let thread = std::thread::spawn(move || session.serve());
+            Served {
+                conn,
+                client,
+                thread: Some(thread),
+                _tmp: tmp,
+                writer: Some(writer),
+            }
+        }
+
+        /// The connection's thread has ended.
+        fn ended(&mut self) {
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.conn.close();
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.close();
+            }
+        }
+    }
+
+    /// An event line of about `len` bytes, numbered `n`.
+    fn numbered(n: u64, len: usize) -> Value {
+        json!({"v": 1, "event": "x", "n": n, "pad": "p".repeat(len)})
+    }
+
+    /// What is queued the ordinary way (a response, an event) is never
+    /// waited for: past the outbox's cap, a client that has not read it is
+    /// cut off, and the outbox never holds more than the cap.
+    #[test]
+    fn outbox_cap_closes_a_slow_subscriber_connection() {
+        let hello = Hello::new("boxcar/test", "s", Vec::new());
+        let (server, client) = UnixStream::pair().unwrap();
+        let conn = Conn::new(server, &hello).unwrap();
+        // No thread serves this connection, so nothing is ever sent: every
+        // byte queued stays in the outbox.
+        let line = to_line(&numbered(0, 60 * 1024)).unwrap().len();
+        let mut queued = 0;
+        while !conn.is_closing() {
+            conn.send_event(&numbered(queued, 60 * 1024));
+            queued += 1;
+            assert!(conn.lock().pending() <= OUTBOX_MAX);
+            assert!(queued <= (OUTBOX_MAX / line) as u64 + 2, "never cut off");
+        }
+        // The one that would pass the cap was not queued.
+        assert_eq!(queued as usize, OUTBOX_MAX / line + 1, "{line}");
+        // What it was sent before is all it gets, then the end.
+        let got = lines(client);
+        assert_eq!(got.len(), 1, "only the hello, which was sent at once");
+    }
+
+    /// A paced stream (`send_paced`) goes at the client's own speed: while
+    /// the client reads nothing the producer waits, with the outbox under
+    /// the high-water mark; once it reads, every line arrives, in order,
+    /// and the connection is not cut off.
+    #[test]
+    fn a_paced_stream_goes_at_the_clients_pace() {
+        const LINES: u64 = 300;
+        const LEN: usize = 24 * 1024;
+        let served = Served::new();
+        let producer = std::thread::spawn({
+            let conn = served.conn.clone();
+            move || {
+                for n in 0..LINES {
+                    assert!(conn.send_paced(&numbered(n, LEN), Duration::from_secs(20)));
+                }
+            }
+        });
+        // The client reads nothing: the socket fills, then the outbox,
+        // up to the mark, and there the producer waits.
+        let started = Instant::now();
+        while served.conn.lock().pending() <= PACE_HIGH_WATER / 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "never backed up"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..50 {
+            assert!(served.conn.lock().pending() <= PACE_HIGH_WATER);
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert!(!producer.is_finished(), "it should be waiting");
+
+        // Now it reads, slowly, and gets every line.
+        let mut reader = std::io::BufReader::new(served.client.try_clone().unwrap());
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        for n in 0..LINES {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let got: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(got["n"], n);
+            if n % 16 == 0 {
+                assert!(served.conn.lock().pending() <= PACE_HIGH_WATER);
+            }
+        }
+        producer.join().unwrap();
+        assert!(!served.conn.is_closing());
+    }
+
+    /// A paced stream does not wait for ever for a client that takes
+    /// nothing: after the stall limit it cuts the client off and says so,
+    /// with the outbox never past the high-water mark, and the
+    /// connection's thread ends.
+    #[test]
+    fn a_paced_stream_cuts_off_a_client_that_takes_nothing() {
+        let mut served = Served::new();
+        let stall = Duration::from_millis(300);
+        let started = Instant::now();
+        let mut sent = 0;
+        while served.conn.send_paced(&numbered(sent, 16 * 1024), stall) {
+            sent += 1;
+            assert!(served.conn.lock().pending() <= PACE_HIGH_WATER);
+            assert!(sent < 1000, "never cut off");
+        }
+        let waited = started.elapsed();
+        assert!(waited >= stall, "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert!(served.conn.is_closing());
+        // More than the high-water mark went out (the socket's own buffer
+        // holds some), and less than it and the socket's buffers can hold.
+        assert!(sent as usize * 16 * 1024 > PACE_HIGH_WATER);
+        // Nothing more is taken once it is closed.
+        assert!(!served.conn.send_paced(&numbered(0, 1), stall));
+        served.ended();
+        // The client reads what it was sent, then the end.
+        let got = lines(served.client.try_clone().unwrap());
+        assert!(got.len() as u64 <= sent + 1, "{} of {sent}", got.len());
+    }
+
+    /// A producer waiting for room is let go when the connection closes,
+    /// well before the stall limit.
+    #[test]
+    fn a_waiting_paced_send_returns_when_the_connection_closes() {
+        let served = Served::new();
+        let producer = std::thread::spawn({
+            let conn = served.conn.clone();
+            move || {
+                let mut n = 0;
+                while conn.send_paced(&numbered(n, 32 * 1024), Duration::from_secs(3600)) {
+                    n += 1;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!producer.is_finished(), "it should be waiting");
+        let closed = Instant::now();
+        served.conn.close();
+        producer.join().unwrap();
+        assert!(
+            closed.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            closed.elapsed()
+        );
     }
 
     #[test]
