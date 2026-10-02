@@ -67,7 +67,7 @@ const LEVEL_TYPE_CORE: u32 = 2;
 ///   subleaf 0 is the thread level (type 1, EBX = 1, EAX shift 0), subleaf 1
 ///   the core level (type 2, EBX = `num_cpus`, EAX = bits needed for
 ///   `num_cpus` IDs); any further subleaf is marked invalid (type 0,
-///   EAX = EBX = 0) so the enumeration ends at the core level. ECX[7:0] is the
+///   EAX = EBX = 0) so the enumeration ends at the core level. ECX `[7:0]` is the
 ///   subleaf number.
 /// - AMD leaf 0x8000_0008: ECX `[7:0]` = `num_cpus - 1`.
 /// - AMD leaf 0x8000_001E: EAX = `vcpu_id` (extended APIC ID).
@@ -156,7 +156,7 @@ fn add_missing_ext_topology_levels(cpuid: &mut CpuId) -> Result<()> {
 /// Sets the CPUID of `vcpu` to KVM's supported CPUID patched by
 /// [`patch_cpuid`] for vCPU `vcpu_id` of `num_cpus`. With more than one
 /// vCPU, leaf 0xB gets the subleaves it needs first (see
-/// [`add_missing_ext_topology_levels`]); one vCPU is left as KVM reports it.
+/// `add_missing_ext_topology_levels`); one vCPU is left as KVM reports it.
 pub fn setup_cpuid(kvm: &Kvm, vcpu: &VcpuFd, vcpu_id: u8, num_cpus: u8) -> Result<()> {
     let mut cpuid = kvm
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)

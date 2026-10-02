@@ -387,16 +387,15 @@ fn device_error(message: String) -> ActivateError {
 
 // Moving frames.
 
-/// Hands every chain the driver made available on the TX `queue` to
+/// Takes every frame the driver has queued on the TX queue, hands it to
 /// `stack`, each frame without its header, and returns each to the used
 /// ring with nothing written. Returns whether the driver wants an
 /// interrupt.
 ///
-/// It drains as [`boxcar_virtio::drain_queue`] does (notifications off
-/// while it pops, then on again, and a chain offered meanwhile is taken),
-/// but checks `stop` before every write to the ring: handing a frame to
-/// the stack can wait on the audit log, and a reset may come meanwhile.
-/// Once `stop` is set it returns at once, touching the ring no more.
+/// It drains with [`boxcar_virtio::drain_queue_until`], stopping as soon as
+/// `stop` is set: handing a frame to the stack can wait on the audit log,
+/// and a reset may come meanwhile; once it has come the ring is touched no
+/// more.
 ///
 /// An `Err` means the ring is unusable: it announces chains that cannot be
 /// popped, or its used ring or notification fields cannot be written.
@@ -408,42 +407,15 @@ pub(crate) fn transmit(
     stop: &StopFlag,
 ) -> Result<bool, virtio_queue::Error> {
     let mut frame = Vec::with_capacity(MAX_FRAME_LEN);
-    // Consecutive passes that popped nothing though the ring said there was
-    // more: once is a race with the driver, twice a broken ring.
-    let mut idle_passes = 0;
-    loop {
-        if stop.is_set() {
-            return Ok(false);
-        }
-        queue.disable_notification(mem)?;
-        let mut used_any = false;
-        loop {
-            if stop.is_set() {
-                return Ok(false);
-            }
-            let Some(chain) = queue.pop_descriptor_chain(mem) else {
-                break;
-            };
-            let head = chain.head_index();
+    boxcar_virtio::drain_queue_until(
+        queue,
+        mem,
+        || stop.is_set(),
+        |chain| {
             hand_over(mem, chain, &mut frame, stack, counters);
-            if stop.is_set() {
-                return Ok(false);
-            }
-            queue.add_used(mem, head, 0)?;
-            used_any = true;
-        }
-        if stop.is_set() {
-            return Ok(false);
-        }
-        if !queue.enable_notification(mem)? {
-            break;
-        }
-        idle_passes = if used_any { 0 } else { idle_passes + 1 };
-        if idle_passes == 2 {
-            return Err(virtio_queue::Error::InvalidAvailRingIndex);
-        }
-    }
-    queue.needs_notification(mem)
+            Ok::<u32, virtio_queue::Error>(0)
+        },
+    )
 }
 
 /// Gives `stack` the frame in a TX `chain`, or counts and logs why not.

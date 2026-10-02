@@ -41,8 +41,31 @@ use vm_memory::GuestMemoryMmap;
 ///
 /// The queue must be ready and inside guest memory ([`QueueT::is_valid`]); a
 /// device checks that once, at activation.
-pub fn drain_queue<F, E>(queue: &mut Queue, mem: &GuestMemoryMmap, mut f: F) -> Result<bool, E>
+pub fn drain_queue<F, E>(queue: &mut Queue, mem: &GuestMemoryMmap, f: F) -> Result<bool, E>
 where
+    F: FnMut(DescriptorChain<&GuestMemoryMmap>) -> Result<u32, E>,
+    E: From<virtio_queue::Error>,
+{
+    drain_queue_until(queue, mem, || false, f)
+}
+
+/// [`drain_queue`], stopping short when `stop` says so.
+///
+/// `stop` is asked before each pop, after each callback and before each
+/// write to the ring's notification fields: a device whose callback can
+/// wait (on the audit log, say) and whose reset may come meanwhile returns
+/// at once when it does, touching the ring no more, with `Ok(false)` (no
+/// interrupt wanted). A chain whose callback ran when the stop came is not
+/// handed back to the guest: the device is being reset, and the guest's
+/// driver forgets its queues with it.
+pub fn drain_queue_until<S, F, E>(
+    queue: &mut Queue,
+    mem: &GuestMemoryMmap,
+    mut stop: S,
+    mut f: F,
+) -> Result<bool, E>
+where
+    S: FnMut() -> bool,
     F: FnMut(DescriptorChain<&GuestMemoryMmap>) -> Result<u32, E>,
     E: From<virtio_queue::Error>,
 {
@@ -52,9 +75,18 @@ where
     // pops it. Two in a row means the ring cannot be popped at all.
     let mut idle_passes = 0;
     loop {
+        if stop() {
+            return Ok(false);
+        }
         queue.disable_notification(mem)?;
         let mut used_any = false;
-        while let Some(chain) = queue.pop_descriptor_chain(mem) {
+        loop {
+            if stop() {
+                return Ok(false);
+            }
+            let Some(chain) = queue.pop_descriptor_chain(mem) else {
+                break;
+            };
             let head = chain.head_index();
             let len = match f(chain) {
                 Ok(len) => len,
@@ -65,8 +97,14 @@ where
                     return Err(err);
                 }
             };
+            if stop() {
+                return Ok(false);
+            }
             queue.add_used(mem, head, len)?;
             used_any = true;
+        }
+        if stop() {
+            return Ok(false);
         }
         if !queue.enable_notification(mem)? {
             break;

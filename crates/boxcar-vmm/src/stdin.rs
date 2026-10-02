@@ -24,7 +24,7 @@
 //!
 //! When stdin is a TTY and the console goes to stdout, the VMM puts the
 //! terminal in raw mode ([`RawModeGuard`]) and forwards what is typed to
-//! COM1 ([`StdinSubscriber`]). Ctrl-C then reaches the guest; pressing
+//! COM1 (`StdinSubscriber`). Ctrl-C then reaches the guest; pressing
 //! Ctrl-] twice within a second stops the VM instead, whatever the guest is
 //! doing: the escape is detected on every byte read, before the serial
 //! FIFO is looked at, so a guest that has stopped reading its console
@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::timerfd::TimerFd;
 
 use crate::devices::SerialDevice;
 use crate::lifecycle::{block_signals, SignalFd, StopReason, VmmHandle};
@@ -465,7 +466,7 @@ const JOB_CONTROL_STEP: Duration = Duration::from_millis(200);
 /// gives the terminal back as it was, then stops the process the way the
 /// signal's default action does (the shell sees the job stopped, and has a
 /// cooked terminal, whatever it does or does not save); on `SIGCONT`, and
-/// every [`JOB_CONTROL_STEP`] besides, it takes the terminal again if
+/// every `JOB_CONTROL_STEP` besides, it takes the terminal again if
 /// this process is in the foreground and a guard wants it raw. A run
 /// started in the background, or one stopped and then sent to the
 /// background with `bg`, takes the terminal when `fg` brings it back.
@@ -550,7 +551,27 @@ const READ_CHUNK: usize = 64;
 /// How much input waits for room in the receive FIFO.
 const HOLD_CAP: usize = 4096;
 
+/// How often a [`StdinSubscriber`] that left stdin unread in the
+/// background looks at the foreground again.
+const FOREGROUND_RECHECK: Duration = Duration::from_millis(200);
+
+/// Whether this process is in the foreground of its stdin terminal, or
+/// stdin is not a terminal: what the subscriber asks before every read.
+fn stdin_in_foreground() -> bool {
+    is_foreground(libc::STDIN_FILENO)
+}
+
 /// Forwards stdin to COM1 on the main loop.
+///
+/// Stdin is read only while this process is in the foreground of its
+/// terminal (the rule the `pty-stdin` thread follows too): a read from the
+/// background would stop the process with `SIGTTIN`, so the first line a
+/// user typed for the shell after `kill -TSTP` and `bg`, or a run started
+/// with `&`, would stop the VM. In the background the input is left where
+/// it is, stdin is not watched (a level-triggered wait would spin), and a
+/// timer looks at the foreground every [`FOREGROUND_RECHECK`]; when the
+/// process is in the foreground again, stdin is watched and read as
+/// before, the escape included.
 ///
 /// Every byte read is first run through the [`EscapeDetector`]; a double
 /// Ctrl-] stops the VM and the chunk is dropped. Only then is the input
@@ -566,6 +587,16 @@ const HOLD_CAP: usize = 4096;
 pub(crate) struct StdinSubscriber {
     serial: Arc<Mutex<SerialDevice>>,
     buffer_ready: EventFd,
+    /// The descriptor read: stdin, or a test's pipe.
+    stdin: RawFd,
+    /// Whether this process may read `stdin` now: in the foreground of its
+    /// terminal. A test's says what the test wants.
+    foreground: Box<dyn Fn() -> bool + Send>,
+    /// Fires while `stdin` is left unwatched in the background.
+    recheck: TimerFd,
+    /// `stdin` is not watched: it was readable while the process was in
+    /// the background.
+    unwatched: bool,
     /// Stdin reached EOF or failed; it is never watched again.
     closed: bool,
     escape: EscapeDetector,
@@ -584,10 +615,32 @@ impl StdinSubscriber {
         handle: VmmHandle,
         dropped_input: Arc<AtomicU64>,
     ) -> io::Result<Self> {
+        Self::reading(
+            libc::STDIN_FILENO,
+            Box::new(stdin_in_foreground),
+            serial,
+            handle,
+            dropped_input,
+        )
+    }
+
+    /// [`new`](Self::new), reading `stdin` while `foreground` says this
+    /// process may.
+    pub(crate) fn reading(
+        stdin: RawFd,
+        foreground: Box<dyn Fn() -> bool + Send>,
+        serial: Arc<Mutex<SerialDevice>>,
+        handle: VmmHandle,
+        dropped_input: Arc<AtomicU64>,
+    ) -> io::Result<Self> {
         let buffer_ready = lock(&serial).buffer_ready_evt().try_clone()?;
         Ok(StdinSubscriber {
             serial,
             buffer_ready,
+            stdin,
+            foreground,
+            recheck: TimerFd::new()?,
+            unwatched: false,
             closed: false,
             escape: EscapeDetector::default(),
             handle,
@@ -596,17 +649,67 @@ impl StdinSubscriber {
         })
     }
 
-    /// Stdin and the buffer-ready eventfd. The caller registers both.
-    pub(crate) fn fds(&self) -> [RawFd; 2] {
-        [libc::STDIN_FILENO, self.buffer_ready.as_raw_fd()]
+    /// Stdin, the buffer-ready eventfd and the foreground timer. The
+    /// caller registers them all.
+    pub(crate) fn fds(&self) -> [RawFd; 3] {
+        [
+            self.stdin,
+            self.buffer_ready.as_raw_fd(),
+            self.recheck.as_raw_fd(),
+        ]
     }
 
     fn close(&mut self, ops: &mut EventOps) {
         if !self.closed {
             self.closed = true;
-            if let Err(error) = ops.remove(Events::new_raw(libc::STDIN_FILENO, EventSet::IN)) {
-                tracing::warn!("cannot stop watching stdin: {error}");
+            if !self.unwatched {
+                if let Err(error) = ops.remove(Events::new_raw(self.stdin, EventSet::IN)) {
+                    tracing::warn!("cannot stop watching stdin: {error}");
+                }
             }
+            self.unwatched = false;
+            let _ = self.recheck.clear();
+        }
+    }
+
+    /// Stdin is readable, and this process is in the background: leaves it
+    /// unread and unwatched, and starts looking at the foreground.
+    fn leave_unread(&mut self, ops: &mut EventOps) {
+        if self.unwatched {
+            return;
+        }
+        if let Err(error) = ops.remove(Events::new_raw(self.stdin, EventSet::IN)) {
+            tracing::warn!("cannot stop watching stdin: {error}");
+            return;
+        }
+        self.unwatched = true;
+        if let Err(error) = self
+            .recheck
+            .reset(FOREGROUND_RECHECK, Some(FOREGROUND_RECHECK))
+        {
+            tracing::warn!("cannot arm the foreground timer: {error}");
+        }
+    }
+
+    /// The foreground timer fired: watches stdin again if the process is
+    /// back in the foreground.
+    fn on_recheck(&mut self, ops: &mut EventOps) {
+        if let Err(error) = self.recheck.wait() {
+            tracing::debug!("the foreground timer: {error}");
+        }
+        if !self.unwatched || self.closed {
+            let _ = self.recheck.clear();
+            return;
+        }
+        if !(self.foreground)() {
+            return;
+        }
+        match ops.add(Events::new_raw(self.stdin, EventSet::IN)) {
+            Ok(()) => {
+                self.unwatched = false;
+                let _ = self.recheck.clear();
+            }
+            Err(error) => tracing::warn!("cannot watch stdin again: {error}"),
         }
     }
 
@@ -662,9 +765,12 @@ impl StdinSubscriber {
         if self.closed {
             return;
         }
+        if !(self.foreground)() {
+            return self.leave_unread(ops);
+        }
         let mut buf = [0u8; READ_CHUNK];
         // SAFETY: reads at most `buf.len()` bytes into `buf`.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(self.stdin, buf.as_mut_ptr().cast(), buf.len()) };
         match usize::try_from(n) {
             Ok(0) => {
                 tracing::debug!("stdin reached EOF; no more console input");
@@ -690,7 +796,9 @@ impl MutEventSubscriber for StdinSubscriber {
         if events.fd() == self.buffer_ready.as_raw_fd() {
             let _ = self.buffer_ready.read();
             self.on_buffer_ready();
-        } else if events.fd() == libc::STDIN_FILENO {
+        } else if events.fd() == self.recheck.as_raw_fd() {
+            self.on_recheck(ops);
+        } else if events.fd() == self.stdin {
             self.on_stdin(ops);
         }
     }
@@ -1247,6 +1355,171 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    /// A subscriber on a pipe standing in for stdin, in a real event
+    /// loop, whose foreground is whatever the test says.
+    struct Piped {
+        manager: event_manager::EventManager<Box<dyn MutEventSubscriber>>,
+        id: event_manager::SubscriberId,
+        writer: std::fs::File,
+        reader_fd: RawFd,
+        foreground: Arc<AtomicBool>,
+        serial: Arc<Mutex<SerialDevice>>,
+        _handle: VmmHandle,
+        _audit: boxcar_audit::WriterHandle,
+        _dir: tempfile::TempDir,
+    }
+
+    fn piped(foreground: bool) -> Piped {
+        use event_manager::SubscriberOps;
+        use std::os::fd::FromRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, audit) = test_handle(dir.path());
+        let (sink, _writer) = ConsoleWriter::spawn_with(std::io::sink()).unwrap();
+        let serial = Arc::new(Mutex::new(SerialDevice::new(sink).unwrap()));
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2 writes two descriptors into the array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (reader_fd, writer_fd) = (fds[0], fds[1]);
+        // SAFETY: the write end is ours, just made, and owned once.
+        let writer = unsafe { std::fs::File::from_raw_fd(writer_fd) };
+        let foreground = Arc::new(AtomicBool::new(foreground));
+        let says = Arc::clone(&foreground);
+        let subscriber = StdinSubscriber::reading(
+            reader_fd,
+            Box::new(move || says.load(Ordering::SeqCst)),
+            serial.clone(),
+            handle.clone(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        let watched = subscriber.fds();
+        let mut manager = event_manager::EventManager::new().unwrap();
+        let id = manager.add_subscriber(Box::new(subscriber) as Box<dyn MutEventSubscriber>);
+        let mut ops = manager.event_ops(id).unwrap();
+        for fd in watched {
+            ops.add(Events::new_raw(fd, EventSet::IN)).unwrap();
+        }
+        Piped {
+            manager,
+            id,
+            writer,
+            reader_fd,
+            foreground,
+            serial,
+            _handle: handle,
+            _audit: audit,
+            _dir: dir,
+        }
+    }
+
+    impl Piped {
+        /// Dispatches what is ready within `ms`; how many events there were.
+        fn run(&mut self, ms: i32) -> usize {
+            self.manager.run_with_timeout(ms).unwrap()
+        }
+
+        /// Whether the pipe still holds unread bytes.
+        fn pipe_has_input(&self) -> bool {
+            let mut fd = libc::pollfd {
+                fd: self.reader_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialized pollfd, no wait.
+            unsafe { libc::poll(&mut fd, 1, 0) == 1 }
+        }
+
+        /// What the guest finds in the receive FIFO.
+        fn fifo(&self) -> Vec<u8> {
+            let mut serial = lock(&self.serial);
+            let mut out = Vec::new();
+            while serial.fifo_capacity() < 64 {
+                let mut byte = [0u8];
+                serial.read(0, &mut byte);
+                out.push(byte[0]);
+            }
+            out
+        }
+    }
+
+    /// Runs the loop until `done`, failing after 5 s.
+    fn run_until(piped: &mut Piped, what: &str, mut done: impl FnMut(&Piped) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(piped) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            piped.run(200);
+        }
+    }
+
+    /// Runs the loop until nothing is ready any more, failing after 5 s:
+    /// nothing watched is left readable, so the loop does not spin.
+    fn run_until_quiet(piped: &mut Piped) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while piped.run(200) > 0 {
+            assert!(Instant::now() < deadline, "the loop never went quiet");
+        }
+    }
+
+    /// In the background, input is left in stdin unread (so the kernel
+    /// never stops the process for reading it) and stdin is not watched
+    /// (so the loop does not spin); back in the foreground, the timer sees
+    /// it and the input is read and forwarded as before.
+    #[test]
+    fn stdin_is_read_only_in_the_foreground() {
+        use std::io::Write as _;
+        let mut piped = piped(false);
+        piped.writer.write_all(b"ls\n").unwrap();
+        // Stdin is readable: left alone, and unwatched from now on.
+        assert!(piped.run(1000) >= 1);
+        assert!(piped.pipe_has_input(), "read in the background");
+        assert!(piped.fifo().is_empty());
+        // Only the timer fires now (every 200 ms); stdin stays unread, and
+        // the loop does not spin on it.
+        let fired = piped.run(500);
+        assert!((1..=4).contains(&fired), "{fired} events");
+        assert!(piped.pipe_has_input());
+        assert!(piped.fifo().is_empty());
+
+        // Back in the foreground: within a timer step stdin is watched and
+        // read.
+        piped.foreground.store(true, Ordering::SeqCst);
+        run_until(&mut piped, "the input to be read", |piped| {
+            !piped.pipe_has_input()
+        });
+        assert_eq!(piped.fifo(), b"ls\n");
+        // And it goes on being read at once while in the foreground.
+        piped.writer.write_all(b"x").unwrap();
+        run_until(&mut piped, "the next input", |piped| {
+            !piped.pipe_has_input()
+        });
+        assert_eq!(piped.fifo(), b"x");
+        run_until_quiet(&mut piped);
+    }
+
+    /// In the foreground the escape still stops the VM, and EOF ends the
+    /// reading for good: nothing is left watched.
+    #[test]
+    fn a_piped_stdin_in_the_foreground_forwards_escape_and_eof() {
+        use std::io::Write as _;
+        let mut piped = piped(true);
+        piped.writer.write_all(b"hi").unwrap();
+        run_until(&mut piped, "the input to be read", |piped| {
+            !piped.pipe_has_input()
+        });
+        assert_eq!(piped.fifo(), b"hi");
+        piped.writer.write_all(&[ESCAPE_BYTE, ESCAPE_BYTE]).unwrap();
+        run_until(&mut piped, "the escape", |piped| {
+            piped._handle.state() == VmState::Stopping
+        });
+        assert!(piped.fifo().is_empty(), "the escape is not forwarded");
+        drop(std::mem::replace(
+            &mut piped.writer,
+            tempfile::tempfile().unwrap(),
+        ));
+        run_until_quiet(&mut piped);
+        let _ = piped.id;
     }
 
     #[test]

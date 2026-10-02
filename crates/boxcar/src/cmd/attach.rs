@@ -11,7 +11,7 @@
 //! attach to the foreground. A stop (Ctrl-Z with the terminal cooked,
 //! `kill -TSTP`) gives the terminal back to the shell as it was, and a
 //! continue in the foreground takes it again
-//! ([`start_job_control`](boxcar_vmm::stdin::start_job_control)).
+//! ([`boxcar_vmm::stdin::start_job_control`]).
 //!
 //! Two connections to the session's control socket: one asks `pty.attach`
 //! and becomes the terminal's raw bytes, both ways, and nothing else; the

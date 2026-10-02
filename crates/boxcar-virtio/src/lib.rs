@@ -29,5 +29,5 @@ pub use context::{DeviceContext, MmioSlot};
 pub use device::{ActivateError, ActivatedQueue, VirtioDevice};
 pub use irq::IrqTrigger;
 pub use mmio::MmioTransport;
-pub use queue::drain_queue;
+pub use queue::{drain_queue, drain_queue_until};
 pub use slots::{SlotAllocator, SlotError};

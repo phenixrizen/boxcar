@@ -179,3 +179,31 @@ commit that made it. Written 2026-10-02.
   unaffected); `Hash`, `SessionId` and `Ring` have hand-written schemas.
   `proto/testdata/control-v1.jsonl` holds one example of every message,
   checked by `crates/boxcar-proto/tests/control_golden.rs`.
+
+### Task 14
+
+- `path_b64` is set on every `fs.*` payload with a `path` and on no other
+  name (`path_at_open`, `target_path`, `target`, `from`, `to` stay lossy
+  text), and covers at most the first 4096 bytes of the raw path, as
+  `path` is cut to 4096.
+- `ts_release_ns` is taken when the handle is released, before the hash
+  job is queued, so it is the producer's time whatever the hash takes.
+- A hash thread that panics now records its job's close as `error`
+  (plan item 5c): the `Finished` guard carries the close until the normal
+  record is made. The two existing panic tests expect that record.
+- `FsDevices::attach` takes `FsOptions { audit, request_queues }` so that
+  it keeps seven arguments (clippy's bound); `request_queues(vcpus)` is
+  `vcpus.clamp(1, 4)`.
+- The perf measurements are of a debug build, the only one on the machine
+  (a release target would not fit the disk), and say so.
+- Plan items 5a (a split TX chain over the 64 KiB bound) and 5b (`//
+  boxcar:` comments on the muxer's own fields) were already in the tree
+  (`a_split_tx_chain_over_64_kib_is_read_only_to_its_bound`; every
+  boxcar-added field initializer in `VsockMuxer::new` carries one); 5d is
+  documented in docs/audit-events.md's `vsock.close` row.
+- The stdin console subscriber reads only in the foreground (debt item 1):
+  in the background it unwatches stdin and polls the foreground every
+  200 ms from a timerfd; tested on a pipe with an injected foreground
+  predicate, in a real event loop.
+- `target/debug/incremental` was removed once to make room for the builds
+  (the disk was down to nothing during the workspace test build).

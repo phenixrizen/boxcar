@@ -257,7 +257,7 @@ pub struct VerifyArgs {
 #[derive(Debug, Args)]
 pub struct SessionArgs {
     /// The session's control socket. Default: the session's, under
-    /// $XDG_RUNTIME_DIR/boxcar/, or /tmp/boxcar-<uid>/ without a usable
+    /// $XDG_RUNTIME_DIR/boxcar/, or `/tmp/boxcar-<uid>/` without a usable
     /// XDG_RUNTIME_DIR.
     #[arg(long, value_name = "PATH", conflicts_with = "session_id")]
     pub control: Option<PathBuf>,
@@ -378,7 +378,7 @@ pub struct RunArgs {
     /// Early printk on the serial console and every kernel message.
     #[arg(long)]
     pub debug_boot: bool,
-    /// Where audit logs go: DIR/sessions/<session-id>/. Default:
+    /// Where audit logs go: `DIR/sessions/<session-id>/`. Default:
     /// $XDG_DATA_HOME/boxcar, or ~/.local/share/boxcar. It may not be
     /// inside `--rootfs` or `--workspace`, nor may either of them be DIR,
     /// DIR/sessions or a session's directory, which hold the logs; a
