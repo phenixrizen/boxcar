@@ -123,12 +123,14 @@ fn set_stdin_termios(termios: &libc::termios) -> io::Result<()> {
 }
 
 /// `termios` in raw mode, as [`RawModeGuard`] sets it: no line editing, no
-/// echo, no signals from Ctrl-C or Ctrl-Z and no flow control from Ctrl-S
-/// or Ctrl-Q, so that every key reaches the reader (`boxcar attach`'s
-/// Ctrl-Q, and a guest program's Ctrl-S); output processing stays.
+/// echo, no signals from Ctrl-C or Ctrl-Z, and no flow control either way:
+/// Ctrl-S and Ctrl-Q reach the reader (`boxcar attach`'s Ctrl-Q, a guest
+/// program's Ctrl-S) instead of pausing output (`IXON`), and the terminal
+/// sends no XOFF of its own when its input fills (`IXOFF`). Output
+/// processing stays.
 pub fn raw_termios(mut termios: libc::termios) -> libc::termios {
     termios.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-    termios.c_iflag &= !libc::IXON;
+    termios.c_iflag &= !(libc::IXON | libc::IXOFF);
     termios
 }
 
@@ -374,7 +376,7 @@ mod tests {
     fn raw_mode_lets_every_key_through_and_keeps_the_rest() {
         // SAFETY: termios is plain data; all zeroes is valid.
         let mut cooked: libc::termios = unsafe { std::mem::zeroed() };
-        cooked.c_iflag = libc::ICRNL | libc::IXON | libc::IUTF8;
+        cooked.c_iflag = libc::ICRNL | libc::IXON | libc::IXOFF | libc::IUTF8;
         cooked.c_oflag = libc::OPOST | libc::ONLCR;
         cooked.c_cflag = libc::CS8 | libc::CREAD;
         cooked.c_lflag = libc::ISIG | libc::ICANON | libc::ECHO | libc::ECHOE | libc::IEXTEN;

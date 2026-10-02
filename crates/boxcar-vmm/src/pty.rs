@@ -17,11 +17,23 @@
 //!
 //! **The guest never waits on a viewer.** The hub's thread reads the guest's
 //! stream as fast as it comes, into a [`SCROLLBACK`] (256 KiB) ring and onto
-//! each client's queue, and never waits on a client: a client with more
-//! than [`BACKLOG_MAX`] (1 MiB) of output waiting is detached
-//! ([`End::Slow`]), and a control connection then hears
-//! `{"v":1,"event":"pty.detached","reason":"slow"}`. With no client at all
-//! the hub still reads, into the ring.
+//! each client's queue, and never waits on a client: a viewer with more than
+//! [`BACKLOG_MAX`] (1 MiB) of output waiting is detached ([`End::Slow`]).
+//! The connections that watch its attach (`pty.watch`, [`PtyHub::watch`])
+//! then hear `pty.detached` (reason `slow`), sent by the attach's own writer
+//! (see [`raw`]); the attached stream itself carries only the session's
+//! bytes, and ends. With no client at all the hub still reads, into the
+//! ring.
+//!
+//! **The session waits on `boxcar run`.** The one primary client
+//! ([`PtyHub::attach_primary`]: `boxcar run`'s own stdout) is never
+//! detached and nothing is skipped for it: while it is more than its limit
+//! ([`PRIMARY_BACKLOG_MAX`]) behind, the hub stops reading the guest, whose
+//! output then backs up to the session, which waits on its terminal, until
+//! the primary is back under three quarters of the limit. Viewers get
+//! nothing new meanwhile, and are not detached for it. The pause ends as
+//! well when the primary goes (its output is dropped, or it is detached),
+//! and when the hub is closed.
 //!
 //! A client ([`PtyHub::attach`]) gets the newest bytes of the ring it asks
 //! for (its replay), then everything the session prints from then on: the
@@ -30,7 +42,7 @@
 //! sends goes into one input queue of at most [`INPUT_MAX`] (64 KiB), which
 //! the hub's thread writes to the guest as the stream takes it; what does
 //! not fit is dropped and counted ([`PtyHub::input_dropped`]), never waited
-//! for (`boxcar run`'s own stdin waits for room instead,
+//! for (`boxcar run`'s piped stdin waits for room instead,
 //! [`Input::send_all`]). [`PtyHub::resize`] sends the terminal's new size to
 //! init over the guest control channel: the latest size asked for wins, and
 //! a size the terminal has already is not sent again.
@@ -47,14 +59,14 @@ pub mod input;
 pub mod out;
 pub mod raw;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,6 +78,7 @@ use crate::console::Ring;
 use crate::guest_ctl::{GuestCtlHandle, SendError, REACTIVATED};
 use crate::services::Service;
 
+use boxcar_proto::control::PTY_DETACHED_SLOW;
 pub use boxcar_proto::control::PTY_SESSION as SESSION;
 
 /// A piece of the session's output, as a client gets it: shared by every
@@ -75,8 +88,15 @@ pub type Bytes = Arc<[u8]>;
 /// The scrollback the hub keeps of the session's output, for replays.
 pub const SCROLLBACK: usize = 256 * 1024;
 
-/// The most output a client may leave waiting; past it, it is detached.
+/// The most output a viewer may leave waiting; past it, it is detached.
 pub const BACKLOG_MAX: usize = 1 << 20;
+
+/// How far the primary client (`boxcar run`'s stdout) may fall behind
+/// before the hub stops reading the guest, holding the session back. It is
+/// small on purpose: what the primary holds when the VM stops gets only
+/// `boxcar run`'s post-stop wait (2 s without progress, 30 s at most), so
+/// a stdout that stalls must stall the session while it still runs.
+pub const PRIMARY_BACKLOG_MAX: usize = 1 << 20;
 
 /// The most input waiting for the guest, from every client together.
 pub const INPUT_MAX: usize = 64 * 1024;
@@ -129,6 +149,23 @@ pub enum End {
     Detached,
 }
 
+/// A control connection watching an attach (`pty.watch`): told when the hub
+/// detaches it.
+pub trait Watcher: Send + Sync {
+    /// Queues `pty.detached` for the attach `attach_id` with `reason`,
+    /// without waiting. Returns false when the connection is gone.
+    fn detached(&self, attach_id: &str, reason: &str) -> bool;
+
+    /// What tells one watcher from another: a connection that watches an
+    /// attach twice is told once.
+    fn key(&self) -> usize;
+}
+
+/// `pty.watch` for an attach the hub does not have: never named, or ended.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no attach {0:?}: it never was, or it has ended")]
+pub struct UnknownAttach(pub String);
+
 /// Input from a client that the session's terminal no longer takes: the
 /// session ended, or the client was detached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -148,8 +185,14 @@ struct Shared {
     guest: GuestCtlHandle,
     /// Set once the one connection of the VMM's life is taken.
     taken: AtomicBool,
-    /// Wakes the hub's thread: input is waiting.
-    wake: EventFd,
+    /// Wakes the hub's thread: input is waiting, the primary caught up or
+    /// went, or the hub is closing.
+    wake: Arc<EventFd>,
+    /// [`PtyHub::close`] was called: the hub reads the guest to its end,
+    /// paused or not.
+    closing: AtomicBool,
+    /// [`PRIMARY_BACKLOG_MAX`], or a test's.
+    primary_max: usize,
     state: Mutex<State>,
     /// Told when the input queue has room again and when the terminal
     /// ends.
@@ -170,6 +213,8 @@ struct Totals {
     input_dropped: AtomicU64,
     /// Input read-only clients sent.
     ro_discarded: AtomicU64,
+    /// The hub holds off reading the guest for its primary.
+    paused: AtomicBool,
 }
 
 struct State {
@@ -183,6 +228,8 @@ struct State {
     sent: Option<(u16, u16)>,
     /// The size last asked for.
     wanted: Option<(u16, u16)>,
+    /// The clients control connections can watch, by name.
+    named: HashMap<String, Weak<ClientShared>>,
 }
 
 /// A client, as the hub holds it.
@@ -193,23 +240,33 @@ struct Client {
 }
 
 impl Client {
-    /// Queues `chunk` for the client, unless that would leave it more than
-    /// [`BACKLOG_MAX`] behind or it is gone. Returns whether it stays.
+    /// Queues `chunk` for the client, unless that would leave a viewer more
+    /// than [`BACKLOG_MAX`] behind (the primary is never left behind: the
+    /// hub pauses for it instead) or it is gone. Returns whether it stays.
     fn offer(&self, chunk: &Bytes) -> bool {
         let len = chunk.len();
         let backlog = &self.shared.backlog;
-        if backlog.load(Ordering::Acquire).saturating_add(len) > BACKLOG_MAX {
+        if self.shared.primary.is_none()
+            && backlog.load(Ordering::SeqCst).saturating_add(len) > BACKLOG_MAX
+        {
             self.shared.finish(End::Slow);
             return false;
         }
-        backlog.fetch_add(len, Ordering::AcqRel);
+        backlog.fetch_add(len, Ordering::SeqCst);
         if self.tx.send(Arc::clone(chunk)).is_err() {
-            backlog.fetch_sub(len, Ordering::AcqRel);
+            backlog.fetch_sub(len, Ordering::SeqCst);
             self.shared.finish(End::Detached);
             return false;
         }
         true
     }
+}
+
+/// What the primary client needs to wake a paused hub.
+struct Primary {
+    wake: Arc<EventFd>,
+    /// The backlog the hub reads the guest again at.
+    resume: usize,
 }
 
 /// A client, as its output and input see it.
@@ -221,6 +278,12 @@ struct ClientShared {
     /// its replay's first byte.
     start: u64,
     totals: Arc<Totals>,
+    /// `Some` for the primary client.
+    primary: Option<Primary>,
+    /// Its name for control connections ([`PtyHub::name`]).
+    name: Mutex<Option<String>>,
+    /// The connections watching it ([`PtyHub::watch`]).
+    watchers: Mutex<Vec<Arc<dyn Watcher>>>,
 }
 
 impl ClientShared {
@@ -234,6 +297,10 @@ impl ClientShared {
 
     fn end(&self) -> Option<End> {
         *self.end.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_watchers(&self) -> MutexGuard<'_, Vec<Arc<dyn Watcher>>> {
+        self.watchers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether its input is no longer taken: the session ended or it was
@@ -289,8 +356,48 @@ impl Output {
         self.client.totals.received.load(Ordering::Acquire)
     }
 
+    /// Tells the connections watching this client (`pty.watch`) that it
+    /// was detached for being slow, once; nothing when it was not, or when
+    /// nobody watches. The attach's writer calls it, never the hub's
+    /// thread.
+    pub(crate) fn notify_detached(&self) {
+        if self.end() != Some(End::Slow) {
+            return;
+        }
+        let name = self
+            .client
+            .name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(name) = name else {
+            return;
+        };
+        let watchers = std::mem::take(&mut *self.client.lock_watchers());
+        for watcher in watchers {
+            watcher.detached(&name, PTY_DETACHED_SLOW);
+        }
+    }
+
     fn took(&self, bytes: &Bytes) {
-        self.client.backlog.fetch_sub(bytes.len(), Ordering::AcqRel);
+        let before = self.client.backlog.fetch_sub(bytes.len(), Ordering::SeqCst);
+        if let Some(primary) = &self.client.primary {
+            // Back at the resume mark: a paused hub reads again.
+            let after = before.saturating_sub(bytes.len());
+            if after <= primary.resume && self.client.totals.paused.load(Ordering::SeqCst) {
+                let _ = primary.wake.write(1);
+            }
+        }
+    }
+}
+
+impl Drop for Output {
+    /// A primary that goes ends, and a hub paused for it reads again.
+    fn drop(&mut self) {
+        if let Some(primary) = &self.client.primary {
+            self.client.finish(End::Detached);
+            let _ = primary.wake.write(1);
+        }
     }
 }
 
@@ -303,7 +410,8 @@ pub struct Input {
 impl Input {
     /// Queues as much of `bytes` as the input queue has room for, without
     /// waiting; the rest is dropped and counted. Returns how many were
-    /// taken.
+    /// taken. For control connections, and for a terminal, whose escape
+    /// must always be read.
     pub fn send(&self, bytes: &[u8]) -> Result<usize, Closed> {
         let taken = self.queue(bytes)?;
         let dropped = bytes.len() - taken;
@@ -362,11 +470,19 @@ impl PtyHub {
     /// A hub whose resizes go to `guest`; idle until its
     /// [`service`](PtyHub::service) takes init's connection.
     pub fn new(guest: GuestCtlHandle) -> io::Result<PtyHub> {
+        PtyHub::with_primary_limit(guest, PRIMARY_BACKLOG_MAX)
+    }
+
+    /// [`PtyHub::new`] with the primary client's limit at `primary_max`
+    /// bytes instead of [`PRIMARY_BACKLOG_MAX`].
+    pub fn with_primary_limit(guest: GuestCtlHandle, primary_max: usize) -> io::Result<PtyHub> {
         Ok(PtyHub {
             shared: Arc::new(Shared {
                 guest,
                 taken: AtomicBool::new(false),
-                wake: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
+                wake: Arc::new(EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?),
+                closing: AtomicBool::new(false),
+                primary_max,
                 state: Mutex::new(State {
                     phase: PtyState::Waiting,
                     ring: Ring::new(SCROLLBACK),
@@ -375,6 +491,7 @@ impl PtyHub {
                     input: VecDeque::new(),
                     sent: None,
                     wanted: None,
+                    named: HashMap::new(),
                 }),
                 changed: Condvar::new(),
                 totals: Arc::new(Totals::default()),
@@ -443,9 +560,34 @@ impl PtyHub {
     /// terminal opens (it then gets the session's output from its first
     /// byte) and after it ended (its replay, then the end).
     pub fn attach(&self, mode: Mode, replay_bytes: usize) -> (ClientId, Output, Option<Input>) {
+        let mut state = self.shared.lock();
+        self.attach_locked(&mut state, mode, replay_bytes, false)
+    }
+
+    /// Attaches the primary client, `boxcar run`'s own, with no replay: the
+    /// hub holds the session back for it rather than leave it behind (see
+    /// the module docs). `None` when one is attached already.
+    pub fn attach_primary(&self, mode: Mode) -> Option<(ClientId, Output, Option<Input>)> {
+        let mut state = self.shared.lock();
+        let attached = state
+            .clients
+            .iter()
+            .any(|client| client.shared.primary.is_some() && client.shared.end().is_none());
+        if attached {
+            return None;
+        }
+        Some(self.attach_locked(&mut state, mode, 0, true))
+    }
+
+    fn attach_locked(
+        &self,
+        state: &mut State,
+        mode: Mode,
+        replay_bytes: usize,
+        primary: bool,
+    ) -> (ClientId, Output, Option<Input>) {
         let shared = &self.shared;
         let (id, rx, client) = {
-            let mut state = shared.lock();
             let id = state.next_id;
             state.next_id += 1;
             let replay = state.ring.tail(replay_bytes.min(SCROLLBACK));
@@ -455,6 +597,12 @@ impl PtyHub {
                 end: Mutex::new(None),
                 start: received.saturating_sub(replay.len() as u64),
                 totals: Arc::clone(&shared.totals),
+                primary: primary.then(|| Primary {
+                    wake: Arc::clone(&shared.wake),
+                    resume: shared.primary_max / 4 * 3,
+                }),
+                name: Mutex::new(None),
+                watchers: Mutex::new(Vec::new()),
             });
             let (tx, rx) = mpsc::channel();
             if !replay.is_empty() {
@@ -482,14 +630,74 @@ impl PtyHub {
     /// Detaches a client: its output ends once what is queued is received,
     /// and its input is no longer taken. Nothing for one that is gone.
     pub fn detach(&self, id: ClientId) {
+        self.remove(id, End::Detached);
+    }
+
+    /// Detaches a client for being slow: its attach's writer found that it
+    /// took nothing for too long.
+    pub(crate) fn detach_slow(&self, id: ClientId) {
+        self.remove(id, End::Slow);
+    }
+
+    fn remove(&self, id: ClientId, end: End) {
         let client = {
             let mut state = self.shared.lock();
             let index = state.clients.iter().position(|client| client.id == id.0);
             index.map(|index| state.clients.swap_remove(index))
         };
         if let Some(client) = client {
-            client.shared.finish(End::Detached);
+            client.shared.finish(end);
+            // It may have been the primary the hub paused for.
+            self.shared.wake();
         }
+    }
+
+    /// Names a client for control connections, which watch it by that name
+    /// ([`PtyHub::watch`]): 128 random bits, in hex.
+    pub fn name(&self, output: &Output) -> io::Result<String> {
+        let name = random_name()?;
+        *output
+            .client
+            .name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(name.clone());
+        let mut state = self.shared.lock();
+        state.named.retain(|_, client| {
+            client
+                .upgrade()
+                .is_some_and(|client| client.end().is_none())
+        });
+        state
+            .named
+            .insert(name.clone(), Arc::downgrade(&output.client));
+        Ok(name)
+    }
+
+    /// Makes `watcher` hear when the client named `name` is detached, until
+    /// then (a watcher that watches again changes nothing). An error for a
+    /// name the hub does not have, or whose client has ended.
+    pub fn watch(&self, name: &str, watcher: Arc<dyn Watcher>) -> Result<(), UnknownAttach> {
+        let client = self
+            .shared
+            .lock()
+            .named
+            .get(name)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| UnknownAttach(name.to_owned()))?;
+        let mut watchers = client.lock_watchers();
+        // Under the watchers' lock: an end after this is told to it.
+        if client.end().is_some() {
+            return Err(UnknownAttach(name.to_owned()));
+        }
+        if !watchers.iter().any(|known| known.key() == watcher.key()) {
+            watchers.push(watcher);
+        }
+        Ok(())
+    }
+
+    /// Whether the hub holds off reading the guest for its primary.
+    pub fn paused(&self) -> bool {
+        self.shared.totals.paused.load(Ordering::SeqCst)
     }
 
     /// Asks for the terminal to be `rows` by `cols`: sent to init as
@@ -536,10 +744,13 @@ impl PtyHub {
     }
 
     /// Ends the session's terminal from the host's side: the hub's stream
-    /// is shut down, so its thread reads what is left and ends, and so do
-    /// the clients; a terminal init never opened ends at once. The stop
-    /// sequence calls it: it logs nothing and waits on nothing.
+    /// is shut down, so its thread reads what is left (paused or not) and
+    /// ends, and so do the clients; a terminal init never opened ends at
+    /// once. The stop sequence calls it: it logs nothing and waits on
+    /// nothing.
     pub fn close(&self) {
+        self.shared.closing.store(true, Ordering::SeqCst);
+        self.shared.wake();
         if let Some(stream) = self.shared.stream_slot().take() {
             let _ = stream.shutdown(Shutdown::Both);
             return;
@@ -582,6 +793,55 @@ impl Shared {
     fn wake(&self) {
         // A full eventfd is awake already.
         let _ = self.wake.write(1);
+    }
+
+    /// Whether the hub is to hold off reading the guest: the primary is
+    /// more than its limit behind, or, once the hub paused, more than three
+    /// quarters of it. A primary that has ended is let go here, and a
+    /// closing hub never pauses.
+    fn hold_for_primary(&self) -> bool {
+        let paused = &self.totals.paused;
+        if self.closing.load(Ordering::SeqCst) {
+            paused.store(false, Ordering::SeqCst);
+            return false;
+        }
+        let mut state = self.lock();
+        let Some(index) = state
+            .clients
+            .iter()
+            .position(|client| client.shared.primary.is_some())
+        else {
+            paused.store(false, Ordering::SeqCst);
+            return false;
+        };
+        let client = Arc::clone(&state.clients[index].shared);
+        if client.end().is_some() {
+            state.clients.swap_remove(index);
+            paused.store(false, Ordering::SeqCst);
+            return false;
+        }
+        drop(state);
+        let resume = client.primary.as_ref().map_or(0, |primary| primary.resume);
+        let backlog = || client.backlog.load(Ordering::SeqCst);
+        if paused.load(Ordering::SeqCst) {
+            if backlog() > resume {
+                return true;
+            }
+            paused.store(false, Ordering::SeqCst);
+            return false;
+        }
+        if backlog() <= self.primary_max {
+            return false;
+        }
+        // Paused from here; the primary's `took` now wakes the hub at the
+        // resume mark. One that got there before it could see the flag is
+        // caught by looking again.
+        paused.store(true, Ordering::SeqCst);
+        if backlog() <= resume {
+            paused.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
     }
 
     /// Sends the size asked for last, unless init has it.
@@ -749,16 +1009,27 @@ fn pump(shared: &Shared, stream: &UnixStream) {
             sent = 0;
             shared.take_input(&mut out, guest_takes_input);
         }
-        let mut events = libc::POLLIN;
+        // While the primary is behind, the guest is not read: its output
+        // backs up to the session. The guest's descriptor is then left out
+        // of the poll unless input waits for it, so a hangup cannot spin.
+        let hold = shared.hold_for_primary();
+        let mut events = 0;
+        if !hold {
+            events |= libc::POLLIN;
+        }
         if sent < out.len() {
             events |= libc::POLLOUT;
         }
-        if let Err(error) = poll(fd, events, shared.wake.as_raw_fd()) {
+        let watched = if events == 0 { -1 } else { fd };
+        if let Err(error) = poll(watched, events, shared.wake.as_raw_fd()) {
             boxcar_virtio::limited!(warn, "pty hub: poll failed: {error}; closing");
             return;
         }
         let _ = shared.wake.read();
         for _ in 0..READS_PER_TURN {
+            if hold {
+                break;
+            }
             match (&*stream).read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => shared.deliver(&buf[..n]),
@@ -813,6 +1084,27 @@ fn poll(fd: RawFd, events: libc::c_short, wake: RawFd) -> io::Result<()> {
     }
 }
 
+/// 128 random bits, in hex, from the kernel's generator.
+fn random_name() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let rest = &mut bytes[filled..];
+        // SAFETY: getrandom writes at most `rest.len()` bytes into `rest`.
+        let n = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        match usize::try_from(n) {
+            Ok(n) => filled += n,
+            Err(_) => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// `send(2)` that never blocks and never raises `SIGPIPE`.
 fn send_nowait(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
     // SAFETY: sends at most `bytes.len()` bytes from `bytes`.
@@ -840,6 +1132,7 @@ pub(crate) mod testing {
     use boxcar_audit::WriterHandle;
     use boxcar_proto::guest::{decode, encode, GuestMsg, HostMsg};
     use boxcar_vsock::{ConnMeta, InternalServices};
+    use std::sync::Mutex;
 
     use super::{Output, PtyHub};
     use crate::lifecycle::{test_handle, VmmHandle};
@@ -883,6 +1176,19 @@ pub(crate) mod testing {
             stream.set_read_timeout(Some(LIMIT)).unwrap();
             stream.write_all(HEADER).unwrap();
             stream
+        }
+
+        /// A hub of its own on this handle's guest control channel, whose
+        /// primary client may fall `primary_limit` behind, and init's
+        /// terminal stream to it, the header sent.
+        pub(crate) fn hub_with_primary_limit(&self, primary_limit: usize) -> (PtyHub, UnixStream) {
+            let hub = PtyHub::with_primary_limit(self.handle.guest_ctl(), primary_limit).unwrap();
+            let mut stream = hub
+                .connect(ConnMeta { guest_port: 1022 }, UnixStream::pair)
+                .unwrap();
+            stream.set_read_timeout(Some(LIMIT)).unwrap();
+            stream.write_all(HEADER).unwrap();
+            (hub, stream)
         }
 
         /// Init's control channel: port 1024 from guest port 1023, its
@@ -967,6 +1273,24 @@ pub(crate) mod testing {
         }
     }
 
+    /// A watcher that keeps what it is told.
+    #[derive(Default)]
+    pub(crate) struct Recorder(pub(crate) Mutex<Vec<(String, String)>>);
+
+    impl super::Watcher for Recorder {
+        fn detached(&self, attach_id: &str, reason: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .push((attach_id.to_owned(), reason.to_owned()));
+            true
+        }
+
+        fn key(&self) -> usize {
+            self as *const Recorder as usize
+        }
+    }
+
     /// `len` bytes that never repeat in a short period: a gap or a
     /// duplicate in a copy of them shows.
     pub(crate) fn pattern(len: usize) -> Vec<u8> {
@@ -995,6 +1319,7 @@ mod tests {
 
     use super::testing::{pattern, read_n, read_to_end, wait_until, Fixture, LIMIT};
     use super::*;
+    use std::sync::Arc;
 
     /// A client gets the replay it asked for, then what the session prints
     /// from then on, with nothing missing in between and nothing twice.
@@ -1052,13 +1377,35 @@ mod tests {
         let mut guest = fixture.guest();
         let (_, slow, _) = hub.attach(Mode::Ro, 0);
         let (_, steady, _) = hub.attach(Mode::Ro, 0);
-        let reader = thread::spawn(move || {
-            let got = read_to_end(&steady);
-            (got.len(), steady.end())
-        });
-        // Nothing the guest writes waits on a client.
+        let steady_got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let steady_got = Arc::clone(&steady_got);
+            thread::spawn(move || {
+                let mut got = 0;
+                while let Ok(bytes) = steady.recv_timeout(LIMIT) {
+                    got += bytes.len();
+                    steady_got.store(got, std::sync::atomic::Ordering::Release);
+                }
+                (got, steady.end())
+            })
+        };
+        // Nothing the guest writes waits on the client that reads nothing:
+        // 3 MiB goes through. The writes are paced only by the client that
+        // reads, so that it never falls a backlog behind, however slowly a
+        // loaded machine runs its thread.
         let mut to_hub = guest.try_clone().unwrap();
-        let session = thread::spawn(move || to_hub.write_all(&vec![b'x'; PRINTED]).unwrap());
+        let paced_by = Arc::clone(&steady_got);
+        let session = thread::spawn(move || {
+            for (n, chunk) in vec![b'x'; PRINTED].chunks(64 * 1024).enumerate() {
+                to_hub.write_all(chunk).unwrap();
+                let written = (n + 1) * 64 * 1024;
+                let deadline = Instant::now() + LIMIT;
+                while paced_by.load(std::sync::atomic::Ordering::Acquire) + (512 << 10) < written {
+                    assert!(Instant::now() < deadline, "the reading client fell behind");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
         session.join().unwrap();
         wait_until("all of it in", || hub.received() == PRINTED as u64);
         assert_eq!(slow.end(), Some(End::Slow));
@@ -1291,5 +1638,112 @@ mod tests {
         assert_eq!(read_to_end(&output), b"");
         assert!(hub.wait_ended(LIMIT));
         assert_eq!(hub.state(), PtyState::Ended);
+    }
+
+    /// `boxcar run`'s own client (the primary) is never detached: when it
+    /// falls the hub's limit for it behind, the hub stops reading the guest
+    /// (the session then waits on its terminal) until it has caught up. A
+    /// viewer that does not read is still detached at 1 MiB, and once the
+    /// primary reads, it gets every byte, in order.
+    #[test]
+    fn a_primary_that_falls_behind_pauses_the_guest_and_loses_nothing() {
+        const PRIMARY_LIMIT: usize = 2 << 20;
+        const PRINTED: usize = 8 << 20;
+        let fixture = Fixture::new();
+        let (hub, mut guest) = fixture.hub_with_primary_limit(PRIMARY_LIMIT);
+        let (_, primary, _) = hub.attach_primary(Mode::Ro).unwrap();
+        assert!(hub.attach_primary(Mode::Ro).is_none(), "one primary");
+        let (_, viewer, _) = hub.attach(Mode::Ro, 0);
+        let printed = pattern(PRINTED);
+        let sent = printed.clone();
+        let session = thread::spawn(move || {
+            guest.write_all(&sent).unwrap();
+            guest.shutdown(Shutdown::Write).unwrap();
+        });
+        wait_until("paused", || hub.paused());
+        let at = hub.received();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(hub.received(), at, "the hub read on while paused");
+        assert!(at >= PRIMARY_LIMIT as u64 && at < PRINTED as u64, "{at}");
+        assert!(!session.is_finished(), "the session did not wait");
+        assert_eq!(viewer.end(), Some(End::Slow));
+        let got = read_to_end(&primary);
+        session.join().unwrap();
+        assert_eq!(got.len(), PRINTED);
+        assert!(got == printed, "the bytes came out of order");
+        assert_eq!(primary.end(), Some(End::SessionEnded));
+        assert!(!hub.paused());
+    }
+
+    /// A hub paused for its primary still ends when the stop sequence
+    /// closes it.
+    #[test]
+    fn a_paused_hub_still_ends_when_closed() {
+        let fixture = Fixture::new();
+        let (hub, mut guest) = fixture.hub_with_primary_limit(256 << 10);
+        let (_, primary, _) = hub.attach_primary(Mode::Ro).unwrap();
+        let session = thread::spawn(move || {
+            let _ = guest.write_all(&vec![b'x'; 4 << 20]);
+        });
+        wait_until("paused", || hub.paused());
+        hub.close();
+        assert!(hub.wait_ended(LIMIT), "a paused hub did not end on close");
+        let got = read_to_end(&primary).len() as u64;
+        assert_eq!(got, hub.received());
+        session.join().unwrap();
+    }
+
+    /// A primary that goes away (its writer failed or stopped) releases the
+    /// pause: the hub reads the guest again.
+    #[test]
+    fn a_primary_that_goes_away_releases_the_pause() {
+        const PRINTED: usize = 4 << 20;
+        let fixture = Fixture::new();
+        let (hub, mut guest) = fixture.hub_with_primary_limit(256 << 10);
+        let (_, primary, _) = hub.attach_primary(Mode::Ro).unwrap();
+        let session = thread::spawn(move || guest.write_all(&vec![b'x'; PRINTED]).unwrap());
+        wait_until("paused", || hub.paused());
+        drop(primary);
+        session.join().unwrap();
+        wait_until("all of it in", || hub.received() == PRINTED as u64);
+        assert!(!hub.paused());
+        // Detaching a primary releases it as well.
+        let fixture = Fixture::new();
+        let (hub, mut guest) = fixture.hub_with_primary_limit(256 << 10);
+        let (id, _primary, _) = hub.attach_primary(Mode::Ro).unwrap();
+        let session = thread::spawn(move || guest.write_all(&vec![b'x'; PRINTED]).unwrap());
+        wait_until("paused", || hub.paused());
+        hub.detach(id);
+        session.join().unwrap();
+        wait_until("all of it in", || hub.received() == PRINTED as u64);
+    }
+
+    /// A client named for control connections can be watched by its name:
+    /// 128 random bits in hex. A watcher hears that it was detached and
+    /// why; an unknown name, or one whose client has ended, is not found.
+    #[test]
+    fn a_named_client_is_watched_by_its_name() {
+        let fixture = Fixture::new();
+        let hub = &fixture.hub;
+        let _guest = fixture.guest();
+        let (id, output, _) = hub.attach(Mode::Ro, 0);
+        let name = hub.name(&output).unwrap();
+        assert_eq!(name.len(), 32);
+        assert!(name.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        let (_, other, _) = hub.attach(Mode::Ro, 0);
+        assert_ne!(hub.name(&other).unwrap(), name);
+        let watcher = Arc::new(super::testing::Recorder::default());
+        hub.watch(&name, watcher.clone()).unwrap();
+        // Watching twice from one watcher tells it once.
+        hub.watch(&name, watcher.clone()).unwrap();
+        assert!(hub.watch(&"0".repeat(32), watcher.clone()).is_err());
+        hub.detach_slow(id);
+        assert_eq!(output.end(), Some(End::Slow));
+        output.notify_detached();
+        assert_eq!(
+            *watcher.0.lock().unwrap(),
+            [(name.clone(), "slow".to_owned())]
+        );
+        assert!(hub.watch(&name, watcher).is_err(), "it has ended");
     }
 }

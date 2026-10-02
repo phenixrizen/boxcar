@@ -343,9 +343,9 @@ pub enum StopMode {
 pub const PTY_SESSION: &str = "main";
 
 /// The parameters of `pty.attach`: `{"session":"main","mode":"rw"|"ro",
-/// "replay_bytes":N}`. The response is `{"raw":true}`, after which the
-/// connection is the terminal's bytes, both ways (see
-/// [`PtyMode`]); `replay_bytes` (0 when absent) of the terminal's latest
+/// "replay_bytes":N}`. The response is [`PtyAttached`], after which the
+/// connection is the terminal's bytes, both ways (see [`PtyMode`]), and
+/// only those; `replay_bytes` (0 when absent) of the terminal's latest
 /// output come first, at most the server's scrollback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtyAttachParams {
@@ -354,6 +354,27 @@ pub struct PtyAttachParams {
     pub mode: PtyMode,
     #[serde(default)]
     pub replay_bytes: u64,
+}
+
+/// The result of `pty.attach`: `{"raw":true,"attach_id":"<hex>"}`. The
+/// attach's id (128 random bits, in hex) is what another connection
+/// watches it by ([`PtyWatchParams`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyAttached {
+    /// `true`: the connection is raw from the next byte.
+    pub raw: bool,
+    pub attach_id: String,
+}
+
+/// The parameters of `pty.watch`: `{"attach_id":"<hex>"}` (with
+/// `"session":"main"`, optionally). The response is `{}`; from then on the
+/// connection that sent it hears the attach's [`PtyDetached`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyWatchParams {
+    pub attach_id: String,
+    /// [`PTY_SESSION`], when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// How a client attaches to the session's terminal.
@@ -392,27 +413,36 @@ impl PtyResizeParams {
 /// The reason of a [`PtyDetached`] whose client fell too far behind.
 pub const PTY_DETACHED_SLOW: &str = "slow";
 
-/// `{"v":1,"event":"pty.detached","reason":"slow"}`: the server detached
-/// the client from the session's terminal. It is the last line of an
-/// attached connection, after its last raw byte; the server then closes
-/// the connection. `slow`: the client left more of the terminal's output
-/// unread than the server keeps for it.
+/// `{"v":1,"event":"pty.detached","attach_id":"<hex>","reason":"slow"}`:
+/// the server detached the attach `attach_id` from the session's terminal.
+/// It goes to the connections that watch the attach (`pty.watch`), never
+/// into the attached connection itself, which carries only the terminal's
+/// bytes: that one just ends, after its last byte. `slow`: the client left
+/// more of the terminal's output unread than the server keeps for it, or
+/// took none for 30 s.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtyDetached {
     pub v: u32,
     /// `"pty.detached"`.
     pub event: String,
+    pub attach_id: String,
     pub reason: String,
 }
 
 impl PtyDetached {
-    /// The client fell too far behind: [`PTY_DETACHED_SLOW`].
-    pub fn slow() -> PtyDetached {
+    /// The attach `attach_id` was detached for `reason`.
+    pub fn new(attach_id: &str, reason: &str) -> PtyDetached {
         PtyDetached {
             v: VERSION,
             event: "pty.detached".to_owned(),
-            reason: PTY_DETACHED_SLOW.to_owned(),
+            attach_id: attach_id.to_owned(),
+            reason: reason.to_owned(),
         }
+    }
+
+    /// The attach `attach_id` fell too far behind: [`PTY_DETACHED_SLOW`].
+    pub fn slow(attach_id: &str) -> PtyDetached {
+        PtyDetached::new(attach_id, PTY_DETACHED_SLOW)
     }
 }
 
@@ -845,9 +875,22 @@ mod tests {
             );
         }
 
+        let attached: PtyAttached =
+            serde_json::from_value(json!({"raw": true, "attach_id": "00ff"})).unwrap();
         assert_eq!(
-            String::from_utf8(to_line(&PtyDetached::slow()).unwrap()).unwrap(),
-            "{\"v\":1,\"event\":\"pty.detached\",\"reason\":\"slow\"}\n"
+            serde_json::to_value(&attached).unwrap(),
+            json!({"raw": true, "attach_id": "00ff"})
+        );
+        let watch: PtyWatchParams = serde_json::from_value(json!({"attach_id": "00ff"})).unwrap();
+        assert_eq!((watch.attach_id.as_str(), watch.session), ("00ff", None));
+        let watch: PtyWatchParams =
+            serde_json::from_value(json!({"session": "main", "attach_id": "00ff"})).unwrap();
+        assert_eq!(watch.session.as_deref(), Some("main"));
+        assert!(serde_json::from_value::<PtyWatchParams>(json!({"session": "main"})).is_err());
+
+        assert_eq!(
+            String::from_utf8(to_line(&PtyDetached::slow("00ff")).unwrap()).unwrap(),
+            "{\"v\":1,\"event\":\"pty.detached\",\"attach_id\":\"00ff\",\"reason\":\"slow\"}\n"
         );
     }
 

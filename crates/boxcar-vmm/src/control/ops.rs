@@ -6,27 +6,30 @@
 //!
 //! The connection serves `status` with [`Ops::status`] and `stop` with
 //! [`Ops::stop`] once its parameters parse; every other op goes to
-//! [`Ops::dispatch`]: the VMM's serves `pty.attach` and `pty.resize` (the
-//! hello's capability `pty`), where later ops (`audit.*`, `policy.*`) are
-//! added.
+//! [`Ops::dispatch`]: the VMM's serves `pty.attach`, `pty.watch` and
+//! `pty.resize` (the hello's capability `pty`), where later ops (`audit.*`,
+//! `policy.*`) are added.
 //!
 //! ## `pty.attach`
 //!
 //! `{"v":1,"id":N,"op":"pty.attach","session":"main","mode":"rw"|"ro",
 //! "replay_bytes":R}` attaches the connection to the session's terminal
-//! (the PTY hub, [`crate::pty`]). The response is `{"raw":true}`; after
-//! that line the connection carries the terminal's raw bytes both ways, and
-//! no more lines or events, but one: the newest `R` bytes of the hub's
-//! 256 KiB scrollback come first (`replay_bytes` is 0 when absent and is
-//! capped at the scrollback), then the session's output as it comes, with
-//! nothing missed or repeated between the two. With `rw`, what the client
-//! sends is typed into the session (bytes past the hub's 64 KiB input
-//! queue are dropped, never waited for); with `ro` it is discarded. A
-//! client that leaves more than 1 MiB of output unread is detached: its
-//! stream ends with the line `{"v":1,"event":"pty.detached","reason":
-//! "slow"}`, and the connection is closed. When the session's terminal
-//! ends, the stream ends after its last byte, and the connection is
-//! closed. A client may close its sending side and keep reading.
+//! (the PTY hub, [`crate::pty`]). The response is
+//! `{"raw":true,"attach_id":"<32 hex digits>"}`, the id 128 random bits;
+//! after that line the connection carries the terminal's raw bytes both
+//! ways and nothing else, no line or event: the newest `R` bytes of the
+//! hub's 256 KiB scrollback come first (`replay_bytes` is 0 when absent and
+//! is capped at the scrollback), then the session's output as it comes,
+//! with nothing missed or repeated between the two. With `rw`, what the
+//! client sends is typed into the session (bytes past the hub's 64 KiB
+//! input queue are dropped, never waited for); with `ro` it is discarded.
+//! A client that leaves more than 1 MiB of output unread, or takes no byte
+//! for 30 s, is detached as slow: its stream ends after the last byte it
+//! took, and the connection is closed; the reason goes to the connections
+//! that watch the attach (`pty.watch`), and is not heard otherwise. When
+//! the session's terminal ends, the stream ends after its last byte, and
+//! the connection is closed. A client may close its sending side and keep
+//! reading.
 //!
 //! Errors: `bad_request` for parameters that do not parse (no `session`, a
 //! `mode` other than `rw` or `ro`, a `replay_bytes` that is not an unsigned
@@ -34,6 +37,21 @@
 //! `invalid_state` before the guest's init has opened the session's
 //! terminal, and on a VM without the vsock device. Once the terminal has
 //! ended, an attach gets its replay, then the end.
+//!
+//! ## `pty.watch`
+//!
+//! `{"v":1,"id":N,"op":"pty.watch","attach_id":"<hex>"}` (with
+//! `"session":"main"`, optionally), on any other control connection,
+//! answers `{}` and makes that connection hear the attach's end for being
+//! slow: `{"v":1,"event":"pty.detached","attach_id":"<hex>",
+//! "reason":"slow"}`, queued on its outbox without waiting and sent before
+//! the attached stream is closed (the two connections are not ordered with
+//! each other: a client that reads the stream's end first should wait a
+//! moment for the event). Every connection is the VMM's own user's.
+//! Watching twice from one connection changes nothing. Errors:
+//! `bad_request` (no `attach_id`), `not_found` (an `attach_id` the server
+//! does not have, one whose attach has ended, or a session other than
+//! `main`), `invalid_state` (a VM without the vsock device).
 //!
 //! ## `pty.resize`
 //!
@@ -49,16 +67,19 @@
 use std::fmt;
 use std::os::unix::net::UnixStream;
 
+use std::sync::{Arc, Weak};
+
 use boxcar_proto::control::{
-    ErrorBody, ErrorCode, PtyAttachParams, PtyMode, PtyResizeParams, Request, Status, StopMode,
-    StopParams, PTY_SESSION,
+    ErrorBody, ErrorCode, PtyAttachParams, PtyAttached, PtyDetached, PtyMode, PtyResizeParams,
+    PtyWatchParams, Request, Status, StopMode, StopParams, PTY_SESSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use super::conn::Conn;
 use crate::guest_ctl::SendError;
 use crate::lifecycle::{StopReason, VmmHandle, GRACEFUL_STOP_MARGIN};
-use crate::pty::{raw, Mode, PtyHub, PtyState, SCROLLBACK};
+use crate::pty::{raw, Mode, PtyHub, PtyState, Watcher, SCROLLBACK};
 
 /// The ops a control connection serves.
 pub trait Ops: Send + Sync {
@@ -91,6 +112,38 @@ pub struct ConnCtx {
     /// Set by an op that turns the connection into a raw byte stream
     /// after its response (`pty.attach`).
     pub raw_upgrade: Option<RawUpgrade>,
+    /// How events from elsewhere reach this connection (`pty.watch`).
+    pub events: Option<ConnEvents>,
+}
+
+/// A connection's way to hear events from elsewhere: each is queued on its
+/// outbox, and its own thread sends it. Never waits. Holds the connection
+/// weakly: one that has gone hears nothing.
+#[derive(Clone)]
+pub struct ConnEvents {
+    conn: Weak<Conn>,
+}
+
+impl ConnEvents {
+    pub(crate) fn new(conn: &Arc<Conn>) -> ConnEvents {
+        ConnEvents {
+            conn: Arc::downgrade(conn),
+        }
+    }
+}
+
+impl Watcher for ConnEvents {
+    fn detached(&self, attach_id: &str, reason: &str) -> bool {
+        let Some(conn) = self.conn.upgrade() else {
+            return false;
+        };
+        conn.send_event(&PtyDetached::new(attach_id, reason));
+        true
+    }
+
+    fn key(&self) -> usize {
+        self.conn.as_ptr() as usize
+    }
 }
 
 /// What takes over a connection that an op turned into a raw byte stream.
@@ -154,10 +207,11 @@ impl Ops for VmmOps {
         Ok(json!({"accepted": true}))
     }
 
-    /// `pty.attach` and `pty.resize`: see the module docs.
+    /// `pty.attach`, `pty.watch` and `pty.resize`: see the module docs.
     fn dispatch(&self, conn: &mut ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
         match req.op.as_str() {
             "pty.attach" => self.pty_attach(conn, req),
+            "pty.watch" => self.pty_watch(conn, req),
             "pty.resize" => self.pty_resize(req),
             _ => Err(ErrorBody::unknown_op(&req.op)),
         }
@@ -199,11 +253,33 @@ impl VmmOps {
             .unwrap_or(usize::MAX)
             .min(SCROLLBACK);
         let (id, output, input) = hub.attach(mode, replay);
-        let attached = raw::Attached::new(hub, id);
+        let attached = raw::Attached::new(hub.clone(), id);
+        let attach_id = hub.name(&output).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("cannot name the attach: {error}"),
+            )
+        })?;
         conn.raw_upgrade = Some(RawUpgrade::new(move |stream, pending| {
             raw::serve(attached, output, input, stream, pending)
         }));
-        Ok(json!({"raw": true}))
+        let result = PtyAttached {
+            raw: true,
+            attach_id,
+        };
+        serde_json::to_value(result)
+            .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
+    }
+
+    fn pty_watch(&self, conn: &ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
+        let params: PtyWatchParams = params(req)?;
+        let hub = self.terminal(params.session.as_deref().unwrap_or(PTY_SESSION))?;
+        let events = conn.events.clone().ok_or_else(|| {
+            ErrorBody::new(ErrorCode::Internal, "this connection cannot hear events")
+        })?;
+        hub.watch(&params.attach_id, Arc::new(events))
+            .map_err(|error| ErrorBody::new(ErrorCode::NotFound, error.to_string()))?;
+        Ok(json!({}))
     }
 
     fn pty_resize(&self, req: &Request) -> Result<Value, ErrorBody> {
@@ -261,7 +337,7 @@ mod tests {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use boxcar_proto::control::{to_line, ErrorCode, Hello, PtyDetached, VmState};
+    use boxcar_proto::control::{to_line, ErrorCode, Hello, VmState};
     use boxcar_proto::guest::HostMsg;
 
     use super::*;
@@ -281,6 +357,7 @@ mod tests {
             peer_pid: 1,
             peer_uid: 0,
             raw_upgrade: None,
+            events: None,
         };
         let other = Request::new(1, "pty.detach", Value::Null);
         assert_eq!(
@@ -318,13 +395,15 @@ mod tests {
             let (server, client) = UnixStream::pair().unwrap();
             let ops: Arc<dyn Ops> = Arc::new(VmmOps::new(fixture.handle.clone()));
             let hello = Hello::new("boxcar/test", "session", ops.capabilities());
+            let conn = Arc::new(Conn::new(server, &hello).unwrap());
             let session = Session {
-                conn: Arc::new(Conn::new(server, &hello).unwrap()),
                 ctx: ConnCtx {
                     peer_pid: 1,
                     peer_uid: 0,
                     raw_upgrade: None,
+                    events: Some(ConnEvents::new(&conn)),
                 },
+                conn,
                 ops,
                 audit: fixture.handle.audit().clone(),
             };
@@ -399,7 +478,10 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(wire.hello["capabilities"], json!(["pty"]));
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
-        assert_eq!(response["result"], json!({"raw": true}), "{response}");
+        assert_eq!(response["result"]["raw"], true, "{response}");
+        let id = response["result"]["attach_id"].as_str().unwrap();
+        assert_eq!(id.len(), 32, "{response}");
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{response}");
         let mut replay = [0u8; 7];
         wire.reader.read_exact(&mut replay).unwrap();
         assert_eq!(&replay, b"before ");
@@ -532,7 +614,7 @@ mod tests {
         });
         let mut wire = Wire::new(&fixture);
         let response = wire.request("pty.attach", attach("ro", 0));
-        assert_eq!(response["result"], json!({"raw": true}), "{response}");
+        assert_eq!(response["result"]["raw"], true, "{response}");
         wire.writer.write_all(b"rm -rf /\r").unwrap();
         wait_until("discarded", || fixture.hub.ro_discarded() == 9);
         guest.write_all(b"out").unwrap();
@@ -547,33 +629,104 @@ mod tests {
     }
 
     /// A client that reads nothing while the session prints 4 MiB is
-    /// detached: the guest never waits on it, and once it does read, its
-    /// stream ends with `pty.detached` (reason `slow`) after its last raw
-    /// byte.
+    /// detached: the guest never waits on it, its raw stream carries only
+    /// the session's bytes and then ends, and the connection that watches
+    /// the attach (`pty.watch`) hears why.
     #[test]
-    fn a_slow_attach_gets_the_detached_event_then_the_end() {
+    fn a_slow_attach_ends_its_stream_and_its_watcher_hears_why() {
         const PRINTED: usize = 4 << 20;
         let fixture = Fixture::new();
         let mut guest = fixture.guest();
         wait_until("the terminal open", || {
             fixture.hub.state() == PtyState::Live
         });
-        let mut wire = Wire::new(&fixture);
-        let response = wire.request("pty.attach", attach("rw", 0));
-        assert_eq!(response["result"], json!({"raw": true}), "{response}");
+        let mut attached = Wire::new(&fixture);
+        let response = attached.request("pty.attach", attach("rw", 0));
+        let id = response["result"]["attach_id"].as_str().unwrap().to_owned();
+        let mut watcher = Wire::new(&fixture);
+        let watched = watcher.request("pty.watch", json!({"attach_id": id}));
+        assert_eq!(watched["result"], json!({}), "{watched}");
         guest.write_all(&vec![b'x'; PRINTED]).unwrap();
         wait_until("all of it in", || fixture.hub.received() == PRINTED as u64);
         wait_until("detached", || fixture.hub.clients() == 0);
-        let got = wire.read_to_end();
-        let event = to_line(&PtyDetached::slow()).unwrap();
-        assert!(
-            got.ends_with(&event),
-            "{:?}",
-            &got[got.len().saturating_sub(80)..]
+        assert_eq!(
+            watcher.line(),
+            json!({"v": 1, "event": "pty.detached", "attach_id": id, "reason": "slow"})
         );
-        let raw = &got[..got.len() - event.len()];
-        assert!(!raw.is_empty() && raw.len() < PRINTED);
-        assert!(raw.iter().all(|&b| b == b'x'));
-        wire.ended();
+        let raw = attached.read_to_end();
+        assert!(!raw.is_empty() && raw.len() < PRINTED, "{}", raw.len());
+        assert!(
+            raw.iter().all(|&b| b == b'x'),
+            "the raw stream is not only the session's"
+        );
+        attached.ended();
+        // The watcher stays a control connection; the attach has ended.
+        assert_eq!(watcher.request("status", Value::Null)["ok"], true);
+        let again = watcher.request("pty.watch", json!({"attach_id": id}));
+        assert_eq!(code(&again), "not_found");
+    }
+
+    /// `pty.watch` takes an `attach_id` (and the session, `main`, if
+    /// named): an unknown one is not found, and parameters that do not
+    /// parse are a bad request.
+    #[test]
+    fn watch_validates() {
+        let fixture = Fixture::new();
+        let _guest = fixture.guest();
+        wait_until("the terminal open", || {
+            fixture.hub.state() == PtyState::Live
+        });
+        let mut wire = Wire::new(&fixture);
+        assert_eq!(
+            code(&wire.request("pty.watch", json!({"attach_id": "0".repeat(32)}))),
+            "not_found"
+        );
+        assert_eq!(code(&wire.request("pty.watch", json!({}))), "bad_request");
+        assert_eq!(
+            code(&wire.request("pty.watch", json!({"attach_id": 7}))),
+            "bad_request"
+        );
+        let mut attached = Wire::new(&fixture);
+        let id = attached.request("pty.attach", attach("ro", 0))["result"]["attach_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            code(&wire.request("pty.watch", json!({"session": "other", "attach_id": id}))),
+            "not_found"
+        );
+        let ok = wire.request("pty.watch", json!({"session": "main", "attach_id": id}));
+        assert_eq!(ok["result"], json!({}), "{ok}");
+    }
+
+    /// The writer of an attached connection does not wait on its client
+    /// for ever: one that takes nothing for the stall limit (30 s; shorter
+    /// here) is detached as slow, its stream closed, and its watcher told,
+    /// while the hub still holds less than the client's 1 MiB for it.
+    #[test]
+    fn a_client_that_takes_nothing_is_cut_off_after_the_stall_limit() {
+        let fixture = Fixture::new();
+        let hub = &fixture.hub;
+        let mut guest = fixture.guest();
+        wait_until("the terminal open", || hub.state() == PtyState::Live);
+        let (id, output, input) = hub.attach(Mode::Rw, 0);
+        let name = hub.name(&output).unwrap();
+        let watcher = Arc::new(crate::pty::testing::Recorder::default());
+        hub.watch(&name, watcher.clone()).unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let attached = raw::Attached::with_stall_limit(hub.clone(), id, Duration::from_millis(300));
+        let serving =
+            thread::spawn(move || raw::serve(attached, output, input, server, Vec::new()));
+        // More than the sockets hold, less than the hub keeps for it.
+        guest.write_all(&vec![b'y'; 700 * 1024]).unwrap();
+        wait_until("cut off", || hub.clients() == 0);
+        let mut client = client;
+        client.set_read_timeout(Some(LIMIT)).unwrap();
+        let mut raw_bytes = Vec::new();
+        client.read_to_end(&mut raw_bytes).unwrap();
+        assert!(raw_bytes.iter().all(|&b| b == b'y'));
+        drop(client);
+        serving.join().unwrap();
+        assert_eq!(*watcher.0.lock().unwrap(), [(name, "slow".to_owned())]);
     }
 }

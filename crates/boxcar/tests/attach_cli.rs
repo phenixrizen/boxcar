@@ -2,22 +2,26 @@
 // Copyright 2026 The boxcar Authors
 
 //! `boxcar attach` against a fake control server in the test: the two
-//! connections, `pty.attach` turning one into the terminal's raw bytes,
-//! the detach keys, a read-only attach and a detach for being slow. No KVM
-//! needed.
+//! connections, `pty.attach` turning one into the terminal's raw bytes and
+//! `pty.watch` on the other, the detach keys, a read-only attach, a detach
+//! for being slow (said on the watching connection), and a stream that
+//! carries only the session's bytes. No KVM needed.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boxcar_proto::control::{to_line, Hello, PtyDetached, Response};
 use serde_json::{json, Value};
 
 const SESSION: &str = "01999a8e-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
+
+/// The attach's id the fake server hands out.
+const ATTACH_ID: &str = "00112233445566778899aabbccddeeff";
 
 /// What the fake server does with an attached connection.
 #[derive(Clone, Copy)]
@@ -25,9 +29,15 @@ enum Terminal {
     /// Sends back what it gets, until the client closes its side; then
     /// closes.
     Echo,
-    /// Sends some output, then `pty.detached` (slow), then closes.
+    /// Sends some output, then `pty.detached` (slow) on the connection
+    /// that watches the attach, then closes the stream.
     DetachSlow,
+    /// Runs the script on the stream, then closes it.
+    Script(fn(&mut UnixStream)),
 }
+
+/// The connection that sent `pty.watch`, for the attached one to tell.
+type Watching = Arc<Mutex<Option<UnixStream>>>;
 
 /// What the fake server saw.
 #[derive(Debug, Default)]
@@ -45,19 +55,21 @@ struct Seen {
 fn fake_server(path: &Path, terminal: Terminal) -> mpsc::Receiver<Seen> {
     let listener = UnixListener::bind(path).unwrap();
     let (tx, rx) = mpsc::channel();
+    let watching: Watching = Arc::default();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
             let tx = tx.clone();
+            let watching = Arc::clone(&watching);
             thread::spawn(move || {
-                let _ = tx.send(serve(stream, terminal));
+                let _ = tx.send(serve(stream, terminal, &watching));
             });
         }
     });
     rx
 }
 
-fn serve(mut stream: UnixStream, terminal: Terminal) -> Seen {
+fn serve(mut stream: UnixStream, terminal: Terminal, watching: &Watching) -> Seen {
     let mut seen = Seen::default();
     let hello = Hello::new("boxcar/fake", SESSION, vec!["pty".into()]);
     let _ = stream.write_all(&to_line(&hello).unwrap());
@@ -74,7 +86,8 @@ fn serve(mut stream: UnixStream, terminal: Terminal) -> Seen {
         seen.requests.push(request);
         match op.as_str() {
             "pty.attach" => {
-                let response = to_line(&Response::success(id, json!({"raw": true}))).unwrap();
+                let result = json!({"raw": true, "attach_id": ATTACH_ID});
+                let response = to_line(&Response::success(id, result)).unwrap();
                 let _ = stream.write_all(&response);
                 match terminal {
                     Terminal::Echo => {
@@ -91,7 +104,22 @@ fn serve(mut stream: UnixStream, terminal: Terminal) -> Seen {
                     }
                     Terminal::DetachSlow => {
                         let _ = stream.write_all(b"partial output");
-                        let _ = stream.write_all(&to_line(&PtyDetached::slow()).unwrap());
+                        // The event goes to the watcher, before the end.
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            if let Some(watcher) = watching.lock().unwrap().as_mut() {
+                                let event = to_line(&PtyDetached::slow(ATTACH_ID)).unwrap();
+                                let _ = watcher.write_all(&event);
+                                break;
+                            }
+                            assert!(Instant::now() < deadline, "nobody watched the attach");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return seen;
+                    }
+                    Terminal::Script(script) => {
+                        script(&mut stream);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return seen;
                     }
@@ -99,6 +127,10 @@ fn serve(mut stream: UnixStream, terminal: Terminal) -> Seen {
             }
             "pty.resize" => {
                 let _ = stream.write_all(&to_line(&Response::success(id, json!({}))).unwrap());
+            }
+            "pty.watch" => {
+                let _ = stream.write_all(&to_line(&Response::success(id, json!({}))).unwrap());
+                *watching.lock().unwrap() = Some(stream.try_clone().unwrap());
             }
             other => panic!("unexpected op {other}"),
         }
@@ -172,6 +204,13 @@ fn attach_round_trips_bytes_against_a_fake_server() {
     assert_eq!(request["session"], "main");
     assert_eq!(request["mode"], "rw");
     assert_eq!(request["replay_bytes"], 65536);
+    // The other connection watches the attach by its id.
+    let watch = seen
+        .iter()
+        .flat_map(|seen| &seen.requests)
+        .find(|request| request["op"] == "pty.watch")
+        .expect("no pty.watch");
+    assert_eq!(watch["attach_id"], ATTACH_ID);
     let typed: Vec<u8> = seen.iter().flat_map(|seen| seen.typed.clone()).collect();
     assert_eq!(typed, b"hello, session\n");
 }
@@ -221,8 +260,8 @@ fn a_read_only_attach_sends_no_input() {
     assert!(seen.iter().all(|seen| seen.typed.is_empty()));
 }
 
-/// Detached for being slow: what came before is printed, the event line
-/// is not, and `boxcar attach` says so and exits 3.
+/// Detached for being slow: what came before is printed, the watching
+/// connection hears why, and `boxcar attach` says so and exits 3.
 #[test]
 fn a_slow_detach_exits_3() {
     let tmp = tempfile::tempdir().unwrap();
@@ -234,6 +273,133 @@ fn a_slow_detach_exits_3() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.contains("detached"), "{stderr}");
+}
+
+/// The reviewer's first probe: an echoed `{` with nothing after it for a
+/// while is shown at once (nothing in the stream is held back).
+#[test]
+fn an_echoed_brace_is_shown_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let _seen = fake_server(
+        &socket,
+        Terminal::Script(|stream| {
+            let _ = stream.write_all(b"$ echo ${");
+            thread::sleep(Duration::from_millis(1500));
+            let _ = stream.write_all(b"HOME}");
+        }),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["attach", "--control"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut brace_at = None;
+    let mut buf = [0u8; 256];
+    loop {
+        let n = out.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+        if brace_at.is_none() && got.contains(&b'{') {
+            brace_at = Some(start.elapsed());
+        }
+    }
+    assert!(child.wait().unwrap().success());
+    assert_eq!(got, b"$ echo ${HOME}");
+    let brace_at = brace_at.unwrap();
+    assert!(brace_at < Duration::from_millis(1000), "{brace_at:?}");
+}
+
+/// The reviewer's second probe: a session whose last bytes are the very
+/// line `pty.detached` is written as is; the stream's end is the session's
+/// end, and `boxcar attach` exits 0.
+#[test]
+fn a_session_printing_the_event_line_is_not_a_detach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let _seen = fake_server(
+        &socket,
+        Terminal::Script(|stream| {
+            let _ = stream.write_all(b"printf ...\r\n");
+            let _ = stream.write_all(&to_line(&PtyDetached::slow(ATTACH_ID)).unwrap());
+        }),
+    );
+    let output = attach(&socket, &[], b"");
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let mut want = b"printf ...\r\n".to_vec();
+    want.extend_from_slice(&to_line(&PtyDetached::slow(ATTACH_ID)).unwrap());
+    assert_eq!(output.stdout, want, "{}", describe(&output));
+    assert!(output.stderr.is_empty(), "{}", describe(&output));
+}
+
+/// The reviewer's third probe: a non-blocking stdout pipe (`EAGAIN` once
+/// full), read late and slowly, gets every byte.
+#[test]
+fn a_non_blocking_stdout_gets_every_byte() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let _seen = fake_server(
+        &socket,
+        Terminal::Script(|stream| {
+            let _ = stream.write_all(&vec![b'x'; 1 << 20]);
+        }),
+    );
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two new descriptors into `fds`.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both are new descriptors that nothing else owns.
+    let (mut read_end, write_end) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    // SAFETY: fcntl with integer arguments only.
+    unsafe {
+        let fd = write_end.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["attach", "--control"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write_end))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let reader = thread::spawn(move || {
+        let mut total = 0usize;
+        let mut buf = [0u8; 4096];
+        loop {
+            match read_end.read(&mut buf) {
+                Ok(0) | Err(_) => return total,
+                Ok(n) => total += n,
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(reader.join().unwrap(), 1 << 20, "{status} {stderr}");
+    assert!(status.success(), "{status} {stderr}");
 }
 
 /// A terminal's settings: input, output, control and local flags.

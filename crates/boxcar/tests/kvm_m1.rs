@@ -457,11 +457,11 @@ fn the_last_line_reaches_stdout_through_the_pty_hub() {
 
 /// The reviewer's stdout probe as a test: stdout is a non-blocking pipe
 /// (`EAGAIN` once full) whose reader stalls a second while the session
-/// prints 300,000 bytes, then reads slowly. Every byte arrives, in order,
-/// and the run exits 0: the PTY hub takes the session's output as it comes
-/// (300,000 bytes is under the 1 MiB it keeps for a client), the stdout
-/// writer waits out `EAGAIN`, and `boxcar run` writes out what it holds
-/// before it exits.
+/// prints 3,000,000 bytes, then reads slowly. Every byte arrives, in order,
+/// and the run exits 0 with nothing said: the stdout writer waits out
+/// `EAGAIN`, the hub holds the session back while `boxcar run`'s own client
+/// is behind (it is never detached and nothing is skipped), and `boxcar
+/// run` writes out what it holds before it exits.
 #[test]
 fn a_slow_non_blocking_stdout_gets_all_of_the_session() {
     use std::io::Read;
@@ -485,7 +485,7 @@ fn a_slow_non_blocking_stdout_gets_all_of_the_session() {
             0
         );
     }
-    let script = "head -c 300000 /dev/zero | tr '\\0' x; echo; echo END_OF_OUTPUT";
+    let script = "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo END_OF_OUTPUT";
     let start = Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
         .arg("run")
@@ -529,9 +529,328 @@ fn a_slow_non_blocking_stdout_gets_all_of_the_session() {
         got.len()
     );
     assert_eq!(status.code(), Some(0), "{stderr}");
-    assert_eq!(xs, 300_000, "{stderr}");
+    assert_eq!(xs, 3_000_000, "{stderr}");
     let text = String::from_utf8_lossy(&got);
     assert!(text.ends_with("x\r\nEND_OF_OUTPUT\r\n"), "{stderr}");
+    assert!(!stderr.contains("not delivered"), "{stderr}");
+}
+
+/// The review's slated probe: stdout's reader stalls 6 s while the session
+/// prints 3,000,000 bytes, longer than `boxcar run` waits for a stdout that
+/// takes nothing once the VM has stopped (2 s). The hub holds the session
+/// back meanwhile, so the VM is still running when the reader comes back,
+/// and nothing is lost.
+#[test]
+fn a_stalled_stdout_holds_the_session_and_loses_nothing() {
+    use std::io::Read;
+
+    let Some(guest) = guest_or_skip("kvm_m1 stalled stdout") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let script = "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo END_OF_OUTPUT";
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .args(["--", "/bin/sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(6));
+    let mut got = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut got).unwrap();
+    let status = child.wait().unwrap();
+    let stderr = read_lossy(&scratch.path("stderr.log"));
+    let xs = got.iter().filter(|&&b| b == b'x').count();
+    eprintln!(
+        "kvm_m1 stalled stdout: {status} after {:?}, {} bytes, {xs} x",
+        start.elapsed(),
+        got.len()
+    );
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(xs, 3_000_000, "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&got).ends_with("x\r\nEND_OF_OUTPUT\r\n"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not delivered"), "{stderr}");
+}
+
+/// A terminal pair: the master end for the test, the slave end for boxcar.
+fn openpty() -> (File, File) {
+    use std::os::fd::FromRawFd;
+
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty writes two new descriptors; the name, termios and
+    // winsize arguments may be null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // SAFETY: both are new descriptors that nothing else owns.
+    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+}
+
+/// A terminal's settings, as bytes to compare.
+fn termios_of(file: &File) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: termios is plain data; all zeroes is valid.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes one termios into `t`, alive for the call.
+    assert_eq!(unsafe { libc::tcgetattr(file.as_raw_fd(), &mut t) }, 0);
+    format!(
+        "{} {} {} {} {:?}",
+        t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_cc
+    )
+    .into_bytes()
+}
+
+/// What a run on a terminal of its own left behind.
+struct TerminalRun {
+    status: ExitStatus,
+    /// What the terminal showed.
+    shown: String,
+    stderr: String,
+    /// The terminal's settings are what they were before.
+    restored: bool,
+}
+
+/// `boxcar run ... -- <command>` on a terminal of its own (a PTY pair):
+/// once the terminal shows `ready`, `typed` is typed on it. The run must
+/// end within [`LIMIT`].
+fn run_on_a_terminal(guest: &Guest, command: &[&str], ready: &str, typed: &[u8]) -> TerminalRun {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let scratch = Scratch::new();
+    let (master, slave) = openpty();
+    let before = termios_of(&slave);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .arg("--")
+        .args(command)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    // The terminal's output, read as it comes (the test keeps the slave
+    // open, so the master never reads its end: poll, until told to stop).
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let shown = Arc::clone(&shown);
+        let done = Arc::clone(&done);
+        let mut master = master.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !done.load(Ordering::Acquire) {
+                let mut pollfd = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll reads and writes the one pollfd it is given.
+                if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                    match master.read(&mut buf) {
+                        Ok(n) if n > 0 => shown.lock().unwrap().extend_from_slice(&buf[..n]),
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
+        })
+    };
+    let start = Instant::now();
+    while !String::from_utf8_lossy(&shown.lock().unwrap()).contains(ready) {
+        assert!(start.elapsed() < LIMIT, "never showed {ready:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    (&master).write_all(typed).unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the run did not end; the terminal showed:\n{}",
+                String::from_utf8_lossy(&shown.lock().unwrap())
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    thread::sleep(Duration::from_millis(200));
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    let shown = String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    TerminalRun {
+        status,
+        shown,
+        stderr: read_lossy(&scratch.path("stderr.log")),
+        restored: termios_of(&slave) == before,
+    }
+}
+
+/// A `-- CMD` run whose stdin is a terminal takes the keys: what is typed
+/// on it runs in the session (`-- /bin/sh -l` is interactive), and the
+/// terminal is as it was afterwards.
+#[test]
+fn typing_on_a_terminal_reaches_a_command_session() {
+    let Some(guest) = guest_or_skip("kvm_m1 command on a terminal") else {
+        return;
+    };
+    let run = run_on_a_terminal(
+        &guest,
+        &["/bin/sh", "-l"],
+        "boxcar:",
+        b"echo T_$((3*5)); exit 5\r",
+    );
+    eprintln!(
+        "kvm_m1 command on a terminal: {} {:?}",
+        run.status, run.shown
+    );
+    assert_eq!(run.status.code(), Some(5), "{}\n{}", run.shown, run.stderr);
+    assert!(run.shown.contains("\nT_15\r"), "{}", run.shown);
+    assert!(run.restored, "the terminal was not restored");
+}
+
+/// On a terminal, Ctrl-] twice stops a `-- CMD` run too: exit 130.
+#[test]
+fn the_escape_stops_a_command_session_on_a_terminal() {
+    let Some(guest) = guest_or_skip("kvm_m1 command escape") else {
+        return;
+    };
+    let run = run_on_a_terminal(&guest, &["/bin/sh", "-l"], "boxcar:", b"\x1d\x1d");
+    assert_eq!(
+        run.status.code(),
+        Some(130),
+        "{}\n{}",
+        run.shown,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("stopped from the console"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.restored, "the terminal was not restored");
+}
+
+/// With `--stdin`, a `-- CMD` run sends piped input to the session, and its
+/// end is an end-of-file there. The input is written once the shell shows
+/// its prompt: an end-of-file character that reaches the session's
+/// terminal while it is still in canonical mode, before the shell's line
+/// editor has taken it, is read by the editor as a NUL, not as the end.
+#[test]
+fn piped_stdin_reaches_a_command_session_with_the_stdin_flag() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let Some(guest) = guest_or_skip("kvm_m1 --stdin") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .args(["--stdin", "--", "/bin/sh"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let shown = Arc::clone(&shown);
+        let mut stdout = child.stdout.take().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => shown.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+    };
+    let start = Instant::now();
+    while !String::from_utf8_lossy(&shown.lock().unwrap()).contains("$ ") {
+        assert!(start.elapsed() < LIMIT, "no prompt");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Written, then the pipe's end.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"echo got_$((1+1))\n")
+        .unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the run did not end:\n{}",
+                String::from_utf8_lossy(&shown.lock().unwrap())
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    reader.join().unwrap();
+    let out = String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    let stderr = read_lossy(&scratch.path("stderr.log"));
+    assert_eq!(status.code(), Some(0), "{out}\n{stderr}");
+    assert!(out.contains("\ngot_2\r"), "{out}");
 }
 
 /// A loop of 200 file writes in the workspace, then `AFTER`.

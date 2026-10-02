@@ -222,8 +222,8 @@ fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Ru
     let vmm = Vmm::new(cfg).unwrap();
     let out = File::create(dir.path().join("session.out")).unwrap();
     let hub = vmm.handle().pty().expect("the hub, with the vsock device");
-    let (_, output, _) = hub.attach(Mode::Ro, 0);
-    let session_out = out::spawn(output, Target::file(out), None).unwrap();
+    let (_, output, _) = hub.attach_primary(Mode::Ro).unwrap();
+    let session_out = out::spawn(output, Target::file(out)).unwrap();
     let control = vmm.control_path().unwrap().to_owned();
 
     let handle = vmm.handle();

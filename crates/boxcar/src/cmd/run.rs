@@ -68,6 +68,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::from(USAGE_EXIT));
     }
     let vsock = vsock_enabled(args.rootfs.is_some(), args.vsock, args.no_vsock);
+    if args.stdin && !(vsock && args.rootfs.is_some()) {
+        tell(
+            "error: --stdin needs the vsock device: without it (--no-vsock, or no shares) the \
+             session runs on the serial console, which takes no piped input",
+        );
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
     if !vsock && !args.vsock_allow.is_empty() {
         tell(
             "error: --vsock-allow needs --vsock: without shares (--no-fs) the VM has no vsock \
@@ -183,6 +190,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
     // A command needs no input: the terminal stays as it is.
     let interactive = args.command.is_empty();
+    // In vsock mode stdin goes to the session's terminal: always without a
+    // command, and for a command when stdin is a terminal or with --stdin.
+    let forward_stdin = interactive || stdin_is_tty() || args.stdin;
     let cfg = VmConfig {
         kernel: args.kernel,
         initramfs: args.initramfs,
@@ -224,7 +234,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
             let mut attached = None;
             if relayed {
-                match attach_session(&mut vmm, interactive) {
+                match attach_session(&mut vmm, forward_stdin) {
                     Ok(local) => attached = Some(local),
                     Err(error) => {
                         // The VM was built, and its stop records vmm.stop:
@@ -685,27 +695,29 @@ struct LocalAttach {
 
 /// Attaches `boxcar run` to the session's terminal, in the same process,
 /// before the VM runs (so it gets the session's output from the first
-/// byte): the output to stdout ([`out`]); for an interactive run, stdin to
-/// the session ([`input`]), with the terminal in raw mode when stdin is
-/// one, restored by the VM's stop sequence; and when stdin is a terminal,
-/// its size to the session's, now and on every `SIGWINCH`.
-fn attach_session(vmm: &mut Vmm, interactive: bool) -> anyhow::Result<LocalAttach> {
+/// byte), as the hub's primary client, which the session waits for: the
+/// output to stdout ([`out`]); with `forward_stdin`, stdin to the session
+/// ([`input`]), with the terminal in raw mode when stdin is one, restored
+/// by the VM's stop sequence; and when stdin is a terminal, its size to the
+/// session's, now and on every `SIGWINCH`.
+fn attach_session(vmm: &mut Vmm, forward_stdin: bool) -> anyhow::Result<LocalAttach> {
     let handle = vmm.handle();
     let hub = handle
         .pty()
         .context("the VM has no terminal for its session")?;
-    let mode = if interactive { Mode::Rw } else { Mode::Ro };
-    let (_, output, typed) = hub.attach(mode, 0);
+    let mode = if forward_stdin { Mode::Rw } else { Mode::Ro };
+    let (_, output, typed) = hub
+        .attach_primary(mode)
+        .context("the session's terminal has its primary client already")?;
     let stdout = Target::stdout().context("cannot write to stdout")?;
-    let writer = out::spawn(output, stdout, Some(hub.clone()))
-        .context("cannot write the session's output")?;
+    let writer = out::spawn(output, stdout).context("cannot write the session's output")?;
     if let Some(typed) = typed {
         let stdin = LocalInput::stdin().context("cannot read stdin")?;
         input::forward(stdin, typed, handle).context("cannot send stdin to the session")?;
     }
     if stdin_is_tty() {
         follow_terminal_size(&hub).context("cannot follow the terminal's size")?;
-        if interactive {
+        if forward_stdin {
             if let Some(guard) =
                 RawModeGuard::enter().context("cannot put the terminal in raw mode")?
             {
@@ -775,20 +787,14 @@ fn finish_output(local: &LocalAttach) -> Option<String> {
     });
     local.writer.stop(STOP_GRACE);
     local.hub.wait_ended(STOP_GRACE);
-    undelivered_line(
-        ended,
-        local.writer.fell_behind(),
-        local.writer.undelivered(),
-    )
+    undelivered_line(ended, local.writer.undelivered())
 }
 
 /// The line `boxcar run` says when the wait for stdout ended (`ended`) with
-/// `bytes` of the session's output not written, `fell_behind` when the hub
-/// detached the writer for being slow at some point: none when it is all
-/// out, or when stdout's reader is gone.
-fn undelivered_line(ended: OutWait, fell_behind: bool, bytes: u64) -> Option<String> {
+/// `bytes` of the session's output not written: none when it is all out,
+/// or when stdout's reader is gone.
+fn undelivered_line(ended: OutWait, bytes: u64) -> Option<String> {
     let why = match ended {
-        OutWait::Done if fell_behind => "stdout fell more than 1 MiB behind",
         OutWait::Done | OutWait::Failed => return None,
         OutWait::Stalled => "stdout stalled",
         OutWait::Capped => "stdout still not done after 30 s",
@@ -1095,34 +1101,25 @@ mod tests {
     /// with the count and why; nothing when it is all out.
     #[test]
     fn output_left_behind_is_said_with_its_count() {
-        assert_eq!(undelivered_line(OutWait::Done, false, 0), None);
+        assert_eq!(undelivered_line(OutWait::Done, 0), None);
         assert_eq!(
-            undelivered_line(OutWait::Stalled, false, 113_000).as_deref(),
+            undelivered_line(OutWait::Stalled, 113_000).as_deref(),
             Some("boxcar: 113000 bytes of session output not delivered: stdout stalled")
         );
         assert_eq!(
-            undelivered_line(OutWait::Capped, false, 5).as_deref(),
+            undelivered_line(OutWait::Capped, 5).as_deref(),
             Some(
                 "boxcar: 5 bytes of session output not delivered: stdout still not done after 30 s"
             )
         );
         assert_eq!(
-            undelivered_line(OutWait::Stopped, true, 7).as_deref(),
+            undelivered_line(OutWait::Stopped, 7).as_deref(),
             Some("boxcar: 7 bytes of session output not delivered: stopped by a signal")
         );
-        // The writer finished, but the hub had detached it for being slow:
-        // the bytes it skipped.
-        assert_eq!(
-            undelivered_line(OutWait::Done, true, 2_000_000).as_deref(),
-            Some(
-                "boxcar: 2000000 bytes of session output not delivered: stdout fell more than \
-                 1 MiB behind"
-            )
-        );
         // Stdout's reader is gone: nothing to say, as before.
-        assert_eq!(undelivered_line(OutWait::Failed, false, 9), None);
+        assert_eq!(undelivered_line(OutWait::Failed, 9), None);
         // Given up with nothing left (it finished meanwhile): nothing to say.
-        assert_eq!(undelivered_line(OutWait::Stalled, false, 0), None);
+        assert_eq!(undelivered_line(OutWait::Stalled, 0), None);
         assert_eq!(OUTPUT_CAP, Duration::from_secs(30));
         assert_eq!(OUTPUT_IDLE, Duration::from_secs(2));
     }

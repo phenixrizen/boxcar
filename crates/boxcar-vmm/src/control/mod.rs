@@ -18,5 +18,5 @@ pub mod ops;
 pub mod peercred;
 pub mod server;
 
-pub use ops::{ConnCtx, Ops, RawUpgrade, VmmOps};
+pub use ops::{ConnCtx, ConnEvents, Ops, RawUpgrade, VmmOps};
 pub use server::ControlServer;

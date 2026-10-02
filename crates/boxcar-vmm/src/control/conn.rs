@@ -153,6 +153,17 @@ impl Conn {
         }
     }
 
+    /// Queues `event` as a line, from outside the connection's thread,
+    /// without sending anything here: the connection's thread, woken, sends
+    /// it. Never waits (`pty.detached` for a watched attach).
+    pub(crate) fn send_event<T: Serialize>(&self, event: &T) {
+        {
+            let mut out = self.lock();
+            self.queue(&mut out, event);
+        }
+        self.wake();
+    }
+
     fn queue_state(&self, out: &mut Outbox, state: VmState) {
         if out.raw || out.state.is_some_and(|sent| sent >= state) {
             return;
@@ -476,11 +487,21 @@ impl Session {
             _ => {
                 let result = self.ops.dispatch(&mut self.ctx, &request);
                 let upgrade = self.ctx.raw_upgrade.take();
-                let ok = result.is_ok();
-                self.respond(request.id, result);
-                match upgrade {
-                    Some(upgrade) if ok => Flow::Upgrade(upgrade, Vec::new()),
-                    _ => Flow::Continue,
+                match (result, upgrade) {
+                    (Ok(value), Some(upgrade)) => {
+                        // The response, then raw, under one outbox lock: no
+                        // event can be queued between the two, where the
+                        // client would read it as raw bytes.
+                        let mut out = self.conn.lock();
+                        self.conn.queue(&mut out, &response(request.id, Ok(value)));
+                        out.raw = true;
+                        self.conn.flush(&mut out);
+                        Flow::Upgrade(upgrade, Vec::new())
+                    }
+                    (result, _) => {
+                        self.respond(request.id, result);
+                        Flow::Continue
+                    }
                 }
             }
         }
@@ -711,6 +732,7 @@ mod tests {
                 peer_pid: 1,
                 peer_uid: 0,
                 raw_upgrade: None,
+                events: None,
             },
             ops: Arc::new(Unreached),
             audit: handle.audit().clone(),
@@ -742,6 +764,56 @@ mod tests {
             got[2]["error"]["message"],
             "over 100 requests a second; the request was dropped"
         );
+        writer.close().unwrap();
+    }
+
+    /// Ops whose `raw` upgrades the connection.
+    struct Upgrading;
+
+    impl Ops for Upgrading {
+        fn status(&self) -> boxcar_proto::control::Status {
+            unreachable!("not asked")
+        }
+
+        fn stop(&self, _: StopParams) -> Result<Value, ErrorBody> {
+            unreachable!("not asked")
+        }
+
+        fn dispatch(&self, conn: &mut ConnCtx, _: &Request) -> Result<Value, ErrorBody> {
+            conn.raw_upgrade = Some(RawUpgrade::new(|_, _| {}));
+            Ok(json!({"raw": true}))
+        }
+    }
+
+    /// The connection is raw from the moment the upgrading response is
+    /// queued, under the same lock: a state event sent before the handler
+    /// takes over is not queued behind the response, where the client
+    /// would read it as raw bytes.
+    #[test]
+    fn no_event_comes_between_an_upgrading_response_and_the_raw_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = crate::lifecycle::test_handle(tmp.path());
+        let (server, client) = UnixStream::pair().unwrap();
+        let hello = Hello::new("boxcar/test", "s", Vec::new());
+        let mut session = Session {
+            conn: Arc::new(Conn::new(server, &hello).unwrap()),
+            ctx: ConnCtx {
+                peer_pid: 1,
+                peer_uid: 0,
+                raw_upgrade: None,
+                events: None,
+            },
+            ops: Arc::new(Upgrading),
+            audit: handle.audit().clone(),
+        };
+        let mut limit = RateLimit::new(Instant::now());
+        let flow = session.line(br#"{"v":1,"id":7,"op":"raw"}"#, &mut limit);
+        assert!(matches!(flow, Flow::Upgrade(..)));
+        session.conn.send_state(VmState::Stopping);
+        session.conn.close();
+        let got = lines(client);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1]["result"], json!({"raw": true}));
         writer.close().unwrap();
     }
 

@@ -546,3 +546,63 @@ fn vsock_allow_refuses_an_internal_port() {
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(stderr(&output).contains("internal"), "{}", stderr(&output));
 }
+
+/// `--stdin` sends piped input to a `-- CMD` session's terminal, which only
+/// the vsock device has: without it (`--no-vsock`, or no shares) it is a
+/// usage error, before a session starts.
+#[test]
+fn stdin_needs_the_vsock_device() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--no-vsock",
+        "--stdin",
+        "--",
+        "true",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--stdin"), "{}", stderr(&output));
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--no-fs",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--stdin",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--stdin needs the vsock device"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+    // With the vsock device it is taken: the run gets past it and fails
+    // only for want of a kernel.
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--stdin",
+        "--",
+        "true",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("/nonexistent/vmlinux"),
+        "{}",
+        stderr(&output)
+    );
+}

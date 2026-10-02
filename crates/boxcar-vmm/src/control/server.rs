@@ -40,7 +40,7 @@ use boxcar_proto::{ControlConnect, Payload, Verdict};
 use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use super::conn::{poll_two, record, Conn, Session};
-use super::ops::{ConnCtx, Ops};
+use super::ops::{ConnCtx, ConnEvents, Ops};
 use super::peercred::peer_cred;
 use crate::lifecycle::VmmHandle;
 
@@ -292,11 +292,17 @@ impl Accept {
             &self.audit,
             Payload::ControlConnect(ControlConnect { pid, uid, verdict }),
         );
-        // The hello is queued here, before the connection is in
-        // `shared.conns` where `notify_state` and `close` reach it.
+        // The connections' lock is held from before the hello is sent to
+        // after the connection is in `shared.conns`, where `notify_state`
+        // and `close` reach it: nothing they send comes before the hello,
+        // and a client that has read its hello hears everything sent after
+        // it.
+        let mut conns = self.shared.conns();
         let conn = match Conn::new(stream, &self.hello) {
             Ok(conn) => Arc::new(conn),
             Err(error) => {
+                // Not under the lock: the stop sequence takes it.
+                drop(conns);
                 tracing::warn!("control: cannot set up a connection: {error}");
                 return;
             }
@@ -307,6 +313,7 @@ impl Accept {
                 peer_pid: pid,
                 peer_uid: uid,
                 raw_upgrade: None,
+                events: Some(ConnEvents::new(&conn)),
             },
             ops: self.ops.clone(),
             audit: self.audit.clone(),
@@ -317,11 +324,11 @@ impl Accept {
         let thread = match thread {
             Ok(thread) => thread,
             Err(error) => {
+                drop(conns);
                 tracing::warn!("control: cannot start a connection thread: {error}");
                 return;
             }
         };
-        let mut conns = self.shared.conns();
         let (done, live): (Vec<Served>, Vec<Served>) = mem::take(&mut *conns)
             .into_iter()
             .partition(|served| served.thread.is_finished());

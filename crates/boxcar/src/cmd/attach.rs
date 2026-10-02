@@ -4,18 +4,23 @@
 //! `boxcar attach`: a running session's terminal, from this one.
 //!
 //! Two connections to the session's control socket: one asks `pty.attach`
-//! and becomes the terminal's raw bytes, both ways; the other sends
-//! `pty.resize` with this terminal's size, at the start and on every
-//! `SIGWINCH`, and hears the server's events. The terminal is in raw mode
-//! while attached ([`RawModeGuard`]), restored on every way out: the stop
-//! signals and `SIGWINCH` are blocked and read from a signalfd, so a
-//! signal ends the attach like a detach does, and a panic restores it
-//! too.
+//! and becomes the terminal's raw bytes, both ways, and nothing else; the
+//! other watches that attach (`pty.watch`, by the id the attach's response
+//! names), sends `pty.resize` with this terminal's size, at the start and
+//! on every `SIGWINCH`, and hears the server's events. The terminal is in
+//! raw mode while attached ([`RawModeGuard`]), restored on every way out,
+//! before anything is said: the stop signals and `SIGWINCH` are blocked and
+//! read from a signalfd, so a signal ends the attach like a detach does,
+//! stdout is written in steps that a stop interrupts (a stalled stdout
+//! holds up neither), and a panic restores it too.
 //!
 //! Ctrl-P then Ctrl-Q within a second detaches ([`DetachKeys`]); the two
-//! keys are not sent. A server that detaches the client for being slow
-//! ends the stream with the `pty.detached` line, which is not printed
-//! ([`DetachedTail`]).
+//! keys are not sent. The stream's end is the attach's end: when the server
+//! detached this client for being slow, the watching connection hears
+//! `pty.detached` (reason `slow`), and `boxcar attach` exits 3; as the two
+//! connections are not ordered with each other, it waits a moment
+//! ([`REASON_WAIT`]) for the event after the stream's end, unless the VM
+//! is stopping. Otherwise the end of the stream is the session's (exit 0).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -23,13 +28,15 @@ use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
-use boxcar_proto::control::{to_line, PtyDetached, PTY_SESSION};
+use boxcar_proto::control::{PtyAttached, PTY_DETACHED_SLOW, PTY_SESSION};
 use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, SignalFd, STOP_SIGNALS};
+use boxcar_vmm::pty::out::Target;
 use boxcar_vmm::stdin::{stdin_is_tty, RawModeGuard};
 use serde_json::json;
 
@@ -48,6 +55,10 @@ const DETACH_WINDOW: Duration = Duration::from_secs(1);
 /// The exit code when the server detached this client for being slow.
 const SLOW_EXIT: u8 = 3;
 
+/// How long, after the stream's end, `boxcar attach` waits for the reason
+/// on the watching connection.
+const REASON_WAIT: Duration = Duration::from_millis(500);
+
 /// Bytes moved at a time.
 const CHUNK: usize = 16 * 1024;
 
@@ -65,23 +76,67 @@ enum Outcome {
 
 /// What the threads tell the main one, which copies the stream.
 struct Ending {
-    outcome: Mutex<Option<Outcome>>,
+    state: Mutex<EndState>,
+    changed: Condvar,
+    /// Set with an outcome: the copy stops writing to stdout.
+    stop: AtomicBool,
     /// The attached stream, shut down to end the copy.
     stream: UnixStream,
 }
 
+#[derive(Default)]
+struct EndState {
+    outcome: Option<Outcome>,
+    /// The watching connection is done: it closed, or the VM is stopping
+    /// (the stream's end is then the VM's, not a detach).
+    control_done: bool,
+}
+
 impl Ending {
+    fn lock(&self) -> MutexGuard<'_, EndState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Ends the attach for `outcome`, unless something ended it first.
     fn end(&self, outcome: Outcome) {
-        let mut slot = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.is_none() {
-            *slot = Some(outcome);
+        {
+            let mut state = self.lock();
+            if state.outcome.is_none() {
+                state.outcome = Some(outcome);
+            }
         }
+        self.stop.store(true, Ordering::Release);
+        self.changed.notify_all();
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 
+    /// The watching connection has nothing more to say.
+    fn control_done(&self) {
+        self.lock().control_done = true;
+        self.changed.notify_all();
+    }
+
     fn outcome(&self) -> Option<Outcome> {
-        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner)
+        self.lock().outcome
+    }
+
+    /// After the stream's end: the outcome, waiting up to `wait` for one
+    /// unless the watching connection is done.
+    fn outcome_within(&self, wait: Duration) -> Option<Outcome> {
+        let deadline = Instant::now() + wait;
+        let mut state = self.lock();
+        while state.outcome.is_none() && !state.control_done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state.outcome
     }
 }
 
@@ -99,12 +154,16 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
     let mut control = Client::connect(attached.path())?;
     let mode = if args.ro { "ro" } else { "rw" };
     let params = json!({"session": PTY_SESSION, "mode": mode, "replay_bytes": args.replay});
-    attached
+    let result = attached
         .request("pty.attach", params)?
         .map_err(|error| anyhow!("attach: {error}"))?;
     let (stream, pending) = attached
         .into_raw()
         .context("cannot read the session's terminal")?;
+    // A server that names no attach cannot be asked why it ended one.
+    let attach_id = serde_json::from_value::<PtyAttached>(result)
+        .ok()
+        .map(|attached| attached.attach_id);
 
     let tty = stdin_is_tty();
     if tty {
@@ -113,12 +172,19 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
             let _ = control.request("pty.resize", resize_params(size))?;
         }
     }
+    if let Some(attach_id) = &attach_id {
+        // An attach that has ended already is not found: its stream ends.
+        let _ = control.request("pty.watch", json!({"attach_id": attach_id}))?;
+    }
     control.set_timeout(None)?;
     let sender = control.sender()?;
     let ending = Arc::new(Ending {
-        outcome: Mutex::new(None),
+        state: Mutex::new(EndState::default()),
+        changed: Condvar::new(),
+        stop: AtomicBool::new(false),
         stream: stream.try_clone()?,
     });
+    let mut stdout = Target::stdout().context("cannot write to stdout")?;
     let to_session = stream.try_clone()?;
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
 
@@ -140,25 +206,31 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
         let ending = Arc::clone(&ending);
         thread::Builder::new()
             .name("attach-control".into())
-            .spawn(move || watch_control(control, &ending))?;
+            .spawn(move || watch_control(control, attach_id.as_deref(), &ending))?;
     }
-    let copied = copy_out(&stream, &pending, &mut io::stdout().lock());
+    let copied = copy_out(&stream, &pending, &mut stdout, &ending.stop);
     // Back to the terminal as it was before anything is said.
     drop(terminal);
+    let outcome = match &copied {
+        // The stream's end: why, if the watching connection says.
+        Ok(()) => ending.outcome_within(REASON_WAIT),
+        Err(_) => ending.outcome(),
+    };
 
-    match (ending.outcome(), copied) {
+    match (outcome, copied) {
         (Some(Outcome::Detached), _) => Ok(ExitCode::SUCCESS),
         (Some(Outcome::Signal(signo)), _) => Ok(ExitCode::from(
             u8::try_from(128 + signo.clamp(0, 127)).unwrap_or(1),
         )),
-        (Some(Outcome::Slow), _) | (None, Ok(true)) => {
+        (Some(Outcome::Slow), _) => {
             tell(
                 "boxcar: detached: the session's output came faster than this terminal took it \
-                 (the VMM keeps at most 1 MiB for each client)",
+                 (the VMM keeps at most 1 MiB for each client, and lets one take nothing for at \
+                 most 30 s)",
             );
             Ok(ExitCode::from(SLOW_EXIT))
         }
-        (None, Ok(false)) => Ok(ExitCode::SUCCESS),
+        (None, Ok(())) => Ok(ExitCode::SUCCESS),
         (None, Err(error)) => Err(error).context("the session's terminal"),
     }
 }
@@ -169,33 +241,34 @@ fn resize_params(size: (u16, u16)) -> serde_json::Value {
 }
 
 /// The stream to `out`: `pending` first, then what comes, until the stream
-/// ends. Returns whether it ended with the server's `pty.detached` line,
-/// which is not written out.
-fn copy_out(stream: &UnixStream, pending: &[u8], out: &mut impl Write) -> io::Result<bool> {
-    let mut tail = DetachedTail::new(to_line(&PtyDetached::slow()).map_err(io::Error::other)?);
-    let ready = tail.push(pending);
-    out.write_all(&ready)?;
-    out.flush()?;
+/// ends or `stop` is set. Stdout is written in steps (see
+/// [`Target::write_until`]): a non-blocking stdout's `EAGAIN` is waited
+/// out, and a stalled one does not hold up a stop.
+fn copy_out(
+    stream: &UnixStream,
+    pending: &[u8],
+    out: &mut Target,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    if !out.write_until(pending, stop)? {
+        return Ok(());
+    }
     let mut buf = vec![0u8; CHUNK];
     loop {
         match (&*stream).read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => return Ok(()),
             Ok(n) => {
-                let ready = tail.push(&buf[..n]);
-                out.write_all(&ready)?;
-                out.flush()?;
+                if !out.write_until(&buf[..n], stop)? {
+                    return Ok(());
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             // A server that closes with input it did not read resets the
             // connection: an end as well.
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
             Err(error) => return Err(error),
         }
     }
-    let (rest, slow) = tail.finish();
-    out.write_all(&rest)?;
-    out.flush()?;
-    Ok(slow)
 }
 
 /// Stdin to the session, but for the detach keys, which end the attach;
@@ -299,18 +372,28 @@ fn watch_signals(signals: &SignalFd, mut sender: Sender, tty: bool, ending: &End
     }
 }
 
-/// The control connection's events: a `pty.detached` there ends the
-/// attach; anything else (the responses to resizes, `state`) is left to
-/// the stream, which ends when the session or the VM does.
-fn watch_control(mut control: Client, ending: &Ending) {
+/// The watching connection's events: `pty.detached` (slow) for this
+/// attach ends it as slow; a `state` event (the VM is stopping) or the
+/// connection's end says no reason is coming. Anything else (the responses
+/// to resizes) is left alone: the stream ends when the session or the VM
+/// does.
+fn watch_control(mut control: Client, attach_id: Option<&str>, ending: &Ending) {
     loop {
         match control.next_message() {
-            Ok(Some(Message::Event { name, .. })) if name == "pty.detached" => {
-                ending.end(Outcome::Slow);
+            Ok(Some(Message::Event { name, body })) if name == "pty.detached" => {
+                if attach_id.is_some_and(|id| body["attach_id"] == id)
+                    && body["reason"] == PTY_DETACHED_SLOW
+                {
+                    ending.end(Outcome::Slow);
+                    return;
+                }
+            }
+            Ok(Some(Message::Event { name, .. })) if name == "state" => ending.control_done(),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                ending.control_done();
                 return;
             }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return,
         }
     }
 }
@@ -368,44 +451,6 @@ impl DetachKeys {
     }
 }
 
-/// Holds back the end of the stream for as long as it could be the
-/// server's `pty.detached` line: only the line at the very end of the
-/// stream is the server's; the same bytes anywhere else are the session's.
-struct DetachedTail {
-    line: Vec<u8>,
-    held: Vec<u8>,
-}
-
-impl DetachedTail {
-    fn new(line: Vec<u8>) -> DetachedTail {
-        DetachedTail {
-            line,
-            held: Vec::new(),
-        }
-    }
-
-    /// Takes `bytes`; returns what can be written out now.
-    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.held.extend_from_slice(bytes);
-        let longest = self.line.len().min(self.held.len());
-        let keep = (0..=longest)
-            .rev()
-            .find(|&len| self.line.starts_with(&self.held[self.held.len() - len..]))
-            .unwrap_or(0);
-        self.held.drain(..self.held.len() - keep).collect()
-    }
-
-    /// At the stream's end: what is left to write out, and whether the
-    /// stream ended with the line.
-    fn finish(self) -> (Vec<u8>, bool) {
-        if self.held == self.line {
-            (Vec::new(), true)
-        } else {
-            (self.held, false)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,31 +495,5 @@ mod tests {
         assert_eq!(keys.feed(b"\x10", t0), (Vec::new(), false));
         assert_eq!(keys.release(), Some(CTRL_P));
         assert_eq!(keys.release(), None);
-    }
-
-    #[test]
-    fn only_the_line_at_the_end_of_the_stream_is_the_servers() {
-        let line = b"{\"v\":1,\"event\":\"pty.detached\",\"reason\":\"slow\"}\n".to_vec();
-        assert_eq!(to_line(&PtyDetached::slow()).unwrap(), line);
-        // At the end, in pieces: held back, and not written out.
-        let mut tail = DetachedTail::new(line.clone());
-        let mut out = tail.push(b"output then ");
-        out.extend(tail.push(&line[..10]));
-        out.extend(tail.push(&line[10..]));
-        assert_eq!(out, b"output then ");
-        assert_eq!(tail.finish(), (Vec::new(), true));
-        // Followed by more: the session's, written out.
-        let mut tail = DetachedTail::new(line.clone());
-        let mut out = tail.push(&line);
-        out.extend(tail.push(b"more"));
-        let (rest, slow) = tail.finish();
-        out.extend(rest);
-        assert!(!slow);
-        assert_eq!(out, [line.as_slice(), b"more"].concat());
-        // A start of it at the end: written out at the end.
-        let mut tail = DetachedTail::new(line.clone());
-        let out = tail.push(b"ab{\"v\":1");
-        assert_eq!(out, b"ab");
-        assert_eq!(tail.finish(), (b"{\"v\":1".to_vec(), false));
     }
 }

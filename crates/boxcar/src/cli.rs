@@ -111,16 +111,18 @@ pub enum Command {
     /// audit log could not be written (the VM is stopped and stderr says
     /// `audit log failed: <why>`), 130 after SIGINT (Ctrl-C) or the console
     /// escape, 143 after SIGTERM, 129 after SIGHUP and 131 after SIGQUIT.
-    /// When stdin is a terminal and no command is given, the terminal is
-    /// the session's: every key goes to the guest, Ctrl-C included; press
-    /// Ctrl-] twice within a second to stop the VM. With the vsock device,
-    /// input from a pipe or a file goes to the session too, and its end is
-    /// an end-of-file there; the session's terminal takes this one's size,
-    /// now and whenever it changes; and other terminals can attach to the
-    /// session (`boxcar attach`). The VMM never waits for stdout: when it
-    /// falls more than 1 MiB behind the session, what the session printed
-    /// in between is skipped, and once the VM has stopped boxcar says on
-    /// stderr how many bytes of the session's output stdout did not get.
+    /// When stdin is a terminal, the terminal is the session's: every key
+    /// goes to the guest, Ctrl-C included; press Ctrl-] twice within a
+    /// second to stop the VM. With the vsock device this holds for a `--
+    /// CMD` run too, and input from a pipe or a file goes to the session as
+    /// well when no command is given (or with `--stdin`), its end an
+    /// end-of-file there; the session's terminal takes this one's size, now
+    /// and whenever it changes; and other terminals can attach to the
+    /// session (`boxcar attach`). A slow stdout slows the session down:
+    /// once 1 MiB of its output waits for stdout, the session waits too.
+    /// Once the VM has stopped, boxcar writes out what is left for as long
+    /// as stdout takes it (giving up after 2 s with none taken, or 30 s in
+    /// all), and says on stderr how many bytes stdout did not get.
     ///
     /// With shares the guest also gets a network card (see `--net`): it
     /// reaches only what the policy allows (`--policy-file`, `--deny`,
@@ -292,12 +294,20 @@ pub struct RunArgs {
     /// The command the guest runs instead of a login shell, and its
     /// arguments, after `--`: an argv, run without a shell, with CMD looked
     /// up in the guest's PATH unless it holds a `/`. A `--` must be
-    /// followed by one. The run is not interactive: stdin is not forwarded
-    /// and the terminal is left as it is. With the vsock device the
-    /// command and its environment may take up to 64 KiB; with
-    /// `--no-vsock` it travels on the kernel command line.
+    /// followed by one. With the vsock device, the command takes stdin when
+    /// it is a terminal (in raw mode: Ctrl-C reaches the command, Ctrl-]
+    /// twice stops the VM), or with `--stdin`; otherwise stdin is not read.
+    /// The command and its environment may take up to 64 KiB. With
+    /// `--no-vsock` the run is not interactive (stdin is not forwarded and
+    /// the terminal is left as it is), and the command travels on the
+    /// kernel command line.
     #[arg(last = true, value_name = "CMD", conflicts_with = "no_fs")]
     pub command: Vec<String>,
+    /// Send stdin to the session's terminal when it is not a terminal (a
+    /// pipe or a file) for a `-- CMD` run, which otherwise does not read
+    /// it; its end is an end-of-file there. Needs the vsock device.
+    #[arg(long, conflicts_with = "no_vsock")]
+    pub stdin: bool,
     /// Once the control socket is ready, write one line to file descriptor
     /// FD, `{"ready":true,"control":"<path>","session_id":"<id>"}`, and
     /// close it. FD must be open for writing, and not 0, 1 or 2.

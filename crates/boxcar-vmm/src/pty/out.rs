@@ -13,10 +13,12 @@
 //! Only a target that fails for good (its reader is gone) ends the
 //! writing; the writer then lets its output go, and the hub forgets it.
 //!
-//! The hub never waits on the writer: a writer more than the hub's
-//! backlog behind is detached, and, given the hub ([`spawn`]'s `reattach`),
-//! attaches again and goes on with what the session prints next; the bytes
-//! it missed are counted ([`OutHandle::undelivered`]).
+//! The writer is the hub's primary client ([`PtyHub::attach_primary`]):
+//! while it is behind, the hub holds the session back, so it is never
+//! detached and nothing is skipped for it.
+//!
+//! [`Target::write_until`] is the same piecewise, stoppable write, for a
+//! caller that writes on its own thread (`boxcar attach`).
 //!
 //! Once the VM has stopped, `boxcar run` waits for the writer to finish
 //! ([`OutHandle::wait_with`]) for as long as stdout keeps taking bytes: a
@@ -39,7 +41,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{End, Mode, Output, PtyHub, Totals};
+use super::{Output, Totals};
+
+#[cfg(doc)]
+use super::PtyHub;
 
 /// The most bytes given to one `write`: `PIPE_BUF`. A pipe that polls
 /// writable takes a write this size whole, and a smaller write shows
@@ -182,23 +187,42 @@ impl Target {
         }
     }
 
-    /// Writes all of `bytes`, at most [`WRITE_PIECE`] at a time, waiting
-    /// while the target takes nothing, and counts each byte taken. Ends
-    /// early when asked to stop, or when the target fails for good.
-    fn write_all(&mut self, mut bytes: &[u8], progress: &Progress) -> Result<(), Finish> {
+    /// Writes all of `bytes` as the writer's thread does: at most
+    /// [`WRITE_PIECE`] at a time, each after a poll for room in
+    /// [`POLL_STEP`]s, and again on `EAGAIN`, so it never sits in a write
+    /// a stalled reader holds up. `Ok(true)` once written, `Ok(false)` as
+    /// soon as `stop` is set (looked at between the steps), and an error
+    /// when the target fails for good.
+    pub fn write_until(&mut self, bytes: &[u8], stop: &AtomicBool) -> io::Result<bool> {
+        let written = AtomicU64::new(0);
+        match self.put(bytes, stop, &written) {
+            Ok(()) => Ok(true),
+            Err(Halt::Stopped) => Ok(false),
+            Err(Halt::Failed(error)) => Err(error),
+        }
+    }
+
+    /// Writes all of `bytes` (see [`Target::write_until`]), counting each
+    /// byte taken in `written`.
+    fn put(
+        &mut self,
+        mut bytes: &[u8],
+        stop: &AtomicBool,
+        written: &AtomicU64,
+    ) -> Result<(), Halt> {
         while !bytes.is_empty() {
-            if progress.stopping() {
-                return Err(Finish::Stopped);
+            if stop.load(Ordering::Acquire) {
+                return Err(Halt::Stopped);
             }
             if !self.writable() {
                 continue;
             }
             let piece = &bytes[..bytes.len().min(WRITE_PIECE)];
             match self.write(piece) {
-                Ok(0) => return Err(Finish::Failed),
+                Ok(0) => return Err(Halt::Failed(io::ErrorKind::WriteZero.into())),
                 Ok(n) => {
                     bytes = &bytes[n..];
-                    progress.written.fetch_add(n as u64, Ordering::Relaxed);
+                    written.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -206,12 +230,12 @@ impl Target {
                         thread::sleep(WOULD_BLOCK_RETRY);
                     }
                 }
-                Err(_) => return Err(Finish::Failed),
+                Err(error) => return Err(Halt::Failed(error)),
             }
         }
         loop {
-            if progress.stopping() {
-                return Err(Finish::Stopped);
+            if stop.load(Ordering::Acquire) {
+                return Err(Halt::Stopped);
             }
             match self.writer.flush() {
                 Ok(()) => return Ok(()),
@@ -219,10 +243,18 @@ impl Target {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(WOULD_BLOCK_RETRY);
                 }
-                Err(_) => return Err(Finish::Failed),
+                Err(error) => return Err(Halt::Failed(error)),
             }
         }
     }
+}
+
+/// How a write ended early.
+enum Halt {
+    /// It was asked to stop.
+    Stopped,
+    /// The target failed for good.
+    Failed(io::Error),
 }
 
 /// How the writer's thread ended.
@@ -241,8 +273,6 @@ struct Progress {
     /// Bytes the target took.
     written: AtomicU64,
     stop: AtomicBool,
-    /// The hub detached the writer for being slow at least once.
-    fell_behind: AtomicBool,
     finished: Mutex<Option<Finish>>,
     finished_changed: Condvar,
     /// A copy of the target's descriptor, to see its reader take bytes; let
@@ -320,9 +350,9 @@ pub struct OutHandle {
     totals: Arc<Totals>,
 }
 
-/// Starts writing `output` to `target`. With `reattach`, a writer the hub
-/// detached for being slow attaches to it again (see the module docs).
-pub fn spawn(output: Output, target: Target, reattach: Option<PtyHub>) -> io::Result<OutHandle> {
+/// Starts writing `output` (the hub's primary client's, as `boxcar run`
+/// attaches it) to `target`.
+pub fn spawn(output: Output, target: Target) -> io::Result<OutHandle> {
     let queue = target.fd.and_then(|fd| {
         // SAFETY: `fd` is the descriptor `target` owns, open until it is
         // dropped; it is only duplicated here.
@@ -334,7 +364,6 @@ pub fn spawn(output: Output, target: Target, reattach: Option<PtyHub>) -> io::Re
     let progress = Arc::new(Progress {
         written: AtomicU64::new(0),
         stop: AtomicBool::new(false),
-        fell_behind: AtomicBool::new(false),
         finished: Mutex::new(None),
         finished_changed: Condvar::new(),
         queue: Mutex::new(queue),
@@ -348,7 +377,7 @@ pub fn spawn(output: Output, target: Target, reattach: Option<PtyHub>) -> io::Re
         .name("pty-stdout".into())
         .spawn(move || {
             // The target goes with `write_out`'s return.
-            let finish = write_out(output, target, reattach.as_ref(), &progress);
+            let finish = write_out(&output, target, &progress);
             *progress.lock_queue() = None;
             *progress.lock_finished() = Some(finish);
             progress.finished_changed.notify_all();
@@ -358,33 +387,19 @@ pub fn spawn(output: Output, target: Target, reattach: Option<PtyHub>) -> io::Re
 
 /// The writer's thread: each piece of the output to the target until the
 /// output ends, the target fails, or the writer is asked to stop.
-fn write_out(
-    mut output: Output,
-    mut target: Target,
-    reattach: Option<&PtyHub>,
-    progress: &Progress,
-) -> Finish {
+fn write_out(output: &Output, mut target: Target, progress: &Progress) -> Finish {
     loop {
         if progress.stopping() {
             return Finish::Stopped;
         }
         match output.recv_timeout(POLL_STEP) {
-            Ok(bytes) => {
-                if let Err(finish) = target.write_all(&bytes, progress) {
-                    return finish;
-                }
-            }
+            Ok(bytes) => match target.put(&bytes, &progress.stop, &progress.written) {
+                Ok(()) => {}
+                Err(Halt::Stopped) => return Finish::Stopped,
+                Err(Halt::Failed(_)) => return Finish::Failed,
+            },
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                if output.end() != Some(End::Slow) {
-                    return Finish::Done;
-                }
-                progress.fell_behind.store(true, Ordering::Release);
-                match reattach {
-                    Some(hub) => output = hub.attach(Mode::Ro, 0).1,
-                    None => return Finish::Done,
-                }
-            }
+            Err(RecvTimeoutError::Disconnected) => return Finish::Done,
         }
     }
 }
@@ -471,10 +486,9 @@ impl OutHandle {
     }
 
     /// Bytes of the session's output, from where the writer started, that
-    /// the target has not taken: what the writer holds, what it missed
-    /// while it was detached, and what came after it stopped. Exact once
-    /// the writer has stopped (and the terminal ended); while a write is
-    /// under way its bytes count as not delivered.
+    /// the target has not taken: what the writer holds, and what came after
+    /// it stopped. Exact once the writer has stopped (and the terminal
+    /// ended); while a write is under way its bytes count as not delivered.
     pub fn undelivered(&self) -> u64 {
         let offered = self
             .totals
@@ -482,12 +496,6 @@ impl OutHandle {
             .load(Ordering::Acquire)
             .saturating_sub(self.start);
         offered.saturating_sub(self.written())
-    }
-
-    /// Whether the hub detached the writer at least once for being slow:
-    /// the session's output has a gap.
-    pub fn fell_behind(&self) -> bool {
-        self.progress.fell_behind.load(Ordering::Acquire)
     }
 
     /// The bytes waiting in the target for its reader, when it says.
@@ -566,19 +574,25 @@ mod tests {
 
     /// The reviewer's probe as a test: a non-blocking stdout (`EAGAIN`
     /// once full) read slowly gets every byte the session wrote, in order,
-    /// and its reader sees the end once the writer is done.
+    /// and its reader sees the end once the writer is done. The writer is
+    /// the hub's primary client, as `boxcar run`'s is: 3 MB, three times
+    /// its limit, is held back for it, never skipped.
     #[test]
     fn a_non_blocking_output_read_slowly_gets_every_byte() {
         let fixture = Fixture::new();
         let (read_end, write_end) = small_non_blocking_pipe();
-        let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::file(write_end), None).unwrap();
-        let mut printed = pattern(300_000);
+        let (_, output, _) = fixture.hub.attach_primary(Mode::Ro).unwrap();
+        let writer = spawn(output, Target::file(write_end)).unwrap();
+        let mut printed = pattern(3_000_000);
         printed.extend_from_slice(b"END_OF_OUTPUT");
         let mut guest = fixture.guest();
-        guest.write_all(&printed).unwrap();
-        guest.shutdown(Shutdown::Write).unwrap();
-        let reader = slow_reader(read_end, 1024, Duration::from_micros(500));
+        let sent = printed.clone();
+        let session = thread::spawn(move || {
+            guest.write_all(&sent).unwrap();
+            guest.shutdown(Shutdown::Write).unwrap();
+        });
+        let reader = slow_reader(read_end, 16 * 1024, Duration::from_micros(500));
+        session.join().unwrap();
         assert_eq!(writer.wait(LIMIT), OutWait::Done);
         let got = reader.join().unwrap();
         assert_eq!(got.len(), printed.len());
@@ -596,7 +610,7 @@ mod tests {
         let fixture = Fixture::new();
         let (read_end, write_end) = small_pipe();
         let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::file(write_end), None).unwrap();
+        let writer = spawn(output, Target::file(write_end)).unwrap();
         let mut guest = fixture.guest();
         guest.write_all(&[b'z'; PAYLOAD]).unwrap();
         guest.shutdown(Shutdown::Write).unwrap();
@@ -619,7 +633,7 @@ mod tests {
         let fixture = Fixture::new();
         let (mut read_end, write_end) = small_pipe();
         let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::file(write_end), None).unwrap();
+        let writer = spawn(output, Target::file(write_end)).unwrap();
         let mut guest = fixture.guest();
         guest.write_all(&[b'z'; PAYLOAD]).unwrap();
         guest.shutdown(Shutdown::Write).unwrap();
@@ -678,7 +692,7 @@ mod tests {
         let (read_end, write_end) = small_non_blocking_pipe();
         drop(read_end);
         let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::file(write_end), None).unwrap();
+        let writer = spawn(output, Target::file(write_end)).unwrap();
         let mut guest = fixture.guest();
         guest.write_all(&vec![b'x'; 1 << 20]).unwrap();
         assert_eq!(writer.wait(LIMIT), OutWait::Failed);
@@ -686,30 +700,30 @@ mod tests {
         wait_until("the hub forgot it", || fixture.hub.clients() == 0);
     }
 
-    /// A writer that falls more than the backlog behind is detached by the
-    /// hub; it attaches again and goes on with what the session prints
-    /// next, and the bytes it missed are counted exactly.
+    /// `write_until`, which `boxcar attach` writes its stdout with: it
+    /// waits through a full pipe, and ends as soon as it is told to stop,
+    /// with what the pipe took counted, never inside a write.
     #[test]
-    fn a_writer_that_fell_behind_attaches_again_and_counts_what_it_missed() {
-        const PRINTED: usize = 3 << 20;
-        let fixture = Fixture::new();
-        let (read_end, write_end) = small_pipe();
-        let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::file(write_end), Some(fixture.hub.clone())).unwrap();
-        let mut guest = fixture.guest();
-        guest.write_all(&vec![b'x'; PRINTED]).unwrap();
-        wait_until("all of it in", || fixture.hub.received() == PRINTED as u64);
-        let reader = slow_reader(read_end, 64 * 1024, Duration::ZERO);
-        wait_until("attached again", || writer.fell_behind());
-        guest.write_all(b"TAIL").unwrap();
-        guest.shutdown(Shutdown::Write).unwrap();
-        assert_eq!(writer.wait(LIMIT), OutWait::Done);
-        let got = reader.join().unwrap();
-        assert!(got.ends_with(b"xTAIL") || got.ends_with(b"TAIL"), "no tail");
-        let missed = writer.undelivered();
-        assert!(missed > 0);
-        assert_eq!(got.len() as u64 + missed, PRINTED as u64 + 4);
-        assert_eq!(writer.written(), got.len() as u64);
+    fn a_write_can_be_stopped_while_the_target_takes_nothing() {
+        let (mut read_end, write_end) = small_pipe();
+        let mut target = Target::file(write_end);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopper = std::sync::Arc::clone(&stop);
+        let started = Instant::now();
+        let writing = thread::spawn(move || target.write_until(&[b'q'; 64 * 1024], &stopper));
+        thread::sleep(Duration::from_millis(200));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!writing.join().unwrap().unwrap(), "not stopped");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The pipe took one page; the target is gone with the thread.
+        let mut got = Vec::new();
+        read_end.read_to_end(&mut got).unwrap();
+        assert_eq!(got.len(), 4096);
+        // A target that takes everything: written.
+        let file = tempfile::tempfile().unwrap();
+        let mut target = Target::file(file);
+        let never = std::sync::atomic::AtomicBool::new(false);
+        assert!(target.write_until(&[b'q'; 64 * 1024], &never).unwrap());
     }
 
     /// A socket's backlog is its send queue (`SIOCOUTQ`): `FIONREAD` on the
@@ -758,7 +772,7 @@ mod tests {
         let fixture = Fixture::new();
         let out = Shared::default();
         let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::writer(out.clone()), None).unwrap();
+        let writer = spawn(output, Target::writer(out.clone())).unwrap();
         let mut guest = fixture.guest();
         guest.write_all(b"hi\r\n\x1b[1mbold\x1b[0m $ ").unwrap();
         guest.shutdown(Shutdown::Write).unwrap();
@@ -775,7 +789,7 @@ mod tests {
     fn nothing_to_wait_for_when_the_guest_never_connected() {
         let fixture = Fixture::new();
         let (_, output, _) = fixture.hub.attach(Mode::Ro, 0);
-        let writer = spawn(output, Target::writer(std::io::sink()), None).unwrap();
+        let writer = spawn(output, Target::writer(std::io::sink())).unwrap();
         fixture.hub.close();
         assert_eq!(writer.wait(LIMIT), OutWait::Done);
         assert_eq!(writer.undelivered(), 0);

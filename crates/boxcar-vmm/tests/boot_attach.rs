@@ -9,9 +9,11 @@
 //! What it proves:
 //!
 //! - the hello names the `pty` capability, and `pty.attach` turns the
-//!   connection into the session's terminal: what the client types runs in
-//!   the shell (`stty size` says 24 80, the size init opened it at), and
-//!   what the shell prints comes back;
+//!   connection into the session's terminal, naming the attach
+//!   (`attach_id`): what the client types runs in the shell (`stty size`
+//!   says 24 80, the size init opened it at), and what the shell prints
+//!   comes back; another connection watches the attach by that name
+//!   (`pty.watch`);
 //! - `pty.resize` from another connection resizes it (`stty size` then
 //!   says 40 120), and `exit` ends the session and the VM with code 0;
 //! - a second, read-only attach sees the same bytes as the first from
@@ -141,6 +143,8 @@ impl Control {
 /// A connection attached to the session's terminal, its output collected
 /// by a thread until the stream ends.
 struct Attached {
+    /// What the server named the attach.
+    id: String,
     to_session: UnixStream,
     got: Arc<Mutex<Vec<u8>>>,
     reader: Option<JoinHandle<()>>,
@@ -161,7 +165,10 @@ impl Attached {
             let params = json!({"session": "main", "mode": mode, "replay_bytes": replay});
             let response = control.request("pty.attach", params);
             if response.ok {
-                assert_eq!(response.result, Some(json!({"raw": true})));
+                let result = response.result.unwrap();
+                assert_eq!(result["raw"], true, "{result}");
+                let id = result["attach_id"].as_str().unwrap().to_owned();
+                assert_eq!(id.len(), 32, "{result}");
                 let got = Arc::new(Mutex::new(control.reader.buffer().to_vec()));
                 let mut stream = control.reader.into_inner();
                 stream.set_read_timeout(None).unwrap();
@@ -176,6 +183,7 @@ impl Attached {
                     }
                 });
                 return Attached {
+                    id,
                     to_session: control.writer,
                     got,
                     reader: Some(reader),
@@ -301,9 +309,9 @@ fn run<T: Send + 'static>(
     };
     let vmm = Vmm::new(cfg).unwrap();
     let hub = vmm.handle().pty().expect("the hub, with the vsock device");
-    let (_, output, _) = hub.attach(Mode::Ro, 0);
+    let (_, output, _) = hub.attach_primary(Mode::Ro).unwrap();
     let out = File::create(dir.path().join("session.out")).unwrap();
-    let writer_out = out::spawn(output, Target::file(out), None).unwrap();
+    let writer_out = out::spawn(output, Target::file(out)).unwrap();
     let control = vmm.control_path().unwrap().to_owned();
 
     let handle = vmm.handle();
@@ -336,6 +344,7 @@ fn run<T: Send + 'static>(
 struct Typed {
     size_at_start: bool,
     attached: bool,
+    watched: Option<Response>,
     resized: Option<Response>,
     size_after: bool,
     output: Vec<u8>,
@@ -353,6 +362,7 @@ fn an_attached_client_types_into_the_session_and_resizes_it() {
         saw.size_at_start = attached.shows("24 80");
         saw.attached = attached.shows("ATTACHED");
         let mut control = Control::connect(&beside.control);
+        saw.watched = Some(control.request("pty.watch", json!({"attach_id": attached.id})));
         saw.resized = Some(control.request(
             "pty.resize",
             json!({"session": "main", "rows": 40, "cols": 120}),
@@ -382,6 +392,9 @@ fn an_attached_client_types_into_the_session_and_resizes_it() {
         run.describe()
     );
     assert!(saw.attached, "no `ATTACHED`:\n{output}\n{}", run.describe());
+    let watched = saw.watched.as_ref().unwrap();
+    assert!(watched.ok, "{watched:?}");
+    assert_eq!(watched.result, Some(json!({})));
     let resized = saw.resized.as_ref().unwrap();
     assert!(resized.ok, "{resized:?}");
     assert_eq!(resized.result, Some(json!({})));

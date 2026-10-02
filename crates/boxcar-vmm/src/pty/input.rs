@@ -4,13 +4,18 @@
 //! `boxcar run`'s stdin to the session: the input of its own read-write
 //! client of the hub ([`forward`]).
 //!
-//! What is read goes to the session as it is read, waiting for room in the
-//! hub's input queue ([`Input::send_all`]): piped input is never dropped.
+//! From a pipe or a file, what is read goes to the session as it is read,
+//! waiting for room in the hub's input queue ([`Input::send_all`]): piped
+//! input is never dropped; its end becomes end-of-file characters (`^D`,
+//! two when the input did not end a line), so a shell reading it ends.
+//!
 //! From a terminal (which `boxcar run` puts in raw mode, as M1's console
-//! does) Ctrl-] twice within a second stops the VM instead, as on the
-//! console (the run exits 130), and the escape does not reach the session;
-//! from a pipe or a file, its end becomes end-of-file characters (`^D`, two
-//! when the input did not end a line), so a shell reading it ends.
+//! does) each read is looked at for the escape first: Ctrl-] twice within a
+//! second stops the VM instead, as on the console (the run exits 130), and
+//! the escape does not reach the session. Then it is queued without
+//! waiting ([`Input::send`]): what the queue has no room for (a session
+//! that reads nothing, a large paste) is dropped and counted, so that the
+//! reads, and the escape, never stop.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -78,11 +83,16 @@ fn forward_all(mut input: LocalInput, to: &Input, handle: &VmmHandle) {
             Err(_) => return,
         };
         let bytes = &buf[..n];
-        if input.tty && escape.feed(bytes, Instant::now()) {
-            handle.request_stop(StopReason::ConsoleEscape);
-            return;
-        }
-        if to.send_all(bytes).is_err() {
+        let sent = if input.tty {
+            if escape.feed(bytes, Instant::now()) {
+                handle.request_stop(StopReason::ConsoleEscape);
+                return;
+            }
+            to.send(bytes).map(drop)
+        } else {
+            to.send_all(bytes)
+        };
+        if sent.is_err() {
             return;
         }
         last = bytes.last().copied();
@@ -182,5 +192,53 @@ mod tests {
             .unwrap();
         let mut more = [0u8; 1];
         assert!(guest.read(&mut more).is_err(), "{more:?}");
+    }
+
+    /// From a terminal, the escape is seen before anything is queued, and
+    /// input the queue has no room for is dropped (counted), not waited
+    /// on: a session that reads nothing cannot take the escape away, even
+    /// after a 1 MiB paste.
+    #[test]
+    fn a_paste_the_session_does_not_take_cannot_hold_back_the_escape() {
+        let fixture = Fixture::new();
+        // Connected, and never reading.
+        let _guest = fixture.guest();
+        struct Pasted(Vec<Vec<u8>>);
+        impl Read for Pasted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    return Ok(0);
+                }
+                let next = self.0.remove(0);
+                buf[..next.len()].copy_from_slice(&next);
+                Ok(next.len())
+            }
+        }
+        let mut reads: Vec<Vec<u8>> = pattern(1 << 20)
+            .chunks(16 * 1024)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&b| if b == 0x1d { b'.' } else { b })
+                    .collect()
+            })
+            .collect();
+        reads.push(b"\x1d\x1d".to_vec());
+        let (_, _, input) = fixture.hub.attach(Mode::Rw, 0);
+        let local = LocalInput {
+            reader: Box::new(Pasted(reads)),
+            tty: true,
+        };
+        forward(local, input.unwrap(), fixture.handle.clone()).unwrap();
+        let deadline = Instant::now() + LIMIT;
+        while fixture.handle.state() != VmState::Stopping {
+            assert!(
+                Instant::now() < deadline,
+                "the escape was held back behind the paste"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fixture.hub.input_dropped() > 0);
     }
 }
