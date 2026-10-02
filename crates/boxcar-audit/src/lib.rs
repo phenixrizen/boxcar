@@ -38,6 +38,6 @@ pub use chain::{Chainer, PartialRecord};
 pub use reader::{Filter, LogReader, Records};
 pub use segment::{Fdatasync, Syncer};
 pub use sink::{AuditSink, EmitError, Priority, Submission};
-pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE};
+pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE, REPLAY_YIELD};
 pub use verify::{verify_jsonl, verify_session, VerifyError, VerifyReport};
 pub use writer::{spawn, spawn_with_syncer, CloseStats, WriteFailure, WriterConfig, WriterHandle};

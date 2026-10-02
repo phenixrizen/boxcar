@@ -38,7 +38,8 @@ use super::conn::PACE_STALL;
 use super::ops::{params, ConnCtx, ConnEvents};
 
 /// How long a forwarder waits for a record before it looks at whether its
-/// connection has gone.
+/// connection has gone. A replay looks as often as
+/// [`boxcar_audit::REPLAY_YIELD`] records passed over.
 const TICK: Duration = Duration::from_millis(50);
 
 /// How far a subscription may fall behind, and how long a client may take
@@ -204,8 +205,12 @@ fn forward(
             Ok(Next::End) => return,
             Err(error) => {
                 // The stream cannot go on, and a client must not read on
-                // as if it did: ending the connection says so.
-                tracing::warn!("control: audit subscription {sub} failed: {error}; closing");
+                // as if it did: ending the connection says so. Debug, not
+                // warn: this thread is joined by the connection's, which the
+                // stop sequence joins, and a stalled stderr must not hold
+                // the stop (the writer's failure, the usual cause, is
+                // logged by the writer itself).
+                tracing::debug!("control: audit subscription {sub} failed: {error}; closing");
                 events.close();
                 return;
             }

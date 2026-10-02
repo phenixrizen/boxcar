@@ -53,6 +53,14 @@ use crate::sink::AuditSink;
 /// for being too slow.
 pub const DEFAULT_QUEUE: usize = 16384;
 
+/// How many records a replay passes over (ones the filter does not take,
+/// or below the seq wanted) before [`Subscription::next_timeout`] returns
+/// [`Next::Idle`] rather than read on: a caller that also watches
+/// something else, such as a connection that may be closing, is not held
+/// for the whole of a long replay that yields little. [`Subscription::next`]
+/// reads straight through.
+pub const REPLAY_YIELD: usize = 1024;
+
 /// What a [`Subscription`] yields.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
@@ -68,7 +76,8 @@ pub enum Item {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Next {
     Item(Item),
-    /// Nothing came in time.
+    /// Nothing came in time, or a replay passed over [`REPLAY_YIELD`]
+    /// records without one to deliver: call again.
     Idle,
     /// The writer closed and every record has been delivered.
     End,
@@ -290,7 +299,9 @@ impl Subscription {
 
     /// [`next`](Self::next), waiting at most `timeout` for a live record:
     /// [`Next::Idle`] when none comes. Reading the log back is not part of
-    /// the wait.
+    /// the wait, but a replay that passes over [`REPLAY_YIELD`] records
+    /// without one to deliver returns `Idle` as well, so that the caller
+    /// gets to look at whatever else it watches before the replay goes on.
     pub fn next_timeout(&mut self, timeout: Duration) -> io::Result<Next> {
         self.advance(Some(timeout))
     }
@@ -339,6 +350,8 @@ impl Subscription {
     }
 
     fn advance(&mut self, wait: Option<Duration>) -> io::Result<Next> {
+        // Records a replay passed over in this call, for `REPLAY_YIELD`.
+        let mut passed_over = 0;
         loop {
             match std::mem::replace(&mut self.state, State::Ended) {
                 State::Ended => return Ok(Next::End),
@@ -381,12 +394,15 @@ impl Subscription {
                         until,
                         then,
                     };
-                    if record.seq < self.next_wanted {
-                        continue;
+                    if record.seq >= self.next_wanted {
+                        self.next_wanted = record.seq + 1;
+                        if self.filter.matches(&record) {
+                            return Ok(Next::Item(Item::Record(Arc::new(record))));
+                        }
                     }
-                    self.next_wanted = record.seq + 1;
-                    if self.filter.matches(&record) {
-                        return Ok(Next::Item(Item::Record(Arc::new(record))));
+                    passed_over += 1;
+                    if wait.is_some() && passed_over >= REPLAY_YIELD {
+                        return Ok(Next::Idle);
                     }
                 }
                 State::Live(live) => {

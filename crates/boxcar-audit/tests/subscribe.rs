@@ -469,3 +469,50 @@ fn every_seq_is_delivered_once_to_each_of_several_subscribers() {
         assert_eq!(got.len(), want.len());
     }
 }
+
+/// A replay that passes over many records without one to deliver (a filter
+/// that few records match, over a long log) does not hold `next_timeout`
+/// for its whole length: it returns `Idle` now and then, so that a caller
+/// that also watches something else (a connection that is closing) gets to
+/// look. `next`, which was not asked for a wait, reads straight through.
+#[test]
+fn a_long_filtered_replay_yields_idle_now_and_then() {
+    const EVENTS: u64 = 5_000;
+    let tmp = TempDir::new().unwrap();
+    let (sink, writer) = quiet_writer(tmp.path());
+    for n in 0..EVENTS {
+        sink.emit(fs_event(n, 1)).unwrap();
+    }
+    sink.emit(net_event(EVENTS, 1)).unwrap(); // seq 5001
+    barrier(&sink);
+    let only_net = Filter {
+        kinds: vec!["net.".into()],
+        ..Filter::default()
+    };
+
+    let mut sub = sink.subscribe(1, only_net.clone()).unwrap();
+    let mut idles = 0;
+    let record = loop {
+        match sub.next_timeout(LIMIT).unwrap() {
+            Next::Idle => idles += 1,
+            Next::Item(Item::Record(record)) => break record,
+            other => panic!("{other:?}"),
+        }
+        assert!(idles < 100, "idle for ever");
+    };
+    assert_eq!(record.seq, EVENTS + 1);
+    assert_eq!(
+        idles,
+        (EVENTS as usize) / boxcar_audit::REPLAY_YIELD,
+        "one idle per {} records passed over",
+        boxcar_audit::REPLAY_YIELD
+    );
+
+    // Without a wait, the replay is read through to the record.
+    let mut plain = sink.subscribe(1, only_net).unwrap();
+    match plain.next().unwrap() {
+        Some(Item::Record(record)) => assert_eq!(record.seq, EVENTS + 1),
+        other => panic!("{other:?}"),
+    }
+    writer.close().unwrap();
+}
