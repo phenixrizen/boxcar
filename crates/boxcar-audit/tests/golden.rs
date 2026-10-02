@@ -47,6 +47,7 @@ fn awkward_close() -> Payload {
     Payload::FsClose(FsClose {
         mount: "workspace".into(),
         path: AWKWARD_PATH.into(),
+        path_b64: None,
         path_at_open: AWKWARD_PATH.into(),
         fh: 7,
         bytes_read: 0,
@@ -56,6 +57,8 @@ fn awkward_close() -> Payload {
         hash_status: HashStatus::Ok,
         open_seq: Some(3),
         attrib: Attrib::Caller,
+        // Another integer a float64 cannot hold exactly: 2^53 + 7.
+        ts_release_ns: 9_007_199_254_740_999,
     })
 }
 
@@ -117,6 +120,7 @@ fn golden_records() -> Vec<Record> {
         Payload::FsOpen(FsOpen {
             mount: "workspace".into(),
             path: "/src/main.rs".into(),
+            path_b64: None,
             fh: 7,
             flags: 0o102,
             flags_decoded: vec!["O_RDWR".into(), "O_CREAT".into()],

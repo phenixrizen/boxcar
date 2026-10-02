@@ -48,10 +48,12 @@ const QUEUE_LEN: u16 = 16;
 /// so its own used ring overlaps the available ring's entries; a used ring
 /// of our own keeps the two independent.
 const USED_RING_OFFSET: u64 = 0x800;
-/// Request buffers, 0x1000 apart.
-const REQUESTS: u64 = 0x4_0000;
+/// Request buffers, 0x1000 apart: past the rings of the five queues a
+/// device may have behind a transport (`queue_start`, 0x1_0000 each from
+/// 0x1_0000).
+const REQUESTS: u64 = 0x8_0000;
 /// Reply buffers, 0x1000 apart.
-const REPLIES: u64 = 0x8_0000;
+const REPLIES: u64 = 0xC_0000;
 /// Every reply buffer's length.
 const REPLY_LEN: u32 = 0x1000;
 
@@ -103,10 +105,16 @@ impl Share {
     }
 
     fn device(&self) -> VirtioFs {
+        self.device_with(1)
+    }
+
+    /// A device with `request_queues` request queues.
+    fn device_with(&self, request_queues: u16) -> VirtioFs {
         VirtioFs::new(
             self.config.clone(),
             self.sink.clone(),
             AuditFsOptions::default(),
+            request_queues,
         )
         .expect("a virtio-fs device over the share")
     }
@@ -294,8 +302,34 @@ fn config_space_holds_the_tag_and_the_request_queue_count() {
     assert_eq!(straddle, [0, 0, 0xaa, 0xaa]);
     device.read_config(u64::MAX, &mut past);
     assert_eq!(past, [0xaa; 4]);
-
     drop(device);
+
+    // Four request queues: five queues, and the count in the config space.
+    let four = share.device_with(4);
+    assert_eq!(four.num_queues(), 5);
+    assert_eq!(four.request_queues(), 4);
+    assert_eq!(four.queue_max_size(4), QUEUE_MAX_SIZE);
+    assert_eq!(four.queue_max_size(5), 0);
+    let mut queues = [0xaa; 4];
+    four.read_config(0x24, &mut queues);
+    assert_eq!(u32::from_le_bytes(queues), 4);
+    drop(four);
+    // Neither none nor more than four.
+    for bad in [0, 5, u16::MAX] {
+        let error = VirtioFs::new(
+            share.config.clone(),
+            share.sink.clone(),
+            AuditFsOptions::default(),
+            bad,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{bad} request queues were accepted"));
+        assert!(
+            matches!(error, FsError::RequestQueues(n) if n == bad),
+            "{error}"
+        );
+    }
+
     drop(share.payloads());
 }
 
@@ -318,7 +352,7 @@ fn shares_the_device_cannot_serve_are_refused() {
     let with = |f: &dyn Fn(&mut FsShareConfig)| {
         let mut config = share.config.clone();
         f(&mut config);
-        VirtioFs::new(config, share.sink.clone(), AuditFsOptions::default())
+        VirtioFs::new(config, share.sink.clone(), AuditFsOptions::default(), 1)
     };
 
     for tag in [String::new(), "t".repeat(37), "a\0b".to_owned()] {
@@ -484,6 +518,8 @@ struct Driver {
     transport: Transport,
     irq: Arc<IrqTrigger>,
     kicks: Vec<EventFd>,
+    /// The device's queues, the high-priority one included.
+    queues: u32,
 }
 
 /// Where queue `q` behind the transport lives: the mock lays out the
@@ -530,13 +566,20 @@ impl Driver {
             .iter()
             .map(|evt| evt.try_clone().unwrap())
             .collect();
+        let queues = u32::try_from(device.num_queues()).unwrap_or(u32::MAX);
         let transport = MmioTransport::new(device, mem.clone(), ctx);
         Driver {
             mem,
             transport,
             irq,
             kicks,
+            queues,
         }
+    }
+
+    /// How many threads hash closed files for the device's share.
+    fn hash_threads(&self) -> usize {
+        self.transport.device().hash_threads()
     }
 
     fn read(&mut self, offset: u64) -> u32 {
@@ -566,7 +609,7 @@ impl Driver {
         self.write(regs::DRIVER_FEATURES, 1);
         self.set_status(ACKNOWLEDGE | DRIVER | FEATURES_OK);
         assert_eq!(self.status(), u32::from(ACKNOWLEDGE | DRIVER | FEATURES_OK));
-        for q in 0..2 {
+        for q in 0..self.queues {
             let (desc, avail, used) = ring_addrs(q);
             self.write(regs::QUEUE_SEL, q);
             assert_eq!(self.read(regs::QUEUE_NUM_MAX), u32::from(QUEUE_MAX_SIZE));
@@ -610,6 +653,21 @@ fn thread_names() -> Vec<String> {
         .filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
         .map(|name| name.trim_end().to_owned())
         .collect()
+}
+
+/// Whether no thread named with `prefix` is left, giving a joined thread
+/// a moment to leave the kernel's task list.
+fn no_thread_with_prefix(prefix: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !thread_names().iter().any(|n| n.starts_with(prefix)) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
@@ -751,4 +809,123 @@ fn activation_with_a_queue_that_is_not_ready_fails() {
     driver.set_status(0);
     drop(driver);
     drop(share.payloads());
+}
+
+/// Four request queues are four workers: a request on each queue, kicked
+/// together, is answered by that queue's own thread, and the first worker
+/// serves the high-priority queue too.
+#[test]
+fn four_request_queues_serve_requests_concurrently() {
+    let share = Share::new("mq");
+    let mut driver = Driver::new(share.device_with(4));
+    driver.handshake(&[0, 1, 2, 3, 4]);
+    assert_eq!(
+        driver.status(),
+        u32::from(ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK),
+        "activated"
+    );
+    let names = thread_names();
+    for q in 1..=4 {
+        assert!(
+            names.iter().any(|n| *n == format!("fs-mq-q{q}")),
+            "no worker for queue {q}: {names:?}"
+        );
+    }
+
+    // INIT first, on queue 1, so the filesystem is mounted.
+    let mem = driver.mem.clone();
+    let mocks: Vec<_> = (1..=4).map(|q| queue_mock(&mem, q)).collect();
+    offer(&mem, &mocks[0], 0, &init_request(1));
+    driver.kick_and_wait(1, 1);
+    let (out, _): (OutHeader, InitOut) = reply(&mem, 0);
+    assert_eq!(out.error, 0);
+
+    // One lookup on each of the four queues, every kick before any wait:
+    // the four workers answer side by side.
+    for (i, mock) in mocks.iter().enumerate() {
+        let n = u16::try_from(i + 1).unwrap();
+        offer(&mem, mock, n, &lookup_request(10 + u64::from(n), HELLO));
+        driver.kicks[i + 1].write(1).unwrap();
+    }
+    for q in 1..=4u32 {
+        let want = if q == 1 { 2 } else { 1 };
+        driver.kick_and_wait(q, want);
+        let (out, entry): (OutHeader, EntryOut) = reply(&mem, q as u16);
+        assert_eq!((out.error, out.unique), (0, 10 + u64::from(q)), "queue {q}");
+        assert_eq!(entry.attr.size, HELLO_BODY.len() as u64);
+    }
+    assert_eq!(driver.transport.device().metrics().count(FUSE_LOOKUP), 4);
+
+    // The high-priority queue is the first worker's.
+    let hiprio = queue_mock(&mem, 0);
+    offer(&mem, &hiprio, 5, &lookup_request(20, "missing"));
+    driver.kick_and_wait(0, 1);
+    let (out, _): (OutHeader, EntryOut) = reply(&mem, 5);
+    assert_eq!(out.error, -libc::ENOENT);
+
+    driver.set_status(0);
+    assert!(
+        no_thread_with_prefix("fs-mq-q"),
+        "the workers are joined by the reset: {:?}",
+        thread_names()
+    );
+    drop(driver);
+    drop(share.payloads());
+}
+
+/// A reset stops the hash threads with the workers; the next activation
+/// starts them again, so a close after a mid-session reset is hashed off
+/// the reply path as before, not inline.
+#[test]
+fn reactivation_restarts_the_hash_threads() {
+    let share = Share::new("rehash");
+    let mut driver = Driver::new(share.device());
+    assert_eq!(driver.hash_threads(), 2, "started with the device");
+    driver.handshake(&[0, 1]);
+    assert_eq!(driver.hash_threads(), 2);
+
+    // The driver resets the device: workers and hash threads stop.
+    driver.set_status(0);
+    assert_eq!(driver.status(), 0);
+    assert_eq!(driver.hash_threads(), 0, "stopped by the reset");
+    assert!(
+        no_thread_with_prefix("fs-rehash-hash"),
+        "{:?}",
+        thread_names()
+    );
+
+    // And activates it again: the hash threads are back.
+    let mem = driver.mem.clone();
+    let mock = queue_mock(&mem, 1);
+    let used = used_ring(&mock);
+    mem.write_obj(0u16, GuestAddress(used.0 + 2)).unwrap();
+    driver.handshake(&[0, 1]);
+    assert_eq!(driver.hash_threads(), 2, "restarted by the activation");
+    assert!(thread_names().iter().any(|n| n == "fs-rehash-hash0"));
+
+    // A truncating open and the reset's close: hashed, by a hash thread.
+    offer(&mem, &mock, 0, &init_request(1));
+    offer(&mem, &mock, 1, &lookup_request(2, HELLO));
+    driver.kick_and_wait(1, 2);
+    let (_, entry): (OutHeader, EntryOut) = reply(&mem, 1);
+    let flags = (libc::O_WRONLY | libc::O_TRUNC) as u32;
+    offer(&mem, &mock, 2, &open_request(3, entry.nodeid, flags));
+    driver.kick_and_wait(1, 3);
+    let (out, opened): (OutHeader, OpenOut) = reply(&mem, 2);
+    assert_eq!(out.error, 0);
+    driver.set_status(0);
+    assert_eq!(driver.hash_threads(), 0);
+
+    let payloads = share.payloads();
+    drop(driver);
+    let close = payloads
+        .iter()
+        .find_map(|p| match p {
+            Payload::FsClose(c) if c.fh == opened.fh => Some(c.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no fs.close in {payloads:?}"));
+    assert_eq!(close.hash_status, HashStatus::Ok);
+    assert_eq!(close.blake3, Some(Hash::from_blake3(blake3::hash(b""))));
+    assert!(close.ts_release_ns > 1_600_000_000_000_000_000, "{close:?}");
 }

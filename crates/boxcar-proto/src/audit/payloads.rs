@@ -6,6 +6,11 @@
 //! Field names are the wire names. `Option` fields that the schema marks
 //! skip-if-none are omitted from the JSON when unset; every other `Option` is
 //! written as an explicit `null`.
+//!
+//! Every `fs.*` payload with a `path` has a `path_b64` beside it, set only
+//! when the name was not valid UTF-8: `path` then holds the lossy form and
+//! `path_b64` the raw bytes in base64. The other names a payload carries
+//! (`path_at_open`, `target_path`, `from`, `to`, `target`) are lossy only.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -127,6 +132,11 @@ pub struct FsMount {
 pub struct FsOpen {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub fh: u64,
     /// The raw `open(2)` flags.
     pub flags: u32,
@@ -143,6 +153,11 @@ pub struct FsOpen {
 pub struct FsCreate {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub fh: u64,
     pub mode: u32,
     pub flags: u32,
@@ -186,6 +201,11 @@ pub struct FsClose {
     pub mount: String,
     /// The path at close time.
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     /// The path when the handle was opened; differs after a rename.
     pub path_at_open: String,
     pub fh: u64,
@@ -199,6 +219,12 @@ pub struct FsClose {
     /// The `seq` of the record that opened this handle, when known.
     pub open_seq: Option<u64>,
     pub attrib: Attrib,
+    /// Host `CLOCK_REALTIME`, nanoseconds since the epoch, when the guest
+    /// released the handle: the producer's time, before the hash that
+    /// completes the record, which can come a while later. 0 in logs
+    /// written before it existed.
+    #[serde(default)]
+    pub ts_release_ns: u64,
 }
 
 /// `fs.read` and `fs.write`.
@@ -207,6 +233,11 @@ pub struct FsClose {
 pub struct FsIo {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub fh: u64,
     pub offset: u64,
     pub len: u32,
@@ -223,6 +254,11 @@ pub struct FsIo {
 pub struct FsPathOp {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub result: OpResult,
 }
 
@@ -232,6 +268,11 @@ pub struct FsPathOp {
 pub struct FsMkdir {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub mode: u32,
     pub result: OpResult,
 }
@@ -242,6 +283,11 @@ pub struct FsMkdir {
 pub struct FsMknod {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub mode: u32,
     pub rdev: u32,
     pub result: OpResult,
@@ -253,6 +299,11 @@ pub struct FsMknod {
 pub struct FsSymlink {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub target: String,
     pub result: OpResult,
 }
@@ -263,6 +314,11 @@ pub struct FsSymlink {
 pub struct FsLink {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub target_path: String,
     pub result: OpResult,
 }
@@ -306,6 +362,11 @@ pub struct SetAttr {
 pub struct FsSetattr {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub set: SetAttr,
     pub result: OpResult,
 }
@@ -316,6 +377,11 @@ pub struct FsSetattr {
 pub struct FsFallocate {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub offset: u64,
     pub len: u64,
     pub mode: u32,
@@ -328,6 +394,11 @@ pub struct FsFallocate {
 pub struct FsXattr {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     pub name: String,
     /// `set` or `remove`.
     pub op: String,
@@ -340,6 +411,11 @@ pub struct FsXattr {
 pub struct FsDenied {
     pub mount: String,
     pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
     /// The refused operation: `lookup`, `access`, `open`, and so on.
     pub op: String,
     pub errno: i32,

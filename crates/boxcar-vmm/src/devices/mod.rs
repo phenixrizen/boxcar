@@ -140,6 +140,33 @@ fn check_shares(shares: &[FsShareConfig]) -> Result<(), DeviceError> {
 /// A virtio-fs device behind its transport.
 pub type FsTransport = MmioTransport<VirtioFs>;
 
+/// How many request queues a share's device gets for `vcpus` vCPUs: one
+/// per vCPU, so that Linux's per-CPU queue choice spreads requests over
+/// workers, up to [`boxcar_fs::MAX_REQUEST_QUEUES`], and at least one.
+pub fn request_queues(vcpus: u8) -> u16 {
+    u16::from(vcpus).clamp(1, boxcar_fs::MAX_REQUEST_QUEUES)
+}
+
+/// How the shares' devices are built: what they record, and how many
+/// request queues each has.
+#[derive(Clone, Copy, Debug)]
+pub struct FsOptions {
+    pub audit: AuditFsOptions,
+    /// 1 to [`boxcar_fs::MAX_REQUEST_QUEUES`]: see [`request_queues`].
+    pub request_queues: u16,
+}
+
+impl FsOptions {
+    /// Devices recording as `audit` says, with [`request_queues`] for
+    /// `vcpus` vCPUs.
+    pub fn for_vcpus(audit: AuditFsOptions, vcpus: u8) -> FsOptions {
+        FsOptions {
+            audit,
+            request_queues: request_queues(vcpus),
+        }
+    }
+}
+
 /// The virtio-fs devices, in slot order.
 #[derive(Default)]
 pub struct FsDevices {
@@ -160,7 +187,7 @@ impl FsDevices {
         slots: &mut SlotAllocator,
         shares: &[FsShareConfig],
         audit: &AuditSink,
-        options: AuditFsOptions,
+        options: FsOptions,
     ) -> Result<FsDevices, DeviceError> {
         check_shares(shares)?;
         let mut devices = FsDevices::default();
@@ -168,8 +195,13 @@ impl FsDevices {
             let tag = || share.tag.clone();
             let wiring = |source| DeviceError::Wiring { tag: tag(), source };
             let slot = reserve_slot(slots, id, &share.tag)?;
-            let device = VirtioFs::new(share.clone(), audit.clone(), options)
-                .map_err(|source| DeviceError::Fs { tag: tag(), source })?;
+            let device = VirtioFs::new(
+                share.clone(),
+                audit.clone(),
+                options.audit,
+                options.request_queues,
+            )
+            .map_err(|source| DeviceError::Fs { tag: tag(), source })?;
             let ctx = DeviceContext::new(slot, device.num_queues()).map_err(wiring)?;
             // Before the transport takes the context apart.
             ctx.register(vm).map_err(wiring)?;
@@ -214,6 +246,20 @@ impl FsDevices {
 
 #[cfg(test)]
 mod tests {
+    use super::request_queues;
+
+    /// One request queue per vCPU, one at least, four at most.
+    #[test]
+    fn request_queues_are_one_per_vcpu_up_to_four() {
+        assert_eq!(request_queues(0), 1);
+        assert_eq!(request_queues(1), 1);
+        assert_eq!(request_queues(2), 2);
+        assert_eq!(request_queues(3), 3);
+        assert_eq!(request_queues(4), 4);
+        assert_eq!(request_queues(8), 4);
+        assert_eq!(request_queues(u8::MAX), 4);
+    }
+
     use boxcar_fs::CachePolicyKind;
 
     use super::*;

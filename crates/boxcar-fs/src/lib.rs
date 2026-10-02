@@ -24,10 +24,10 @@ pub mod path_map;
 pub mod share;
 
 pub use audit_fs::{AuditFs, AuditFsOptions, AuditLevel};
-pub use device::{FsError, FsServer, OpcodeCounts, VirtioFs};
+pub use device::{FsError, FsServer, OpcodeCounts, VirtioFs, MAX_REQUEST_QUEUES};
 pub use handles::{HandleEntry, HandleTable};
 pub use hasher::{HashJob, HashWorker};
-pub use path_map::{FileId, PathMap, ROOT_INO};
+pub use path_map::{FileId, PathMap, PathText, ROOT_INO};
 pub use share::{passthrough_config, CachePolicyKind, FsShareConfig};
 
 #[cfg(test)]

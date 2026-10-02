@@ -297,6 +297,7 @@ mod tests {
             payload: Payload::FsRead(FsIo {
                 mount: "workspace".into(),
                 path: "/f".into(),
+                path_b64: None,
                 fh: n,
                 offset: 0,
                 len: 1,

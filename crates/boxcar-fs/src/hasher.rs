@@ -20,7 +20,7 @@
 //!   size must be read.
 //! - the fstat checks catch only a change made while the file is read. A
 //!   change made after the close but before the hash starts, through
-//!   another handle, is caught by [`Generations`]: from the close on, the
+//!   another handle, is caught by `Generations`: from the close on, the
 //!   job watches its file, every write, truncate, fallocate or create that
 //!   reaches the file moves the file's generation, and a hash whose file's
 //!   generation moved is `raced`, not `ok`.
@@ -42,8 +42,14 @@
 //! level, not a mode of operation.
 //!
 //! A worker that panics dies, but the job it held still counts as done, so
-//! [`HashWorker::flush`] cannot wait for it forever; `flush` also returns
+//! [`HashWorker::flush`] cannot wait for it forever, and its close is still
+//! recorded, with `hash_status` `error` and no hash; `flush` also returns
 //! once every worker has stopped, leaving any jobs still queued unhashed.
+//!
+//! [`HashWorker::shutdown`] (a device reset) stops the threads; a later
+//! [`HashWorker::restart`] (the next activation) starts them again, so a
+//! guest that resets its virtio-fs driver mid-session does not leave the
+//! closes hashed inline for the rest of the session.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -243,12 +249,16 @@ impl Shared {
         self.counts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Hashes the job's file and records its close.
+    /// Hashes the job's file and records its close. A panic on the way
+    /// (the hash function's, or the record's) records the close as
+    /// `error`, so a handle the guest released never goes unrecorded.
     fn run(&self, job: HashJob, inline: bool) {
-        // Counts the job as finished however this ends, a panic included.
-        let _finished = Finished {
+        // Counts the job as finished however this ends, a panic included,
+        // and records the close itself if the panic came first.
+        let mut finished = Finished {
             shared: self,
             inline,
+            unrecorded: Some((job.subject, job.close.clone())),
         };
         let mut outcome = (self.hash)(&self.root, &job.rel_path, job.expected, self.max_bytes);
         let moved = job.watch.as_ref().is_some_and(|watch| !watch.unchanged());
@@ -266,19 +276,34 @@ impl Shared {
             hash_status: outcome.status,
             ..job.close
         };
+        // Recorded: the guard has nothing to record.
+        finished.unrecorded = None;
         self.events
             .record(Some(job.subject), Payload::FsClose(close));
     }
 }
 
-/// Counts one job as finished when dropped.
+/// Counts one job as finished when dropped, and records its close as
+/// `error` if it was not recorded (the thread panicked on the way).
 struct Finished<'a> {
     shared: &'a Shared,
     inline: bool,
+    unrecorded: Option<(Subject, FsClose)>,
 }
 
 impl Drop for Finished<'_> {
     fn drop(&mut self) {
+        if let Some((subject, close)) = self.unrecorded.take() {
+            let close = FsClose {
+                size: None,
+                blake3: None,
+                hash_status: HashStatus::Error,
+                ..close
+            };
+            self.shared
+                .events
+                .record(Some(subject), Payload::FsClose(close));
+        }
         let mut counts = self.shared.counts();
         counts.pending = counts.pending.saturating_sub(1);
         if self.inline {
@@ -303,6 +328,8 @@ impl Drop for Alive<'_> {
 /// The hashing threads of one share.
 pub struct HashWorker {
     shared: Arc<Shared>,
+    /// The share's tag, which names the threads.
+    tag: String,
     /// `None` once shut down, or when no thread could be started; jobs are
     /// then hashed on the caller's thread.
     tx: Mutex<Option<Sender<HashJob>>>,
@@ -328,32 +355,38 @@ impl HashWorker {
             counts: Mutex::new(Counts::default()),
             changed: Condvar::new(),
         });
-        let (tx, rx) = bounded::<HashJob>(QUEUE);
-        let mut threads = Vec::with_capacity(THREADS);
-        for n in 0..THREADS {
-            let (worker, rx) = (Arc::clone(&shared), rx.clone());
-            // Counted before it starts, so no flush can see it missing.
-            shared.counts().alive += 1;
-            let spawned = thread::Builder::new()
-                .name(format!("fs-{tag}-hash{n}"))
-                .spawn(move || serve(&worker, &rx));
-            match spawned {
-                Ok(handle) => threads.push(handle),
-                Err(error) => {
-                    shared.counts().alive -= 1;
-                    tracing::error!(tag, "starting a hash thread failed: {error}");
-                }
-            }
-        }
-        if threads.is_empty() {
-            tracing::error!(tag, "no hash thread started; closes are hashed inline");
-        }
-        let tx = (!threads.is_empty()).then_some(tx);
+        let (tx, threads) = start_threads(&shared, tag);
         HashWorker {
             shared,
+            tag: tag.to_owned(),
             tx: Mutex::new(tx),
             threads: Mutex::new(threads),
         }
+    }
+
+    /// Starts the threads again after [`shutdown`](Self::shutdown); does
+    /// nothing while they run. Jobs submitted from now on go to them.
+    pub fn restart(&self) {
+        let mut tx = self.tx.lock().unwrap_or_else(PoisonError::into_inner);
+        if tx.is_some() {
+            return;
+        }
+        let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+        // Threads of a run that ended on their own (a panic) are joined
+        // here, so none is left behind.
+        for thread in threads.drain(..) {
+            if thread.join().is_err() {
+                tracing::error!(tag = self.tag, "a hash thread panicked");
+            }
+        }
+        let (sender, started) = start_threads(&self.shared, &self.tag);
+        *threads = started;
+        *tx = sender;
+    }
+
+    /// How many hash threads are running.
+    pub fn threads_alive(&self) -> usize {
+        self.shared.counts().alive
     }
 
     /// Queues a job, waiting while the queue is full (see the module docs).
@@ -420,6 +453,36 @@ impl Drop for HashWorker {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Starts [`THREADS`] threads named `fs-<tag>-hash<N>` serving a new queue,
+/// and returns its sender (`None` when no thread could be started: jobs
+/// are then hashed inline, which is logged) and the threads.
+fn start_threads(
+    shared: &Arc<Shared>,
+    tag: &str,
+) -> (Option<Sender<HashJob>>, Vec<JoinHandle<()>>) {
+    let (tx, rx) = bounded::<HashJob>(QUEUE);
+    let mut threads = Vec::with_capacity(THREADS);
+    for n in 0..THREADS {
+        let (worker, rx) = (Arc::clone(shared), rx.clone());
+        // Counted before it starts, so no flush can see it missing.
+        shared.counts().alive += 1;
+        let spawned = thread::Builder::new()
+            .name(format!("fs-{tag}-hash{n}"))
+            .spawn(move || serve(&worker, &rx));
+        match spawned {
+            Ok(handle) => threads.push(handle),
+            Err(error) => {
+                shared.counts().alive -= 1;
+                tracing::error!(tag, "starting a hash thread failed: {error}");
+            }
+        }
+    }
+    if threads.is_empty() {
+        tracing::error!(tag, "no hash thread started; closes are hashed inline");
+    }
+    ((!threads.is_empty()).then_some(tx), threads)
 }
 
 fn serve(shared: &Shared, rx: &Receiver<HashJob>) {
@@ -656,6 +719,7 @@ mod tests {
             close: FsClose {
                 mount: "t".into(),
                 path: format!("/{rel_path}"),
+                path_b64: None,
                 path_at_open: format!("/{rel_path}"),
                 fh,
                 bytes_read: 0,
@@ -665,6 +729,7 @@ mod tests {
                 hash_status: HashStatus::NotHashed,
                 open_seq: None,
                 attrib: Attrib::Caller,
+                ts_release_ns: 0,
             },
             watch: None,
         }
@@ -720,7 +785,11 @@ mod tests {
         flush_within(&worker, Duration::from_secs(10));
         assert_eq!(worker.shared.counts().pending, 0);
         worker.shutdown();
-        assert_eq!(closes(writer), [(2, HashStatus::Ok)]);
+        // The job that panicked is recorded all the same, as `error`.
+        assert_eq!(
+            closes(writer),
+            [(1, HashStatus::Error), (2, HashStatus::Ok)]
+        );
     }
 
     #[test]
@@ -782,6 +851,10 @@ mod tests {
             assert_eq!((counts.pending, counts.alive), (1, 0), "{counts:?}");
         }
         worker.shutdown();
-        assert_eq!(closes(writer), []);
+        // The two jobs the workers died on are recorded as `error` (in the
+        // order the threads died); the queued one is not.
+        let mut recorded = closes(writer);
+        recorded.sort_unstable_by_key(|(fh, _)| *fh);
+        assert_eq!(recorded, [(1, HashStatus::Error), (2, HashStatus::Error)]);
     }
 }

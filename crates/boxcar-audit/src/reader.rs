@@ -357,6 +357,7 @@ mod tests {
             payload: Payload::FsWrite(FsIo {
                 mount: "workspace".into(),
                 path: format!("/f{n}"),
+                path_b64: None,
                 fh: n,
                 offset: 0,
                 len: 1,

@@ -176,12 +176,26 @@
           "description": "The path when the handle was opened; differs after a rename.",
           "type": "string"
         },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "size": {
           "description": "The file size at close, when it was measured.",
           "type": [
             "integer",
             "null"
           ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ts_release_ns": {
+          "description": "Host `CLOCK_REALTIME`, nanoseconds since the epoch, when the guest released the handle: the producer's time, before the hash that completes the record, which can come a while later. 0 in logs written before it existed.",
+          "default": 0,
+          "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         }
@@ -220,6 +234,13 @@
         "path": {
           "type": "string"
         },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "result": {
           "$ref": "#/definitions/OpResult"
         }
@@ -248,6 +269,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -283,6 +311,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "result": {
           "$ref": "#/definitions/OpResult"
@@ -327,6 +362,13 @@
         "path": {
           "type": "string"
         },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "result": {
           "$ref": "#/definitions/OpResult"
         }
@@ -347,6 +389,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "result": {
           "$ref": "#/definitions/OpResult"
@@ -377,6 +426,13 @@
         "path": {
           "type": "string"
         },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "result": {
           "$ref": "#/definitions/OpResult"
         }
@@ -403,6 +459,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "rdev": {
           "type": "integer",
@@ -482,6 +545,13 @@
         "path": {
           "type": "string"
         },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "result": {
           "$ref": "#/definitions/OpResult"
         }
@@ -501,6 +571,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "result": {
           "$ref": "#/definitions/OpResult"
@@ -554,6 +631,13 @@
         "path": {
           "type": "string"
         },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "result": {
           "$ref": "#/definitions/OpResult"
         },
@@ -577,6 +661,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "result": {
           "$ref": "#/definitions/OpResult"
@@ -609,6 +700,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "result": {
           "$ref": "#/definitions/OpResult"

@@ -72,12 +72,18 @@ in-process. `mount` is the share's tag and `path` is within the share.
 Writes, creates, unlinks, renames, setattr and denials are never dropped;
 reads may be (and are counted in `checkpoint.dropped`).
 
+Every payload with a `path` has `path_b64` beside it, present only when
+the name was not valid UTF-8: `path` then holds the lossy text (`U+FFFD`
+for each bad byte) and `path_b64` the raw bytes in standard base64, at most
+the first 4096 of them. The other names (`path_at_open`, `target_path`,
+`target`, `from`, `to`) are lossy text only.
+
 | Type | Fields |
 |---|---|
 | `fs.mount` | `mount`, `guest_path`, `host_root`, `cache_policy` |
 | `fs.open` | `mount`, `path`, `fh`, `flags` (raw `open(2)` flags), `flags_decoded [string]`, `exec` (the open is for `execve`), `result` |
 | `fs.create` | `mount`, `path`, `fh`, `mode`, `flags`, `result` |
-| `fs.close` | `mount`, `path` (at close), `path_at_open`, `fh`, `bytes_read`, `bytes_written`, `size` (or null), `blake3` (or null), `hash_status`, `open_seq` (or null), `attrib` |
+| `fs.close` | `mount`, `path` (at close), `path_at_open`, `fh`, `bytes_read`, `bytes_written`, `size` (or null), `blake3` (or null), `hash_status`, `open_seq` (or null), `attrib`, `ts_release_ns` (host `CLOCK_REALTIME` at the release itself: the hash that completes the record may come later, and the record's `ts_host_ns` is then later still; 0 in logs written before it existed) |
 | `fs.read` | `mount`, `path`, `fh`, `offset`, `len`, `result`, `attrib` |
 | `fs.write` | `mount`, `path`, `fh`, `offset`, `len`, `result`, `attrib` |
 | `fs.unlink` | `mount`, `path`, `result` |
@@ -95,7 +101,11 @@ reads may be (and are counted in `checkpoint.dropped`).
 
 `fs.close.hash_status`: `ok` (`blake3` is set), `raced` (the file changed
 while it was hashed), `gone`, `skipped_size` (over the hashing limit),
-`not_hashed` (nothing was written through the handle), `error`.
+`not_hashed` (nothing was written through the handle), `error` (the file
+could not be read, its path was not fully known, or the hash thread failed
+on it). The hash is computed off the FUSE reply path by two threads a
+share; a guest that resets its virtio-fs driver stops them, and the next
+activation starts them again.
 
 ## `net.*` (host, src `net`)
 
@@ -123,7 +133,7 @@ Every allowed `net.connect` and `net.udp` has exactly one `net.close`.
 | Type | Fields | When |
 |---|---|---|
 | `vsock.connect` | `port`, `dir` (`guest` or `host`), `peer` (`internal`, `uds` or `guest`), `src_port`, `verdict`, `reason` (or null) | A vsock connection was decided. A guest connection to an internal port (1024 `boxcar.ctl`, 1025 `boxcar.pty`, 1026 `boxcar.sensor`) is served by the VMM only from a guest source port below 1024 and only the first per port per activation; one to any other port reaches the host socket `<state>/vsock.sock_<port>` only when the port is allowlisted (`--vsock-allow`, `policy.update`). A host connection (`CONNECT <port>` on `<state>/vsock.sock`) is recorded once the guest accepts it. `reason` on a denial: `unprivileged`, `duplicate`, `no_service`, `port`, or the service's own, such as `reactivated`. |
-| `vsock.close` | `port`, `dir`, `tx`, `rx` | A connection that a `vsock.connect` let through ended. |
+| `vsock.close` | `port`, `dir`, `tx`, `rx` | A connection that a `vsock.connect` let through ended. `tx` and `rx` count payload bytes that reached the other side; bytes the VMM still held for the guest (up to 64 KiB a connection) when the guest reset its vsock driver are neither counted nor reported. |
 
 ## `session.*` (guest, ring 1, src `session`)
 

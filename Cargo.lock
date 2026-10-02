@@ -175,6 +175,7 @@ dependencies = [
 name = "boxcar-fs"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "boxcar-audit",
  "boxcar-proto",
@@ -183,6 +184,7 @@ dependencies = [
  "event-manager",
  "fuse-backend-rs",
  "libc",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

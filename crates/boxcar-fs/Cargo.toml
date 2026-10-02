@@ -17,6 +17,8 @@ virtio-bindings = { workspace = true }
 vmm-sys-util = { workspace = true }
 event-manager = { workspace = true }
 blake3 = { workspace = true }
+# `path_b64`: a name that is not UTF-8, as its raw bytes.
+base64 = { workspace = true }
 crossbeam-channel = { workspace = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
@@ -24,6 +26,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The tests read records' JSON text.
+serde_json = { workspace = true }
 # `boxcar_virtio::testing`: guest memory and register helpers, so the
 # device tests drive the virtio-fs device through a transport without KVM.
 boxcar-virtio = { workspace = true, features = ["testing"] }

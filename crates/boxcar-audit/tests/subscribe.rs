@@ -48,6 +48,7 @@ fn fs_event(n: u64, pid: u32) -> Submission {
         payload: Payload::FsWrite(FsIo {
             mount: "workspace".into(),
             path: format!("/file-{n:06}.txt"),
+            path_b64: None,
             fh: n,
             offset: 0,
             len: 1,

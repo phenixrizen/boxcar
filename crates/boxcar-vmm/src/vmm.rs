@@ -57,7 +57,7 @@ use crate::console::ConsoleWriter;
 use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
-use crate::devices::{DeviceError, FsDevices, LegacyDevices, NetDevice, VsockDevice};
+use crate::devices::{DeviceError, FsDevices, FsOptions, LegacyDevices, NetDevice, VsockDevice};
 use crate::guest_ctl::{GuestCtl, SessionConfig, CLOSE_DEADLINE};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
@@ -443,7 +443,7 @@ impl Vmm {
             &mut slots,
             &cfg.fs_shares,
             &cfg.audit,
-            cfg.fs_audit,
+            FsOptions::for_vcpus(cfg.fs_audit, cfg.vcpus),
         )?;
         let net = NetDevice::attach(
             &vm,

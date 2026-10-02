@@ -702,6 +702,7 @@ mod tests {
                 Payload::FsOpen(FsOpen {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 7,
                     flags: 0o102,
                     flags_decoded: vec!["O_RDWR".into(), "O_CREAT".into()],
@@ -722,6 +723,7 @@ mod tests {
                 Payload::FsCreate(FsCreate {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 8,
                     mode: 0o644,
                     flags: 0o101,
@@ -740,6 +742,7 @@ mod tests {
                 Payload::FsClose(FsClose {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     path_at_open: "/a/old.txt".into(),
                     fh: 8,
                     bytes_read: 0,
@@ -749,6 +752,7 @@ mod tests {
                     hash_status: HashStatus::Ok,
                     open_seq: Some(41),
                     attrib: Attrib::Caller,
+                    ts_release_ns: 1_700_000_000_000_000_007,
                 }),
                 json!({
                     "mount": "workspace",
@@ -762,12 +766,14 @@ mod tests {
                     "hash_status": "ok",
                     "open_seq": 41,
                     "attrib": "caller",
+                    "ts_release_ns": 1_700_000_000_000_000_007_u64,
                 }),
             ),
             (
                 Payload::FsRead(FsIo {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 7,
                     offset: 4096,
                     len: 512,
@@ -788,6 +794,7 @@ mod tests {
                 Payload::FsWrite(FsIo {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 7,
                     offset: 0,
                     len: 3,
@@ -808,6 +815,7 @@ mod tests {
                 Payload::FsUnlink(FsPathOp {
                     mount: "workspace".into(),
                     path: "/a/old".into(),
+                    path_b64: None,
                     result: OpResult::ok(),
                 }),
                 json!({"mount": "workspace", "path": "/a/old", "result": {"ok": true}}),
@@ -816,6 +824,7 @@ mod tests {
                 Payload::FsRmdir(FsPathOp {
                     mount: "workspace".into(),
                     path: "/a".into(),
+                    path_b64: None,
                     result: OpResult::errno(39),
                 }),
                 json!({
@@ -828,6 +837,7 @@ mod tests {
                 Payload::FsMkdir(FsMkdir {
                     mount: "workspace".into(),
                     path: "/a/d".into(),
+                    path_b64: None,
                     mode: 0o755,
                     result: OpResult::ok(),
                 }),
@@ -837,6 +847,7 @@ mod tests {
                 Payload::FsMknod(FsMknod {
                     mount: "root".into(),
                     path: "/dev/null".into(),
+                    path_b64: None,
                     mode: 0o020666,
                     rdev: 259,
                     result: OpResult::errno(1),
@@ -853,6 +864,7 @@ mod tests {
                 Payload::FsSymlink(FsSymlink {
                     mount: "workspace".into(),
                     path: "/a/link".into(),
+                    path_b64: None,
                     target: "/etc/passwd".into(),
                     result: OpResult::ok(),
                 }),
@@ -867,6 +879,7 @@ mod tests {
                 Payload::FsLink(FsLink {
                     mount: "workspace".into(),
                     path: "/a/hard".into(),
+                    path_b64: None,
                     target_path: "/a/b.txt".into(),
                     result: OpResult::ok(),
                 }),
@@ -897,6 +910,7 @@ mod tests {
                 Payload::FsSetattr(FsSetattr {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     set: SetAttr {
                         mode: Some(0o600),
                         size: Some(0),
@@ -915,6 +929,7 @@ mod tests {
                 Payload::FsFallocate(FsFallocate {
                     mount: "workspace".into(),
                     path: "/a/big".into(),
+                    path_b64: None,
                     offset: 0,
                     len: 1 << 20,
                     mode: 0,
@@ -933,6 +948,7 @@ mod tests {
                 Payload::FsXattr(FsXattr {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     name: "user.k".into(),
                     op: "set".into(),
                     result: OpResult::ok(),
@@ -949,6 +965,7 @@ mod tests {
                 Payload::FsDenied(FsDenied {
                     mount: "root".into(),
                     path: "/etc/shadow".into(),
+                    path_b64: None,
                     op: "lookup".into(),
                     errno: 13,
                 }),
@@ -958,6 +975,7 @@ mod tests {
                 Payload::FsReaddir(FsPathOp {
                     mount: "root".into(),
                     path: "/".into(),
+                    path_b64: None,
                     result: OpResult::ok(),
                 }),
                 json!({"mount": "root", "path": "/", "result": {"ok": true}}),
@@ -1209,6 +1227,7 @@ mod tests {
                 Payload::FsClose(FsClose {
                     mount: "root".into(),
                     path: "/bin/sh".into(),
+                    path_b64: None,
                     path_at_open: "/bin/sh".into(),
                     fh: 1,
                     bytes_read: 1024,
@@ -1218,6 +1237,7 @@ mod tests {
                     hash_status: HashStatus::NotHashed,
                     open_seq: None,
                     attrib: Attrib::Handle,
+                    ts_release_ns: 0,
                 }),
                 json!({
                     "mount": "root",
@@ -1231,12 +1251,14 @@ mod tests {
                     "hash_status": "not_hashed",
                     "open_seq": null,
                     "attrib": "handle",
+                    "ts_release_ns": 0,
                 }),
             ),
             (
                 Payload::FsSetattr(FsSetattr {
                     mount: "workspace".into(),
                     path: "/a".into(),
+                    path_b64: None,
                     set: SetAttr {
                         atime: Some(1_700_000_000),
                         mtime: Some(-1),
