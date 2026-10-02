@@ -29,11 +29,13 @@ cargo run -p boxcar -- run --kernel target/guest/vmlinux \
     --initramfs target/guest/initramfs.cpio --rootfs target/guest/rootfs-alpine
 ```
 
-The last command boots the guest into a login shell on its serial console,
-as your own uid and gid, with a fresh workspace at `/workspace`; `exit` ends
-it (Ctrl-] twice stops the VM). Add `-- CMD [ARGS...]` to run a command
-instead, such as `-- /bin/sh -c 'echo hi > /workspace/a.txt'`. `boxcar run`
-prints the session's audit directory on stderr (`audit: ...`, in
+The last command boots the guest into a login shell on a terminal of its
+own, relayed to yours, as your own uid and gid, with a fresh workspace at
+`/workspace` and a network card behind a policy that allows nothing yet;
+`exit` ends it (Ctrl-] twice stops the VM). Add `-- CMD [ARGS...]` to run a
+command instead, such as `-- /bin/sh -c 'echo hi > /workspace/a.txt'`; the
+run exits with the command's exit code. `boxcar run` prints the session's
+id, its audit directory and its control socket on stderr (`audit: ...`, in
 `~/.local/share/boxcar/sessions/` unless `XDG_DATA_HOME` or `--audit-dir`
 says otherwise). To check that its log is intact:
 
@@ -119,6 +121,104 @@ and the blake3 of the file as it was when it was closed. Each record's
 - `boxcar audit verify` proves that the chain is intact and complete up to
   its last record: nothing was changed, removed or reordered. It does not
   prove that the session ended cleanly; look for its `vmm.stop`.
+
+## Networking and policy
+
+With shares the guest gets a network card. The network is played inside
+the runtime, with no TAP device and no privileges: the guest is
+`10.0.2.15/24`, `10.0.2.2` is its gateway, DNS server and DHCP server, and
+the guest's TCP connections end in the runtime and are relayed to host
+sockets; UDP is relayed by NAT. Nothing leaves without a policy rule that
+allows it. `--no-net` takes the card away.
+
+```bash
+boxcar run ... --allow example.com --allow '*.github.com:443' \
+    --allow 198.51.100.7:22 --policy-file team.policy -- npm ci
+```
+
+- `--allow RULE` and `--deny RULE` take `domain[:port]` (the name, or every
+  name under it for `*.domain`) or `cidr[:port]` (an address, or a network
+  such as `198.51.100.0/24`); `--policy-file PATH` reads `allow RULE`,
+  `deny RULE` and at most one `default allow|deny` (deny when absent), one
+  a line. The file's rules come first, then the denies, then the allows,
+  and the first rule that matches decides.
+- A domain rule admits only clients that say the name: the guest's DNS
+  query for it is answered, and a connection it allowed is held until its
+  first bytes show that name as a TLS server name or an HTTP `Host`, or it
+  is reset. Protocols that show no name (SSH, SMTP) and UDP need a CIDR
+  rule. A name no rule allows does not resolve (NXDOMAIN).
+- Private and local networks (`127.0.0.0/8`, `10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16`,
+  `0.0.0.0/8`, multicast, and the host's own addresses) stay denied unless
+  a rule names exactly that range, so an agent cannot reach the host's
+  services or a cloud metadata endpoint by accident.
+- The policy can change while the VM runs: `boxcar policy show`, `boxcar
+  policy allow RULE` and `boxcar policy deny RULE` (or `policy.update` on
+  the control socket). Connections the new policy denies are closed at
+  once and recorded as such.
+- Every decision is in the log: `net.dhcp`, `net.dns` (the query, its
+  verdict and the addresses answered), `net.connect` (each connection with
+  its verdict and the rule that decided), `net.tls` (the name the
+  connection showed), `net.close` (bytes each way, duration, why it ended),
+  `net.udp`, `net.drop`, and `policy.changed`. See
+  [docs/audit-events.md](docs/audit-events.md) for every field and
+  [docs/networking.md](docs/networking.md) for what the network does and
+  does not do.
+
+## Attach
+
+A session's terminal is the runtime's, not your terminal's: `boxcar run`
+relays it, and other terminals can join.
+
+```bash
+boxcar attach                    # the only running session
+boxcar attach --ro <session-id>  # watch without typing
+boxcar attach --replay 0 <id>    # without the last 64 KiB of output first
+```
+
+- What the session prints shows on every attached terminal, starting with
+  the newest `--replay` bytes of its output (64 KiB by default, up to the
+  runtime's 256 KiB scrollback). What is typed on any `rw` attach goes to
+  the session, every key included; `--ro` sends nothing.
+- Press Ctrl-P then Ctrl-Q, within a second, to detach: the session goes
+  on. The session's terminal takes the size of the latest terminal to
+  attach or to resize.
+- The runtime keeps at most 1 MiB of output for each attached terminal,
+  and waits at most 30 s for one that takes nothing. A terminal that falls
+  further behind than that (or sits stopped that long) is detached with
+  the reason `slow`, and `boxcar attach` exits 3; attach again to catch
+  up. The session itself is never held up by a viewer.
+- `boxcar run`'s own terminal is the primary one: when its stdout is a
+  slow pipe the session waits for it (1 MiB behind), so nothing of a
+  command's output is lost. Once the VM has stopped boxcar writes out what
+  is left for as long as stdout takes it, and says how much it did not.
+- The same terminal is reachable for programs over the control socket
+  (`pty.attach`, `pty.resize`, `pty.watch`): see
+  [docs/control-protocol.md](docs/control-protocol.md).
+
+## Exit codes of `boxcar run`
+
+| Code | Meaning |
+|---|---|
+| the command's | The session's command exited with it. |
+| 128 + N | The session's command was killed by signal N (137: SIGKILL). |
+| 0 | The guest reset with no session to report; `boxcar stop` ended the run; the console session (`--no-vsock`) ended. |
+| 1 | A vCPU error, or a usage error that is not a parse error. |
+| 2 | A command-line error, a policy rule that does not parse included. |
+| 3 | The audit log could not be written: the VM was stopped, and stderr says `audit log failed: <why>`. |
+| 130 | SIGINT (Ctrl-C on a non-raw terminal, or `kill -INT`), or Ctrl-] twice on the terminal. |
+| 143, 129, 131 | SIGTERM, SIGHUP, SIGQUIT. |
+
+## Job control
+
+`boxcar run` and `boxcar attach` take the terminal only while they are in
+its foreground. A run started in the background (`boxcar run ... &`) does
+not read the terminal and leaves its settings alone; `fg` brings it
+forward and it takes the terminal, raw. `kill -TSTP` (or Ctrl-Z while the
+terminal is cooked; while it is raw, Ctrl-Z goes to the guest) stops the
+run and gives the terminal back to the shell as it was; `fg` takes it
+again, `bg` leaves it to the shell. A session stopped with its attach for
+longer than 30 s is detached as slow when it continues (see above).
 
 Licensed under Apache-2.0. Ported code keeps its original notices; see
 [NOTICE](NOTICE).

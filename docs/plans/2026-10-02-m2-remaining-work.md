@@ -207,3 +207,32 @@ commit that made it. Written 2026-10-02.
   predicate, in a real event loop.
 - `target/debug/incremental` was removed once to make room for the builds
   (the disk was down to nothing during the workspace test build).
+
+### Task 15
+
+- `cargo xtask test-kvm m1` and `m2` run the same packages' gated tests
+  (the tests are not separable by milestone); `m1` exports
+  `BOXCAR_TEST_NET=0` so the tests that reach example.com skip, `m2`
+  exports `1` when the host resolves example.com, else `0` and says so.
+- The guest takes its address from the kernel command line and runs no
+  DHCP client, so a session's log has no `net.dhcp` unless the guest asks
+  for a lease: the end-to-end tests check the query, the connection, the
+  gate's pass and the close, not a lease. The plan's "(e) prints at least
+  the DHCP ... records" was written on the assumption of a lease.
+- The `policy allow` test denies and then allows `example.com` itself
+  rather than `blocked.example`, which does not exist on the network: a
+  second download can only succeed for a name that resolves.
+- The CONTRIBUTING and CI parts of this task (the `m2` line, the KVM job
+  gated on `vars.HAS_KVM`) landed with the debt commit `826e309` by
+  mistake, a day early; the CI job runs only on a self-hosted runner with
+  the variable set.
+- README: the quick start now says the login shell is on a terminal of
+  the runtime's relayed to the user's (it was the serial console in M1).
+- Hand-off: `cargo xtask test-kvm m2` on 2026-10-02 at the Task 15 commit:
+  384 tests passed, 0 failed, none skipped (example.com reachable), in the
+  gated suites of `boxcar-vmm` (`boot_hello`, `boot_console`, `boot_smp`,
+  `boot_net`, `boot_vsock`, `boot_session`, `boot_attach`, `smoke`) and
+  `boxcar` (`kvm_m1`, `kvm_m2`) plus the packages' unit and CLI tests. The
+  run before it, at the Task 14 commits, passed 115 gated tests with the
+  two `kvm_m2` network tests failing on the `net.dhcp` expectation fixed
+  here.
