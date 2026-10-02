@@ -285,6 +285,7 @@ dependencies = [
 name = "boxcar-vsock"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "boxcar-audit",
  "boxcar-proto",
  "boxcar-virtio",

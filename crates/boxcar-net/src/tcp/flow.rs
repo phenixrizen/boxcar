@@ -395,6 +395,16 @@ impl FlowTable {
         self.flows.values_mut()
     }
 
+    /// Every flow, in no order.
+    pub fn flows(&self) -> impl Iterator<Item = &Flow> {
+        self.flows.values()
+    }
+
+    /// The ids of the connects under way, oldest first.
+    pub fn pending_ids(&self) -> Vec<FlowId> {
+        self.pending.keys().copied().collect()
+    }
+
     /// The flow to evict for a new one: one already ending if there is
     /// one, else the one whose last byte moved longest ago (the oldest of
     /// those that tie).

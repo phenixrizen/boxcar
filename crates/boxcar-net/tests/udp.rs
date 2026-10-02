@@ -648,10 +648,12 @@ fn domain_allows_are_passed_over_for_udp() {
     rig.send(40_003, at, b"named and denied");
     rig.settle();
     assert!(nothing_at(&server), "nothing more reached the server");
-    assert_eq!(rig.h.stack.udp_mappings(), 1);
+    // The first mapping went with the second policy, which denies it too.
+    assert_eq!(rig.h.stack.udp_mappings(), 0);
 
     rig.h.stack.shutdown();
     let events = rig.events();
+    assert_eq!(closes(&events), [(1, 10, 0, "policy".into())]);
     let names = ["bad.test", "echo.test"];
     assert_eq!(
         udps(&events),
@@ -1196,5 +1198,71 @@ fn shutdown_closes_mappings() {
             (1, 1, 0, "shutdown".to_owned()),
             (2, 2, 0, "shutdown".to_owned()),
         ]
+    );
+}
+
+/// A policy swapped in while mappings are open closes, at the stack's next
+/// poll, every mapping the new policy denies, recorded as
+/// `net.close{reason:"policy"}`; its tuple is decided again, and refused,
+/// at its next datagram. A mapping the new policy still allows goes on.
+#[test]
+fn a_policy_update_drops_the_mappings_it_denies_and_keeps_the_rest() {
+    let (kept_server, kept_at) = server();
+    let (dropped_server, dropped_at) = server();
+    let mut rig = Rig::new(harness_with(policy(&["allow 127.0.0.0/8"])));
+    rig.send(40_001, kept_at, b"kept");
+    rig.send(40_002, dropped_at, b"dropped");
+    assert_eq!(recv(&kept_server).0, b"kept");
+    assert_eq!(recv(&dropped_server).0, b"dropped");
+    rig.poll(Instant::now());
+    assert_eq!(rig.h.stack.udp_mappings(), 2);
+
+    // The exact range with the kept server's port lifts the loopback
+    // denial there, nowhere else.
+    let keep = format!("allow 127.0.0.0/8:{}", kept_at.port());
+    rig.h.policy.store(Arc::new(policy(&[&keep])));
+    rig.poll(Instant::now());
+    assert_eq!(rig.h.stack.udp_mappings(), 1, "the denied mapping is gone");
+    assert_eq!(rig.events.udp_watched(), 1, "and its host fd unwatched");
+
+    rig.send(40_001, kept_at, b"kept again");
+    assert_eq!(recv(&kept_server).0, b"kept again");
+    rig.send(40_002, dropped_at, b"again");
+    assert!(nothing_at(&dropped_server));
+    rig.h.stack.shutdown();
+
+    let events = rig.events();
+    assert_eq!(
+        udps(&events),
+        [
+            net_udp(
+                1,
+                guest(40_001),
+                kept_at,
+                &[],
+                Verdict::Allow,
+                Some("allow 127.0.0.0/8")
+            ),
+            net_udp(
+                2,
+                guest(40_002),
+                dropped_at,
+                &[],
+                Verdict::Allow,
+                Some("allow 127.0.0.0/8")
+            ),
+            net_udp(
+                3,
+                guest(40_002),
+                dropped_at,
+                &[],
+                Verdict::Deny,
+                Some(BUILTIN_PRIVATE)
+            ),
+        ]
+    );
+    assert_eq!(
+        closes(&events),
+        [(2, 7, 0, "policy".into()), (1, 14, 0, "shutdown".into())]
     );
 }

@@ -15,6 +15,7 @@ use boxcar_virtio::bus::Bus;
 use boxcar_virtio::{DeviceContext, MmioSlot, MmioTransport, SlotAllocator, VirtioDevice};
 use kvm_ioctls::VmFd;
 use vm_memory::GuestMemoryMmap;
+use vmm_sys_util::eventfd::EventFd;
 
 use super::slots::{slot, SlotId};
 use super::DeviceError;
@@ -26,6 +27,8 @@ pub type NetTransport = MmioTransport<VirtioNet>;
 #[derive(Default)]
 pub struct NetDevice {
     device: Option<Arc<Mutex<NetTransport>>>,
+    /// The device's policy wake (`VirtioNet::policy_wake`).
+    policy_wake: Option<EventFd>,
 }
 
 impl NetDevice {
@@ -50,6 +53,10 @@ impl NetDevice {
         let slot = reserve(slots)?;
         let device = VirtioNet::new(cfg.clone(), audit.clone(), Arc::clone(policy))
             .map_err(DeviceError::Net)?;
+        let policy_wake = device
+            .policy_wake()
+            .try_clone()
+            .map_err(DeviceError::NetWake)?;
         let ctx = DeviceContext::new(slot, device.num_queues()).map_err(DeviceError::NetWiring)?;
         // Before the transport takes the context apart.
         ctx.register(vm).map_err(DeviceError::NetWiring)?;
@@ -58,12 +65,19 @@ impl NetDevice {
         tracing::debug!("virtio-net: slot {:#x}, GSI {}", slot.base, slot.gsi);
         Ok(NetDevice {
             device: Some(transport),
+            policy_wake: Some(policy_wake),
         })
     }
 
     /// Whether the VM has the device.
     pub fn is_attached(&self) -> bool {
         self.device.is_some()
+    }
+
+    /// The device's policy wake, to write after a new policy is stored
+    /// (see `VirtioNet::policy_wake`); `None` without the device.
+    pub fn policy_wake(&self) -> Option<&EventFd> {
+        self.policy_wake.as_ref()
     }
 
     /// Resets the device through its transport, as a driver's status-0

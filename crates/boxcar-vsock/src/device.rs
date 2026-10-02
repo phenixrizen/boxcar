@@ -85,6 +85,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
 use boxcar_virtio::features::{EVENT_IDX, VERSION_1};
 use boxcar_virtio::{ActivateError, ActivatedQueue, IrqTrigger, VirtioDevice};
@@ -98,6 +99,7 @@ use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use crate::defs::MAX_PKT_BUF_SIZE;
 use crate::packet_ext::{PacketExt, VsockPacket};
+use crate::rules::AllowPorts;
 use crate::services::InternalServices;
 use crate::unix::{bind_listener, VsockMuxer, VsockUnixError};
 use crate::{VsockChannel, VsockEpollListener};
@@ -171,6 +173,10 @@ pub enum VsockDeviceError {
 /// The guest's vsock device, in front of a [`VsockMuxer`].
 pub struct VirtioVsock {
     cfg: VsockConfig,
+    /// The host ports a guest connection may reach besides the internal
+    /// ones: `cfg.allow_ports` to begin with, swapped by the VMM's
+    /// `policy.update`, read by every activation's muxer at each request.
+    allow_ports: AllowPorts,
     /// The host socket, bound by `new`; each activation's muxer accepts on
     /// a clone of it.
     listener: UnixListener,
@@ -199,8 +205,10 @@ impl VirtioVsock {
                 path: cfg.uds_path.clone(),
                 source,
             })?;
+        let allow_ports = Arc::new(ArcSwap::from_pointee(cfg.allow_ports.clone()));
         Ok(VirtioVsock {
             cfg,
+            allow_ports,
             listener,
             unlinked: false,
             services,
@@ -212,6 +220,13 @@ impl VirtioVsock {
     /// The host socket's path.
     pub fn uds_path(&self) -> &Path {
         &self.cfg.uds_path
+    }
+
+    /// The allowlist the device's muxer reads at each guest request
+    /// (`cfg.allow_ports` to begin with): storing a new list in it decides
+    /// the next request, in this activation and every later one.
+    pub fn allow_ports(&self) -> AllowPorts {
+        Arc::clone(&self.allow_ports)
     }
 
     /// Unlinks the host socket, so that no host process can connect any
@@ -306,8 +321,9 @@ impl VirtioDevice for VirtioVsock {
         let (Some(rx), Some(tx), Some(evq)) = (queues.next(), queues.next(), queues.next()) else {
             return Err(device_error("the queues went missing".into()));
         };
-        let muxer = VsockMuxer::new(
+        let muxer = VsockMuxer::with_allow_ports(
             &self.cfg,
+            Arc::clone(&self.allow_ports),
             self.listener.try_clone()?,
             Arc::clone(&self.services),
             self.audit.clone(),

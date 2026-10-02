@@ -32,8 +32,10 @@
 //!
 //! Activation starts one thread, `net`, which owns the stack. It waits with
 //! one `EventManager` on the RX and TX queues' eventfds, a kill eventfd, a
-//! timerfd, and the host fds the stack asks for ([`FdChange`]). Each
-//! wakeup, in this order:
+//! timerfd, the device's policy wake ([`VirtioNet::policy_wake`], written
+//! after a policy is swapped in, so that the poll below revokes what it
+//! denies at once), and the host fds the stack asks for ([`FdChange`]).
+//! Each wakeup, in this order:
 //!
 //! 1. if the driver kicked TX, every chain on the TX queue goes to the
 //!    stack and back to the used ring;
@@ -199,6 +201,10 @@ pub struct VirtioNet {
     cfg: NetConfig,
     sink: AuditSink,
     policy: Arc<ArcSwap<Policy>>,
+    /// Written by whoever swaps the policy ([`VirtioNet::policy_wake`]):
+    /// the net thread wakes and polls its stack, which revokes what the
+    /// new policy denies.
+    wake: EventFd,
     /// The config space: the guest's MAC.
     mac: [u8; 6],
     /// The stack the next activation runs, built ahead so that a config the
@@ -226,11 +232,14 @@ impl VirtioNet {
         let ids = FlowIds::default();
         let spare =
             NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?;
+        let wake = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)
+            .map_err(|error| ConfigError::Wake(error.to_string()))?;
         Ok(VirtioNet {
             mac: cfg.guest_mac,
             cfg,
             sink,
             policy,
+            wake,
             spare: Some(spare),
             ids,
             counters: Arc::new(NetCounters::default()),
@@ -241,6 +250,15 @@ impl VirtioNet {
     /// What the device dropped and passed so far.
     pub fn counts(&self) -> NetCounts {
         self.counters.snapshot()
+    }
+
+    /// The eventfd to write after storing a new policy in the handle the
+    /// stack reads: the net thread, if the device is active, wakes at once
+    /// and polls its stack, which revokes what the new policy denies
+    /// (`NetStack::poll`). Without the write, that waits for the thread's
+    /// next wakeup. A clone shares the eventfd.
+    pub fn policy_wake(&self) -> &EventFd {
+        &self.wake
     }
 
     /// The stack for the next activation, counting flow ids on from the
@@ -338,6 +356,7 @@ impl VirtioDevice for VirtioNet {
             rx: Ring::new(RX_QUEUE, rx),
             tx: Ring::new(TX_QUEUE, tx),
             kill: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
+            wake: self.wake.try_clone()?,
             timer: TimerFd::new().map_err(io::Error::from)?,
             counters: Arc::clone(&self.counters),
             stop: StopFlag::default(),
@@ -686,6 +705,8 @@ struct Worker {
     rx: Ring,
     tx: Ring,
     kill: EventFd,
+    /// The device's policy wake ([`VirtioNet::policy_wake`]): a poll is due.
+    wake: EventFd,
     /// Armed for the stack's next deadline. It is only read after the wait
     /// found it readable, and it is not re-armed in between, so the read
     /// does not block.
@@ -725,6 +746,11 @@ impl Worker {
             } else if fd == self.timer.as_raw_fd() {
                 if let Err(error) = self.timer.wait() {
                     boxcar_virtio::limited!(warn, "virtio-net: the timer: {error}");
+                }
+            } else if fd == self.wake.as_raw_fd() {
+                // The poll every cycle makes is what was asked for.
+                if let Err(error) = self.wake.read() {
+                    boxcar_virtio::limited!(warn, "virtio-net: the policy wake: {error}");
                 }
             } else if let Some(&token) = self.tokens.get(&fd) {
                 // An error or a hang-up is both: the stack finds out which.
@@ -938,6 +964,7 @@ fn spawn(worker: Worker) -> Result<WorkerHandle, ActivateError> {
         worker.rx.evt.as_raw_fd(),
         worker.tx.evt.as_raw_fd(),
         worker.timer.as_raw_fd(),
+        worker.wake.as_raw_fd(),
     ] {
         // Level-triggered: no EventSet::EDGE_TRIGGERED, here or anywhere.
         ops.add(Events::new_raw(fd, EventSet::IN))

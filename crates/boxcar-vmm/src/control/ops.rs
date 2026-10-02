@@ -7,8 +7,9 @@
 //! The connection serves `status` with [`Ops::status`] and `stop` with
 //! [`Ops::stop`] once its parameters parse; every other op goes to
 //! [`Ops::dispatch`]: the VMM's serves `pty.attach`, `pty.watch` and
-//! `pty.resize` (the hello's capability `pty`) and `audit.subscribe` (the
-//! capability `audit`), where later ops (`policy.*`) are added.
+//! `pty.resize` (the hello's capability `pty`), `audit.subscribe` (the
+//! capability `audit`), and `policy.get` and `policy.update` (the
+//! capability `policy.net`).
 //!
 //! ## `pty.attach`
 //!
@@ -96,6 +97,38 @@
 //! that do not parse: `types` more than 32 entries, or an empty one or one
 //! over 64 bytes), `busy` (4 subscriptions already), `invalid_state` (the
 //! audit log is closed or has failed), `internal` (the log cannot be read).
+//!
+//! ## `policy.get`
+//!
+//! `{"v":1,"id":N,"op":"policy.get"}` answers with the policy in force:
+//! `{"net":{"default":"deny","allow":["example.com:443"],"deny":["10.0.0.0/8"]},
+//! "vsock":{"allow_ports":[5000]},"version":V}`. `net` is the network
+//! policy ([`crate::policy`]): its default and its rules' targets as
+//! written, the allows and the denies each in order; `vsock.allow_ports`
+//! the host ports a guest vsock connection may reach besides the VMM's
+//! own; `version` 1 for the policy the VM started with, one more for each
+//! update. A VM without a device reports that device's part empty.
+//!
+//! ## `policy.update`
+//!
+//! `{"v":1,"id":N,"op":"policy.update","net":{...},"vsock":{...}}`, with
+//! `net` and `vsock` as `policy.get` reports them and each optional,
+//! replaces the whole network policy, the whole vsock allowlist, or both,
+//! and answers `{"policy_version":V}`, the version from now on. The policy
+//! in force puts every deny before every allow, in the order given, so a
+//! deny wins over an allow of the same target. The new policy decides every
+//! later query, connection and datagram, and the VMM then ends what is
+//! open and the new policy denies: TCP connections and connects under way
+//! are reset, UDP mappings closed, each recorded as
+//! `net.close{reason:"policy"}`. Connections already made to a vsock port
+//! taken off the allowlist stay. The update is recorded as
+//! `policy.changed{by_pid,version}` (`by_pid` the client's process id).
+//! Errors, with nothing changed: `bad_request` (parameters that do not
+//! parse; neither `net` nor `vsock` given; over 4096 rules, a rule over
+//! 512 bytes, or over 1024 ports; a rule that does not parse, named as
+//! `net.allow[2] "..."`, or a port below 1027, as
+//! `vsock.allow_ports[0]`), `invalid_state` (`net` on a VM without a
+//! network card, `vsock` on one without a vsock device).
 
 use std::fmt;
 use std::os::unix::net::UnixStream;
@@ -104,16 +137,19 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use boxcar_proto::control::{
-    ErrorBody, ErrorCode, PtyAttachParams, PtyAttached, PtyDetached, PtyMode, PtyResizeParams,
-    PtyWatchParams, Request, Status, StopMode, StopParams, PTY_SESSION,
+    ErrorBody, ErrorCode, PolicyUpdateParams, PolicyUpdated, PtyAttachParams, PtyAttached,
+    PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Request, Status, StopMode, StopParams,
+    PTY_SESSION,
 };
+use boxcar_proto::{Payload, PolicyChanged};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use super::audit::{self, AuditSubs, Limits};
-use super::conn::Conn;
+use super::conn::{record, Conn};
 use crate::guest_ctl::SendError;
 use crate::lifecycle::{StopReason, VmmHandle, GRACEFUL_STOP_MARGIN};
+use crate::policy::UpdateError;
 use crate::pty::{raw, Mode, PtyHub, PtyState, Watcher, SCROLLBACK};
 
 /// The ops a control connection serves.
@@ -294,19 +330,26 @@ impl Ops for VmmOps {
         Ok(json!({"accepted": true}))
     }
 
-    /// `pty.attach`, `pty.watch` and `pty.resize`: see the module docs.
+    /// `pty.attach`, `pty.watch`, `pty.resize`, `audit.subscribe`,
+    /// `policy.get` and `policy.update`: see the module docs.
     fn dispatch(&self, conn: &mut ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
         match req.op.as_str() {
             "pty.attach" => self.pty_attach(conn, req),
             "pty.watch" => self.pty_watch(conn, req),
             "pty.resize" => self.pty_resize(req),
             "audit.subscribe" => audit::subscribe(self.handle.audit(), conn, req, self.audit),
+            "policy.get" => self.policy_get(),
+            "policy.update" => self.policy_update(conn, req),
             _ => Err(ErrorBody::unknown_op(&req.op)),
         }
     }
 
     fn capabilities(&self) -> Vec<String> {
-        vec!["pty".to_owned(), "audit".to_owned()]
+        vec![
+            "pty".to_owned(),
+            "audit".to_owned(),
+            "policy.net".to_owned(),
+        ]
     }
 }
 
@@ -396,6 +439,38 @@ impl VmmOps {
             })?;
         Ok(json!({}))
     }
+
+    fn policy_get(&self) -> Result<Value, ErrorBody> {
+        serde_json::to_value(self.handle.policy().view())
+            .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
+    }
+
+    /// `policy.update`: checked and swapped by [`crate::policy::LivePolicy`],
+    /// then recorded as `policy.changed`, attributed to the client.
+    fn policy_update(&self, conn: &ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
+        let params: PolicyUpdateParams = params(req)?;
+        params
+            .check()
+            .map_err(|message| ErrorBody::new(ErrorCode::BadRequest, message))?;
+        let version = self.handle.policy().update(&params).map_err(|error| {
+            let code = match error {
+                UpdateError::Rule { .. } => ErrorCode::BadRequest,
+                UpdateError::NoNetDevice | UpdateError::NoVsockDevice => ErrorCode::InvalidState,
+            };
+            ErrorBody::new(code, error.to_string())
+        })?;
+        record(
+            self.handle.audit(),
+            Payload::PolicyChanged(PolicyChanged {
+                by_pid: conn.peer_pid,
+                version,
+            }),
+        );
+        serde_json::to_value(PolicyUpdated {
+            policy_version: version,
+        })
+        .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
+    }
 }
 
 /// The request's parameters as `T`, or `bad_request`.
@@ -428,7 +503,7 @@ mod tests {
     use boxcar_audit::{Priority, Submission};
     use boxcar_proto::control::{to_line, ErrorCode, Hello, VmState};
     use boxcar_proto::guest::HostMsg;
-    use boxcar_proto::{Attrib, FsIo, NetDrop, OpResult, Payload, Record, Ring, Subject};
+    use boxcar_proto::{Attrib, FsIo, NetDrop, OpResult, Payload, Record, Ring, Subject, Verdict};
 
     use super::*;
     use crate::control::conn::{Conn, Session};
@@ -441,7 +516,7 @@ mod tests {
         let handle = fixture.handle.clone();
         let ops = VmmOps::new(handle.clone());
         assert_eq!(ops.status(), handle.status());
-        assert_eq!(ops.capabilities(), ["pty", "audit"]);
+        assert_eq!(ops.capabilities(), ["pty", "audit", "policy.net"]);
 
         let mut conn = ConnCtx::new(1, 0);
         let other = Request::new(1, "pty.detach", Value::Null);
@@ -563,7 +638,10 @@ mod tests {
         guest.write_all(b"before ").unwrap();
         wait_until("7 bytes in", || fixture.hub.received() == 7);
         let mut wire = Wire::new(&fixture);
-        assert_eq!(wire.hello["capabilities"], json!(["pty", "audit"]));
+        assert_eq!(
+            wire.hello["capabilities"],
+            json!(["pty", "audit", "policy.net"])
+        );
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
         assert_eq!(response["result"]["raw"], true, "{response}");
         let id = response["result"]["attach_id"].as_str().unwrap();
@@ -885,7 +963,10 @@ mod tests {
             sink.emit(fs_event(n, 42, 0)).unwrap();
         }
         let mut wire = Wire::new(&fixture);
-        assert_eq!(wire.hello["capabilities"], json!(["pty", "audit"]));
+        assert_eq!(
+            wire.hello["capabilities"],
+            json!(["pty", "audit", "policy.net"])
+        );
 
         // The response comes first, though the log has records to send.
         let response = wire.request("audit.subscribe", json!({}));
@@ -1116,5 +1197,148 @@ mod tests {
         ended
             .recv_timeout(Duration::from_secs(5))
             .expect("the connection's thread did not end");
+    }
+
+    /// `policy.get` reports the policy in force; `policy.update` replaces
+    /// it: the next decision is the new policy's, the vsock allowlist
+    /// swaps the same way, `policy.changed{by_pid,version}` is recorded,
+    /// and `policy.get` reports the new version. An update of one part
+    /// leaves the other as it is.
+    #[test]
+    fn policy_update_flips_a_live_verdict_and_records_policy_changed() {
+        let fixture = Fixture::new();
+        let live = fixture.handle.policy();
+        let dst = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(93, 184, 215, 14), 443);
+        let names = vec!["api.github.com".to_owned()];
+        assert_eq!(live.net().egress(dst, &names), (Verdict::Deny, None));
+
+        let mut events = Wire::new(&fixture);
+        events.request("audit.subscribe", json!({"types": ["policy."]}));
+        let mut wire = Wire::new(&fixture);
+        assert_eq!(
+            wire.hello["capabilities"],
+            json!(["pty", "audit", "policy.net"])
+        );
+        let before = wire.request("policy.get", Value::Null);
+        assert_eq!(
+            before["result"],
+            json!({
+                "net": {"default": "deny", "allow": [], "deny": []},
+                "vsock": {"allow_ports": []},
+                "version": 1,
+            }),
+            "{before}"
+        );
+
+        let updated = wire.request(
+            "policy.update",
+            json!({
+                "net": {"default": "deny", "allow": ["api.github.com:443"], "deny": ["evil.example"]},
+                "vsock": {"allow_ports": [5000]},
+            }),
+        );
+        assert_eq!(updated["result"], json!({"policy_version": 2}), "{updated}");
+        assert_eq!(
+            live.net().egress(dst, &names),
+            (Verdict::Allow, Some("allow api.github.com:443".to_owned()))
+        );
+        assert_eq!(
+            live.net().egress(dst, &["evil.example".to_owned()]),
+            (Verdict::Deny, Some("deny evil.example".to_owned()))
+        );
+        assert_eq!(live.vsock_allow(), [5000]);
+        let after = wire.request("policy.get", Value::Null);
+        assert_eq!(
+            after["result"],
+            json!({
+                "net": {"default": "deny", "allow": ["api.github.com:443"], "deny": ["evil.example"]},
+                "vsock": {"allow_ports": [5000]},
+                "version": 2,
+            }),
+            "{after}"
+        );
+        let changed = rec_of(&events.line(), 1);
+        assert_eq!(changed.kind, "policy.changed");
+        assert_eq!(changed.src, boxcar_proto::Source::Policy);
+        assert_eq!(changed.data, json!({"by_pid": 1, "version": 2}));
+
+        // The vsock list alone: the network policy stays, the version
+        // moves on.
+        let only_vsock = wire.request("policy.update", json!({"vsock": {"allow_ports": []}}));
+        assert_eq!(only_vsock["result"], json!({"policy_version": 3}));
+        assert!(live.vsock_allow().is_empty());
+        assert_eq!(live.net().egress(dst, &names).0, Verdict::Allow);
+        assert_eq!(
+            rec_of(&events.line(), 1).data,
+            json!({"by_pid": 1, "version": 3})
+        );
+        assert_eq!(
+            wire.request("policy.get", Value::Null)["result"]["version"],
+            3
+        );
+    }
+
+    /// A rule that does not parse, a port the allowlist cannot hold, or an
+    /// update that names nothing is a bad request that names what is
+    /// wrong, and the policy and its version stay as they were, with
+    /// nothing recorded.
+    #[test]
+    fn policy_update_refuses_a_malformed_rule_naming_it() {
+        let fixture = Fixture::new();
+        let mut events = Wire::new(&fixture);
+        events.request("audit.subscribe", json!({"types": ["policy."]}));
+        let mut wire = Wire::new(&fixture);
+        for (params, named) in [
+            (
+                json!({"net": {"default": "deny", "allow": ["exa_mple.com"]}}),
+                "net.allow[0] \"exa_mple.com\"",
+            ),
+            (
+                json!({"net": {"default": "deny", "allow": ["a.test"], "deny": ["ok.test", "192.168.1.300"]}}),
+                "net.deny[1] \"192.168.1.300\"",
+            ),
+            (
+                json!({"net": {"default": "allow", "allow": ["two words"]}}),
+                "net.allow[0] \"two words\"",
+            ),
+            (
+                json!({"net": {"default": "deny", "allow": [""]}}),
+                "net.allow[0]",
+            ),
+            (
+                json!({"vsock": {"allow_ports": [1025]}}),
+                "vsock.allow_ports[0]",
+            ),
+            (
+                json!({"net": {"default": "deny", "allow": ["a.test"]}, "vsock": {"allow_ports": [5000, 1023]}}),
+                "vsock.allow_ports[1]",
+            ),
+            (json!({}), "nothing to update"),
+            (
+                json!({"net": {"default": "maybe"}}),
+                "policy.update parameters",
+            ),
+            (
+                json!({"net": {"allow": ["a.test"]}}),
+                "policy.update parameters",
+            ),
+        ] {
+            let response = wire.request("policy.update", params.clone());
+            assert_eq!(code(&response), "bad_request", "{params}: {response}");
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(message.contains(named), "{params}: {message}");
+        }
+        // Nothing changed, and nothing was recorded.
+        let view = wire.request("policy.get", Value::Null);
+        assert_eq!(view["result"]["version"], 1, "{view}");
+        assert_eq!(view["result"]["net"]["allow"], json!([]));
+        assert!(fixture.handle.policy().vsock_allow().is_empty());
+        let good = wire.request("policy.update", json!({"vsock": {"allow_ports": [6000]}}));
+        assert_eq!(good["result"], json!({"policy_version": 2}), "{good}");
+        assert_eq!(
+            rec_of(&events.line(), 1).data,
+            json!({"by_pid": 1, "version": 2}),
+            "the first record is the good update's"
+        );
     }
 }

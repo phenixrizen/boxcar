@@ -31,7 +31,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::audit::Record;
+use crate::audit::{Record, Verdict};
 
 /// The `protocol` of the [`Hello`].
 pub const PROTOCOL: &str = "boxcar.control";
@@ -562,6 +562,147 @@ impl AuditLagged {
     }
 }
 
+/// The most rules (allows and denies together) a `policy.update` may give
+/// the network.
+pub const MAX_POLICY_RULES: usize = 4096;
+/// The longest rule text a `policy.update` may give, in bytes: a name of
+/// 253 bytes with a port, and room to spare.
+pub const MAX_POLICY_RULE_LEN: usize = 512;
+/// The most ports a `policy.update` may allowlist for vsock.
+pub const MAX_VSOCK_ALLOW_PORTS: usize = 1024;
+
+/// The network policy as `policy.get` reports it and `policy.update` takes
+/// it: `{"default":"deny","allow":["example.com:443"],"deny":["10.0.0.0/8"]}`.
+/// Each rule is a target as `boxcar run --allow` takes it: `name[:port]`,
+/// `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The
+/// policy in force puts every deny before every allow, in the order given,
+/// as `boxcar run` orders `--deny` and `--allow`: the first rule that
+/// matches decides, so a deny wins over an allow of the same target. A
+/// policy file whose allows and denies are interleaved reads back from
+/// `policy.get` in this shape, which is the same policy only when no
+/// allow before a deny matches what the deny does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetPolicy {
+    /// The verdict when no rule matches: `allow` or `deny`.
+    pub default: Verdict,
+    /// The allow rules, as targets, in order.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// The deny rules, as targets, in order.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl NetPolicy {
+    /// Whether the policy is within the limits: at most
+    /// [`MAX_POLICY_RULES`] rules in all, each 1 to
+    /// [`MAX_POLICY_RULE_LEN`] bytes and one line. What a rule says is for
+    /// the server to parse (`bad_request` names the rule it refuses).
+    pub fn check(&self) -> Result<(), String> {
+        let rules = self.allow.len() + self.deny.len();
+        if rules > MAX_POLICY_RULES {
+            return Err(format!("{rules} rules: at most {MAX_POLICY_RULES}"));
+        }
+        for (list, rules) in [("allow", &self.allow), ("deny", &self.deny)] {
+            for (at, rule) in rules.iter().enumerate() {
+                if rule.is_empty() || rule.len() > MAX_POLICY_RULE_LEN {
+                    return Err(format!(
+                        "net.{list}[{at}]: a rule is 1 to {MAX_POLICY_RULE_LEN} bytes, not {}",
+                        rule.len()
+                    ));
+                }
+                if rule.contains(['\n', '#']) {
+                    return Err(format!(
+                        "net.{list}[{at}] {rule:?}: a rule is one target, with no newline or #"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The vsock policy as `policy.get` reports it and `policy.update` takes
+/// it: `{"allow_ports":[5000]}`, the host ports a guest connection may
+/// reach besides the internal ones (`boxcar run --vsock-allow`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VsockPolicy {
+    #[serde(default)]
+    pub allow_ports: Vec<u32>,
+}
+
+impl VsockPolicy {
+    /// Whether the list is within the limits: at most
+    /// [`MAX_VSOCK_ALLOW_PORTS`] ports, each 1027 or more (1024 to 1026
+    /// are the VMM's own, and below 1024 is privileged).
+    pub fn check(&self) -> Result<(), String> {
+        if self.allow_ports.len() > MAX_VSOCK_ALLOW_PORTS {
+            return Err(format!(
+                "{} vsock ports: at most {MAX_VSOCK_ALLOW_PORTS}",
+                self.allow_ports.len()
+            ));
+        }
+        for (at, port) in self.allow_ports.iter().enumerate() {
+            if *port <= 1026 {
+                return Err(format!(
+                    "vsock.allow_ports[{at}]: port {port} is below 1027 (1024 to 1026 are the \
+                     VMM's internal ports, and below 1024 is privileged)"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The result of `policy.get`: `{"net":{...},"vsock":{...},"version":N}`,
+/// the policy in force and its version (1 for the one the VM started with,
+/// one more for each `policy.update`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyView {
+    pub net: NetPolicy,
+    pub vsock: VsockPolicy,
+    /// 0 when a server did not say.
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// The parameters of `policy.update`: `{"net":{...},"vsock":{...}}`, each
+/// optional and each replacing its whole policy when given. The response
+/// is [`PolicyUpdated`]; the server records `policy.changed`. A rule that
+/// does not parse is a `bad_request` naming it, and nothing changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyUpdateParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vsock: Option<VsockPolicy>,
+}
+
+impl PolicyUpdateParams {
+    /// Whether the parameters are within the limits ([`NetPolicy::check`]
+    /// and [`VsockPolicy::check`]) and change something: at least one of
+    /// `net` and `vsock` is given.
+    pub fn check(&self) -> Result<(), String> {
+        if self.net.is_none() && self.vsock.is_none() {
+            return Err("nothing to update: give net, vsock or both".to_owned());
+        }
+        if let Some(net) = &self.net {
+            net.check()?;
+        }
+        if let Some(vsock) = &self.vsock {
+            vsock.check()?;
+        }
+        Ok(())
+    }
+}
+
+/// The result of `policy.update`: `{"policy_version":N}`, the version of
+/// the policy now in force.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyUpdated {
+    pub policy_version: u64,
+}
+
 /// The one line `boxcar run --ready-fd N` writes to fd N once the control
 /// socket is bound: `{"ready":true,"control":"<path>","session_id":"<id>"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1166,129 @@ mod tests {
             "hash": format!("b3:{}", "1".repeat(64)),
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn policy_messages_have_their_documented_shape_and_limits() {
+        let view = PolicyView {
+            net: NetPolicy {
+                default: Verdict::Deny,
+                allow: vec!["example.com:443".into(), "*.github.io".into()],
+                deny: vec!["10.0.0.0/8".into()],
+            },
+            vsock: VsockPolicy {
+                allow_ports: vec![5000],
+            },
+            version: 3,
+        };
+        let wire = json!({
+            "net": {"default": "deny", "allow": ["example.com:443", "*.github.io"], "deny": ["10.0.0.0/8"]},
+            "vsock": {"allow_ports": [5000]},
+            "version": 3,
+        });
+        assert_eq!(serde_json::to_value(&view).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<PolicyView>(wire).unwrap(), view);
+        // A view without a version, or lists, still reads.
+        let bare: PolicyView =
+            serde_json::from_value(json!({"net": {"default": "allow"}, "vsock": {}})).unwrap();
+        assert_eq!(bare.version, 0);
+        assert_eq!(bare.net.default, Verdict::Allow);
+        assert!(bare.net.allow.is_empty() && bare.net.deny.is_empty());
+        assert!(bare.vsock.allow_ports.is_empty());
+        for bad in [
+            json!({"net": {"default": "maybe"}, "vsock": {}}),
+            json!({"net": {}, "vsock": {}}),
+            json!({"vsock": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<PolicyView>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+
+        // An update names what it replaces; nothing at all is refused.
+        let none: PolicyUpdateParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(none, PolicyUpdateParams::default());
+        assert!(none.check().is_err());
+        assert_eq!(serde_json::to_value(&none).unwrap(), json!({}));
+        let net_only: PolicyUpdateParams =
+            serde_json::from_value(json!({"net": {"default": "deny", "allow": ["a.test"]}}))
+                .unwrap();
+        assert_eq!(net_only.check(), Ok(()));
+        assert!(net_only.vsock.is_none());
+        assert_eq!(
+            serde_json::to_value(&net_only).unwrap(),
+            json!({"net": {"default": "deny", "allow": ["a.test"], "deny": []}})
+        );
+        let vsock_only: PolicyUpdateParams =
+            serde_json::from_value(json!({"vsock": {"allow_ports": [1027, 5000]}})).unwrap();
+        assert_eq!(vsock_only.check(), Ok(()));
+        assert!(vsock_only.net.is_none());
+        assert!(serde_json::from_value::<PolicyUpdateParams>(
+            json!({"vsock": {"allow_ports": [-1]}})
+        )
+        .is_err());
+
+        // The limits, with the rule at fault named.
+        let net = |allow: Vec<String>, deny: Vec<String>| NetPolicy {
+            default: Verdict::Deny,
+            allow,
+            deny,
+        };
+        assert_eq!(
+            net(
+                vec!["a".into(); MAX_POLICY_RULES / 2],
+                vec!["b".into(); MAX_POLICY_RULES / 2]
+            )
+            .check(),
+            Ok(())
+        );
+        assert!(net(vec!["a".into(); MAX_POLICY_RULES + 1], Vec::new())
+            .check()
+            .is_err());
+        assert_eq!(
+            net(vec!["x".repeat(MAX_POLICY_RULE_LEN)], Vec::new()).check(),
+            Ok(())
+        );
+        let long = net(
+            Vec::new(),
+            vec!["ok".into(), "x".repeat(MAX_POLICY_RULE_LEN + 1)],
+        )
+        .check()
+        .unwrap_err();
+        assert!(long.starts_with("net.deny[1]"), "{long}");
+        let empty = net(vec![String::new()], Vec::new()).check().unwrap_err();
+        assert!(empty.starts_with("net.allow[0]"), "{empty}");
+        let line = net(vec!["a.test\nb.test".into()], Vec::new())
+            .check()
+            .unwrap_err();
+        assert!(
+            line.starts_with("net.allow[0]") && line.contains("newline"),
+            "{line}"
+        );
+        let comment = net(Vec::new(), vec!["a.test # x".into()])
+            .check()
+            .unwrap_err();
+        assert!(comment.starts_with("net.deny[0]"), "{comment}");
+
+        let ports = |ports: Vec<u32>| VsockPolicy { allow_ports: ports };
+        assert_eq!(
+            ports((1027..1027 + MAX_VSOCK_ALLOW_PORTS as u32).collect()).check(),
+            Ok(())
+        );
+        assert!(ports(vec![5000; MAX_VSOCK_ALLOW_PORTS + 1])
+            .check()
+            .is_err());
+        for low in [0, 1, 1023, 1024, 1025, 1026] {
+            let error = ports(vec![5000, low]).check().unwrap_err();
+            assert!(error.starts_with("vsock.allow_ports[1]"), "{low}: {error}");
+        }
+        assert_eq!(ports(vec![1027, u32::MAX]).check(), Ok(()));
+
+        assert_eq!(
+            serde_json::to_value(PolicyUpdated { policy_version: 2 }).unwrap(),
+            json!({"policy_version": 2})
+        );
     }
 
     #[test]

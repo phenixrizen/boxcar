@@ -357,6 +357,49 @@ impl Relay {
         }
     }
 
+    /// For a policy swapped in (`cx.policy` is the new one): ends every
+    /// connect under way and every flow that it denies, decided as the SYN
+    /// was ([`upstream::decide`]), on the names the guest knew the
+    /// destination by then. A connect under way is given up as a timed-out
+    /// one is (the guest reset, the host socket closed); a flow is aborted
+    /// (both sides reset). Each is recorded as `net.close{reason:"policy"}`,
+    /// the connects first, then the flows, in id order. A flow the new
+    /// policy still allows is left as it is.
+    pub(crate) fn revoke(&mut self, cx: &mut Ctx) {
+        let policy = Arc::clone(&cx.policy);
+        for id in self.table.pending_ids() {
+            let denied = self.table.pending(id).is_some_and(|pending| {
+                upstream::decide(cx.host_addrs, &policy, pending.dst, &pending.names, cx.now)
+                    .verdict
+                    == Verdict::Deny
+            });
+            if !denied {
+                continue;
+            }
+            if let Some(mut pending) = self.table.take_pending(id) {
+                cx.reset_guest(&pending.syn);
+                cx.record(close_record(id, 0, 0, pending.opened, cx.now, "policy"));
+                self.discard(id, pending.host, &mut pending.watched, false);
+            }
+        }
+        let mut flows: Vec<FlowId> = self
+            .table
+            .flows()
+            .filter(|flow| !flow.ending())
+            .map(|flow| flow.id)
+            .collect();
+        flows.sort_unstable();
+        for id in flows {
+            let denied = self.table.get(id).is_some_and(|flow| {
+                upstream::decide(cx.host_addrs, &policy, flow.dst, &flow.names, cx.now).verdict
+                    == Verdict::Deny
+            });
+            if denied {
+                self.end(cx, id, Step::Abort("policy"));
+            }
+        }
+    }
+
     /// Moves what can move on every flow, gates, sends what that queued,
     /// and lets go of the flows that are over. Runs after smoltcp has
     /// taken the guest's frames.

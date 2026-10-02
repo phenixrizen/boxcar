@@ -13,6 +13,7 @@ pub mod kick;
 pub mod kvm;
 pub mod lifecycle;
 pub mod memory;
+pub mod policy;
 pub mod pty;
 pub mod services;
 pub mod stdin;

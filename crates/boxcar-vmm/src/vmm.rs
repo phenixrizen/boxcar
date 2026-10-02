@@ -66,6 +66,7 @@ use crate::lifecycle::{
     MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
+use crate::policy::LivePolicy;
 use crate::pty::PtyHub;
 use crate::services::ServiceRegistry;
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
@@ -503,6 +504,11 @@ impl Vmm {
 
         let vcpus = create_vcpus(&kvm, &vm, &mem, cfg.vcpus, entry)?;
         let latch = Arc::new(StopLatch::new().map_err(setup("stop eventfd"))?);
+        let net_wake = match net.policy_wake() {
+            Some(wake) => Some(wake.try_clone().map_err(setup("policy wake"))?),
+            None => None,
+        };
+        let live_policy = LivePolicy::new(Arc::clone(&cfg.policy), net_wake, vsock.allow_ports());
         let info = Arc::new(VmInfo {
             session_id: cfg
                 .control
@@ -520,6 +526,7 @@ impl Vmm {
             services,
             guest,
             pty,
+            policy: Arc::new(live_policy),
         });
 
         let start = VmmStart {

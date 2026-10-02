@@ -16,10 +16,12 @@
 //!   (`Deny::Refused`); otherwise served by the service, and the port is taken
 //!   once the muxer has added the connection (`Rules::served`): a
 //!   connection the muxer could not add leaves the port free;
-//! - to an allowlisted port: connected to the host socket `<uds>_<port>`,
-//!   without waiting (`connect_port_socket`): a socket whose accept queue
-//!   is full refuses at once, as one nobody listens on does, so a host
-//!   service that does not accept cannot hold up the vsock thread;
+//! - to an allowlisted port ([`AllowPorts`], read at each request, so a
+//!   list swapped in by the control socket's `policy.update` decides the
+//!   next one): connected to the host socket `<uds>_<port>`, without
+//!   waiting (`connect_port_socket`): a socket whose accept queue is full
+//!   refuses at once, as one nobody listens on does, so a host service
+//!   that does not accept cannot hold up the vsock thread;
 //! - to any other port: refused as `port`.
 //!
 //! A refused request is reset and recorded as `vsock.connect` with verdict
@@ -38,11 +40,20 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_proto::{Payload, Ring, Verdict, VsockClose, VsockConnect};
 use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::services::{ConnMeta, Deny, InternalServices, PRIVILEGED_PORT_LIMIT};
+
+/// The host ports, other than the internal ones, a guest connection may
+/// reach: read at each request, so that a list stored here while the
+/// device runs decides the next request. The device makes one from its
+/// config ([`VirtioVsock::allow_ports`](crate::VirtioVsock::allow_ports))
+/// and the VMM's `policy.update` swaps it. Connections already made to a
+/// port taken off the list are not closed.
+pub type AllowPorts = Arc<ArcSwap<Vec<u32>>>;
 
 /// Who opened a connection: the `dir` of its records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +136,7 @@ pub(crate) enum Decision {
 /// internal ports already served.
 pub(crate) struct Rules {
     uds_path: PathBuf,
-    allow_ports: HashSet<u32>,
+    allow_ports: AllowPorts,
     services: Arc<dyn InternalServices>,
     /// The internal ports whose connection the muxer added: each is served
     /// once an activation.
@@ -135,12 +146,12 @@ pub(crate) struct Rules {
 impl Rules {
     pub(crate) fn new(
         uds_path: &Path,
-        allow_ports: &[u32],
+        allow_ports: AllowPorts,
         services: Arc<dyn InternalServices>,
     ) -> Rules {
         Rules {
             uds_path: uds_path.to_owned(),
-            allow_ports: allow_ports.iter().copied().collect(),
+            allow_ports,
             services,
             served: HashSet::new(),
         }
@@ -184,7 +195,7 @@ impl Rules {
                 }
             };
         }
-        if self.allow_ports.contains(&port) {
+        if self.allow_ports.load().contains(&port) {
             Decision::Uds(port_socket_path(&self.uds_path, port))
         } else {
             Decision::Deny(Peer::Uds, Refusal::Port)
@@ -325,7 +336,7 @@ mod tests {
     /// like `no_service`, leaves the port free.
     #[test]
     fn a_service_refusal_carries_its_reason() {
-        let mut rules = Rules::new(Path::new("/s/vsock.sock"), &[], Arc::new(Refusing));
+        let mut rules = Rules::new(Path::new("/s/vsock.sock"), fixed(&[]), Arc::new(Refusing));
         let refused = refusal(rules.decide(1024, 1023));
         assert_eq!(
             refused,
@@ -333,6 +344,11 @@ mod tests {
         );
         assert_eq!(Refusal::Refused("reactivated").as_str(), "reactivated");
         assert!(rules.served.is_empty());
+    }
+
+    /// An allowlist of `ports` that nothing swaps.
+    fn fixed(ports: &[u32]) -> AllowPorts {
+        Arc::new(ArcSwap::from_pointee(ports.to_vec()))
     }
 
     fn refusal(decision: Decision) -> Option<(Peer, Refusal)> {
@@ -345,7 +361,7 @@ mod tests {
     #[test]
     fn an_internal_port_is_served_once_and_only_from_a_privileged_port() {
         let services = Arc::new(Everything::default());
-        let mut rules = Rules::new(Path::new("/s/vsock.sock"), &[], services.clone());
+        let mut rules = Rules::new(Path::new("/s/vsock.sock"), fixed(&[]), services.clone());
         assert_eq!(
             refusal(rules.decide(1024, 1024)),
             Some((Peer::Internal, Refusal::Unprivileged))
@@ -372,7 +388,11 @@ mod tests {
     /// the next privileged connection.
     #[test]
     fn an_internal_port_nothing_serves_is_refused_and_stays_free() {
-        let mut rules = Rules::new(Path::new("/s/vsock.sock"), &[1026], Arc::new(Nothing));
+        let mut rules = Rules::new(
+            Path::new("/s/vsock.sock"),
+            fixed(&[1026]),
+            Arc::new(Nothing),
+        );
         for _ in 0..2 {
             assert_eq!(
                 refusal(rules.decide(1026, 1000)),
@@ -382,9 +402,43 @@ mod tests {
         assert!(rules.served.is_empty());
     }
 
+    /// The allowlist is read when a guest connects, so one swapped in
+    /// while the device runs (`policy.update`) decides the next request:
+    /// a port added is reached, one taken away is refused.
+    #[test]
+    fn the_allowlist_is_read_at_each_connect() {
+        let allow: AllowPorts = Arc::new(ArcSwap::from_pointee(vec![5000]));
+        let mut rules = Rules::new(
+            Path::new("/s/vsock.sock"),
+            Arc::clone(&allow),
+            Arc::new(Nothing),
+        );
+        assert!(matches!(rules.decide(5000, 40_000), Decision::Uds(_)));
+        assert_eq!(
+            refusal(rules.decide(5001, 40_000)),
+            Some((Peer::Uds, Refusal::Port))
+        );
+        allow.store(Arc::new(vec![5001]));
+        assert!(matches!(rules.decide(5001, 40_000), Decision::Uds(_)));
+        assert_eq!(
+            refusal(rules.decide(5000, 40_000)),
+            Some((Peer::Uds, Refusal::Port))
+        );
+        // The internal ports are never the allowlist's to open.
+        allow.store(Arc::new(vec![1024]));
+        assert_eq!(
+            refusal(rules.decide(1024, 40_000)),
+            Some((Peer::Internal, Refusal::Unprivileged))
+        );
+    }
+
     #[test]
     fn other_ports_reach_the_suffixed_socket_only_when_allowlisted() {
-        let mut rules = Rules::new(Path::new("/s/vsock.sock"), &[5000], Arc::new(Nothing));
+        let mut rules = Rules::new(
+            Path::new("/s/vsock.sock"),
+            fixed(&[5000]),
+            Arc::new(Nothing),
+        );
         match rules.decide(5000, 40_000) {
             Decision::Uds(path) => assert_eq!(path, Path::new("/s/vsock.sock_5000")),
             _ => panic!("5000 is allowlisted"),

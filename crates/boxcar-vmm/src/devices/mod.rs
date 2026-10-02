@@ -82,6 +82,9 @@ pub enum DeviceError {
     /// KVM.
     #[error("cannot wire the virtio-net device into KVM")]
     NetWiring(#[source] io::Error),
+    /// The net device's policy wake could not be shared with the VMM.
+    #[error("cannot share the net device's policy wake")]
+    NetWake(#[source] io::Error),
     /// The directory of the vsock socket could not be created.
     #[error("cannot create the directory of the vsock socket {}", path.display())]
     VsockDir {

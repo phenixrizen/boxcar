@@ -174,6 +174,10 @@ pub enum ConfigError {
     MacNotUnicast { role: &'static str, mac: String },
     #[error("the guest and the gateway both have the MAC address {0}")]
     SameMac(String),
+    /// The device's policy wake eventfd could not be made: the error's
+    /// text.
+    #[error("cannot make the policy wake eventfd: {0}")]
+    Wake(String),
     #[error("host name {0:?} is not 1 to 63 ASCII letters, digits and hyphens")]
     Hostname(String),
     #[error("the network interface has no room for {0}")]

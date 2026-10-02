@@ -33,9 +33,9 @@ pub use audit::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
     FsSymlink, FsXattr, Hash, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls,
-    NetUdp, OpResult, ParseHashError, Payload, Record, Ring, SessionExit, SessionStart, SetAttr,
-    ShareRef, Source, SpanRef, Subject, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
-    SCHEMA_VERSION,
+    NetUdp, OpResult, ParseHashError, Payload, PolicyChanged, Record, Ring, SessionExit,
+    SessionStart, SetAttr, ShareRef, Source, SpanRef, Subject, Verdict, VmmStart, VmmStop,
+    VsockClose, VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

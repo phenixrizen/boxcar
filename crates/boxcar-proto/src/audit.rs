@@ -44,8 +44,8 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
     FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
     FsSymlink, FsXattr, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp,
-    OpResult, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose,
-    VsockConnect,
+    OpResult, PolicyChanged, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart,
+    VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -98,6 +98,8 @@ pub enum Source {
     /// The guest's session, as its init reports it over the control
     /// channel.
     Session,
+    /// The session's policy, as the control socket changes it.
+    Policy,
 }
 
 impl Source {
@@ -105,8 +107,8 @@ impl Source {
     /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
     /// device, `net.*` from the network stack, `vsock.*` from the vsock
     /// device, `control.*` from the control socket, `session.*` from the
-    /// guest's session. `None` for every other kind; later milestones add
-    /// theirs.
+    /// guest's session, `policy.*` from the policy. `None` for every other
+    /// kind; later milestones add theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
         if kind == "checkpoint" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
@@ -120,6 +122,8 @@ impl Source {
             Some(Source::Control)
         } else if kind.starts_with("session.") {
             Some(Source::Session)
+        } else if kind.starts_with("policy.") {
+            Some(Source::Policy)
         } else {
             None
         }
@@ -392,6 +396,8 @@ pub enum Payload {
     SessionStart(SessionStart),
     #[serde(rename = "session.exit")]
     SessionExit(SessionExit),
+    #[serde(rename = "policy.changed")]
+    PolicyChanged(PolicyChanged),
 }
 
 impl Payload {
@@ -433,6 +439,7 @@ impl Payload {
             Payload::VsockClose(_) => "vsock.close",
             Payload::SessionStart(_) => "session.start",
             Payload::SessionExit(_) => "session.exit",
+            Payload::PolicyChanged(_) => "policy.changed",
         }
     }
 
@@ -440,8 +447,8 @@ impl Payload {
     /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, the
     /// network stack for `net.*`, the vsock device for `vsock.*`, the
     /// control socket for `control.*`, the guest's session for `session.*`,
-    /// as [`Source::from_kind`] says. A new variant does not compile until
-    /// it is given one.
+    /// the policy for `policy.*`, as [`Source::from_kind`] says. A new
+    /// variant does not compile until it is given one.
     pub fn source(&self) -> Source {
         match self {
             Payload::VmmStart(_) | Payload::VmmStop(_) | Payload::Checkpoint(_) => Source::Vmm,
@@ -473,6 +480,7 @@ impl Payload {
             | Payload::NetUdp(_) => Source::Net,
             Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
             Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
+            Payload::PolicyChanged(_) => Source::Policy,
         }
     }
 
@@ -507,7 +515,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 34 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 34] = [
+    const KINDS: [&str; 35] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -542,6 +550,7 @@ mod tests {
         "vsock.close",
         "session.start",
         "session.exit",
+        "policy.changed",
     ];
 
     fn session() -> SessionId {
@@ -1083,6 +1092,13 @@ mod tests {
                 }),
                 json!({"code": 7, "signal": null}),
             ),
+            (
+                Payload::PolicyChanged(PolicyChanged {
+                    by_pid: 4242,
+                    version: 2,
+                }),
+                json!({"by_pid": 4242, "version": 2}),
+            ),
         ]
     }
 
@@ -1408,6 +1424,8 @@ mod tests {
                 Source::Control
             } else if payload.kind().starts_with("session.") {
                 Source::Session
+            } else if payload.kind().starts_with("policy.") {
+                Source::Policy
             } else {
                 Source::Vmm
             };
@@ -1421,6 +1439,7 @@ mod tests {
         assert_eq!(Source::from_kind("net.drop"), Some(Source::Net));
         assert_eq!(Source::from_kind("vsock.close"), Some(Source::Vsock));
         assert_eq!(Source::from_kind("session.exit"), Some(Source::Session));
+        assert_eq!(Source::from_kind("policy.changed"), Some(Source::Policy));
         for other in [
             "proc.exec",
             "finding",
@@ -1437,6 +1456,8 @@ mod tests {
             "vsocks.close",
             "session",
             "sessions.exit",
+            "policy",
+            "policyx.changed",
         ] {
             assert_eq!(Source::from_kind(other), None, "{other:?}");
         }
@@ -1821,6 +1842,7 @@ mod tests {
             (Source::Gateway, "gateway"),
             (Source::Control, "control"),
             (Source::Session, "session"),
+            (Source::Policy, "policy"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), json!(name));
             assert_eq!(

@@ -36,6 +36,13 @@
 //! queue is full smoltcp reads nothing, so its answers cannot overflow it;
 //! guest frames wait for it until their own queue fills, and then the
 //! dispatcher drops new ones as `queue_full`.
+//!
+//! The policy is read at every decision, so one swapped in decides the
+//! next query, connection or datagram; and the first [`poll`](NetStack::poll)
+//! after a swap revokes what is open and the new policy denies: those TCP
+//! connections and connects under way are reset and those UDP mappings
+//! closed, each recorded as `net.close{reason:"policy"}` (see the relays'
+//! `revoke`). What the new policy still allows is left as it is.
 
 use std::collections::hash_map::RandomState;
 use std::collections::VecDeque;
@@ -107,6 +114,9 @@ pub struct NetStack {
     cfg: NetConfig,
     sink: AuditSink,
     policy: Arc<ArcSwap<Policy>>,
+    /// The policy the relays last had in force: a swap is noticed at the
+    /// next poll, which revokes what the new policy denies.
+    policy_seen: Arc<Policy>,
     pipe: Pipe,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -179,10 +189,12 @@ impl NetStack {
         iface.set_any_ip(true);
         let tcp = Relay::new(cfg.tcp.clone());
         let udp = UdpRelay::new(cfg.udp.clone());
+        let policy_seen = policy.load_full();
         Ok(NetStack {
             cfg,
             sink,
             policy,
+            policy_seen,
             pipe,
             iface,
             sockets: SocketSet::new(Vec::new()),
@@ -199,7 +211,8 @@ impl NetStack {
     }
 
     /// The handle the stack reads its policy through; storing a new
-    /// policy in it decides the next query or connection.
+    /// policy in it decides the next query or connection, and the next
+    /// [`poll`](Self::poll) revokes what is open and it denies.
     pub fn policy(&self) -> Arc<ArcSwap<Policy>> {
         Arc::clone(&self.policy)
     }
@@ -319,10 +332,20 @@ impl NetStack {
     /// denied, and UDP mappings idle too long are closed, so
     /// `next_deadline` counts the next of each too. The first poll asks for
     /// the DNS socket to be watched. Host sockets the last outcome asked to
-    /// be unwatched are closed first.
+    /// be unwatched are closed first. A policy swapped in since the last
+    /// poll revokes what it denies (see the module docs).
     pub fn poll(&mut self, now: Instant) -> PollOutcome {
         self.tcp.bury();
         self.udp.bury();
+        let policy = self.policy.load_full();
+        if !Arc::ptr_eq(&policy, &self.policy_seen) {
+            self.policy_seen = policy;
+            let Parts {
+                tcp, udp, mut cx, ..
+            } = self.split(now);
+            tcp.revoke(&mut cx);
+            udp.revoke(&mut cx);
+        }
         for pending in self.dns.expire(now) {
             self.refuse(pending, dns::SERVFAIL, now);
         }

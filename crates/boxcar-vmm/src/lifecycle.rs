@@ -71,6 +71,7 @@ use crate::console::ConsoleWriter;
 use crate::control::ControlServer;
 use crate::devices::{FsDevices, NetDevice, VsockDevice};
 use crate::guest_ctl::{GuestCtl, GuestCtlHandle, CLOSE_DEADLINE};
+use crate::policy::LivePolicy;
 use crate::pty::PtyHub;
 use crate::services::ServiceRegistry;
 use crate::stdin::RawModeGuard;
@@ -334,6 +335,10 @@ pub(crate) struct VmInfo {
     /// The session's terminal (port 1025), when the VM has the vsock
     /// device.
     pub(crate) pty: Option<PtyHub>,
+    /// The policy in force: the network policy the net stack reads and
+    /// the vsock allowlist, which the control socket's `policy.update`
+    /// replaces.
+    pub(crate) policy: Arc<LivePolicy>,
 }
 
 /// Stops a VM from another thread, and reports its status. Cheap to clone.
@@ -439,6 +444,12 @@ impl VmmHandle {
     /// The sink of the session's audit log.
     pub(crate) fn audit(&self) -> &AuditSink {
         &self.info.audit
+    }
+
+    /// The policy in force, and the way to replace it (the control
+    /// socket's `policy.get` and `policy.update`).
+    pub fn policy(&self) -> &LivePolicy {
+        &self.info.policy
     }
 
     /// The services on the internal vsock ports, where the guest control
@@ -804,8 +815,10 @@ fn emit_stop(
 
 /// A handle on a VM that was never built: a fresh latch, 2 vCPUs, 256 MiB,
 /// both virtio-fs devices, an audit log under `dir`, the guest control
-/// channel at port 1024 for a login shell as uid 1000, and the PTY hub at
-/// port 1025.
+/// channel at port 1024 for a login shell as uid 1000, the PTY hub at
+/// port 1025, and a policy that denies everything, with a net device's
+/// wake nobody reads and an empty vsock allowlist standing for the
+/// devices.
 #[cfg(test)]
 pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::WriterHandle) {
     let session_id = boxcar_proto::SessionId::new();
@@ -823,6 +836,13 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
     services
         .register(boxcar_vsock::services::PTY_PORT, pty.service())
         .expect("register the PTY hub");
+    let policy = LivePolicy::new(
+        Arc::new(arc_swap::ArcSwap::from_pointee(
+            boxcar_net::Policy::default(),
+        )),
+        Some(EventFd::new(EFD_NONBLOCK).expect("the policy wake")),
+        Some(Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()))),
+    );
     let info = VmInfo {
         session_id: session_id.to_string(),
         built: Instant::now(),
@@ -833,6 +853,7 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         services,
         guest,
         pty: Some(pty),
+        policy: Arc::new(policy),
     };
     let latch = Arc::new(StopLatch::new().expect("stop latch"));
     (VmmHandle::new(latch, Arc::new(info)), writer)

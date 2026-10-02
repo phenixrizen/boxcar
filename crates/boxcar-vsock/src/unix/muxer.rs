@@ -83,6 +83,7 @@ use std::sync::Arc;
 // boxcar: for the `CONNECT` deadlines.
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 // boxcar: the `CONNECT` deadlines' timer.
@@ -92,7 +93,7 @@ use super::super::csm::ConnState;
 use super::super::defs::uapi;
 use super::super::device::VsockConfig;
 use super::super::packet_ext::VsockPacket;
-use super::super::rules::{self, Decision, Dir, Peer, Rules};
+use super::super::rules::{self, AllowPorts, Decision, Dir, Peer, Rules};
 use super::super::services::InternalServices;
 use super::super::{Result as VsockResult, VsockChannel, VsockEpollListener, VsockError};
 use super::muxer_killq::MuxerKillQ;
@@ -415,8 +416,24 @@ impl VsockMuxer {
     /// connections on `host_sock`, which the device bound at `cfg.uds_path` (see
     /// `super::bind_listener`), serves the internal ports through `services`, reaches
     /// `<cfg.uds_path>_<port>` for the ports in `cfg.allow_ports`, and records into `audit`.
+    /// The allowlist is this muxer's own; [`VsockMuxer::with_allow_ports`] takes one that
+    /// is shared and swapped.
     pub fn new(
         cfg: &VsockConfig,
+        host_sock: UnixListener,
+        services: Arc<dyn InternalServices>,
+        audit: AuditSink,
+    ) -> Result<Self> {
+        let allow_ports: AllowPorts = Arc::new(ArcSwap::from_pointee(cfg.allow_ports.clone()));
+        VsockMuxer::with_allow_ports(cfg, allow_ports, host_sock, services, audit)
+    }
+
+    /// boxcar: [`VsockMuxer::new`], reaching `<cfg.uds_path>_<port>` for the ports in
+    /// `allow_ports` as it stands at each guest request (`cfg.allow_ports` is not read): the
+    /// device hands every activation's muxer the one list the VMM swaps.
+    pub fn with_allow_ports(
+        cfg: &VsockConfig,
+        allow_ports: AllowPorts,
         host_sock: UnixListener,
         services: Arc<dyn InternalServices>,
         audit: AuditSink,
@@ -440,7 +457,7 @@ impl VsockMuxer {
             local_port_last: (1u32 << 30) - 1,
             local_port_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
             // boxcar: the rules that decide a guest's connection requests.
-            rules: Rules::new(&cfg.uds_path, &cfg.allow_ports, services),
+            rules: Rules::new(&cfg.uds_path, allow_ports, services),
             // boxcar: where `vsock.connect` and `vsock.close` go.
             audit,
             // boxcar: the connections a `vsock.connect` let through, whose end is recorded.

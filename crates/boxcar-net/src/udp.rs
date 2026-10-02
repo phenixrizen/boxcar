@@ -168,6 +168,9 @@ const READABLE: Interest = Interest {
 struct Mapping {
     guest: SocketAddrV4,
     dst: SocketAddrV4,
+    /// The names the DNS cache gave `dst` when the first datagram came:
+    /// what a policy swapped in decides the mapping on again.
+    names: Vec<String>,
     /// Bound to `0.0.0.0:0` and connected to `dst`.
     socket: UdpSocket,
     /// When its first datagram was decided.
@@ -280,7 +283,7 @@ impl UdpRelay {
             flow: id.0,
             src: guest,
             dst,
-            names,
+            names: names.clone(),
             verdict,
             rule,
         }));
@@ -309,6 +312,7 @@ impl UdpRelay {
             Mapping {
                 guest,
                 dst,
+                names,
                 socket,
                 opened: cx.now,
                 last_active: cx.now,
@@ -371,6 +375,28 @@ impl UdpRelay {
             }
             self.idle.remove(&(last, id));
             self.close(cx, id, "idle");
+        }
+    }
+
+    /// For a policy swapped in (`cx.policy` is the new one): closes every
+    /// mapping that it denies, decided as the first datagram was
+    /// ([`upstream::decide_udp`]), on the names the guest knew the
+    /// destination by then, and records each as `net.close{reason:
+    /// "policy"}`, in id order. Its tuple is decided afresh at its next
+    /// datagram. A mapping the new policy still allows is left as it is.
+    pub(crate) fn revoke(&mut self, cx: &mut Ctx) {
+        let policy = Arc::clone(&cx.policy);
+        let denied: Vec<FlowId> = self
+            .mappings
+            .iter()
+            .filter(|(_, mapping)| {
+                upstream::decide_udp(cx.host_addrs, &policy, mapping.dst, &mapping.names, cx.now).0
+                    == Verdict::Deny
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in denied {
+            self.close(cx, id, "policy");
         }
     }
 

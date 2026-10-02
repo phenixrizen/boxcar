@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use boxcar_audit::AuditSink;
 use boxcar_virtio::bus::Bus;
 use boxcar_virtio::{DeviceContext, MmioSlot, MmioTransport, SlotAllocator, VirtioDevice};
-use boxcar_vsock::{VirtioVsock, VsockConfig};
+use boxcar_vsock::{AllowPorts, VirtioVsock, VsockConfig};
 use kvm_ioctls::VmFd;
 use vm_memory::GuestMemoryMmap;
 
@@ -41,6 +41,8 @@ pub struct VsockDevice {
     device: Option<Arc<Mutex<VsockTransport>>>,
     /// The socket's directory, when the device made it.
     made_dir: Option<PathBuf>,
+    /// The allowlist the device's muxer reads (`VirtioVsock::allow_ports`).
+    allow_ports: Option<AllowPorts>,
 }
 
 impl VsockDevice {
@@ -76,9 +78,11 @@ impl VsockDevice {
         let mut vsock = VsockDevice {
             device: None,
             made_dir,
+            allow_ports: None,
         };
         let device = VirtioVsock::new(cfg.clone(), services.clone(), audit.clone())
             .map_err(DeviceError::Vsock)?;
+        vsock.allow_ports = Some(device.allow_ports());
         let ctx: DeviceContext =
             DeviceContext::new(slot, device.num_queues()).map_err(DeviceError::VsockWiring)?;
         // Before the transport takes the context apart.
@@ -94,6 +98,13 @@ impl VsockDevice {
     /// Whether the VM has the device.
     pub fn is_attached(&self) -> bool {
         self.device.is_some()
+    }
+
+    /// The allowlist the device's muxer reads at each guest request:
+    /// storing a new list in it decides the next request. `None` without
+    /// the device.
+    pub fn allow_ports(&self) -> Option<AllowPorts> {
+        self.allow_ports.clone()
     }
 
     /// Resets the device through its transport, as a driver's status-0
@@ -225,6 +236,7 @@ mod tests {
         let vsock = VsockDevice {
             device: None,
             made_dir: socket_dir(&state.join("vsock.sock")).unwrap(),
+            allow_ports: None,
         };
         fs::write(state.join("control.sock"), b"").unwrap();
         vsock.close();
@@ -238,6 +250,7 @@ mod tests {
         let vsock = VsockDevice {
             device: None,
             made_dir: socket_dir(&state.join("vsock.sock")).unwrap(),
+            allow_ports: None,
         };
         drop(vsock);
         assert!(state.exists());

@@ -2077,3 +2077,113 @@ proptest! {
         parse_client_hello(&framed);
     }
 }
+
+/// A policy swapped in while flows are open ends, at the stack's next
+/// poll, every flow the new policy denies: the guest's side is reset, the
+/// host's socket is closed with a reset, and each is recorded as
+/// `net.close{reason:"policy"}`; a connect still under way is given up the
+/// same way. A flow the new policy still allows goes on untouched.
+#[test]
+fn a_policy_update_revokes_the_flows_it_denies_and_keeps_the_rest() {
+    let kept_server = echo_server();
+    let (dropped_server, seen) = host_peer(usize::MAX, b"");
+    let (hole, _held) = black_hole();
+    let mut rig = Rig::new(harness_with(policy(&["allow 127.0.0.0/8"])));
+    let (kept, kept_guest) = rig.connect(kept_server);
+    let (dropped, dropped_guest) = rig.connect(dropped_server);
+    rig.ping(kept, b"kept one");
+    rig.send(dropped, b"dropped one");
+    let (pending, pending_guest) = rig.connect(hole);
+    rig.until(
+        Duration::from_secs(5),
+        "the connect to be under way",
+        |rig| rig.h.stack.open_flows() == 3,
+    );
+
+    // The new policy allows the kept server's port alone: the exact range
+    // with that port lifts the loopback denial there, nowhere else.
+    let keep = format!("allow 127.0.0.0/8:{}", kept_server.port());
+    rig.h.policy.store(Arc::new(policy(&[&keep])));
+    rig.until(Duration::from_secs(5), "the revoked flows to end", |rig| {
+        rig.socket(dropped).state() == tcp::State::Closed
+            && rig.socket(pending).state() == tcp::State::Closed
+    });
+    let dropped_seen = rig.seen(&seen);
+    assert_eq!(dropped_seen.bytes, b"dropped one");
+    assert_eq!(
+        dropped_seen.end,
+        Err(ErrorKind::ConnectionReset),
+        "the host's side is reset, not ended"
+    );
+    // The kept flow is untouched, and still relays.
+    rig.ping(kept, b"still here");
+    rig.until(Duration::from_secs(5), "the ended flows to go", |rig| {
+        rig.h.stack.open_flows() == 1
+    });
+    rig.socket(kept).close();
+    rig.settle();
+    assert_eq!(rig.events.flows_watched(), 0, "every host fd unwatched");
+
+    let events = rig.events();
+    assert_eq!(
+        connects(&events),
+        [
+            connect_record(
+                1,
+                kept_guest,
+                kept_server,
+                &[],
+                Verdict::Allow,
+                Some("allow 127.0.0.0/8")
+            ),
+            connect_record(
+                2,
+                dropped_guest,
+                dropped_server,
+                &[],
+                Verdict::Allow,
+                Some("allow 127.0.0.0/8")
+            ),
+            connect_record(
+                3,
+                pending_guest,
+                hole,
+                &[],
+                Verdict::Allow,
+                Some("allow 127.0.0.0/8")
+            ),
+        ]
+    );
+    // The connect under way first, then the flows, each as `policy`; the
+    // kept flow ends as the guest ended it.
+    assert_eq!(
+        close_summary(&events),
+        [
+            (3, 0, 0, "policy".into()),
+            (2, 11, 0, "policy".into()),
+            (1, 18, 18, "fin".into()),
+        ]
+    );
+    assert!(drops(&events).is_empty(), "{:?}", drops(&events));
+}
+
+/// A policy swapped in that still allows every open flow changes nothing
+/// about them: no flow is reset and nothing is recorded for them.
+#[test]
+fn a_policy_update_that_allows_the_open_flows_leaves_them_alone() {
+    let server = echo_server();
+    let mut rig = Rig::new(harness_with(policy(&["allow 127.0.0.0/8"])));
+    let (s, _) = rig.connect(server);
+    rig.ping(s, b"before");
+    rig.h.policy.store(Arc::new(policy(&[
+        "allow 127.0.0.0/8",
+        "deny evil.example",
+    ])));
+    rig.step();
+    rig.ping(s, b"after");
+    assert_eq!(rig.h.stack.open_flows(), 1);
+    rig.socket(s).close();
+    rig.settle();
+    let events = rig.events();
+    assert_eq!(close_summary(&events), [(1, 11, 11, "fin".into())]);
+}

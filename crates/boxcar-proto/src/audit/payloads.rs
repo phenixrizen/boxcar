@@ -362,6 +362,20 @@ pub struct ControlStop {
     pub mode: StopMode,
 }
 
+/// `policy.changed`: a control client replaced the session's policy (the
+/// control socket's `policy.update`): the network rules, the vsock
+/// allowlist, or both. The new policy decides every later query,
+/// connection and datagram, and what was open and it denies is closed
+/// (`net.close{reason:"policy"}`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyChanged {
+    /// The client's process id.
+    pub by_pid: u32,
+    /// The policy's version from now on: 1 is the policy the VM started
+    /// with, and each update adds one. `policy.get` reports it.
+    pub version: u64,
+}
+
 /// `net.dhcp`: the network stack answered a guest DHCP message with the
 /// session's static lease.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
