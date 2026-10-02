@@ -30,6 +30,14 @@
 //! FIFO is looked at, so a guest that has stopped reading its console
 //! cannot take the escape away.
 //!
+//! The terminal is the process's only while it is in the terminal's
+//! foreground process group: [`RawModeGuard::enter`] does not touch it from
+//! the background (a write of its settings there would stop the process
+//! with `SIGTTOU`, the VM with it), and with [`start_job_control`] running a
+//! stop (Ctrl-Z, `kill -TSTP`) hands it back to the shell as it was, a
+//! continue in the foreground (`fg`) takes it again, and one in the
+//! background (`bg`) leaves it to the shell.
+//!
 //! A paste of more than about 4 KiB into the console loses its oldest bytes
 //! when the guest reads slower than the host types, by design (the M2
 //! decision: input waits in a 4 KiB holding buffer behind the 64-byte
@@ -42,15 +50,16 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::SerialDevice;
-use crate::lifecycle::{StopReason, VmmHandle};
+use crate::lifecycle::{block_signals, SignalFd, StopReason, VmmHandle};
 
 /// Ctrl-], the console escape.
 pub const ESCAPE_BYTE: u8 = 0x1d;
@@ -92,8 +101,12 @@ impl EscapeDetector {
 
 /// Whether stdin is a terminal.
 pub fn stdin_is_tty() -> bool {
+    isatty(libc::STDIN_FILENO)
+}
+
+fn isatty(fd: RawFd) -> bool {
     // SAFETY: isatty has no preconditions.
-    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+    unsafe { libc::isatty(fd) == 1 }
 }
 
 /// Whether this process may use the terminal `fd`: it is in the
@@ -112,12 +125,9 @@ pub fn is_foreground(fd: RawFd) -> bool {
     group == unsafe { libc::getpgrp() }
 }
 
-/// Whether stdin is a terminal this process may use ([`is_foreground`]):
-/// `boxcar run` and `boxcar attach` read it, and put it in raw mode, only
-/// then. A run started in the background (`boxcar run -- cmd &`) leaves the
-/// terminal to the shell.
-pub fn stdin_is_foreground_tty() -> bool {
-    stdin_is_tty() && is_foreground(libc::STDIN_FILENO)
+fn job_control_sigset(signals: &[i32]) -> io::Result<libc::sigset_t> {
+    vmm_sys_util::signal::create_sigset(signals)
+        .map_err(|error| io::Error::from_raw_os_error(error.errno()))
 }
 
 /// Blocks `SIGTTIN` and `SIGTTOU` on the calling thread, and only there: a
@@ -126,8 +136,7 @@ pub fn stdin_is_foreground_tty() -> bool {
 /// read stdin call it; the others keep the shell's job control (a
 /// background write to a terminal with `tostop` still stops the process).
 pub fn block_job_control_signals() -> io::Result<()> {
-    let set = vmm_sys_util::signal::create_sigset(&[libc::SIGTTIN, libc::SIGTTOU])
-        .map_err(|error| io::Error::from_raw_os_error(error.errno()))?;
+    let set = job_control_sigset(&[libc::SIGTTIN, libc::SIGTTOU])?;
     // SAFETY: `set` is a valid sigset and the old mask is not requested.
     let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     if rc != 0 {
@@ -136,27 +145,48 @@ pub fn block_job_control_signals() -> io::Result<()> {
     Ok(())
 }
 
-/// The terminal's settings from before raw mode: there while the terminal
-/// is in raw mode, so that exactly one of the guard and the panic hook
-/// restores them.
-static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
+/// `SIGTTIN` and `SIGTTOU` blocked on the calling thread for as long as
+/// this lives, so that the terminal calls made under it never stop the
+/// process. (The kernel lets a background process through, for `SIGTTOU`,
+/// when it is blocked: the look at the foreground comes first, and again
+/// after the write.)
+struct JobSignalsBlocked(libc::sigset_t);
 
-/// Stdin's terminal settings (std's stdin lock stays out of it: the panic
-/// hook must not wait on it).
-fn stdin_termios() -> io::Result<libc::termios> {
+impl JobSignalsBlocked {
+    fn new() -> io::Result<Self> {
+        let set = job_control_sigset(&[libc::SIGTTIN, libc::SIGTTOU])?;
+        // SAFETY: zeroed is a valid sigset to be written by pthread_sigmask.
+        let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `set` is valid; the old mask is written into `old`.
+        let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        Ok(JobSignalsBlocked(old))
+    }
+}
+
+impl Drop for JobSignalsBlocked {
+    fn drop(&mut self) {
+        // SAFETY: the mask pthread_sigmask wrote in `new`.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+    }
+}
+
+fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
     // SAFETY: termios is plain data; all zeroes is valid.
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: tcgetattr writes one termios into `termios`, alive for the
     // call.
-    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) } != 0 {
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(termios)
 }
 
-fn set_stdin_termios(termios: &libc::termios) -> io::Result<()> {
+fn set_termios(fd: RawFd, termios: &libc::termios) -> io::Result<()> {
     // SAFETY: tcsetattr reads one termios from `termios`.
-    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios) } != 0 {
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, termios) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -174,41 +204,293 @@ pub fn raw_termios(mut termios: libc::termios) -> libc::termios {
     termios
 }
 
-/// Restores the terminal's saved settings, unless the process is in the
-/// background by now: the shell has the terminal then (it took it back
-/// when the job stopped), and writing the settings would stop the process
-/// with `SIGTTOU`. `SIGTTOU` is blocked around the write, for a move to the
-/// background between the look and the write.
-fn restore_terminal() {
-    let saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner).take();
-    let Some(saved) = saved else {
-        return;
-    };
-    if !is_foreground(libc::STDIN_FILENO) {
-        return;
+/// Whether `termios` is what [`raw_termios`] makes of some settings.
+fn is_raw(termios: &libc::termios) -> bool {
+    termios.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
+        && termios.c_iflag & (libc::IXON | libc::IXOFF) == 0
+}
+
+/// A terminal call that failed because there is no terminal to use any
+/// more (`ENOTTY`, or `EIO`: a hung-up terminal, or a background process
+/// of an orphaned group): not an error of this process's, which then does
+/// not take the terminal.
+fn unusable(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EIO | libc::ENOTTY))
+}
+
+/// A terminal this process puts in raw mode, and what it wants of it.
+///
+/// The process's stdin terminal is the one instance, [`STDIN_TTY`]; the
+/// tests make others on a PTY pair of their own.
+struct Tty {
+    fd: RawFd,
+    state: Mutex<TtyState>,
+}
+
+struct TtyState {
+    /// The settings from before raw mode: there while this process has the
+    /// terminal in raw mode, so that exactly one of the guard, the stop and
+    /// the panic hook restores them.
+    saved: Option<libc::termios>,
+    /// A [`RawModeGuard`] is alive: the terminal is to be raw whenever
+    /// this process is in its foreground.
+    wanted: bool,
+}
+
+/// Stdin's terminal (std's stdin lock stays out of it: the panic hook must
+/// not wait on it).
+static STDIN_TTY: Tty = Tty::new(libc::STDIN_FILENO);
+
+impl Tty {
+    const fn new(fd: RawFd) -> Tty {
+        Tty {
+            fd,
+            state: Mutex::new(TtyState {
+                saved: None,
+                wanted: false,
+            }),
+        }
     }
-    let Ok(set) = vmm_sys_util::signal::create_sigset(&[libc::SIGTTOU]) else {
+
+    fn lock(&self) -> MutexGuard<'_, TtyState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Puts the terminal in raw mode, if this process is in its
+    /// foreground. False when it is not, or when the terminal cannot be
+    /// used ([`unusable`]): nothing is changed then, and it is not an
+    /// error. True when the terminal is raw.
+    ///
+    /// The process looks at the foreground right before it writes the
+    /// settings, and again right after: the settings are written with
+    /// `SIGTTOU` blocked (a background write would otherwise stop the
+    /// process, and the VM with it), which makes the kernel let a
+    /// background process through, so a process that moved to the
+    /// background in between gives the settings back at once.
+    ///
+    /// The settings it saves are the terminal's as they are now: when it
+    /// takes the terminal again after a stop, the shell may have changed
+    /// them. A terminal that is raw already, and that this process put
+    /// there, is left alone.
+    fn take(&self, state: &mut TtyState) -> io::Result<bool> {
+        let _blocked = JobSignalsBlocked::new()?;
+        if !is_foreground(self.fd) {
+            return Ok(false);
+        }
+        let current = match get_termios(self.fd) {
+            Ok(termios) => termios,
+            Err(error) if unusable(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if state.saved.is_some() && is_raw(&current) {
+            return Ok(true);
+        }
+        match set_termios(self.fd, &raw_termios(current)) {
+            Ok(()) => {}
+            Err(error) if unusable(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if !is_foreground(self.fd) {
+            // Moved to the background between the look and the write: the
+            // terminal is the shell's, as it was.
+            let _ = set_termios(self.fd, &current);
+            return Ok(false);
+        }
+        state.saved = Some(current);
+        Ok(true)
+    }
+
+    /// Puts the terminal's saved settings back, unless the process is in
+    /// the background by now: the shell has the terminal then (it took it
+    /// back when the job stopped), and what this process left there is
+    /// left to it. The settings stay saved in that case, for the day this
+    /// process takes the terminal again.
+    fn give_back(&self, state: &mut TtyState) {
+        let Some(saved) = state.saved else {
+            return;
+        };
+        if !is_foreground(self.fd) {
+            return;
+        }
+        state.saved = None;
+        let Ok(_blocked) = JobSignalsBlocked::new() else {
+            return;
+        };
+        match set_termios(self.fd, &saved) {
+            Err(error) if !unusable(&error) => {
+                tracing::warn!("cannot restore the terminal: {error}");
+            }
+            _ => {}
+        }
+    }
+
+    /// A guard for the terminal: raw now when this process is in its
+    /// foreground. When it is not, `wait` says whether it gets a guard
+    /// anyway, to take the terminal when it is brought to the foreground
+    /// (see [`Tty::refresh`]), or `None`. `None` for a descriptor that is
+    /// not a terminal.
+    fn hold(&'static self, wait: bool) -> io::Result<Option<RawModeGuard>> {
+        if !isatty(self.fd) {
+            return Ok(None);
+        }
+        let mut state = self.lock();
+        if !self.take(&mut state)? && !wait {
+            return Ok(None);
+        }
+        state.wanted = true;
+        Ok(Some(RawModeGuard { tty: self }))
+    }
+
+    /// The guard is gone (or the process panics): the terminal goes back
+    /// to its settings and is no longer wanted raw.
+    fn release(&self) {
+        let mut state = self.lock();
+        state.wanted = false;
+        self.give_back(&mut state);
+        state.saved = None;
+    }
+
+    /// The terminal goes back to its settings, but is still wanted raw: a
+    /// job-control stop is about to hand it to the shell.
+    fn suspend(&self) {
+        let mut state = self.lock();
+        self.give_back(&mut state);
+    }
+
+    /// Takes the terminal for raw mode when it is wanted and this process
+    /// is in the foreground, and it is not raw: after a stop and a
+    /// continue, whose settings the shell has just changed; when a run that
+    /// began in the background is brought to the foreground; after the
+    /// shell wrote its own settings a moment after it continued the job. A
+    /// raw terminal, and a process in the background, are left alone.
+    fn refresh(&self) {
+        let mut state = self.lock();
+        if !state.wanted {
+            return;
+        }
+        if let Err(error) = self.take(&mut state) {
+            tracing::debug!("cannot put the terminal in raw mode: {error}");
+        }
+    }
+
+    /// A `SIGTSTP`: gives the terminal back to the shell as it was, then
+    /// stops the whole process as the signal's default action does, so that
+    /// the shell sees a stopped job. Returns once the process is
+    /// continued.
+    fn stop(&self) {
+        if tstp_ignored() {
+            // Inherited as ignored: nothing stops, so nothing changes.
+            return;
+        }
+        self.suspend();
+        stop_process();
+    }
+
+    /// Waits up to `wait` for a signal on `signals` (`SIGTSTP`, `SIGCONT`),
+    /// and handles what came; looks at the foreground afterwards, in any
+    /// case, as the shell's `fg` need not send a `SIGCONT` the process
+    /// sees first. True when a stop was handled.
+    fn job_control_step(&self, signals: &SignalFd, wait: Duration) -> io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd: signals.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: poll reads and writes the one pollfd it is given.
+        if unsafe { libc::poll(&mut pollfd, 1, ms) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        let mut stopped = false;
+        while let Some(signo) = signals.read()? {
+            if signo == libc::SIGTSTP {
+                self.stop();
+                stopped = true;
+            }
+        }
+        self.refresh();
+        Ok(stopped)
+    }
+}
+
+/// Whether `SIGTSTP` is ignored by this process (inherited so from a
+/// parent that is not a job-control shell).
+fn tstp_ignored() -> bool {
+    // SAFETY: sigaction is plain data; all zeroes is valid.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: with a null new action, sigaction only reads the current one
+    // into `action`.
+    let rc = unsafe { libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut action) };
+    rc == 0 && action.sa_sigaction == libc::SIG_IGN
+}
+
+/// Stops the process the way an unhandled `SIGTSTP` does: the calling
+/// thread has the signal unblocked and raises it at itself (the other
+/// threads have it blocked, for the signalfd), and the kernel stops every
+/// thread. Returns once the process is continued, or at once when the
+/// signal's default action is not to stop (an orphaned process group).
+fn stop_process() {
+    let Ok(set) = job_control_sigset(&[libc::SIGTSTP]) else {
         return;
     };
     // SAFETY: zeroed is a valid sigset to be written by pthread_sigmask.
     let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
     // SAFETY: `set` is valid; the old mask is written into `old`.
-    let blocked = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) } == 0;
-    let restored = set_stdin_termios(&saved);
-    if blocked {
-        // SAFETY: `old` is the mask pthread_sigmask wrote above.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    if unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut old) } != 0 {
+        return;
     }
-    if let Err(error) = restored {
-        tracing::warn!("cannot restore the terminal: {error}");
-    }
+    // SAFETY: raise has no preconditions; with the default action, the
+    // process is stopped inside it.
+    unsafe { libc::raise(libc::SIGTSTP) };
+    // SAFETY: `old` is the mask pthread_sigmask wrote above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
 }
 
-/// Forgets the terminal's saved settings without writing them back: the
-/// process was moved to the background, where the shell has the terminal.
-/// The guard then restores nothing.
-pub fn forget_terminal() {
-    SAVED.lock().unwrap_or_else(PoisonError::into_inner).take();
+/// How long the job-control thread waits for a signal before it looks at
+/// the foreground.
+const JOB_CONTROL_STEP: Duration = Duration::from_millis(200);
+
+/// Starts the thread that does the terminal's job control, for a process
+/// whose stdin is a terminal (otherwise it does nothing): `boxcar run` and
+/// `boxcar attach` call it before they start any thread.
+///
+/// Ctrl-Z (with the terminal cooked), `kill -TSTP` and the like stop the
+/// process by default and leave the terminal as it is, which is raw while a
+/// [`RawModeGuard`] is alive. So `SIGTSTP` and `SIGCONT` are blocked here,
+/// on the calling thread and every thread it starts afterwards, and read
+/// from a signalfd by the new thread, as `SIGWINCH` is. On `SIGTSTP` it
+/// gives the terminal back as it was, then stops the process the way the
+/// signal's default action does (the shell sees the job stopped, and has a
+/// cooked terminal, whatever it does or does not save); on `SIGCONT`, and
+/// every [`JOB_CONTROL_STEP`] besides, it takes the terminal again if
+/// this process is in the foreground and a guard wants it raw. A run
+/// started in the background, or one stopped and then sent to the
+/// background with `bg`, takes the terminal when `fg` brings it back.
+pub fn start_job_control() -> io::Result<()> {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if !stdin_is_tty() || STARTED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let started = (|| {
+        block_signals(&[libc::SIGTSTP, libc::SIGCONT])?;
+        let signals = SignalFd::with(&[libc::SIGTSTP, libc::SIGCONT])?;
+        thread::Builder::new()
+            .name("job-control".into())
+            .spawn(move || {
+                while STDIN_TTY
+                    .job_control_step(&signals, JOB_CONTROL_STEP)
+                    .is_ok()
+                {}
+            })
+            .map(drop)
+    })();
+    if started.is_err() {
+        STARTED.store(false, Ordering::SeqCst);
+    }
+    started
 }
 
 /// Restores the terminal before the previous hook prints the panic.
@@ -217,41 +499,48 @@ fn install_panic_hook() {
     INSTALLED.call_once(|| {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
-            restore_terminal();
+            STDIN_TTY.release();
             previous(info);
         }));
     });
 }
 
 /// The host terminal in raw mode ([`raw_termios`]: no line editing, no
-/// echo, no signals from Ctrl-C, no flow control). Dropping it restores the
-/// settings the terminal had; so does a panic anywhere in the process.
+/// echo, no signals from Ctrl-C, no flow control), while this process is in
+/// its foreground. Dropping it restores the settings the terminal had; so
+/// does a panic anywhere in the process. With [`start_job_control`] running,
+/// a stop of the process gives the terminal back too, and a continue in the
+/// foreground takes it again.
 pub struct RawModeGuard {
-    _private: (),
+    tty: &'static Tty,
 }
 
 impl RawModeGuard {
-    /// Puts stdin's terminal in raw mode. `None` when stdin is not a TTY.
+    /// Puts stdin's terminal in raw mode, if this process is in its
+    /// foreground. `None` when stdin is not a terminal, or this process is
+    /// not in its foreground, or the terminal cannot be used (`EIO`,
+    /// `ENOTTY`): nothing is changed then. The foreground is looked at
+    /// here, with `SIGTTOU` blocked around the write, so that a process
+    /// that moved to the background is neither stopped nor changes the
+    /// shell's terminal.
     pub fn enter() -> io::Result<Option<RawModeGuard>> {
-        if !stdin_is_tty() {
-            return Ok(None);
-        }
         install_panic_hook();
-        let mut saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner);
-        let before = match *saved {
-            // In raw mode already: what it had before that is restored.
-            Some(before) => before,
-            None => stdin_termios()?,
-        };
-        set_stdin_termios(&raw_termios(before))?;
-        *saved = Some(before);
-        Ok(Some(RawModeGuard { _private: () }))
+        STDIN_TTY.hold(false)
+    }
+
+    /// Like [`RawModeGuard::enter`], but a process in the background gets
+    /// a guard as well (`None` only when stdin is not a terminal): the
+    /// terminal stays the shell's, and the process takes it, raw, when it is
+    /// brought to the foreground ([`start_job_control`] must be running).
+    pub fn enter_when_foreground() -> io::Result<Option<RawModeGuard>> {
+        install_panic_hook();
+        STDIN_TTY.hold(true)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        restore_terminal();
+        self.tty.release();
     }
 }
 
@@ -426,7 +715,7 @@ fn drain_held(held: &mut VecDeque<u8>, serial: &mut SerialDevice) {
     }
 }
 
-fn lock(serial: &Mutex<SerialDevice>) -> std::sync::MutexGuard<'_, SerialDevice> {
+fn lock(serial: &Mutex<SerialDevice>) -> MutexGuard<'_, SerialDevice> {
     serial.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -515,6 +804,325 @@ mod tests {
             0,
             "the child said where it failed"
         );
+        // SAFETY: both are descriptors openpty made, closed once.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    /// The terminal's settings are the same, field for field.
+    fn same_settings(a: &libc::termios, b: &libc::termios) -> bool {
+        a.c_iflag == b.c_iflag
+            && a.c_oflag == b.c_oflag
+            && a.c_cflag == b.c_cflag
+            && a.c_lflag == b.c_lflag
+            && a.c_cc == b.c_cc
+    }
+
+    /// A [`Tty`] for `fd`, as the guard needs it (for as long as the
+    /// process lives).
+    fn leak_tty(fd: RawFd) -> &'static Tty {
+        Box::leak(Box::new(Tty::new(fd)))
+    }
+
+    /// Forks a child that runs `body` and leaves with its result as its
+    /// exit code (99 if it panicked). `SIGALRM` ends it after 30 s, and so
+    /// does the end of its parent. The child makes libc calls and uses the
+    /// module's own code, which allocates nothing on these paths.
+    fn fork_child(body: impl FnOnce() -> i32) -> libc::pid_t {
+        // SAFETY: the child runs `body` and leaves with _exit, never
+        // returning into the test harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // SAFETY: plain system calls.
+            unsafe {
+                libc::alarm(30);
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            }
+            let code = panic::catch_unwind(panic::AssertUnwindSafe(body)).unwrap_or(99);
+            // SAFETY: as above.
+            unsafe { libc::_exit(code) };
+        }
+        child
+    }
+
+    /// The exit code of `child` (128 plus the signal that ended it).
+    fn wait_child(child: libc::pid_t) -> i32 {
+        let mut status = 0;
+        // SAFETY: waits for a child forked by `fork_child`.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            128 + libc::WTERMSIG(status)
+        }
+    }
+
+    /// The calling process becomes a session leader whose controlling
+    /// terminal is `terminal` (its group the foreground), like a shell.
+    fn become_a_shell(terminal: RawFd) -> bool {
+        // SAFETY: plain system calls.
+        unsafe { libc::setsid() >= 0 && libc::ioctl(terminal, libc::TIOCSCTTY, 0) >= 0 }
+    }
+
+    /// Waits up to `limit` for `condition`.
+    fn within(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !condition() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(10 * MS);
+        }
+        true
+    }
+
+    /// In the foreground (here: a terminal that is nobody's controlling
+    /// terminal, where job control does not apply) the guard puts the
+    /// terminal in raw mode, and dropping it gives back exactly the
+    /// settings it had.
+    #[test]
+    fn enter_in_the_foreground_takes_the_terminal_and_drop_restores_it_exactly() {
+        let (master, slave) = openpty();
+        let before = get_termios(slave).unwrap();
+        assert!(!is_raw(&before));
+        let tty = leak_tty(slave);
+        let guard = tty
+            .hold(false)
+            .unwrap()
+            .expect("a terminal that is in the foreground is taken");
+        let raw = get_termios(slave).unwrap();
+        assert!(is_raw(&raw));
+        assert!(same_settings(&raw, &raw_termios(before)));
+        assert!(tty.lock().wanted);
+        drop(guard);
+        assert!(same_settings(&get_termios(slave).unwrap(), &before));
+        assert!(!tty.lock().wanted);
+        // Not a terminal: no guard, with or without waiting.
+        let mut pipe = [0; 2];
+        // SAFETY: pipe writes two new descriptors.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let not_a_tty = leak_tty(pipe[0]);
+        assert!(not_a_tty.hold(false).unwrap().is_none());
+        assert!(not_a_tty.hold(true).unwrap().is_none());
+        // SAFETY: descriptors the test opened, closed once.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    /// A process in the background of its controlling terminal does not
+    /// take it: `enter` gives `None` (and a guard that waits, with `wait`,
+    /// holds nothing), the settings stay as they were, and the process is
+    /// not stopped by `SIGTTOU`: its exit is seen, not a stop.
+    #[test]
+    fn a_process_in_the_background_does_not_take_the_terminal_and_is_not_stopped() {
+        let (master, slave) = openpty();
+        let before = get_termios(slave).unwrap();
+        let shell = fork_child(|| {
+            if !become_a_shell(slave) {
+                return 10;
+            }
+            let job = fork_child(|| {
+                // SAFETY: plain system call.
+                if unsafe { libc::setpgid(0, 0) } < 0 {
+                    return 12;
+                }
+                // Another group of the session: the background.
+                if is_foreground(slave) {
+                    return 13;
+                }
+                let tty = leak_tty(slave);
+                if !matches!(tty.hold(false), Ok(None)) {
+                    return 14;
+                }
+                match tty.hold(true) {
+                    Ok(Some(guard)) => {
+                        if tty.lock().saved.is_some() {
+                            return 15;
+                        }
+                        drop(guard);
+                    }
+                    _ => return 16,
+                }
+                match get_termios(slave) {
+                    Ok(now) if same_settings(&now, &before) => 0,
+                    _ => 17,
+                }
+            });
+            let mut status = 0;
+            // SAFETY: waits for the job forked above, stops included.
+            unsafe { libc::waitpid(job, &mut status, libc::WUNTRACED) };
+            if libc::WIFSTOPPED(status) {
+                // SAFETY: the job is ours.
+                unsafe { libc::kill(job, libc::SIGKILL) };
+                return 20;
+            }
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                21
+            }
+        });
+        let code = wait_child(shell);
+        assert_eq!(code, 0, "the job said where it failed (20: stopped)");
+        // SAFETY: both are descriptors openpty made, closed once.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    /// A stop gives the terminal back as it was and a continue takes it
+    /// again, with a shell's moves played by a session leader: a job that
+    /// starts in the background wants the terminal and takes it when it is
+    /// brought to the foreground; `SIGTSTP` stops it, by that signal, with
+    /// the terminal cooked; `bg` (the shell takes the terminal back, then
+    /// `SIGCONT`) leaves it alone; `fg` takes it again.
+    #[test]
+    fn a_stop_gives_the_terminal_back_and_a_continue_in_the_foreground_takes_it_again() {
+        let (master, slave) = openpty();
+        let shell = fork_child(|| {
+            if !become_a_shell(slave) || block_job_control_signals().is_err() {
+                return 10;
+            }
+            let Ok(before) = get_termios(slave) else {
+                return 10;
+            };
+            let job = fork_child(|| {
+                // SAFETY: plain system call.
+                if unsafe { libc::setpgid(0, 0) } < 0 {
+                    return 30;
+                }
+                if block_signals(&[libc::SIGTSTP, libc::SIGCONT]).is_err() {
+                    return 31;
+                }
+                let Ok(signals) = SignalFd::with(&[libc::SIGTSTP, libc::SIGCONT]) else {
+                    return 32;
+                };
+                let tty = leak_tty(slave);
+                // Started in the background, wanting the terminal.
+                let Ok(Some(_guard)) = tty.hold(true) else {
+                    return 33;
+                };
+                loop {
+                    if tty.job_control_step(&signals, 50 * MS).is_err() {
+                        return 34;
+                    }
+                }
+            });
+            // SAFETY: plain system calls on the job forked above.
+            unsafe { libc::setpgid(job, job) };
+            let raw = || get_termios(slave).is_ok_and(|termios| is_raw(&termios));
+            let cooked =
+                || get_termios(slave).is_ok_and(|termios| same_settings(&termios, &before));
+            // The terminal's foreground group, as the shell hands it over.
+            let hand_to = |group: libc::pid_t| {
+                // SAFETY: SIGTTOU is blocked here, as a shell's is.
+                unsafe { libc::tcsetpgrp(slave, group) == 0 }
+            };
+            // In the background the job leaves the terminal alone.
+            thread::sleep(300 * MS);
+            if !cooked() {
+                return 11;
+            }
+            // `fg`: raw within a step, with no signal at all.
+            // SAFETY: plain system call.
+            let own = unsafe { libc::getpgrp() };
+            if !hand_to(job) || !within(Duration::from_secs(3), raw) {
+                return 12;
+            }
+            // `kill -TSTP`: stopped by that signal, and the terminal is
+            // already cooked when the shell sees the stop.
+            // SAFETY: the job is ours.
+            unsafe { libc::kill(job, libc::SIGTSTP) };
+            let mut status = 0;
+            // SAFETY: waits for the job, stops included.
+            unsafe { libc::waitpid(job, &mut status, libc::WUNTRACED) };
+            if !libc::WIFSTOPPED(status) || libc::WSTOPSIG(status) != libc::SIGTSTP {
+                return 13;
+            }
+            if !cooked() {
+                return 14;
+            }
+            // `bg`: the shell takes the terminal, the job continues, and
+            // leaves the terminal alone (for several steps).
+            // SAFETY: the job is ours.
+            if !hand_to(own) || unsafe { libc::kill(job, libc::SIGCONT) } != 0 {
+                return 15;
+            }
+            thread::sleep(400 * MS);
+            if !cooked() {
+                return 16;
+            }
+            // Running, not stopped again.
+            // SAFETY: waits for the job without blocking, stops included.
+            let again = unsafe { libc::waitpid(job, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if again != 0 {
+                return 17;
+            }
+            // `fg`: the terminal, then the continue the shell sends.
+            // SAFETY: the job is ours.
+            if !hand_to(job) || unsafe { libc::kill(job, libc::SIGCONT) } != 0 {
+                return 18;
+            }
+            if !within(Duration::from_secs(3), raw) {
+                return 19;
+            }
+            // SAFETY: the job is ours.
+            unsafe {
+                libc::kill(job, libc::SIGKILL);
+                libc::waitpid(job, &mut status, 0);
+            }
+            0
+        });
+        let code = wait_child(shell);
+        assert_eq!(code, 0, "the shell said where it failed (see the test)");
+        // SAFETY: both are descriptors openpty made, closed once.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    /// A stop hands the terminal back and a refresh takes it again, from
+    /// the settings the shell left meanwhile (not the old ones); once the
+    /// guard is gone, nothing takes it.
+    #[test]
+    fn a_suspended_terminal_is_taken_again_from_the_settings_the_shell_left() {
+        let (master, slave) = openpty();
+        let before = get_termios(slave).unwrap();
+        let tty = leak_tty(slave);
+        let guard = tty.hold(false).unwrap().unwrap();
+        assert!(is_raw(&get_termios(slave).unwrap()));
+
+        tty.suspend();
+        assert!(same_settings(&get_termios(slave).unwrap(), &before));
+        // The shell's own settings while the job is stopped.
+        let mut shells = before;
+        shells.c_lflag ^= libc::ECHOK;
+        set_termios(slave, &shells).unwrap();
+        tty.refresh();
+        let now = get_termios(slave).unwrap();
+        assert!(is_raw(&now));
+        assert!(same_settings(&now, &raw_termios(shells)));
+        // A shell that writes its settings a moment after the continue is
+        // heard on the next look, and a raw terminal is left alone.
+        set_termios(slave, &shells).unwrap();
+        tty.refresh();
+        assert!(is_raw(&get_termios(slave).unwrap()));
+        tty.refresh();
+        assert!(is_raw(&get_termios(slave).unwrap()));
+
+        drop(guard);
+        assert!(same_settings(&get_termios(slave).unwrap(), &shells));
+        tty.refresh();
+        assert!(same_settings(&get_termios(slave).unwrap(), &shells));
         // SAFETY: both are descriptors openpty made, closed once.
         unsafe {
             libc::close(master);

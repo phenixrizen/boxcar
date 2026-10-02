@@ -30,7 +30,7 @@ use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, exit_code_for, AU
 use boxcar_vmm::pty::input::{self, LocalInput};
 use boxcar_vmm::pty::out::{self, OutHandle, OutWait, Target};
 use boxcar_vmm::pty::{Mode, PtyHub};
-use boxcar_vmm::stdin::{stdin_is_foreground_tty, stdin_is_tty, RawModeGuard};
+use boxcar_vmm::stdin::{start_job_control, stdin_is_tty, RawModeGuard};
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
 };
@@ -154,6 +154,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // session terminal's).
     block_stop_signals().context("cannot block the stop signals")?;
     block_signals(&[libc::SIGWINCH]).context("cannot block SIGWINCH")?;
+    // On a terminal: SIGTSTP and SIGCONT too, read by a thread that gives
+    // the terminal back when the run is stopped (Ctrl-Z, `kill -TSTP`) and
+    // takes it again when it is continued in the foreground.
+    start_job_control().context("cannot start the terminal's job control")?;
 
     let (sink, writer) = start_audit_log(WriterConfig::new(&audit_dir, session_id.clone()))
         .with_context(|| format!("cannot start the audit log under {}", audit_dir.display()))?;
@@ -190,15 +194,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
     // A command needs no input: the terminal stays as it is.
     let interactive = args.command.is_empty();
-    // In vsock mode stdin goes to the session's terminal: a terminal only
-    // while this process is in its foreground (a run started in the
-    // background leaves it to the shell: reading it would stop the run with
-    // SIGTTIN); a pipe or a file without a command, or with --stdin.
-    let forward_stdin = if stdin_is_tty() {
-        stdin_is_foreground_tty()
-    } else {
-        interactive || args.stdin
-    };
+    // In vsock mode stdin goes to the session's terminal. A terminal is
+    // read, and put in raw mode, only while this process is in its
+    // foreground (a run started in the background leaves it to the shell:
+    // reading it would stop the run with SIGTTIN): `attach_session` sets
+    // that up, and the terminal's own job control (`start_job_control`)
+    // carries it through stops and continues. A pipe or a file is
+    // forwarded when there is no command, or with --stdin.
+    let forward_stdin = stdin_is_tty() || interactive || args.stdin;
     let cfg = VmConfig {
         kernel: args.kernel,
         initramfs: args.initramfs,
@@ -717,19 +720,24 @@ fn attach_session(vmm: &mut Vmm, forward_stdin: bool) -> anyhow::Result<LocalAtt
         .context("the session's terminal has its primary client already")?;
     let stdout = Target::stdout().context("cannot write to stdout")?;
     let writer = out::spawn(output, stdout).context("cannot write the session's output")?;
-    if let Some(typed) = typed {
-        let stdin = LocalInput::stdin().context("cannot read stdin")?;
-        input::forward(stdin, typed, handle).context("cannot send stdin to the session")?;
-    }
     if stdin_is_tty() {
         follow_terminal_size(&hub).context("cannot follow the terminal's size")?;
         if forward_stdin {
-            if let Some(guard) =
-                RawModeGuard::enter().context("cannot put the terminal in raw mode")?
+            // Raw now when this process is in the terminal's foreground
+            // (`enter`'s own look, not an earlier one); otherwise the
+            // terminal stays the shell's until `fg` brings the run there.
+            if let Some(guard) = RawModeGuard::enter_when_foreground()
+                .context("cannot put the terminal in raw mode")?
             {
                 vmm.restore_terminal_on_stop(guard);
             }
         }
+    }
+    if let Some(typed) = typed {
+        // Reads the terminal only from the foreground, and waits in the
+        // background (see `input`).
+        let stdin = LocalInput::stdin().context("cannot read stdin")?;
+        input::forward(stdin, typed, handle).context("cannot send stdin to the session")?;
     }
     Ok(LocalAttach { hub, writer })
 }

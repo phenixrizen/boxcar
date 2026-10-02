@@ -4,10 +4,14 @@
 //! `boxcar attach`: a running session's terminal, from this one.
 //!
 //! This terminal is read, and put in raw mode, only while `boxcar attach`
-//! is in its foreground process group: one started in the background
-//! (`boxcar attach &`) only shows the session, and one moved there later
-//! stops reading (its stdin thread blocks `SIGTTIN`, so a read fails rather
-//! than stopping it) and leaves the terminal's settings to the shell.
+//! is in its foreground process group. One started in the background
+//! (`boxcar attach &`) only shows the session, and leaves the terminal to
+//! the shell; its stdin thread waits (blocking `SIGTTIN`, so a read fails
+//! rather than stopping it) and takes the terminal when `fg` brings the
+//! attach to the foreground. A stop (Ctrl-Z with the terminal cooked,
+//! `kill -TSTP`) gives the terminal back to the shell as it was, and a
+//! continue in the foreground takes it again
+//! ([`start_job_control`](boxcar_vmm::stdin::start_job_control)).
 //!
 //! Two connections to the session's control socket: one asks `pty.attach`
 //! and becomes the terminal's raw bytes, both ways, and nothing else; the
@@ -44,8 +48,7 @@ use boxcar_proto::control::{PtyAttached, PTY_DETACHED_SLOW, PTY_SESSION};
 use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, SignalFd, STOP_SIGNALS};
 use boxcar_vmm::pty::out::Target;
 use boxcar_vmm::stdin::{
-    block_job_control_signals, forget_terminal, is_foreground, stdin_is_foreground_tty,
-    stdin_is_tty, RawModeGuard,
+    block_job_control_signals, is_foreground, start_job_control, stdin_is_tty, RawModeGuard,
 };
 use serde_json::json;
 
@@ -158,6 +161,10 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
     // Before any thread starts: they reach only this command's signalfd.
     block_stop_signals().context("cannot block the stop signals")?;
     block_signals(&[libc::SIGWINCH]).context("cannot block SIGWINCH")?;
+    // On a terminal: SIGTSTP and SIGCONT too, for the terminal's job
+    // control (a stop gives it back to the shell, a continue in the
+    // foreground takes it again).
+    start_job_control().context("cannot start the terminal's job control")?;
     let mut signals: Vec<i32> = STOP_SIGNALS.to_vec();
     signals.push(libc::SIGWINCH);
     let signals = SignalFd::with(&signals).context("cannot read signals")?;
@@ -185,8 +192,6 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
         let _ = control.request("pty.watch", json!({"attach_id": attach_id}))?;
     }
     let tty = stdin_is_tty();
-    // A terminal is read, and made raw, only from its foreground.
-    let reads_stdin = !tty || stdin_is_foreground_tty();
     if tty {
         if let Some(size) = stdin_terminal_size() {
             // A size the server refuses leaves the session's as it is.
@@ -205,12 +210,16 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
     let to_session = stream.try_clone()?;
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
 
-    let terminal = if reads_stdin {
-        RawModeGuard::enter().context("cannot put the terminal in raw mode")?
+    // Raw now when this process is in the terminal's foreground (the
+    // guard's own look, not an earlier one); otherwise the terminal stays
+    // the shell's until `fg` brings the attach there. The thread reads the
+    // terminal only from the foreground.
+    let terminal = if tty {
+        RawModeGuard::enter_when_foreground().context("cannot put the terminal in raw mode")?
     } else {
         None
     };
-    if reads_stdin {
+    {
         let ending = Arc::clone(&ending);
         let ro = args.ro;
         thread::Builder::new()
@@ -296,8 +305,8 @@ fn copy_out(
 /// in read-only mode only the keys count. At the end of stdin, the
 /// session's side of the stream is closed for sending: the output goes on.
 /// A terminal is read only while `boxcar attach` is in its foreground (see
-/// the module docs): once in the background, the thread stops, and the
-/// attach goes on.
+/// the module docs): in the background, the thread waits, and the attach
+/// goes on.
 fn forward_input(
     mut stdin: File,
     terminal: bool,
@@ -321,8 +330,11 @@ fn forward_input(
     };
     loop {
         if in_background() {
-            forget_terminal();
-            return;
+            // The terminal is the shell's: look again in a moment. (Not a
+            // poll of it: that returns at once whenever the user types
+            // for the shell.)
+            thread::sleep(FOREGROUND_STEP);
+            continue;
         }
         // While a Ctrl-P waits for its Ctrl-Q, stdin is read with a
         // deadline: a lone Ctrl-P is sent once the window has passed. A
@@ -343,19 +355,18 @@ fn forward_input(
                 continue;
             }
             if in_background() {
-                forget_terminal();
-                return;
+                continue;
             }
         }
         let n = match stdin.read(&mut buf) {
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                if terminal && error.raw_os_error() == Some(libc::EIO) {
-                    forget_terminal();
-                }
-                return;
-            }
+            // Moved to the background since the look, and the read failed
+            // instead of stopping the process: wait for the foreground
+            // again. (A hung-up terminal fails the same way, but from the
+            // foreground: that is the end.)
+            Err(error) if error.raw_os_error() == Some(libc::EIO) && in_background() => continue,
+            Err(_) => return,
         };
         if n == 0 {
             if let Some(byte) = keys.release() {

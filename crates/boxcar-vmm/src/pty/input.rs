@@ -18,14 +18,17 @@
 //! reads, and the escape, never stop.
 //!
 //! A terminal is read only while `boxcar run` is in its foreground process
-//! group (`boxcar run` forwards it only then: see
-//! [`stdin_is_foreground_tty`](crate::stdin::stdin_is_foreground_tty)).
-//! The thread blocks `SIGTTIN` and `SIGTTOU` for itself, waits for input in
-//! short steps, and looks again before each read: once the process is in
-//! the background (a job moved there by the shell), it stops reading, so it
-//! never takes input meant for the shell nor is stopped by `SIGTTIN`, and
-//! it forgets the terminal's saved settings, which are the shell's to set
-//! now. The session goes on; its output still goes to stdout.
+//! group. The thread blocks `SIGTTIN` and `SIGTTOU` for itself, waits for
+//! input in short steps, and looks again at the foreground before each
+//! read. It does not end when the process is in the background (a run
+//! started there, or a job the shell moved there): it waits, reading
+//! nothing, so that it never takes input meant for the shell nor is stopped
+//! by `SIGTTIN`, and it goes on when `fg` brings the process back (the
+//! terminal is made raw again by [`RawModeGuard`](crate::stdin::RawModeGuard)
+//! and the job-control thread, see [`start_job_control`]). The session goes
+//! on meanwhile; its output still goes to stdout.
+//!
+//! [`start_job_control`]: crate::stdin::start_job_control
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -35,9 +38,7 @@ use std::time::{Duration, Instant};
 
 use super::Input;
 use crate::lifecycle::{StopReason, VmmHandle};
-use crate::stdin::{
-    block_job_control_signals, forget_terminal, is_foreground, stdin_is_tty, EscapeDetector,
-};
+use crate::stdin::{block_job_control_signals, is_foreground, stdin_is_tty, EscapeDetector};
 
 /// How long the thread waits for terminal input before it looks again at
 /// whether the process is still in the foreground.
@@ -84,15 +85,19 @@ impl LocalInput {
         })
     }
 
-    /// Waits, a step at a time, until the terminal has input; false once
-    /// the process is in its background (or it cannot be waited on).
+    /// Waits, a step at a time, until the terminal has input and this
+    /// process is in its foreground; false only when the terminal cannot
+    /// be waited on. In the background it only sleeps a step and looks
+    /// again: the terminal is the shell's, and polling it would return at
+    /// once whenever the user types for the shell.
     fn wait_in_foreground(&self) -> bool {
         let Some(fd) = self.terminal else {
             return true;
         };
         loop {
             if !is_foreground(fd) {
-                return false;
+                thread::sleep(FOREGROUND_STEP);
+                continue;
             }
             let mut pollfd = libc::pollfd {
                 fd,
@@ -103,7 +108,11 @@ impl LocalInput {
             // SAFETY: poll reads and writes the one pollfd it is given.
             match unsafe { libc::poll(&mut pollfd, 1, ms) } {
                 0 => {}
-                n if n > 0 => return is_foreground(fd),
+                n if n > 0 => {
+                    if is_foreground(fd) {
+                        return true;
+                    }
+                }
                 _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
                 _ => return false,
             }
@@ -129,8 +138,6 @@ fn forward_all(mut input: LocalInput, to: &Input, handle: &VmmHandle) {
     let mut buf = vec![0u8; CHUNK];
     loop {
         if !input.wait_in_foreground() {
-            // In the background now: the terminal is the shell's.
-            forget_terminal();
             return;
         }
         let n = match input.reader.read(&mut buf) {
@@ -146,12 +153,17 @@ fn forward_all(mut input: LocalInput, to: &Input, handle: &VmmHandle) {
             }
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                if input.tty && error.raw_os_error() == Some(libc::EIO) {
-                    forget_terminal();
-                }
-                return;
+            // The process moved to the background since the look, and the
+            // read failed instead of stopping it: wait for the foreground
+            // again. (A hung-up terminal fails the same way, but from the
+            // foreground: that is the end.)
+            Err(error)
+                if error.raw_os_error() == Some(libc::EIO)
+                    && input.terminal.is_some_and(|fd| !is_foreground(fd)) =>
+            {
+                continue
             }
+            Err(_) => return,
         };
         let bytes = &buf[..n];
         let sent = if input.tty {

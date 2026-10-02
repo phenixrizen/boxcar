@@ -1069,3 +1069,416 @@ fn a_run_started_in_the_background_does_not_take_the_terminal() {
     assert!(shown_now.contains("\nBG_42\r"), "{shown_now}");
     assert!(shown_now.contains("EXIT_0"), "{shown_now}");
 }
+
+/// An interactive `bash` on a PTY pair that is its controlling terminal,
+/// for the job-control tests. It has no line editing, so that it reads the
+/// terminal in canonical mode: a cooked terminal is what it leaves, and
+/// takes back when a job stops. Its prompt, and the job notices, go to the
+/// terminal (its stderr).
+mod job_shell {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use super::{openpty, LIMIT};
+
+    pub struct JobShell {
+        master: File,
+        slave: File,
+        shell: Child,
+        shown: Arc<Mutex<Vec<u8>>>,
+        done: Arc<AtomicBool>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl JobShell {
+        /// Starts the shell and waits for its first prompt.
+        pub fn start() -> JobShell {
+            let (master, slave) = openpty();
+            let mut command = Command::new("/bin/bash");
+            command
+                .args(["--norc", "--noprofile", "--noediting", "-i"])
+                .env("PS1", "PROMPT$ ")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave.try_clone().unwrap()));
+            // SAFETY: setsid and the ioctl are async-signal-safe; the
+            // terminal on stdin becomes the new session's controlling
+            // terminal, its foreground the shell's group.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let shell = command.spawn().unwrap();
+            let shown = Arc::new(Mutex::new(Vec::new()));
+            let done = Arc::new(AtomicBool::new(false));
+            let reader = {
+                let shown = Arc::clone(&shown);
+                let done = Arc::clone(&done);
+                let mut master = master.try_clone().unwrap();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while !done.load(Ordering::Acquire) {
+                        let mut pollfd = libc::pollfd {
+                            fd: master.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        // SAFETY: poll reads and writes the one pollfd it is given.
+                        if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                            match master.read(&mut buf) {
+                                Ok(n) if n > 0 => {
+                                    shown.lock().unwrap().extend_from_slice(&buf[..n]);
+                                }
+                                _ => thread::sleep(Duration::from_millis(10)),
+                            }
+                        }
+                    }
+                })
+            };
+            let started = JobShell {
+                master,
+                slave,
+                shell,
+                shown,
+                done,
+                reader: Some(reader),
+            };
+            assert!(
+                started.wait_for("PROMPT$ ", 0),
+                "no prompt:\n{}",
+                started.text()
+            );
+            started
+        }
+
+        /// Everything the terminal showed so far.
+        pub fn text(&self) -> String {
+            String::from_utf8_lossy(&self.shown.lock().unwrap()).into_owned()
+        }
+
+        /// How much it showed so far, to look only at what follows.
+        pub fn mark(&self) -> usize {
+            self.shown.lock().unwrap().len()
+        }
+
+        /// What it showed after `from`.
+        pub fn since(&self, from: usize) -> String {
+            let shown = self.shown.lock().unwrap();
+            String::from_utf8_lossy(&shown[from.min(shown.len())..]).into_owned()
+        }
+
+        /// Types `bytes` on the terminal.
+        pub fn type_bytes(&self, bytes: &[u8]) {
+            (&self.master).write_all(bytes).unwrap();
+        }
+
+        /// Waits up to [`LIMIT`] for `condition`.
+        pub fn wait_until(&self, mut condition: impl FnMut() -> bool) -> bool {
+            let start = Instant::now();
+            while !condition() {
+                if start.elapsed() > LIMIT {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            true
+        }
+
+        /// Waits up to [`LIMIT`] for the terminal to show `what` after
+        /// `from`.
+        pub fn wait_for(&self, what: &str, from: usize) -> bool {
+            self.wait_until(|| self.since(from).contains(what))
+        }
+
+        fn lflag(&self) -> libc::tcflag_t {
+            // SAFETY: termios is plain data; all zeroes is valid.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: tcgetattr writes one termios into `t`, alive for the call.
+            assert_eq!(
+                unsafe { libc::tcgetattr(self.slave.as_raw_fd(), &mut t) },
+                0
+            );
+            t.c_lflag
+        }
+
+        /// Line editing, echo and signals: as a shell leaves the terminal.
+        pub fn is_cooked(&self) -> bool {
+            let all = libc::ICANON | libc::ECHO | libc::ISIG;
+            self.lflag() & all == all
+        }
+
+        /// None of them: as `boxcar run` leaves it while it forwards keys.
+        pub fn is_raw(&self) -> bool {
+            self.lflag() & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
+        }
+
+        /// The shell's child `boxcar`, once it exists.
+        pub fn job(&self) -> Option<u32> {
+            let shell = self.shell.id();
+            for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                // `pid (comm) state ppid ...`
+                let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+                    continue;
+                };
+                let mut rest = stat[close + 1..].split_whitespace();
+                let (_state, ppid) = (rest.next(), rest.next());
+                if &stat[open + 1..close] == "boxcar" && ppid == Some(&shell.to_string()[..]) {
+                    return Some(pid);
+                }
+            }
+            None
+        }
+    }
+
+    /// The state letter of `pid` (`T`: stopped), `None` once it is gone (a
+    /// zombie the shell has not collected is gone too).
+    pub fn process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let state = stat[stat.rfind(')')? + 1..].trim_start().chars().next()?;
+        (state != 'Z').then_some(state)
+    }
+
+    /// Sends `signal` to `pid`.
+    pub fn signal(pid: u32, signal: libc::c_int) {
+        // SAFETY: kill takes numbers only.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+
+    impl Drop for JobShell {
+        fn drop(&mut self) {
+            if let Some(job) = self.job() {
+                signal(job, libc::SIGKILL);
+            }
+            let _ = self.shell.kill();
+            let _ = self.shell.wait();
+            self.done.store(true, Ordering::Release);
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+
+/// The line that starts a `-- /bin/sh -l` run, for a shell to take.
+fn run_line(guest: &Guest, scratch: &Scratch) -> String {
+    format!(
+        "{} run --kernel {} --initramfs {} --rootfs {} --workspace {} --audit-dir {} \
+         --console-log {} -- /bin/sh -l\r",
+        env!("CARGO_BIN_EXE_boxcar"),
+        guest.kernel.display(),
+        guest.initramfs.display(),
+        guest.rootfs.display(),
+        scratch.workspace().display(),
+        scratch.path("audit").display(),
+        scratch.path("console.log").display(),
+    )
+}
+
+/// The shell's `stty -a`: cooked, as the shell of a stopped job sees it.
+fn assert_stty_is_cooked(shell: &job_shell::JobShell) {
+    let from = shell.mark();
+    shell.type_bytes(b"stty -a; echo SEP_$((20+2))\r");
+    assert!(shell.wait_for("SEP_22", from), "{}", shell.since(from));
+    let stty = shell.since(from);
+    let words: Vec<&str> = stty
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect();
+    for flag in ["icanon", "echo", "isig"] {
+        assert!(
+            words.contains(&flag) && !words.contains(&format!("-{flag}").as_str()),
+            "`stty -a` does not show {flag}:\n{stty}"
+        );
+    }
+}
+
+/// A `-- /bin/sh -l` run on a terminal of an interactive shell, in raw
+/// mode, stopped from outside (`kill -TSTP`: in raw mode Ctrl-Z goes to
+/// the guest): the shell gets a cooked terminal; `bg` keeps it running,
+/// its output on the terminal and no second stop; `fg` puts the terminal
+/// in raw mode again, so that typing reaches the guest and Ctrl-C goes
+/// there too, not to the VM; and the guest's `exit` ends the run with 0.
+#[test]
+fn a_stopped_run_gives_the_terminal_back_and_fg_takes_it_again() {
+    use job_shell::{process_state, signal, JobShell};
+
+    let Some(guest) = guest_or_skip("kvm_m1 stopped run") else {
+        return;
+    };
+    if !Path::new("/bin/bash").exists() {
+        eprintln!("skipping kvm_m1 stopped run: no /bin/bash for an interactive shell");
+        return;
+    }
+    let scratch = Scratch::new();
+    let shell = JobShell::start();
+    shell.type_bytes(run_line(&guest, &scratch).as_bytes());
+    assert!(
+        shell.wait_for("boxcar:", 0),
+        "no guest prompt:\n{}",
+        shell.text()
+    );
+    assert!(
+        shell.wait_until(|| shell.is_raw()),
+        "the terminal is not raw"
+    );
+    let job = shell.job().expect("the shell has no run");
+    // A job of the guest that prints in the background, later.
+    shell.type_bytes(b"(sleep 3; echo LATE_$((6*7))) &\r");
+    thread::sleep(Duration::from_millis(300));
+
+    signal(job, libc::SIGTSTP);
+    assert!(
+        shell.wait_until(|| process_state(job) == Some('T')),
+        "the run was not stopped: {:?}",
+        process_state(job)
+    );
+    assert!(
+        shell.wait_until(|| shell.is_cooked()),
+        "the stopped run left the terminal raw"
+    );
+    assert_stty_is_cooked(&shell);
+
+    // bg: running, in the background, no second stop, output visible.
+    let bg = shell.mark();
+    shell.type_bytes(b"bg\r");
+    assert!(shell.wait_for("LATE_42\r", bg), "{}", shell.since(bg));
+    assert!(
+        matches!(process_state(job), Some('S' | 'R')),
+        "{:?}",
+        process_state(job)
+    );
+    shell.type_bytes(b"echo SHELL_$((6*7))\r");
+    assert!(shell.wait_for("SHELL_42\r", bg), "{}", shell.since(bg));
+    assert!(!shell.since(bg).contains("Stopped"), "{}", shell.since(bg));
+    assert!(
+        shell.is_cooked(),
+        "the run in the background changed the terminal"
+    );
+
+    // fg: raw again; typing and Ctrl-C go to the guest.
+    shell.type_bytes(b"fg\r");
+    assert!(
+        shell.wait_until(|| shell.is_raw()),
+        "fg did not put the terminal in raw mode:\n{}",
+        shell.since(bg)
+    );
+    let fg = shell.mark();
+    shell.type_bytes(b"echo FG_$((3*5))\r");
+    assert!(shell.wait_for("FG_15\r", fg), "{}", shell.since(fg));
+    shell.type_bytes(b"sleep 30\r");
+    thread::sleep(Duration::from_millis(300));
+    shell.type_bytes(b"\x03echo C_$((6*7))\r");
+    assert!(shell.wait_for("C_42\r", fg), "{}", shell.since(fg));
+    assert!(process_state(job).is_some(), "Ctrl-C stopped the VM");
+    shell.type_bytes(b"exit\r");
+    assert!(
+        shell.wait_until(|| process_state(job).is_none()),
+        "the run did not end:\n{}",
+        shell.since(fg)
+    );
+    let end = shell.mark();
+    shell.type_bytes(b"echo EXIT_$?\r");
+    assert!(shell.wait_for("EXIT_0", end), "{}", shell.since(end));
+    assert!(
+        shell.wait_until(|| shell.is_cooked()),
+        "the terminal was not restored"
+    );
+}
+
+/// A Ctrl-Z while the run starts (the terminal is still cooked, so it is
+/// a real `SIGTSTP`), then `bg`: the run is not stopped again by taking the
+/// terminal, which is not its to take (`SIGTTOU`), and the VM boots and
+/// runs in the background; `fg` takes the terminal, raw, and what is typed
+/// reaches the guest, whose `exit` ends the run with 0.
+#[test]
+fn a_ctrl_z_while_the_run_starts_leaves_a_cooked_terminal_and_fg_takes_it_again() {
+    use job_shell::{process_state, JobShell};
+
+    let Some(guest) = guest_or_skip("kvm_m1 ctrl-z at start") else {
+        return;
+    };
+    if !Path::new("/bin/bash").exists() {
+        eprintln!("skipping kvm_m1 ctrl-z at start: no /bin/bash for an interactive shell");
+        return;
+    }
+    let scratch = Scratch::new();
+    let shell = JobShell::start();
+    let from = shell.mark();
+    shell.type_bytes(run_line(&guest, &scratch).as_bytes());
+    let start = Instant::now();
+    let job = loop {
+        if let Some(job) = shell.job() {
+            break job;
+        }
+        assert!(start.elapsed() < LIMIT, "no run:\n{}", shell.text());
+        thread::sleep(Duration::from_millis(1));
+    };
+    // Well before the terminal goes raw (the VM takes 100 ms to build).
+    thread::sleep(Duration::from_millis(20));
+    assert!(shell.is_cooked(), "too late: the terminal was raw already");
+    shell.type_bytes(b"\x1a");
+    assert!(
+        shell.wait_until(|| process_state(job) == Some('T')),
+        "Ctrl-Z did not stop the run: {:?}\n{}",
+        process_state(job),
+        shell.since(from)
+    );
+    assert!(shell.wait_for("Stopped", from), "{}", shell.since(from));
+    assert_stty_is_cooked(&shell);
+
+    // bg: the VM boots and the guest's prompt shows, with no second stop.
+    let bg = shell.mark();
+    shell.type_bytes(b"bg\r");
+    assert!(shell.wait_for("boxcar:", bg), "{}", shell.since(bg));
+    assert!(
+        matches!(process_state(job), Some('S' | 'R')),
+        "{:?}\n{}",
+        process_state(job),
+        shell.since(bg)
+    );
+    assert!(!shell.since(bg).contains("Stopped"), "{}", shell.since(bg));
+    assert!(
+        shell.is_cooked(),
+        "the run in the background changed the terminal"
+    );
+
+    // fg: raw, and typing reaches the guest.
+    shell.type_bytes(b"fg\r");
+    assert!(
+        shell.wait_until(|| shell.is_raw()),
+        "fg did not put the terminal in raw mode:\n{}",
+        shell.since(bg)
+    );
+    let fg = shell.mark();
+    shell.type_bytes(b"echo FG_$((3*5))\r");
+    assert!(shell.wait_for("FG_15\r", fg), "{}", shell.since(fg));
+    shell.type_bytes(b"exit\r");
+    assert!(
+        shell.wait_until(|| process_state(job).is_none()),
+        "the run did not end:\n{}",
+        shell.since(fg)
+    );
+    let end = shell.mark();
+    shell.type_bytes(b"echo EXIT_$?\r");
+    assert!(shell.wait_for("EXIT_0", end), "{}", shell.since(end));
+    assert!(
+        shell.wait_until(|| shell.is_cooked()),
+        "the terminal was not restored"
+    );
+}

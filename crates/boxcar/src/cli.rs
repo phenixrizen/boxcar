@@ -56,9 +56,7 @@ pub enum Command {
     ///
     /// What the session prints shows here, starting with the last 64 KiB
     /// it printed (see `--replay`), and what is typed here goes to the
-    /// session, every key included (only while `boxcar attach` is in the
-    /// foreground: one in the background just shows the session): several
-    /// terminals may be attached at
+    /// session, every key included: several terminals may be attached at
     /// once, and `boxcar run`'s own. The terminal is put in raw mode while
     /// attached and restored after, and the session's terminal takes this
     /// one's size, now and whenever it changes (the latest size any client
@@ -66,6 +64,13 @@ pub enum Command {
     /// detach: the session goes on, and the two keys are not sent (a Ctrl-P
     /// not followed by Ctrl-Q is sent after all). The session is the one
     /// `--control` or SESSION_ID names, or the only one running.
+    ///
+    /// `boxcar attach` takes the terminal only while it is in the
+    /// foreground. One started in the background (`boxcar attach ... &`)
+    /// just shows the session, and takes the terminal, raw, when `fg`
+    /// brings it to the foreground. A stop (`kill -TSTP`; Ctrl-Z goes to
+    /// the session while the terminal is raw) gives the terminal back to the
+    /// shell as it was, and a continue in the foreground takes it again.
     ///
     /// Exits 0 on detach and when the session ends, 1 when the control
     /// socket cannot be reached or refuses the attach, 3 when the session's
@@ -118,16 +123,19 @@ pub enum Command {
     /// second to stop the VM. A run started in the background (`boxcar run
     /// ... &`), or moved there, does not take the terminal: it reads no key
     /// from it and leaves its settings to the shell; the session's output
-    /// still shows. With the vsock device this holds for a `--
-    /// CMD` run too, and input from a pipe or a file goes to the session as
-    /// well when no command is given (or with `--stdin`), its end an
-    /// end-of-file there; the session's terminal takes this one's size, now
-    /// and whenever it changes; and other terminals can attach to the
-    /// session (`boxcar attach`). A slow stdout slows the session down:
-    /// once 1 MiB of its output waits for stdout, the session waits too.
-    /// Once the VM has stopped, boxcar writes out what is left for as long
-    /// as stdout takes it (giving up after 2 s with none taken, or 30 s in
-    /// all), and says on stderr how many bytes stdout did not get.
+    /// still shows. `fg` brings it back to the terminal, which it takes,
+    /// raw, again. A stop (`kill -TSTP`; Ctrl-Z goes to the guest while the
+    /// terminal is raw) gives the terminal back to the shell as it was, and
+    /// a continue in the foreground takes it again. With the vsock device all
+    /// of this holds for a `-- CMD` run too, and input from a pipe or a file
+    /// goes to the session as well when no command is given (or with
+    /// `--stdin`), its end an end-of-file there; the session's terminal takes
+    /// this one's size, now and whenever it changes; and other terminals can
+    /// attach to the session (`boxcar attach`). A slow stdout slows the
+    /// session down: once 1 MiB of its output waits for stdout, the session
+    /// waits too. Once the VM has stopped, boxcar writes out what is left for
+    /// as long as stdout takes it (giving up after 2 s with none taken, or 30
+    /// s in all), and says on stderr how many bytes stdout did not get.
     ///
     /// With shares the guest also gets a network card (see `--net`): it
     /// reaches only what the policy allows (`--policy-file`, `--deny`,
