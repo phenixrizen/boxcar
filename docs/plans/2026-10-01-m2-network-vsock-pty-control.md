@@ -1,14 +1,11 @@
 # M2: Network, vsock, Agent PTY, Control Protocol v1 — Implementation Plan
-
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** After M2, `boxcar run` gives the guest a user-mode network with DNS, an egress allowlist, and connection-level audit events; a vsock device carrying a guest control channel, the agent's PTY, and host-side services; an interactive agent session attachable from another terminal; a versioned control protocol on a Unix socket that conductor can drive; and the guest's exit code propagated to the host.
 
 **Architecture:** Two new device crates. `boxcar-net` is a frame-level user-mode stack on smoltcp inside the VMM: a dispatcher answers ARP, DHCP, and gateway ICMP itself, forwards DNS to the host resolver with a cache, terminates guest TCP with a deferred-SYN relay to host sockets under a policy allowlist, and relays UDP by NAT. `boxcar-vsock` is a port of Cloud Hypervisor's connection state machine and Unix muxer with an internal-services hook. Init gains a vsock control client and runs the agent under a PTY relayed over vsock to a `PtyHub` in the VMM. A control server on a Unix socket exposes status, stop, PTY attach and resize, audit subscription with replay, and policy updates. Fixed virtio slots are assigned by a table so device order never depends on which devices are enabled.
 
 **Tech Stack:** Rust 1.96, the M1 pinned rust-vmm set (vm-memory 0.17.1, virtio-queue 0.17.0, virtio-vsock 0.11.0), smoltcp 0.14, socket2 0.5, arc-swap 1, proptest 1 (dev), schemars 0.8 (schema generation), nix 0.31 (guest PTY), the M1 crates.
 
-**Spec:** `docs/superpowers/specs/2026-09-29-boxcar-design.md`. Roadmap: `docs/superpowers/plans/2026-09-30-boxcar-roadmap.md` (M2 section). M1 plan for the interfaces this builds on: `docs/superpowers/plans/2026-09-30-m1-shell-audited-rootfs.md`. M1 debt carried into M2 is listed in the M1 execution ledger's final-review triage; the items that must land are folded into Tasks 1, 4, 13, and 14 below.
+**Spec:** `docs/specs/2026-09-29-boxcar-design.md`. Roadmap: `docs/plans/2026-09-30-boxcar-roadmap.md` (M2 section). M1 plan for the interfaces this builds on: `docs/plans/2026-09-30-m1-shell-audited-rootfs.md`. M1 debt carried into M2 is listed in the M1 execution ledger's final-review triage; the items that must land are folded into Tasks 1, 4, 13, and 14 below.
 
 ## Global Constraints
 

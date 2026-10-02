@@ -1,14 +1,11 @@
 # M1: Shell on Console with Audited Rootfs — Implementation Plan
-
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** `boxcar run` boots our own Linux 6.18 guest on KVM from a rootfs directory served over virtio-fs, drops into an interactive shell on the serial console, and streams every file operation with the guest pid into a hash-chained audit log that `boxcar audit verify` checks.
 
 **Architecture:** A Cargo workspace. `boxcar-proto` holds the audit record schema; `boxcar-audit` is the single-writer chained log; `boxcar-vmm` owns KVM, memory, Firecracker-style x86 boot, vCPU threads, buses, serial, and shutdown; `boxcar-virtio` is our own virtio device trait and virtio-mmio transport; `boxcar-fs` wraps fuse-backend-rs's passthrough filesystem in an `AuditFs` decorator and exposes it as a virtio-fs device; `boxcar-init` is the static guest PID 1; `xtask` builds the guest kernel (in Docker), the initramfs, and the Alpine rootfs.
 
 **Tech Stack:** Rust 1.96 stable, rust-vmm crates pinned to the vm-memory 0.17.1 set, fuse-backend-rs 0.14, blake3, serde, clap. Linux 6.18 guest built in a `debian:trixie` container.
 
-**Spec:** `docs/superpowers/specs/2026-09-29-boxcar-design.md`. Roadmap for all milestones: `docs/superpowers/plans/2026-09-30-boxcar-roadmap.md`.
+**Spec:** `docs/specs/2026-09-29-boxcar-design.md`. Roadmap for all milestones: `docs/plans/2026-09-30-boxcar-roadmap.md`.
 
 ## Global Constraints
 

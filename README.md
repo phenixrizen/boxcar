@@ -12,8 +12,8 @@ lands in one append-only, hash-chained log. A second, best-effort sensor
 inside the guest reports process lineage, and a reconciler flags where the
 two views, or the model's stated intent, disagree.
 
-Status: pre-alpha. See [docs/superpowers/specs](docs/superpowers/specs) for
-the design and [docs/superpowers/plans](docs/superpowers/plans) for the
+Status: pre-alpha. See [docs/specs](docs/specs) for
+the design and [docs/plans](docs/plans) for the
 roadmap.
 
 ## Quick start
