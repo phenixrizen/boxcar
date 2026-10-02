@@ -5,7 +5,7 @@
 //! raw bytes on disk.
 //!
 //! Each line is parsed as a plain `serde_json::Value`, never as the typed
-//! [`Record`](boxcar_proto::Record). `Record` ignores unknown keys and reads
+//! [`Record`]. `Record` ignores unknown keys and reads
 //! an explicit `"subject": null` as absent, so hashing a typed record would
 //! accept a line with an injected key or null. The verifier removes the
 //! top-level `hash` from the parsed object, serializes the rest with
@@ -37,7 +37,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use boxcar_proto::{genesis_prev, Checkpoint, Hash, SessionId};
+use boxcar_proto::{genesis_prev, Checkpoint, Hash, Record, SessionId};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
@@ -320,6 +320,15 @@ impl<'de> Visitor<'de> for StrictVisitor {
         }
         Ok(Value::Object(object))
     }
+}
+
+/// A line (without its newline) as a typed [`Record`], parsed as strictly as
+/// [`RawLine::parse`] parses it: an object with the same key twice, at any
+/// depth, is an error. The reader's way in, which does not hash.
+pub(crate) fn parse_record(bytes: &[u8]) -> Result<Record, String> {
+    let StrictValue(value) =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+    serde_json::from_value(value).map_err(|e| format!("not a record: {e}"))
 }
 
 fn hash_field(value: Option<&Value>, name: &str) -> Result<Hash, String> {

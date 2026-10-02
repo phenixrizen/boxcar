@@ -17,6 +17,14 @@
 //! [`WriterHandle::close`] drains every accepted event, writes a final
 //! checkpoint, and syncs.
 //!
+//! Subscribers: a subscription request travels in the same channel as the
+//! events, so the thread handles it between two records: it flushes the
+//! current segment, registers the subscriber and answers with the seq of
+//! the next record. Each record it makes after that, checkpoints included,
+//! goes to every subscriber whose filter takes it, through a bounded queue
+//! with `try_send`: the thread never waits for a subscriber, and drops one
+//! whose queue is full (see [`crate::subscribe`]).
+//!
 //! Failure: the first I/O error, or a panic, ends the thread. It is
 //! published as a [`WriteFailure`] (the file, what was being done to it, and
 //! the seq being written) before anything else happens, so that from then on
@@ -44,7 +52,8 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::chain::{Chainer, PartialRecord};
 use crate::checkpoint::{CheckpointIndex, IndexEntry, Window};
 use crate::segment::{on, Fdatasync, FileError, FileResult, SegmentWriter, Syncer};
-use crate::sink::{AuditSink, Priority, Shared, Submission};
+use crate::sink::{AuditSink, Msg, Priority, Shared, Submission};
+use crate::subscribe::{SubscribeAck, SubscribeRequest, Subscribers};
 
 /// Most submissions written between two buffer flushes.
 const MAX_BATCH: usize = 1024;
@@ -220,13 +229,15 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
     let (segments, resume) = SegmentWriter::open_or_create(&session_dir, &cfg.session_id, syncer)?;
     let index = CheckpointIndex::open(&session_dir, segments.segment(), &resume.checkpoints)?;
 
-    let (tx, rx) = bounded(cfg.channel_capacity);
+    let (tx, rx) = bounded::<Msg>(cfg.channel_capacity);
     let (stop, stopped) = bounded(0);
     let shared = Arc::new(Shared::new(resume.last_seq + 1)?);
     let pending_since = (!resume.window.is_empty()).then(Instant::now);
     let consistent_len = segments.len();
     let writer = Writer {
         session_id: cfg.session_id,
+        session_dir: session_dir.clone(),
+        subscribers: Subscribers::default(),
         chain: Chainer::resume(resume.last_seq, resume.last_hash),
         segments,
         index,
@@ -255,6 +266,9 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
 
 struct Writer<S: Syncer> {
     session_id: SessionId,
+    session_dir: PathBuf,
+    /// Who gets each record as it is made.
+    subscribers: Subscribers,
     chain: Chainer,
     segments: SegmentWriter<S>,
     index: CheckpointIndex,
@@ -277,7 +291,7 @@ struct Writer<S: Syncer> {
 }
 
 impl<S: Syncer> Writer<S> {
-    fn run(mut self, rx: Receiver<Submission>, stop: Receiver<()>) -> io::Result<CloseStats> {
+    fn run(mut self, rx: Receiver<Msg>, stop: Receiver<()>) -> io::Result<CloseStats> {
         // Keeps the channel connected until the failure is published, so a
         // sink waiting for room is refused as `Failed`, not `Closed`.
         let held = rx.clone();
@@ -309,11 +323,7 @@ impl<S: Syncer> Writer<S> {
         Err(io::Error::new(failure.kind, failure))
     }
 
-    fn serve(
-        &mut self,
-        mut rx: Receiver<Submission>,
-        stop: Receiver<()>,
-    ) -> FileResult<CloseStats> {
+    fn serve(&mut self, mut rx: Receiver<Msg>, stop: Receiver<()>) -> FileResult<CloseStats> {
         loop {
             let deadline = self
                 .pending_since
@@ -342,21 +352,44 @@ impl<S: Syncer> Writer<S> {
             }
         }
         // The sinks are closed, so the channel holds all there will ever be.
-        while let Ok(submission) = rx.try_recv() {
-            self.write(submission)?;
+        while let Ok(msg) = rx.try_recv() {
+            self.handle(msg)?;
         }
         self.finish()
     }
 
-    fn batch(&mut self, first: Submission, rx: &Receiver<Submission>) -> FileResult<()> {
-        self.write(first)?;
+    fn batch(&mut self, first: Msg, rx: &Receiver<Msg>) -> FileResult<()> {
+        self.handle(first)?;
         for _ in 1..MAX_BATCH {
             match rx.try_recv() {
-                Ok(submission) => self.write(submission)?,
+                Ok(msg) => self.handle(msg)?,
                 Err(_) => break,
             }
         }
         self.segments.flush()
+    }
+
+    fn handle(&mut self, msg: Msg) -> FileResult<()> {
+        match msg {
+            Msg::Event(submission) => self.write(submission),
+            Msg::Subscribe(request) => self.subscribe(request),
+        }
+    }
+
+    /// Registers a subscriber between two records. The segment is flushed
+    /// first, so every record below the seq it is told is in the file its
+    /// reader opens; every record after it is sent to the subscriber.
+    fn subscribe(&mut self, request: SubscribeRequest) -> FileResult<()> {
+        self.segments.flush()?;
+        let ack = SubscribeAck {
+            next_seq: self.chain.last_seq() + 1,
+            session_dir: self.session_dir.clone(),
+        };
+        // A subscriber that is gone before its answer is not registered.
+        if request.reply.send(ack).is_ok() {
+            self.subscribers.add(request);
+        }
+        Ok(())
     }
 
     /// Writes one submission. It is never a checkpoint: the sink refuses those.
@@ -366,6 +399,7 @@ impl<S: Syncer> Writer<S> {
         self.consistent_len = self.segments.len();
         self.window.push(&record.hash);
         self.pending_since.get_or_insert_with(Instant::now);
+        self.subscribers.publish(record);
         if s.priority == Priority::Critical {
             self.segments.sync()?;
         }
@@ -431,6 +465,7 @@ impl<S: Syncer> Writer<S> {
         self.consistent_len = self.segments.len();
         self.dropped_reported = dropped;
         self.pending_since = None;
+        self.subscribers.publish(record);
         Ok(())
     }
 
