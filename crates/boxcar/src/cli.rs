@@ -112,6 +112,25 @@ pub enum Command {
     /// something that is not the protocol, and 128 plus the signal after
     /// SIGTERM, SIGHUP or SIGQUIT.
     Events(EventsArgs),
+    /// Show or change a running session's network policy.
+    ///
+    /// `show` prints the policy in force, as a table or with `--json` as
+    /// the control socket returns it: its version, its default, the allow
+    /// and deny rules, and the vsock ports the guest may reach. `allow
+    /// RULE` and `deny RULE` add RULE, written as for `boxcar run --allow`
+    /// (`name[:port]`, `*.name[:port]`, `address[:port]`,
+    /// `address/prefix[:port]`), to that list, taking the same RULE out of
+    /// the other, and replace the whole network policy; the VMM then ends
+    /// the connections the new policy denies (`net.close` with reason
+    /// `policy`) and records `policy.changed`. Every deny comes before every
+    /// allow, so a deny of a target wins over an allow of it. The session is
+    /// the one `--control` or SESSION_ID names, or the only one running.
+    ///
+    /// Exits 0 and prints `policy version N`, 1 when the control socket
+    /// cannot be reached or refuses the change (a VM without a network card
+    /// has no policy to change), 2 for a RULE that does not parse.
+    #[command(subcommand)]
+    Policy(PolicyCommand),
     /// Boot a microVM.
     ///
     /// Shares `--rootfs` with the guest as its root filesystem and
@@ -186,6 +205,36 @@ pub enum Command {
     /// `boxcar run` then exits 0 as well. The session is the one
     /// `--control` or SESSION_ID names, or the only one running.
     Stop(StopArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommand {
+    /// Print the policy in force.
+    Show(PolicyShowArgs),
+    /// Allow RULE: add it to the allow rules (and take it out of the
+    /// denies).
+    Allow(PolicyRuleArgs),
+    /// Deny RULE: add it to the deny rules (and take it out of the allows).
+    Deny(PolicyRuleArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PolicyShowArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// Print the policy as the control socket returns it, one JSON object.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PolicyRuleArgs {
+    /// The rule's target: `name[:port]`, `*.name[:port]`, `address[:port]`
+    /// or `address/prefix[:port]`.
+    #[arg(value_name = "RULE")]
+    pub rule: String,
+    #[command(flatten)]
+    pub session: SessionArgs,
 }
 
 #[derive(Debug, Subcommand)]

@@ -1,0 +1,31 @@
+{"ready":true,"control":"/run/user/1000/boxcar/017f22e2-79b0-7cc3-98c4-dc0c0c07398f/control.sock","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f"}
+{"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","capabilities":["pty","audit","policy.net"]}
+{"v":1,"id":1,"op":"status"}
+{"v":1,"id":1,"ok":true,"result":{"audit":{"failed":false,"next_seq":8},"devices":["fs:root","fs:workspace","net","vsock"],"guest":{"exit":null,"init_ready":true,"session_pid":212},"mem_mib":512,"pid":4242,"session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","state":"running","uptime_ms":61500,"vcpus":2}}
+{"v":1,"id":2,"op":"pty.attach","mode":"rw","replay_bytes":65536,"session":"main"}
+{"v":1,"id":2,"ok":true,"result":{"attach_id":"0123456789abcdef0123456789abcdef","raw":true}}
+{"v":1,"id":3,"op":"pty.watch","attach_id":"0123456789abcdef0123456789abcdef","session":"main"}
+{"v":1,"id":3,"ok":true,"result":{}}
+{"v":1,"id":4,"op":"pty.resize","cols":120,"rows":40,"session":"main"}
+{"v":1,"id":4,"ok":true,"result":{}}
+{"v":1,"event":"pty.detached","attach_id":"0123456789abcdef0123456789abcdef","reason":"slow"}
+{"v":1,"id":5,"op":"audit.subscribe","from_seq":1,"pid":212,"types":["net."]}
+{"v":1,"id":5,"ok":true,"result":{"next_seq":8,"sub":1}}
+{"v":1,"event":"audit","sub":1,"rec":{"v":1,"session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","seq":7,"ring":0,"src":"net","type":"net.connect","ts_host_ns":1700000000000000000,"ts_mono_ns":5001000000,"subject":{"pid":212,"uid":1000,"gid":1000},"data":{"dst":"93.184.215.14:443","flow":3,"names":["example.com"],"proto":"tcp","rule":"allow example.com","src":"10.0.2.15:40000","verdict":"allow"},"prev":"b3:1111111111111111111111111111111111111111111111111111111111111111","hash":"b3:2222222222222222222222222222222222222222222222222222222222222222"}}
+{"v":1,"event":"audit.lagged","sub":1,"resume_seq":16385}
+{"v":1,"id":6,"op":"policy.get"}
+{"v":1,"id":6,"ok":true,"result":{"net":{"allow":["example.com","*.github.io:443"],"default":"deny","deny":["10.0.0.0/8"]},"version":1,"vsock":{"allow_ports":[5000]}}}
+{"v":1,"id":7,"op":"policy.update","net":{"allow":["example.com","*.github.io:443","api.github.com:443"],"default":"deny","deny":["10.0.0.0/8"]}}
+{"v":1,"id":7,"ok":true,"result":{"policy_version":2}}
+{"v":1,"id":8,"ok":false,"error":{"code":"bad_request","message":"stop parameters: unknown variant `now`"}}
+{"v":1,"id":9,"ok":false,"error":{"code":"unsupported_version","message":"v must be 1"}}
+{"v":1,"id":10,"ok":false,"error":{"code":"unknown_op","message":"no op \"pty.detach\""}}
+{"v":1,"id":11,"ok":false,"error":{"code":"invalid_state","message":"the session's terminal is not open yet: the guest's init has not connected it"}}
+{"v":1,"id":12,"ok":false,"error":{"code":"not_found","message":"no session \"other\": the session is \"main\""}}
+{"v":1,"id":13,"ok":false,"error":{"code":"busy","message":"a connection holds at most 4 audit subscriptions; close one (or the connection) first"}}
+{"v":1,"id":14,"ok":false,"error":{"code":"rate_limited","message":"over 100 requests a second; the request was dropped"}}
+{"v":1,"id":15,"ok":false,"error":{"code":"internal","message":"the response: the line is over 1048576 bytes"}}
+{"v":1,"id":16,"op":"stop","mode":"graceful","timeout_ms":5000}
+{"v":1,"id":16,"ok":true,"result":{"accepted":true}}
+{"v":1,"event":"state","state":"stopping"}
+{"v":1,"event":"state","state":"stopped"}

@@ -24,8 +24,15 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
 cargo deny check
+cargo xtask schema && git diff --exit-code proto/   # the schemas are current
 cargo xtask test-kvm m1          # needs /dev/kvm and target/guest/*
 ```
+
+`cargo xtask schema` writes `proto/schema/{control-v1,audit-v1,guest-v1}.json`
+and `proto/testdata/control-v1.jsonl` from the types in `boxcar-proto`; a
+change to a message or record type is committed with them. The protocols
+are described in [docs/control-protocol.md](docs/control-protocol.md) and
+[docs/audit-events.md](docs/audit-events.md).
 
 ## KVM on the dev machine
 

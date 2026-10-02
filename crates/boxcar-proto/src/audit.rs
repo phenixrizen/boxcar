@@ -68,6 +68,26 @@ impl Serialize for Ring {
     }
 }
 
+/// On the wire the integer 0 or 1.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Ring {
+    fn schema_name() -> String {
+        "Ring".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::Integer.into()),
+            enum_values: Some(vec![serde_json::json!(0), serde_json::json!(1)]),
+            ..Default::default()
+        };
+        schema.metadata().description = Some(
+            "Which side of the VM boundary made the record: 0 the host, 1 the guest.".to_owned(),
+        );
+        schema.into()
+    }
+}
+
 impl<'de> Deserialize<'de> for Ring {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match u8::deserialize(deserializer)? {
@@ -83,6 +103,7 @@ impl<'de> Deserialize<'de> for Ring {
 
 /// The component that produced a record. On the wire, the lowercase name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     Vmm,
@@ -132,6 +153,7 @@ impl Source {
 
 /// The guest identity an event is attributed to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Subject {
     pub pid: u32,
     pub uid: u32,
@@ -140,6 +162,7 @@ pub struct Subject {
 
 /// Where an event sits in a trace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SpanRef {
     pub trace_id: String,
     pub span_id: String,
@@ -222,6 +245,25 @@ impl FromStr for Hash {
     }
 }
 
+/// On the wire a string: `b3:` and 64 lowercase hex digits.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Hash {
+    fn schema_name() -> String {
+        "Hash".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        schema.string().pattern = Some("^b3:[0-9a-f]{64}$".to_owned());
+        schema.metadata().description =
+            Some("A blake3 digest: `b3:` followed by 64 lowercase hex digits.".to_owned());
+        schema.into()
+    }
+}
+
 impl Serialize for Hash {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
@@ -253,6 +295,7 @@ impl<'de> Deserialize<'de> for Hash {
 /// The JSON field names are these field names, except that `kind` is `type`.
 /// Unset optional fields are left out of the JSON, never written as `null`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Record {
     /// The schema version, [`SCHEMA_VERSION`].
     pub v: u8,
@@ -326,6 +369,7 @@ pub fn genesis_prev(session_id: &SessionId) -> Hash {
 /// which are the two fields a [`Record`] carries at its top level. New kinds
 /// are additive, and a consumer ignores kinds it does not know.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "data")]
 pub enum Payload {
     #[serde(rename = "vmm.start")]

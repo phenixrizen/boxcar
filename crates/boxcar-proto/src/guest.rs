@@ -34,6 +34,7 @@ pub const MAX_PTY_HEADER: usize = 1024;
 
 /// What init tells the VMM.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "t")]
 pub enum GuestMsg {
     /// Init is up and connected; its first message. The clocks are the
@@ -64,6 +65,7 @@ pub enum GuestMsg {
 
 /// The level of a [`GuestMsg::Log`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Error,
@@ -74,6 +76,7 @@ pub enum LogLevel {
 
 /// What the VMM tells init.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "t")]
 pub enum HostMsg {
     /// The session to run: the answer to `hello`.
@@ -96,6 +99,7 @@ pub enum HostMsg {
 
 /// The session init runs: the fields of [`HostMsg::Config`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionConfig {
     /// The command and its arguments; the program is looked for on the
     /// session's `PATH` unless it holds a `/`.
@@ -270,6 +274,7 @@ impl SessionConfig {
 /// `{"v":1,"session":"main","rows":R,"cols":C}`. The stream is the
 /// session's terminal bytes, both ways, after it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PtyHeader {
     /// 1.
     pub v: u32,

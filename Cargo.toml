@@ -59,6 +59,9 @@ smoltcp = { version = "0.14", default-features = false, features = ["std", "log"
 socket2 = { version = "0.5", features = ["all"] }
 arc-swap = "1"
 proptest = "1" # dev only
+# JSON Schema generation (`cargo xtask schema`); boxcar-proto's optional
+# `schema` feature, on only for xtask.
+schemars = "0.8"
 
 # Static musl guest init: `cargo build -p boxcar-init --target
 # x86_64-unknown-linux-musl --profile guest`.

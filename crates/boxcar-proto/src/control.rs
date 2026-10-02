@@ -48,6 +48,7 @@ pub const DEFAULT_STOP_TIMEOUT_MS: u64 = 5000;
 
 /// A request: `{"v":1,"id":N,"op":"<op>", ...params}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Request {
     pub v: u32,
     /// Chosen by the client; the response carries it back.
@@ -74,6 +75,7 @@ impl Request {
 /// The answer to one request: `{"v":1,"id":N,"ok":true,"result":{...}}` or
 /// `{"v":1,"id":N,"ok":false,"error":{"code":"...","message":"..."}}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Response {
     pub v: u32,
     /// The request's `id`, or 0 when the request had none that could be
@@ -125,6 +127,7 @@ impl Response {
 
 /// Why a request failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ErrorBody {
     pub code: ErrorCode,
     /// For people; clients act on `code`.
@@ -153,6 +156,7 @@ impl fmt::Display for ErrorBody {
 
 /// The error codes, exactly these; on the wire in snake_case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The line is too long, not UTF-8, not a JSON object, lacks `v`, `id`
@@ -199,6 +203,7 @@ impl fmt::Display for ErrorCode {
 
 /// The server's first line on every connection it accepts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Hello {
     pub v: u32,
     /// `"hello"`.
@@ -232,6 +237,7 @@ impl Hello {
 
 /// Where the VM is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VmState {
     /// Built; the vCPUs have not started.
@@ -246,6 +252,7 @@ pub enum VmState {
 
 /// `{"v":1,"event":"state","state":"..."}`: the VM entered `state`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StateEvent {
     pub v: u32,
     /// `"state"`.
@@ -266,6 +273,7 @@ impl StateEvent {
 /// How the guest's session ended, as its init reported it: the exit code of
 /// the session's process, or the signal that killed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionOutcome {
     /// The exit code, when the process exited.
     pub code: Option<i32>,
@@ -275,6 +283,7 @@ pub struct SessionOutcome {
 
 /// The result of `status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Status {
     pub state: VmState,
     pub session_id: String,
@@ -293,6 +302,7 @@ pub struct Status {
 
 /// What the guest's init has reported. The default is nothing yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GuestStatus {
     /// Whether init has said hello over the guest control channel.
     pub init_ready: bool,
@@ -304,6 +314,7 @@ pub struct GuestStatus {
 
 /// The session's audit log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditStatus {
     /// The sequence number the writer gives the next record it writes.
     pub next_seq: u64,
@@ -313,6 +324,7 @@ pub struct AuditStatus {
 
 /// The parameters of `stop`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StopParams {
     /// `graceful` when absent.
     #[serde(default)]
@@ -332,6 +344,7 @@ impl StopParams {
 
 /// How to stop.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StopMode {
     /// Ask the guest to end its session first.
@@ -350,6 +363,7 @@ pub const PTY_SESSION: &str = "main";
 /// only those; `replay_bytes` (0 when absent) of the terminal's latest
 /// output come first, at most the server's scrollback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PtyAttachParams {
     /// [`PTY_SESSION`].
     pub session: String,
@@ -362,6 +376,7 @@ pub struct PtyAttachParams {
 /// attach's id (128 random bits, in hex) is what another connection
 /// watches it by ([`PtyWatchParams`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PtyAttached {
     /// `true`: the connection is raw from the next byte.
     pub raw: bool,
@@ -372,6 +387,7 @@ pub struct PtyAttached {
 /// `"session":"main"`, optionally). The response is `{}`; from then on the
 /// connection that sent it hears the attach's [`PtyDetached`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PtyWatchParams {
     pub attach_id: String,
     /// [`PTY_SESSION`], when given.
@@ -381,6 +397,7 @@ pub struct PtyWatchParams {
 
 /// How a client attaches to the session's terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PtyMode {
     /// Read and write: what the client sends is typed into the session.
@@ -392,6 +409,7 @@ pub enum PtyMode {
 /// The parameters of `pty.resize`: `{"session":"main","rows":R,"cols":C}`,
 /// each of `rows` and `cols` from 1 to 65535. The response is `{}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PtyResizeParams {
     /// [`PTY_SESSION`].
     pub session: String,
@@ -423,6 +441,7 @@ pub const PTY_DETACHED_SLOW: &str = "slow";
 /// more of the terminal's output unread than the server keeps for it, or
 /// took none for 30 s.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PtyDetached {
     pub v: u32,
     /// `"pty.detached"`.
@@ -460,6 +479,7 @@ pub const MAX_AUDIT_TYPE_LEN: usize = 64;
 /// connection hears [`AuditEvent`]s, and [`AuditLagged`] when it falls
 /// behind, until it closes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditSubscribeParams {
     /// The first seq wanted: the records from it on, those in the log and
     /// then the live ones. 1 when absent; 0 is the same. A seq beyond the
@@ -500,6 +520,7 @@ impl AuditSubscribeParams {
 
 /// The result of `audit.subscribe`: `{"next_seq":N,"sub":K}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditSubscribed {
     /// The seq the log's next record had when the subscription began: the
     /// records below it come from the log, the ones from it on are live.
@@ -518,6 +539,7 @@ pub struct AuditSubscribed {
 ///
 /// [`MAX_RECORD_BYTES`]: crate::limits::MAX_RECORD_BYTES
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditEvent<R = Record> {
     pub v: u32,
     /// `"audit"`.
@@ -543,6 +565,7 @@ impl<R> AuditEvent<R> {
 /// read back from the log and then live again; those before it were
 /// delivered, so nothing is missed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditLagged {
     pub v: u32,
     /// `"audit.lagged"`.
@@ -582,6 +605,7 @@ pub const MAX_VSOCK_ALLOW_PORTS: usize = 1024;
 /// `policy.get` in this shape, which is the same policy only when no
 /// allow before a deny matches what the deny does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetPolicy {
     /// The verdict when no rule matches: `allow` or `deny`.
     pub default: Verdict,
@@ -626,6 +650,7 @@ impl NetPolicy {
 /// it: `{"allow_ports":[5000]}`, the host ports a guest connection may
 /// reach besides the internal ones (`boxcar run --vsock-allow`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct VsockPolicy {
     #[serde(default)]
     pub allow_ports: Vec<u32>,
@@ -658,6 +683,7 @@ impl VsockPolicy {
 /// the policy in force and its version (1 for the one the VM started with,
 /// one more for each `policy.update`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyView {
     pub net: NetPolicy,
     pub vsock: VsockPolicy,
@@ -671,6 +697,7 @@ pub struct PolicyView {
 /// is [`PolicyUpdated`]; the server records `policy.changed`. A rule that
 /// does not parse is a `bad_request` naming it, and nothing changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<NetPolicy>,
@@ -699,6 +726,7 @@ impl PolicyUpdateParams {
 /// The result of `policy.update`: `{"policy_version":N}`, the version of
 /// the policy now in force.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyUpdated {
     pub policy_version: u64,
 }
@@ -706,6 +734,7 @@ pub struct PolicyUpdated {
 /// The one line `boxcar run --ready-fd N` writes to fd N once the control
 /// socket is bound: `{"ready":true,"control":"<path>","session_id":"<id>"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Ready {
     pub ready: bool,
     /// The control socket's path.

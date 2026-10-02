@@ -38,6 +38,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # proto/schema/*.json and proto/testdata/control-v1.jsonl are
+      # generated from the types: a change to the types must come with them.
+      - name: Schemas and golden vectors are current
+        run: cargo xtask schema && git diff --exit-code proto/
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
 

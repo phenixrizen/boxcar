@@ -68,6 +68,26 @@ impl FromStr for SessionId {
     }
 }
 
+/// On the wire a string: a lowercase hyphenated UUID.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for SessionId {
+    fn schema_name() -> String {
+        "SessionId".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        schema.string().pattern =
+            Some("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$".to_owned());
+        schema.metadata().description =
+            Some("A session id: a UUIDv7 in lowercase hyphenated text.".to_owned());
+        schema.into()
+    }
+}
+
 impl Serialize for SessionId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)

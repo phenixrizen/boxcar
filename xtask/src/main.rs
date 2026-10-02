@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The boxcar Authors
 
-//! Build tasks for boxcar: guest kernel, initramfs, rootfs, and gated tests.
+//! Build tasks for boxcar: guest kernel, initramfs, rootfs, gated tests,
+//! and the protocol schemas.
 
 use clap::{Parser, Subcommand};
 
 mod initramfs;
 mod kernel;
 mod rootfs;
+mod schema;
 mod test_kvm;
 
 /// Build tasks for boxcar.
@@ -29,6 +31,10 @@ enum Command {
     /// Run a milestone's KVM-gated tests; skips (exit 0) without /dev/kvm or
     /// the guest artifacts.
     TestKvm(test_kvm::TestKvmArgs),
+    /// Write the JSON Schemas of the control protocol, the audit records and
+    /// the guest channel to proto/schema, and the control protocol's golden
+    /// lines to proto/testdata/control-v1.jsonl.
+    Schema,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,6 +43,7 @@ fn main() -> anyhow::Result<()> {
         Command::Initramfs => initramfs::run(),
         Command::Rootfs(args) => rootfs::run(&args),
         Command::TestKvm(args) => test_kvm::run(&args),
+        Command::Schema => schema::run(),
     }
 }
 

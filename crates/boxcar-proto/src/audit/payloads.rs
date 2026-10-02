@@ -18,6 +18,7 @@ use crate::control::StopMode;
 /// How one operation ended. Present on every filesystem event that performs
 /// an operation, so readers can filter failures without knowing the event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct OpResult {
     pub ok: bool,
     /// The Linux errno of a failure.
@@ -51,6 +52,7 @@ impl OpResult {
 
 /// A file the VMM loaded, identified by where it was and what it held.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ArtifactRef {
     pub path: String,
     pub blake3: Hash,
@@ -58,6 +60,7 @@ pub struct ArtifactRef {
 
 /// A directory the VM was given over virtio-fs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ShareRef {
     /// The share's tag, such as `root` or `workspace`.
     pub tag: String,
@@ -67,6 +70,7 @@ pub struct ShareRef {
 
 /// `vmm.start`: the VM was built and is about to run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct VmmStart {
     /// The boxcar version.
     pub version: String,
@@ -83,6 +87,7 @@ pub struct VmmStart {
 
 /// `vmm.stop`: the VM stopped.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct VmmStop {
     pub reason: String,
     pub exit_code: Option<i32>,
@@ -105,6 +110,7 @@ pub struct VmmStop {
 
 /// `fs.mount`: a virtio-fs share was attached.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsMount {
     /// The share's tag, such as `root` or `workspace`.
     pub mount: String,
@@ -117,6 +123,7 @@ pub struct FsMount {
 
 /// `fs.open`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsOpen {
     pub mount: String,
     pub path: String,
@@ -132,6 +139,7 @@ pub struct FsOpen {
 
 /// `fs.create`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsCreate {
     pub mount: String,
     pub path: String,
@@ -143,6 +151,7 @@ pub struct FsCreate {
 
 /// Whether the content of a closed file was hashed, and if not, why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HashStatus {
     /// Hashed; `blake3` is set.
@@ -160,6 +169,7 @@ pub enum HashStatus {
 
 /// Whose identity a record carries as its `subject`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Attrib {
     /// The process that made the request.
@@ -171,6 +181,7 @@ pub enum Attrib {
 
 /// `fs.close`: a handle was released.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsClose {
     pub mount: String,
     /// The path at close time.
@@ -192,6 +203,7 @@ pub struct FsClose {
 
 /// `fs.read` and `fs.write`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsIo {
     pub mount: String,
     pub path: String,
@@ -207,6 +219,7 @@ pub struct FsIo {
 
 /// `fs.unlink`, `fs.rmdir`, and `fs.readdir`: an operation on one path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsPathOp {
     pub mount: String,
     pub path: String,
@@ -215,6 +228,7 @@ pub struct FsPathOp {
 
 /// `fs.mkdir`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsMkdir {
     pub mount: String,
     pub path: String,
@@ -224,6 +238,7 @@ pub struct FsMkdir {
 
 /// `fs.mknod`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsMknod {
     pub mount: String,
     pub path: String,
@@ -234,6 +249,7 @@ pub struct FsMknod {
 
 /// `fs.symlink`: `path` is the new link and `target` what it points to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsSymlink {
     pub mount: String,
     pub path: String,
@@ -243,6 +259,7 @@ pub struct FsSymlink {
 
 /// `fs.link`: `path` is the new name and `target_path` the file it links to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsLink {
     pub mount: String,
     pub path: String,
@@ -252,6 +269,7 @@ pub struct FsLink {
 
 /// `fs.rename`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsRename {
     pub mount: String,
     pub from: String,
@@ -264,6 +282,7 @@ pub struct FsRename {
 /// The attributes a `setattr` asked to change. Unset fields were not part of
 /// the request and are omitted from the JSON.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetAttr {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
@@ -283,6 +302,7 @@ pub struct SetAttr {
 
 /// `fs.setattr`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsSetattr {
     pub mount: String,
     pub path: String,
@@ -292,6 +312,7 @@ pub struct FsSetattr {
 
 /// `fs.fallocate`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsFallocate {
     pub mount: String,
     pub path: String,
@@ -303,6 +324,7 @@ pub struct FsFallocate {
 
 /// `fs.xattr`: an extended attribute was set or removed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsXattr {
     pub mount: String,
     pub path: String,
@@ -314,6 +336,7 @@ pub struct FsXattr {
 
 /// `fs.denied`: an operation was refused for lack of permission.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FsDenied {
     pub mount: String,
     pub path: String,
@@ -325,6 +348,7 @@ pub struct FsDenied {
 /// `checkpoint`: a summary the log writer chains in periodically, so a reader
 /// can check a stretch of the log against one hash.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Checkpoint {
     /// Records written since the previous checkpoint.
     pub records_since: u64,
@@ -337,6 +361,7 @@ pub struct Checkpoint {
 
 /// Whether something was let through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Verdict {
     Allow,
@@ -347,6 +372,7 @@ pub enum Verdict {
 /// served (`allow`) only when its uid is the VMM's; otherwise the
 /// connection is closed before the hello (`deny`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ControlConnect {
     /// The peer's process id and user id, from `SO_PEERCRED`.
     pub pid: u32,
@@ -356,6 +382,7 @@ pub struct ControlConnect {
 
 /// `control.stop`: a control client asked the VM to stop.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ControlStop {
     /// The client's process id.
     pub by_pid: u32,
@@ -368,6 +395,7 @@ pub struct ControlStop {
 /// connection and datagram, and what was open and it denies is closed
 /// (`net.close{reason:"policy"}`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyChanged {
     /// The client's process id.
     pub by_pid: u32,
@@ -379,6 +407,7 @@ pub struct PolicyChanged {
 /// `net.dhcp`: the network stack answered a guest DHCP message with the
 /// session's static lease.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetDhcp {
     /// `offer`, the answer to a DISCOVER, or `ack`, the answer to a REQUEST.
     pub op: String,
@@ -389,6 +418,7 @@ pub struct NetDhcp {
 /// `net.dns`: a guest DNS query, the policy's verdict on its name, and the
 /// answer the guest got.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetDns {
     /// The transaction id the guest gave the query.
     pub txid: u16,
@@ -409,6 +439,7 @@ pub struct NetDns {
 
 /// `net.connect`: a guest connection attempt and the policy's verdict on it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetConnect {
     /// The flow's id, unique within the session. The flow's `net.tls` and
     /// `net.close` carry it too.
@@ -432,6 +463,7 @@ pub struct NetConnect {
 /// the flows a domain rule allowed: a TLS ClientHello's server name, or a
 /// plain HTTP request's `Host`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetTls {
     /// The `flow` of the flow's `net.connect`.
     pub flow: u64,
@@ -451,6 +483,7 @@ pub struct NetTls {
 
 /// `net.close`: a flow ended.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetClose {
     /// The `flow` of the flow's `net.connect` or `net.udp`.
     pub flow: u64,
@@ -467,6 +500,7 @@ pub struct NetClose {
 /// `net.drop`: the network stack dropped guest frames. Made at most once a
 /// second for each reason, counting every drop since the last.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetDrop {
     /// Why, such as `ipv6` or `icmp`.
     pub reason: String,
@@ -477,6 +511,7 @@ pub struct NetDrop {
 /// `net.udp`: the first datagram of a guest UDP flow, and the policy's
 /// verdict on it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NetUdp {
     /// The flow's id, unique within the session (TCP and UDP flows share
     /// one count); its `net.close` carries it.
@@ -503,6 +538,7 @@ pub struct NetUdp {
 /// allowlisted. A host connection, through the vsock socket, is recorded
 /// once the guest accepts it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct VsockConnect {
     /// The port connected to: the host port for a guest connection, the
     /// guest port for a host one.
@@ -531,6 +567,7 @@ pub struct VsockConnect {
 /// `vsock.close`: a vsock connection that a `vsock.connect` let through
 /// ended.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct VsockClose {
     /// The `port` of the connection's `vsock.connect`.
     pub port: u32,
@@ -546,6 +583,7 @@ pub struct VsockClose {
 /// asked for. Reported by init (ring 1); the record's subject is the
 /// session's process.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionStart {
     /// The command, as the config gave it.
     pub argv: Vec<String>,
@@ -562,6 +600,7 @@ pub struct SessionStart {
 /// exit code, or the signal that killed it. Both are `null` only when init
 /// could not tell.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionExit {
     pub code: Option<i32>,
     pub signal: Option<i32>,
