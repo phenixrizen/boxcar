@@ -29,7 +29,9 @@
 //! joined, and the vsock device, whose vsock thread records the end of
 //! every connection before it is joined, and whose host socket is then
 //! unlinked), wait at most [`CLOSE_DEADLINE`] for the guest control
-//! channel's threads (so a report init sent last is recorded), let the
+//! channel's threads (so a report init sent last is recorded), close the
+//! PTY hub's stream (its clients get the end of the session's output), let
+//! the
 //! console writer drain what it can for at most [`CONSOLE_DEADLINE`]
 //! (it counts what it could not deliver), mark the VM `stopped` and shut
 //! the control server down (each client hears `stopped` and is
@@ -69,6 +71,7 @@ use crate::console::ConsoleWriter;
 use crate::control::ControlServer;
 use crate::devices::{FsDevices, NetDevice, VsockDevice};
 use crate::guest_ctl::{GuestCtl, GuestCtlHandle, CLOSE_DEADLINE};
+use crate::pty::PtyHub;
 use crate::services::ServiceRegistry;
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
@@ -328,6 +331,9 @@ pub(crate) struct VmInfo {
     pub(crate) services: Arc<ServiceRegistry>,
     /// The guest control channel: what init reported, and a way to tell it.
     pub(crate) guest: Arc<GuestCtl>,
+    /// The session's terminal (port 1025), when the VM has the vsock
+    /// device.
+    pub(crate) pty: Option<PtyHub>,
 }
 
 /// Stops a VM from another thread, and reports its status. Cheap to clone.
@@ -398,6 +404,13 @@ impl VmmHandle {
         self.info.guest.handle()
     }
 
+    /// The PTY hub: the session's terminal, which `boxcar run` and the
+    /// control socket's `pty.attach` attach to. `None` without the vsock
+    /// device.
+    pub fn pty(&self) -> Option<PtyHub> {
+        self.info.pty.clone()
+    }
+
     /// The VM's status, as the control socket's `status` reports it, with
     /// what the guest's init reported over the control channel.
     pub fn status(&self) -> Status {
@@ -461,8 +474,8 @@ fn fall_back_after(latch: &StopLatch, wait: Duration) {
 /// and a terminal left raw.
 pub const STOP_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
-fn stop_sigset() -> io::Result<libc::sigset_t> {
-    create_sigset(&STOP_SIGNALS).map_err(|e| io::Error::from_raw_os_error(e.errno()))
+fn sigset(signals: &[i32]) -> io::Result<libc::sigset_t> {
+    create_sigset(signals).map_err(|e| io::Error::from_raw_os_error(e.errno()))
 }
 
 /// Blocks the [`STOP_SIGNALS`] on the calling thread, and so on every
@@ -471,7 +484,15 @@ fn stop_sigset() -> io::Result<libc::sigset_t> {
 /// unblocked would take the signal's default action and kill the process.
 /// `Vmm::run` calls it too, before it starts the vCPU threads.
 pub fn block_stop_signals() -> io::Result<()> {
-    let set = stop_sigset()?;
+    block_signals(&STOP_SIGNALS)
+}
+
+/// Blocks `signals` on the calling thread and every thread it starts
+/// afterwards, so that a [`SignalFd::with`] them sees each one (a signal
+/// is taken by any thread that leaves it unblocked): `SIGWINCH` for a
+/// terminal's size, read by `boxcar run` and `boxcar attach`.
+pub fn block_signals(signals: &[i32]) -> io::Result<()> {
+    let set = sigset(signals)?;
     // SAFETY: `set` is a valid sigset and the old mask is not requested.
     let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut()) };
     if ret != 0 {
@@ -480,13 +501,20 @@ pub fn block_stop_signals() -> io::Result<()> {
     Ok(())
 }
 
-/// A non-blocking signalfd for the [`STOP_SIGNALS`]: with them blocked
-/// ([`block_stop_signals`]), how they are seen.
+/// A non-blocking signalfd for the [`STOP_SIGNALS`] (or other signals,
+/// [`SignalFd::with`]): with them blocked ([`block_stop_signals`]), how
+/// they are seen.
 pub struct SignalFd(OwnedFd);
 
 impl SignalFd {
     pub fn new() -> io::Result<Self> {
-        let set = stop_sigset()?;
+        SignalFd::with(&STOP_SIGNALS)
+    }
+
+    /// A signalfd for `signals`, which the caller has blocked
+    /// ([`block_signals`]).
+    pub fn with(signals: &[i32]) -> io::Result<Self> {
+        let set = sigset(signals)?;
         // SAFETY: `set` is a valid sigset; the result is checked.
         let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
         if fd < 0 {
@@ -671,6 +699,8 @@ pub(crate) struct Teardown<'a> {
     /// The guest control channel, whose threads end once the vsock device
     /// is closed.
     pub(crate) guest: &'a GuestCtl,
+    /// The PTY hub, whose stream is closed after the vsock device.
+    pub(crate) pty: Option<&'a PtyHub>,
     pub(crate) console: ConsoleWriter,
     /// Console input bytes the stdin subscriber dropped, read once the main
     /// loop is done.
@@ -693,6 +723,7 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
         net,
         vsock,
         guest,
+        pty,
         console,
         stdin_dropped_bytes,
         control,
@@ -709,6 +740,11 @@ pub(crate) fn stop(teardown: Teardown<'_>, reason: &str, exit_code: i32) {
     vsock.close();
     // What init sent last is recorded before `vmm.stop`.
     guest.close(CLOSE_DEADLINE);
+    // The session's output has all come: its clients get their end. Logs
+    // nothing and waits on nothing.
+    if let Some(pty) = pty {
+        pty.close();
+    }
     let console = console.flush_and_join(CONSOLE_DEADLINE);
     latch.mark_stopped();
     if let Some(control) = control {
@@ -767,8 +803,9 @@ fn emit_stop(
 }
 
 /// A handle on a VM that was never built: a fresh latch, 2 vCPUs, 256 MiB,
-/// both virtio-fs devices, an audit log under `dir`, and the guest control
-/// channel at port 1024 for a login shell as uid 1000.
+/// both virtio-fs devices, an audit log under `dir`, the guest control
+/// channel at port 1024 for a login shell as uid 1000, and the PTY hub at
+/// port 1025.
 #[cfg(test)]
 pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::WriterHandle) {
     let session_id = boxcar_proto::SessionId::new();
@@ -782,6 +819,10 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
     services
         .register(boxcar_vsock::services::CTL_PORT, guest.service())
         .expect("register the control channel");
+    let pty = PtyHub::new(guest.handle()).expect("the PTY hub");
+    services
+        .register(boxcar_vsock::services::PTY_PORT, pty.service())
+        .expect("register the PTY hub");
     let info = VmInfo {
         session_id: session_id.to_string(),
         built: Instant::now(),
@@ -791,6 +832,7 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         audit: sink,
         services,
         guest,
+        pty: Some(pty),
     };
     let latch = Arc::new(StopLatch::new().expect("stop latch"));
     (VmmHandle::new(latch, Arc::new(info)), writer)
@@ -1103,7 +1145,7 @@ mod tests {
 
     #[test]
     fn a_hangup_or_quit_stops_the_vm_like_an_interrupt() {
-        let set = stop_sigset().unwrap();
+        let set = sigset(&STOP_SIGNALS).unwrap();
         for signo in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
             // SAFETY: `set` is a valid, initialized sigset.
             let member = unsafe { libc::sigismember(&set, signo) };

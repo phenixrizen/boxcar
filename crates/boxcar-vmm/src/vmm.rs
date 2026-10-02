@@ -11,7 +11,8 @@
 //! card and the vsock device, each in its fixed slot of
 //! [`crate::devices::slots`], the vsock device with the VMM's
 //! [`ServiceRegistry`] behind its internal ports, and in it the guest
-//! control channel ([`GuestCtl`]) at port 1024), write
+//! control channel ([`GuestCtl`]) at port 1024 and the session's terminal
+//! ([`PtyHub`]) at port 1025), write
 //! the command line with the network's arguments ([`NET_CMDLINE`]) when
 //! there is a network card and a `virtio_mmio.device=` entry for each slot
 //! of the [`DeviceSet`], write the zero page and MP table, create and set up
@@ -65,6 +66,7 @@ use crate::lifecycle::{
     MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
+use crate::pty::PtyHub;
 use crate::services::ServiceRegistry;
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
 use crate::vcpu::VcpuSet;
@@ -185,7 +187,7 @@ pub struct VmConfig {
     /// mode and what is typed goes to the guest. Off for a run that needs
     /// no input, which leaves the terminal as it is, and in init's vsock
     /// mode, where the session's terminal takes the input instead (see
-    /// [`crate::pty_relay`]).
+    /// [`crate::pty`]).
     pub stdin: bool,
     /// Receives `vmm.start` and `vmm.stop`, and every share's records.
     pub audit: AuditSink,
@@ -451,8 +453,8 @@ impl Vmm {
             &cfg.audit,
             &cfg.policy,
         )?;
-        // The guest control channel's service, when there is a vsock
-        // device; the terminal's (port 1025) is registered by the caller.
+        // The guest control channel's service and the session's terminal's,
+        // when there is a vsock device.
         let services = Arc::new(ServiceRegistry::new());
         let guest = GuestCtl::new(cfg.session.clone(), cfg.audit.clone());
         let vsock = VsockDevice::attach(
@@ -464,11 +466,18 @@ impl Vmm {
             &cfg.audit,
             &services,
         )?;
-        if vsock.is_attached() {
+        let pty = if vsock.is_attached() {
             services
                 .register(boxcar_vsock::services::CTL_PORT, guest.service())
                 .map_err(|error| VmmError::Config(error.to_string()))?;
-        }
+            let pty = PtyHub::new(guest.handle()).map_err(setup("PTY hub"))?;
+            services
+                .register(boxcar_vsock::services::PTY_PORT, pty.service())
+                .map_err(|error| VmmError::Config(error.to_string()))?;
+            Some(pty)
+        } else {
+            None
+        };
         // What was attached is what the command line and `status` say.
         debug_assert_eq!(
             set,
@@ -510,6 +519,7 @@ impl Vmm {
             audit: cfg.audit.clone(),
             services,
             guest,
+            pty,
         });
 
         let start = VmmStart {
@@ -584,9 +594,10 @@ impl Vmm {
         })
     }
 
-    /// Hands over a terminal the caller put in raw mode (the PTY relay's,
-    /// in `boxcar run`): the stop sequence restores it where it restores
-    /// its own, before anything it logs.
+    /// Hands over a terminal the caller put in raw mode (`boxcar run`'s,
+    /// attached to the session's terminal through the PTY hub): the stop
+    /// sequence restores it where it restores its own, before anything it
+    /// logs.
     pub fn restore_terminal_on_stop(&mut self, terminal: RawModeGuard) {
         self.terminal = Some(terminal);
     }
@@ -624,6 +635,9 @@ impl Vmm {
                 self.net.close();
                 self.vsock.close();
                 self.info.guest.close(CLOSE_DEADLINE);
+                if let Some(pty) = &self.info.pty {
+                    pty.close();
+                }
                 let console = self.console.flush_and_join(CONSOLE_DEADLINE);
                 self.latch.mark_stopped();
                 if let Some(control) = self.control.take() {
@@ -648,6 +662,7 @@ impl Vmm {
             net: &self.net,
             vsock: &self.vsock,
             guest: &self.info.guest,
+            pty: self.info.pty.as_ref(),
             console: self.console,
             // The main loop is done: this is the final count.
             stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),

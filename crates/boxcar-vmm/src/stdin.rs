@@ -42,13 +42,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::terminal::Terminal;
 
 use crate::devices::SerialDevice;
 use crate::lifecycle::{StopReason, VmmHandle};
@@ -97,24 +96,46 @@ pub fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-/// Stdin as a [`Terminal`], without taking std's stdin lock (the panic hook
-/// must not wait on it).
-struct StdinTty;
+/// The terminal's settings from before raw mode: there while the terminal
+/// is in raw mode, so that exactly one of the guard and the panic hook
+/// restores them.
+static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 
-// SAFETY: STDIN_FILENO is open for the life of the process.
-unsafe impl Terminal for StdinTty {
-    fn tty_fd(&self) -> RawFd {
-        libc::STDIN_FILENO
+/// Stdin's terminal settings (std's stdin lock stays out of it: the panic
+/// hook must not wait on it).
+fn stdin_termios() -> io::Result<libc::termios> {
+    // SAFETY: termios is plain data; all zeroes is valid.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes one termios into `termios`, alive for the
+    // call.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) } != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(termios)
 }
 
-/// Set while the terminal is in raw mode, so exactly one of the guard and
-/// the panic hook restores it.
-static RAW_MODE: AtomicBool = AtomicBool::new(false);
+fn set_stdin_termios(termios: &libc::termios) -> io::Result<()> {
+    // SAFETY: tcsetattr reads one termios from `termios`.
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `termios` in raw mode, as [`RawModeGuard`] sets it: no line editing, no
+/// echo, no signals from Ctrl-C or Ctrl-Z and no flow control from Ctrl-S
+/// or Ctrl-Q, so that every key reaches the reader (`boxcar attach`'s
+/// Ctrl-Q, and a guest program's Ctrl-S); output processing stays.
+pub fn raw_termios(mut termios: libc::termios) -> libc::termios {
+    termios.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    termios.c_iflag &= !libc::IXON;
+    termios
+}
 
 fn restore_terminal() {
-    if RAW_MODE.swap(false, Ordering::SeqCst) {
-        if let Err(error) = StdinTty.set_canon_mode() {
+    let saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(saved) = saved {
+        if let Err(error) = set_stdin_termios(&saved) {
             tracing::warn!("cannot restore the terminal: {error}");
         }
     }
@@ -132,9 +153,9 @@ fn install_panic_hook() {
     });
 }
 
-/// The host terminal in raw mode (no line editing, no echo, no signals from
-/// Ctrl-C). Dropping it restores canonical mode; so does a panic anywhere
-/// in the process.
+/// The host terminal in raw mode ([`raw_termios`]: no line editing, no
+/// echo, no signals from Ctrl-C, no flow control). Dropping it restores the
+/// settings the terminal had; so does a panic anywhere in the process.
 pub struct RawModeGuard {
     _private: (),
 }
@@ -146,10 +167,14 @@ impl RawModeGuard {
             return Ok(None);
         }
         install_panic_hook();
-        StdinTty
-            .set_raw_mode()
-            .map_err(|error| io::Error::from_raw_os_error(error.errno()))?;
-        RAW_MODE.store(true, Ordering::SeqCst);
+        let mut saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = match *saved {
+            // In raw mode already: what it had before that is restored.
+            Some(before) => before,
+            None => stdin_termios()?,
+        };
+        set_stdin_termios(&raw_termios(before))?;
+        *saved = Some(before);
         Ok(Some(RawModeGuard { _private: () }))
     }
 }
@@ -340,6 +365,25 @@ mod tests {
     use super::*;
 
     const MS: Duration = Duration::from_millis(1);
+
+    /// Raw mode leaves nothing to the line discipline that a reader needs:
+    /// no line editing, echo or signals, and Ctrl-S and Ctrl-Q are input,
+    /// not flow control; everything else, output processing included, is
+    /// as it was.
+    #[test]
+    fn raw_mode_lets_every_key_through_and_keeps_the_rest() {
+        // SAFETY: termios is plain data; all zeroes is valid.
+        let mut cooked: libc::termios = unsafe { std::mem::zeroed() };
+        cooked.c_iflag = libc::ICRNL | libc::IXON | libc::IUTF8;
+        cooked.c_oflag = libc::OPOST | libc::ONLCR;
+        cooked.c_cflag = libc::CS8 | libc::CREAD;
+        cooked.c_lflag = libc::ISIG | libc::ICANON | libc::ECHO | libc::ECHOE | libc::IEXTEN;
+        let raw = raw_termios(cooked);
+        assert_eq!(raw.c_iflag, libc::ICRNL | libc::IUTF8);
+        assert_eq!(raw.c_oflag, cooked.c_oflag);
+        assert_eq!(raw.c_cflag, cooked.c_cflag);
+        assert_eq!(raw.c_lflag, libc::ECHOE | libc::IEXTEN);
+    }
 
     #[test]
     fn double_press_needs_a_previous_press_within_one_second() {

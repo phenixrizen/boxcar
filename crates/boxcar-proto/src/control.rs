@@ -339,6 +339,83 @@ pub enum StopMode {
     Force,
 }
 
+/// The session's terminal the `pty.*` ops name: the only one, `main`.
+pub const PTY_SESSION: &str = "main";
+
+/// The parameters of `pty.attach`: `{"session":"main","mode":"rw"|"ro",
+/// "replay_bytes":N}`. The response is `{"raw":true}`, after which the
+/// connection is the terminal's bytes, both ways (see
+/// [`PtyMode`]); `replay_bytes` (0 when absent) of the terminal's latest
+/// output come first, at most the server's scrollback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyAttachParams {
+    /// [`PTY_SESSION`].
+    pub session: String,
+    pub mode: PtyMode,
+    #[serde(default)]
+    pub replay_bytes: u64,
+}
+
+/// How a client attaches to the session's terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyMode {
+    /// Read and write: what the client sends is typed into the session.
+    Rw,
+    /// Read only: what the client sends is discarded.
+    Ro,
+}
+
+/// The parameters of `pty.resize`: `{"session":"main","rows":R,"cols":C}`,
+/// each of `rows` and `cols` from 1 to 65535. The response is `{}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyResizeParams {
+    /// [`PTY_SESSION`].
+    pub session: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl PtyResizeParams {
+    /// Whether the size is one a terminal can have: neither side 0.
+    pub fn check(&self) -> Result<(), String> {
+        if self.rows == 0 || self.cols == 0 {
+            return Err(format!(
+                "a terminal of {} by {}: rows and cols are 1 to 65535",
+                self.rows, self.cols
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The reason of a [`PtyDetached`] whose client fell too far behind.
+pub const PTY_DETACHED_SLOW: &str = "slow";
+
+/// `{"v":1,"event":"pty.detached","reason":"slow"}`: the server detached
+/// the client from the session's terminal. It is the last line of an
+/// attached connection, after its last raw byte; the server then closes
+/// the connection. `slow`: the client left more of the terminal's output
+/// unread than the server keeps for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyDetached {
+    pub v: u32,
+    /// `"pty.detached"`.
+    pub event: String,
+    pub reason: String,
+}
+
+impl PtyDetached {
+    /// The client fell too far behind: [`PTY_DETACHED_SLOW`].
+    pub fn slow() -> PtyDetached {
+        PtyDetached {
+            v: VERSION,
+            event: "pty.detached".to_owned(),
+            reason: PTY_DETACHED_SLOW.to_owned(),
+        }
+    }
+}
+
 /// The one line `boxcar run --ready-fd N` writes to fd N once the control
 /// socket is bound: `{"ready":true,"control":"<path>","session_id":"<id>"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +790,64 @@ mod tests {
         assert_eq!(
             serde_json::to_value(StopParams::default()).unwrap(),
             json!({"mode": "graceful"})
+        );
+    }
+
+    /// `pty.attach` and `pty.resize` parameters, and `pty.detached`, on the
+    /// wire; a mode or a size outside the protocol does not parse or does
+    /// not check.
+    #[test]
+    fn pty_params_and_events_have_their_wire_shapes() {
+        let attach: PtyAttachParams =
+            serde_json::from_value(json!({"session": "main", "mode": "ro", "replay_bytes": 64}))
+                .unwrap();
+        assert_eq!(
+            attach,
+            PtyAttachParams {
+                session: PTY_SESSION.into(),
+                mode: PtyMode::Ro,
+                replay_bytes: 64
+            }
+        );
+        let rw: PtyAttachParams =
+            serde_json::from_value(json!({"session": "main", "mode": "rw", "extra": 1})).unwrap();
+        assert_eq!((rw.mode, rw.replay_bytes), (PtyMode::Rw, 0));
+        for bad in [
+            json!({"session": "main", "mode": "write"}),
+            json!({"session": "main"}),
+            json!({"mode": "rw"}),
+            json!({"session": "main", "mode": "rw", "replay_bytes": -1}),
+        ] {
+            assert!(
+                serde_json::from_value::<PtyAttachParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+
+        let resize: PtyResizeParams =
+            serde_json::from_value(json!({"session": "main", "rows": 40, "cols": 120})).unwrap();
+        assert_eq!((resize.rows, resize.cols), (40, 120));
+        assert_eq!(resize.check(), Ok(()));
+        let edge: PtyResizeParams =
+            serde_json::from_value(json!({"session": "main", "rows": 1, "cols": 65535})).unwrap();
+        assert_eq!(edge.check(), Ok(()));
+        let zero: PtyResizeParams =
+            serde_json::from_value(json!({"session": "main", "rows": 0, "cols": 80})).unwrap();
+        assert!(zero.check().is_err());
+        for bad in [
+            json!({"session": "main", "rows": 65536, "cols": 80}),
+            json!({"session": "main", "rows": 24}),
+            json!({"session": "main", "rows": -1, "cols": 80}),
+        ] {
+            assert!(
+                serde_json::from_value::<PtyResizeParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+
+        assert_eq!(
+            String::from_utf8(to_line(&PtyDetached::slow()).unwrap()).unwrap(),
+            "{\"v\":1,\"event\":\"pty.detached\",\"reason\":\"slow\"}\n"
         );
     }
 

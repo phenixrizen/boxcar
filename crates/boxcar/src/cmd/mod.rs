@@ -3,10 +3,11 @@
 
 //! The subcommands, one module each.
 
+mod attach;
 mod audit;
 mod doctor;
 mod nofile;
-mod run;
+pub(crate) mod run;
 mod status;
 mod stop;
 
@@ -48,6 +49,7 @@ fn tell_to(mut out: impl Write + Send + 'static, line: &str, limit: Duration) {
 /// Runs the command `cli` names and returns the process exit code.
 pub fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
+        Command::Attach(args) => attach::run(&args),
         Command::Audit(command) => audit::run(command),
         Command::Doctor => doctor::run(),
         Command::Run(args) => run::run(*args),

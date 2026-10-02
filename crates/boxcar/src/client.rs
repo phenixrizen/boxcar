@@ -2,8 +2,9 @@
 // Copyright 2026 The boxcar Authors
 
 //! The client side of the control socket: where each session's socket is,
-//! how `boxcar status` and `boxcar stop` find one, and a connection that
-//! speaks the protocol.
+//! how `boxcar status`, `boxcar stop` and `boxcar attach` find one, and a
+//! connection that speaks the protocol (and becomes a raw byte stream after
+//! `pty.attach`).
 //!
 //! Every session's state directory is `<root>/<session_id>/`, its socket
 //! `control.sock` in it. The root is `$XDG_RUNTIME_DIR/boxcar` when
@@ -20,6 +21,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
@@ -209,7 +212,40 @@ pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     path: PathBuf,
-    next_id: u64,
+    /// Shared with its [`Sender`]s.
+    next_id: Arc<AtomicU64>,
+}
+
+/// Sends requests on a [`Client`]'s connection without waiting for their
+/// responses, which the client's [`Client::next_message`] reads: for a
+/// thread other than the one that reads.
+pub struct Sender {
+    writer: UnixStream,
+    path: PathBuf,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Sender {
+    /// Sends `op` with `params` (an object, or null for none); returns the
+    /// request's id.
+    pub fn send(&mut self, op: &str, params: Value) -> anyhow::Result<u64> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        send_request(&mut self.writer, &self.path, id, op, params)?;
+        Ok(id)
+    }
+}
+
+fn send_request(
+    writer: &mut UnixStream,
+    path: &Path,
+    id: u64,
+    op: &str,
+    params: Value,
+) -> anyhow::Result<()> {
+    let line = to_line(&Request::new(id, op, params))?;
+    writer
+        .write_all(&line)
+        .with_context(|| format!("cannot send {op} to {}", path.display()))
 }
 
 impl Client {
@@ -227,7 +263,7 @@ impl Client {
             reader: BufReader::new(stream),
             writer,
             path: path.to_owned(),
-            next_id: 1,
+            next_id: Arc::new(AtomicU64::new(1)),
         };
         let line = client.read_line()?.ok_or_else(|| {
             anyhow!(
@@ -255,15 +291,35 @@ impl Client {
         self.reader.get_ref().set_read_timeout(timeout)
     }
 
+    /// The control socket's path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A [`Sender`] on this connection.
+    pub fn sender(&self) -> io::Result<Sender> {
+        Ok(Sender {
+            writer: self.writer.try_clone()?,
+            path: self.path.clone(),
+            next_id: Arc::clone(&self.next_id),
+        })
+    }
+
+    /// The connection as a raw byte stream, once an op has turned it into
+    /// one (`pty.attach`): the socket, with no read timeout, and the bytes
+    /// already read past the op's response, which come first.
+    pub fn into_raw(self) -> io::Result<(UnixStream, Vec<u8>)> {
+        let pending = self.reader.buffer().to_vec();
+        let stream = self.reader.into_inner();
+        stream.set_read_timeout(None)?;
+        Ok((stream, pending))
+    }
+
     /// Sends `op` with `params` (an object, or null for none) and returns
     /// its result, skipping the events that come before the response.
     pub fn request(&mut self, op: &str, params: Value) -> anyhow::Result<Result<Value, ErrorBody>> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let line = to_line(&Request::new(id, op, params))?;
-        self.writer
-            .write_all(&line)
-            .with_context(|| format!("cannot send {op} to {}", self.path.display()))?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        send_request(&mut self.writer, &self.path, id, op, params)?;
         loop {
             match self.next_message()? {
                 None => bail!(

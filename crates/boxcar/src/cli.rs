@@ -52,6 +52,25 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Attach this terminal to a running session's terminal.
+    ///
+    /// What the session prints shows here, starting with the last 64 KiB
+    /// it printed (see `--replay`), and what is typed here goes to the
+    /// session, every key included: several terminals may be attached at
+    /// once, and `boxcar run`'s own. The terminal is put in raw mode while
+    /// attached and restored after, and the session's terminal takes this
+    /// one's size, now and whenever it changes (the latest size any client
+    /// asks for wins). Press Ctrl-P then Ctrl-Q, within a second, to
+    /// detach: the session goes on, and the two keys are not sent (a Ctrl-P
+    /// not followed by Ctrl-Q is sent after all). The session is the one
+    /// `--control` or SESSION_ID names, or the only one running.
+    ///
+    /// Exits 0 on detach and when the session ends, 1 when the control
+    /// socket cannot be reached or refuses the attach, 3 when the session's
+    /// output came faster than this terminal took it and the VMM detached
+    /// it (it keeps at most 1 MiB for each client), and 128 plus the signal
+    /// after SIGINT, SIGTERM, SIGHUP or SIGQUIT.
+    Attach(AttachArgs),
     /// Work with audit logs.
     #[command(subcommand)]
     Audit(AuditCommand),
@@ -96,7 +115,12 @@ pub enum Command {
     /// the session's: every key goes to the guest, Ctrl-C included; press
     /// Ctrl-] twice within a second to stop the VM. With the vsock device,
     /// input from a pipe or a file goes to the session too, and its end is
-    /// an end-of-file there.
+    /// an end-of-file there; the session's terminal takes this one's size,
+    /// now and whenever it changes; and other terminals can attach to the
+    /// session (`boxcar attach`). The VMM never waits for stdout: when it
+    /// falls more than 1 MiB behind the session, what the session printed
+    /// in between is skipped, and once the VM has stopped boxcar says on
+    /// stderr how many bytes of the session's output stdout did not get.
     ///
     /// With shares the guest also gets a network card (see `--net`): it
     /// reaches only what the policy allows (`--policy-file`, `--deny`,
@@ -153,6 +177,20 @@ pub struct SessionArgs {
     /// Default: the one session running.
     #[arg(value_name = "SESSION_ID")]
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AttachArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// Attach read-only: what is typed is not sent (the detach keys still
+    /// work).
+    #[arg(long)]
+    pub ro: bool,
+    /// How much of what the session printed last to show first, in bytes:
+    /// at most the VMM's 256 KiB scrollback; 0 for none.
+    #[arg(long, value_name = "BYTES", default_value_t = 64 * 1024)]
+    pub replay: u64,
 }
 
 #[derive(Debug, Args)]

@@ -26,9 +26,11 @@ use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
 use boxcar_vmm::lifecycle::SignalFd;
-use boxcar_vmm::lifecycle::{block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
-use boxcar_vmm::pty_relay::{self, RelayHandle, RelayInput, RelayOutput, RelayWait};
-use boxcar_vmm::stdin::RawModeGuard;
+use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
+use boxcar_vmm::pty::input::{self, LocalInput};
+use boxcar_vmm::pty::out::{self, OutHandle, OutWait, Target};
+use boxcar_vmm::pty::{Mode, PtyHub};
+use boxcar_vmm::stdin::{stdin_is_tty, RawModeGuard};
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
 };
@@ -141,8 +143,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         client::ensure_sessions_root().context("cannot set up the control socket's directory")?;
 
     // Before any thread starts, so that every thread inherits the mask and
-    // the signals reach only the VMM's signalfd.
+    // the signals reach only the VMM's signalfd (and SIGWINCH only the
+    // session terminal's).
     block_stop_signals().context("cannot block the stop signals")?;
+    block_signals(&[libc::SIGWINCH]).context("cannot block SIGWINCH")?;
 
     let (sink, writer) = start_audit_log(WriterConfig::new(&audit_dir, session_id.clone()))
         .with_context(|| format!("cannot start the audit log under {}", audit_dir.display()))?;
@@ -218,10 +222,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                     ready.announce(path, &session_id);
                 }
             }
-            let mut relay = None;
+            let mut attached = None;
             if relayed {
-                match relay_session(&mut vmm, interactive) {
-                    Ok(handle) => relay = Some(handle),
+                match attach_session(&mut vmm, interactive) {
+                    Ok(local) => attached = Some(local),
                     Err(error) => {
                         // The VM was built, and its stop records vmm.stop:
                         // run it to a stop at once rather than leave the
@@ -235,9 +239,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             let outcome = vmm.run();
             // What the session printed last may still be on its way to a
             // slow stdout: it is written before boxcar exits, for as long as
-            // stdout keeps taking it (see `finish_relay`).
-            if let Some(relay) = relay {
-                if let Some(line) = finish_relay(&relay) {
+            // stdout keeps taking it (see `finish_output`).
+            if let Some(local) = attached {
+                if let Some(line) = finish_output(&local) {
                     tell(&line);
                 }
             }
@@ -662,35 +666,133 @@ fn check_cmdline_size(
 
 /// How long, once the VM has stopped, boxcar waits for a stdout that takes
 /// nothing more before it exits without the rest of the session's output.
-const RELAY_IDLE: Duration = Duration::from_secs(2);
+const OUTPUT_IDLE: Duration = Duration::from_secs(2);
 
 /// How long, once the VM has stopped, boxcar waits for the session's output
 /// at most, however steadily stdout takes it.
-const RELAY_CAP: Duration = Duration::from_secs(30);
+const OUTPUT_CAP: Duration = Duration::from_secs(30);
 
-/// Waits, once the VM has stopped, for the relay to write out the session's
-/// output: while stdout keeps taking bytes ([`RELAY_IDLE`]), for at most
-/// [`RELAY_CAP`], and not past another stop signal (`SIGINT`, `SIGTERM`,
-/// `SIGHUP`, `SIGQUIT`, still blocked and now read from a signalfd of its
-/// own). Returns the line to say when output was left behind.
-fn finish_relay(relay: &RelayHandle) -> Option<String> {
+/// How long the stdout writer, once the wait is over, gets to stop; and the
+/// PTY hub to have read the guest's last bytes. Either takes milliseconds.
+const STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// `boxcar run`'s own client of the session's terminal.
+struct LocalAttach {
+    hub: PtyHub,
+    /// Writes the session's output to stdout.
+    writer: OutHandle,
+}
+
+/// Attaches `boxcar run` to the session's terminal, in the same process,
+/// before the VM runs (so it gets the session's output from the first
+/// byte): the output to stdout ([`out`]); for an interactive run, stdin to
+/// the session ([`input`]), with the terminal in raw mode when stdin is
+/// one, restored by the VM's stop sequence; and when stdin is a terminal,
+/// its size to the session's, now and on every `SIGWINCH`.
+fn attach_session(vmm: &mut Vmm, interactive: bool) -> anyhow::Result<LocalAttach> {
+    let handle = vmm.handle();
+    let hub = handle
+        .pty()
+        .context("the VM has no terminal for its session")?;
+    let mode = if interactive { Mode::Rw } else { Mode::Ro };
+    let (_, output, typed) = hub.attach(mode, 0);
+    let stdout = Target::stdout().context("cannot write to stdout")?;
+    let writer = out::spawn(output, stdout, Some(hub.clone()))
+        .context("cannot write the session's output")?;
+    if let Some(typed) = typed {
+        let stdin = LocalInput::stdin().context("cannot read stdin")?;
+        input::forward(stdin, typed, handle).context("cannot send stdin to the session")?;
+    }
+    if stdin_is_tty() {
+        follow_terminal_size(&hub).context("cannot follow the terminal's size")?;
+        if interactive {
+            if let Some(guard) =
+                RawModeGuard::enter().context("cannot put the terminal in raw mode")?
+            {
+                vmm.restore_terminal_on_stop(guard);
+            }
+        }
+    }
+    Ok(LocalAttach { hub, writer })
+}
+
+/// Gives the session's terminal stdin's size now (the hub sends it once the
+/// session's terminal opens, unless that is its size already) and on every
+/// `SIGWINCH` (blocked since the start of the run, and read from a
+/// signalfd of its own on a thread of its own).
+fn follow_terminal_size(hub: &PtyHub) -> io::Result<()> {
+    let resize = |hub: &PtyHub| {
+        if let Some((rows, cols)) = stdin_terminal_size() {
+            // A size init cannot be told now is sent with the next change.
+            let _ = hub.resize(rows, cols);
+        }
+    };
+    resize(hub);
+    let winch = SignalFd::with(&[libc::SIGWINCH])?;
+    let hub = hub.clone();
+    std::thread::Builder::new()
+        .name("winch".into())
+        .spawn(move || loop {
+            let mut pollfd = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&winch),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads and writes the one pollfd it is given.
+            if unsafe { libc::poll(&mut pollfd, 1, -1) } < 0
+                && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+            {
+                return;
+            }
+            let mut changed = false;
+            loop {
+                match winch.read() {
+                    Ok(Some(_)) => changed = true,
+                    Ok(None) => break,
+                    Err(_) => return,
+                }
+            }
+            if changed {
+                resize(&hub);
+            }
+        })?;
+    Ok(())
+}
+
+/// Waits, once the VM has stopped, for the session's output to be written
+/// to stdout: while stdout keeps taking bytes ([`OUTPUT_IDLE`]), for at
+/// most [`OUTPUT_CAP`], and not past another stop signal (`SIGINT`,
+/// `SIGTERM`, `SIGHUP`, `SIGQUIT`, still blocked and now read from a
+/// signalfd of its own). Then stops the writer and counts what stdout did
+/// not get, exactly: the writer has stopped, and the hub read the guest's
+/// last bytes. Returns the line to say when output was left behind.
+fn finish_output(local: &LocalAttach) -> Option<String> {
     let signals = SignalFd::new().ok();
-    let ended = relay.wait_with(RELAY_IDLE, RELAY_CAP, || {
+    let ended = local.writer.wait_with(OUTPUT_IDLE, OUTPUT_CAP, || {
         signals
             .as_ref()
             .is_some_and(|signals| matches!(signals.read(), Ok(Some(_))))
     });
-    undelivered_line(ended, relay.undelivered())
+    local.writer.stop(STOP_GRACE);
+    local.hub.wait_ended(STOP_GRACE);
+    undelivered_line(
+        ended,
+        local.writer.fell_behind(),
+        local.writer.undelivered(),
+    )
 }
 
-/// The line `boxcar run` says when the relay's wait ended (`ended`) with
-/// `bytes` of the session's output not written: none when it is all out.
-fn undelivered_line(ended: RelayWait, bytes: u64) -> Option<String> {
+/// The line `boxcar run` says when the wait for stdout ended (`ended`) with
+/// `bytes` of the session's output not written, `fell_behind` when the hub
+/// detached the writer for being slow at some point: none when it is all
+/// out, or when stdout's reader is gone.
+fn undelivered_line(ended: OutWait, fell_behind: bool, bytes: u64) -> Option<String> {
     let why = match ended {
-        RelayWait::Done => return None,
-        RelayWait::Stalled => "stdout stalled",
-        RelayWait::Capped => "stdout still not done after 30 s",
-        RelayWait::Stopped => "stopped by a signal",
+        OutWait::Done if fell_behind => "stdout fell more than 1 MiB behind",
+        OutWait::Done | OutWait::Failed => return None,
+        OutWait::Stalled => "stdout stalled",
+        OutWait::Capped => "stdout still not done after 30 s",
+        OutWait::Stopped => "stopped by a signal",
     };
     if bytes == 0 {
         return None;
@@ -698,28 +800,6 @@ fn undelivered_line(ended: RelayWait, bytes: u64) -> Option<String> {
     Some(format!(
         "boxcar: {bytes} bytes of session output not delivered: {why}"
     ))
-}
-
-/// Registers the transitional PTY relay (until Task 12's hub) on `vmm`:
-/// the session's terminal to stdout and, for an interactive run, stdin to
-/// the session, with the terminal in raw mode when stdin is one, restored
-/// by the VM's stop sequence.
-fn relay_session(vmm: &mut Vmm, interactive: bool) -> anyhow::Result<RelayHandle> {
-    let input = if interactive {
-        Some(RelayInput::stdin().context("cannot read stdin")?)
-    } else {
-        None
-    };
-    let tty = input.as_ref().is_some_and(|input| input.tty);
-    let out = RelayOutput::stdout().context("cannot write to stdout")?;
-    let relay = pty_relay::register(&vmm.handle().services(), out, input, vmm.handle())
-        .context("cannot serve the session's terminal")?;
-    if tty {
-        if let Some(guard) = RawModeGuard::enter().context("cannot put the terminal in raw mode")? {
-            vmm.restore_terminal_on_stop(guard);
-        }
-    }
-    Ok(relay)
 }
 
 /// The name of the serial console's file in the state directory, in vsock
@@ -762,8 +842,8 @@ fn create_console_log(state_dir: &Path, path: &Path) -> anyhow::Result<()> {
 }
 
 /// The size of the terminal on stdin (`TIOCGWINSZ`), rows then columns,
-/// when stdin is a terminal.
-fn stdin_terminal_size() -> Option<(u16, u16)> {
+/// when stdin is a terminal that has one (neither side 0).
+pub(crate) fn stdin_terminal_size() -> Option<(u16, u16)> {
     if !boxcar_vmm::stdin::stdin_is_tty() {
         return None;
     }
@@ -772,7 +852,7 @@ fn stdin_terminal_size() -> Option<(u16, u16)> {
     // SAFETY: TIOCGWINSZ stores one winsize through its argument, which
     // points at `size`, alive for the call.
     let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut size) };
-    (rc == 0).then_some((size.ws_row, size.ws_col))
+    (rc == 0 && size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
 }
 
 /// The session's terminal size: the host's, when it has one with neither
@@ -1011,29 +1091,40 @@ mod tests {
         assert_eq!(cfg.cwd, "/");
     }
 
-    /// What is said when the relay's wait leaves output behind: one line
+    /// What is said when the wait for stdout leaves output behind: one line
     /// with the count and why; nothing when it is all out.
     #[test]
     fn output_left_behind_is_said_with_its_count() {
-        assert_eq!(undelivered_line(RelayWait::Done, 0), None);
+        assert_eq!(undelivered_line(OutWait::Done, false, 0), None);
         assert_eq!(
-            undelivered_line(RelayWait::Stalled, 113_000).as_deref(),
+            undelivered_line(OutWait::Stalled, false, 113_000).as_deref(),
             Some("boxcar: 113000 bytes of session output not delivered: stdout stalled")
         );
         assert_eq!(
-            undelivered_line(RelayWait::Capped, 5).as_deref(),
+            undelivered_line(OutWait::Capped, false, 5).as_deref(),
             Some(
                 "boxcar: 5 bytes of session output not delivered: stdout still not done after 30 s"
             )
         );
         assert_eq!(
-            undelivered_line(RelayWait::Stopped, 7).as_deref(),
+            undelivered_line(OutWait::Stopped, true, 7).as_deref(),
             Some("boxcar: 7 bytes of session output not delivered: stopped by a signal")
         );
+        // The writer finished, but the hub had detached it for being slow:
+        // the bytes it skipped.
+        assert_eq!(
+            undelivered_line(OutWait::Done, true, 2_000_000).as_deref(),
+            Some(
+                "boxcar: 2000000 bytes of session output not delivered: stdout fell more than \
+                 1 MiB behind"
+            )
+        );
+        // Stdout's reader is gone: nothing to say, as before.
+        assert_eq!(undelivered_line(OutWait::Failed, false, 9), None);
         // Given up with nothing left (it finished meanwhile): nothing to say.
-        assert_eq!(undelivered_line(RelayWait::Stalled, 0), None);
-        assert_eq!(RELAY_CAP, Duration::from_secs(30));
-        assert_eq!(RELAY_IDLE, Duration::from_secs(2));
+        assert_eq!(undelivered_line(OutWait::Stalled, false, 0), None);
+        assert_eq!(OUTPUT_CAP, Duration::from_secs(30));
+        assert_eq!(OUTPUT_IDLE, Duration::from_secs(2));
     }
 
     #[test]

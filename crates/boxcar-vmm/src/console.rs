@@ -86,14 +86,15 @@ pub struct ConsoleStats {
     pub dropped_bytes: u64,
 }
 
-/// The ring, and its overflow rule.
-struct Ring {
+/// The ring, and its overflow rule: the console's, and the PTY hub's
+/// scrollback.
+pub(crate) struct Ring {
     bytes: VecDeque<u8>,
     capacity: usize,
 }
 
 impl Ring {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Ring {
             // Allocated once: a push never allocates under the mutex.
             bytes: VecDeque::with_capacity(capacity),
@@ -104,7 +105,7 @@ impl Ring {
     /// Appends `data`; when it does not all fit, drops the oldest bytes
     /// (the ring's own first, then the front of `data` itself when it is
     /// longer than the ring). Returns how many it dropped.
-    fn push(&mut self, data: &[u8]) -> usize {
+    pub(crate) fn push(&mut self, data: &[u8]) -> usize {
         let keep = data.len().min(self.capacity);
         let from_data = data.len() - keep;
         let from_ring = (self.bytes.len() + keep).saturating_sub(self.capacity);
@@ -118,6 +119,15 @@ impl Ring {
         let count = self.bytes.len().min(max);
         out.extend(self.bytes.drain(..count));
         count
+    }
+
+    /// A copy of the newest `max` bytes (all of them when it holds fewer).
+    pub(crate) fn tail(&self, max: usize) -> Vec<u8> {
+        let count = self.bytes.len().min(max);
+        self.bytes
+            .range(self.bytes.len() - count..)
+            .copied()
+            .collect()
     }
 }
 
@@ -664,6 +674,12 @@ mod tests {
         let mut ring = Ring::new(4);
         assert_eq!(ring.push(b"abcd"), 0);
         assert_eq!(ring.push(b"e"), 1);
+        assert_eq!(contents(&ring), b"bcde");
+
+        // The tail is a copy of the newest bytes, at most what it holds.
+        assert_eq!(ring.tail(2), b"de");
+        assert_eq!(ring.tail(100), b"bcde");
+        assert_eq!(ring.tail(0), b"");
         assert_eq!(contents(&ring), b"bcde");
 
         let mut out = Vec::new();

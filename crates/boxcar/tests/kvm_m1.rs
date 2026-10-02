@@ -426,30 +426,31 @@ fn the_last_line_of_a_command_is_never_lost() {
     assert!(lost.is_empty(), "lost in runs {lost:?}");
 }
 
-/// How many times the relay's last-line test runs its command.
-const RELAY_MARK_RUNS: usize = 20;
+/// How many times the PTY hub's last-line test runs its command.
+const HUB_MARK_RUNS: usize = 20;
 
 /// The same in vsock mode: init drains the session's PTY to the terminal
-/// stream and waits for the relay to have written it out before it
-/// reboots, so the last line is on stdout every time.
+/// stream and waits for the PTY hub to have read it before it reboots, and
+/// `boxcar run` writes out what its own client of the hub holds before it
+/// exits, so the last line is on stdout every time.
 #[test]
-fn the_last_line_reaches_stdout_through_the_relay() {
-    let Some(guest) = guest_or_skip("kvm_m1 relay mark") else {
+fn the_last_line_reaches_stdout_through_the_pty_hub() {
+    let Some(guest) = guest_or_skip("kvm_m1 hub mark") else {
         return;
     };
     let mut lost = Vec::new();
-    for run_no in 1..=RELAY_MARK_RUNS {
+    for run_no in 1..=HUB_MARK_RUNS {
         let scratch = Scratch::new();
         let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
         assert_eq!(run.status.code(), Some(0), "{}", run.describe());
         if run.stdout != "MARK_END\r\n" {
-            eprintln!("kvm_m1 relay mark: run {run_no} got {:?}", run.stdout);
+            eprintln!("kvm_m1 hub mark: run {run_no} got {:?}", run.stdout);
             lost.push(run_no);
         }
     }
     eprintln!(
-        "kvm_m1 relay mark: MARK_END in {} of {RELAY_MARK_RUNS} runs",
-        RELAY_MARK_RUNS - lost.len()
+        "kvm_m1 hub mark: MARK_END in {} of {HUB_MARK_RUNS} runs",
+        HUB_MARK_RUNS - lost.len()
     );
     assert!(lost.is_empty(), "lost in runs {lost:?}");
 }
@@ -457,9 +458,10 @@ fn the_last_line_reaches_stdout_through_the_relay() {
 /// The reviewer's stdout probe as a test: stdout is a non-blocking pipe
 /// (`EAGAIN` once full) whose reader stalls a second while the session
 /// prints 300,000 bytes, then reads slowly. Every byte arrives, in order,
-/// and the run exits 0: the relay waits out `EAGAIN`, backpressure holds
-/// the session, init's drain counts from the last byte the host took, and
-/// `boxcar run` writes out what the relay holds before it exits.
+/// and the run exits 0: the PTY hub takes the session's output as it comes
+/// (300,000 bytes is under the 1 MiB it keeps for a client), the stdout
+/// writer waits out `EAGAIN`, and `boxcar run` writes out what it holds
+/// before it exits.
 #[test]
 fn a_slow_non_blocking_stdout_gets_all_of_the_session() {
     use std::io::Read;

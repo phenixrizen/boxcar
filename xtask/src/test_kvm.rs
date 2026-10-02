@@ -40,9 +40,12 @@ enum Milestone {
     /// M2's own target exists (Task 15), this also runs the M2 gated tests
     /// of the same packages, such as `boot_net` (the guest's network, which
     /// skips when `BOXCAR_TEST_NET=0` or the host cannot reach example.com),
-    /// `boot_vsock` (the vsock device and its host socket) and
+    /// `boot_vsock` (the vsock device and its host socket),
     /// `boot_session` (init's vsock mode: the guest control channel, the
-    /// session's terminal, its exit code and a graceful stop).
+    /// session's terminal, its exit code and a graceful stop) and
+    /// `boot_attach` (`pty.attach` and `pty.resize` over the control
+    /// socket: typing into a login shell, resizing it, a read-only second
+    /// client).
     M1,
 }
 

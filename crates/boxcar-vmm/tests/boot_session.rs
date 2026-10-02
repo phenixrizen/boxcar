@@ -2,14 +2,15 @@
 // Copyright 2026 The boxcar Authors
 
 //! The session over vsock: init in vsock mode with the Alpine rootfs and
-//! the vsock device, the guest control channel on port 1024 and the
-//! transitional PTY relay on 1025 writing the session's terminal to a file.
+//! the vsock device, the guest control channel on port 1024 and the PTY hub
+//! on 1025, with a client of the hub writing the session's terminal to a
+//! file (as `boxcar run` writes it to stdout).
 //!
 //! What it proves:
 //!
 //! - init connects the control channel and the terminal from privileged
 //!   ports, gets its config, and runs the session on a PTY: what the
-//!   session prints reaches the relay's output;
+//!   session prints reaches the hub's client;
 //! - the session's exit code comes back as the run's (7), a session killed
 //!   by a signal as 128 plus it (137), and the log has `session.start`
 //!   (argv, pid) and `session.exit` (code or signal);
@@ -53,7 +54,8 @@ use boxcar_proto::{Record, SessionId};
 use boxcar_vmm::guest_ctl::SessionConfig;
 use boxcar_vmm::kvm::kvm_available;
 use boxcar_vmm::lifecycle::exit_code_for;
-use boxcar_vmm::pty_relay;
+use boxcar_vmm::pty::out::{self, OutWait, Target};
+use boxcar_vmm::pty::Mode;
 use boxcar_vmm::vmm::{ConsoleOut, ControlConfig, StopReason, VmConfig, VmExit, Vmm, VmmHandle};
 use boxcar_vsock::VsockConfig;
 
@@ -151,7 +153,7 @@ struct Beside {
     handle: VmmHandle,
     /// The control socket.
     control: PathBuf,
-    /// The relay's output: the session's terminal.
+    /// The hub's client's output: the session's terminal.
     out: PathBuf,
 }
 
@@ -184,8 +186,8 @@ impl Beside {
     }
 }
 
-/// Boots `argv` as the session in vsock mode, with the relay writing to
-/// `session.out` and the control socket in `state/`; `during` runs beside
+/// Boots `argv` as the session in vsock mode, with a client of the hub
+/// writing to `session.out` and the control socket in `state/`; `during` runs beside
 /// the VM. A watchdog stops a VM that does not end within [`LIMIT`].
 fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Run> {
     let (kernel, initramfs, rootfs) = guest_or_skip(TEST)?;
@@ -219,13 +221,9 @@ fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Ru
     };
     let vmm = Vmm::new(cfg).unwrap();
     let out = File::create(dir.path().join("session.out")).unwrap();
-    let relay = pty_relay::register(
-        &vmm.handle().services(),
-        pty_relay::RelayOutput::file(out),
-        None,
-        vmm.handle(),
-    )
-    .unwrap();
+    let hub = vmm.handle().pty().expect("the hub, with the vsock device");
+    let (_, output, _) = hub.attach(Mode::Ro, 0);
+    let session_out = out::spawn(output, Target::file(out), None).unwrap();
     let control = vmm.control_path().unwrap().to_owned();
 
     let handle = vmm.handle();
@@ -246,9 +244,10 @@ fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Ru
     let started = Instant::now();
     let exit = vmm.run().unwrap();
     let stopped_at = Instant::now();
-    assert!(
-        relay.wait(Duration::from_secs(2)),
-        "the relay did not finish"
+    assert_eq!(
+        session_out.wait(Duration::from_secs(2)),
+        OutWait::Done,
+        "the session's output was not all written"
     );
     let elapsed = started.elapsed();
     drop(done);
