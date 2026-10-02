@@ -947,3 +947,125 @@ fn an_audit_log_failure_stops_the_vm_and_exits_3() {
         "vmm.stop was refused"
     );
 }
+
+/// A `-- CMD` run started in the background from an interactive shell does
+/// not take the terminal: it is not in the terminal's foreground process
+/// group, so it neither reads it (which would stop it with `SIGTTIN`) nor
+/// puts it in raw mode, and it runs to its end, its output on the
+/// terminal.
+#[test]
+fn a_run_started_in_the_background_does_not_take_the_terminal() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let Some(guest) = guest_or_skip("kvm_m1 background run") else {
+        return;
+    };
+    if !Path::new("/bin/bash").exists() {
+        eprintln!("skipping kvm_m1 background run: no /bin/bash for an interactive shell");
+        return;
+    }
+    let scratch = Scratch::new();
+    let (master, slave) = openpty();
+    let mut shell = Command::new("/bin/bash");
+    shell
+        .args(["--norc", "--noprofile", "-i"])
+        .env("PS1", "PROMPT$ ")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()));
+    // SAFETY: setsid and the ioctl are async-signal-safe; the terminal on
+    // stdin becomes the new session's controlling terminal, its foreground
+    // the shell's group.
+    unsafe {
+        shell.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut shell = shell.spawn().unwrap();
+    drop(slave);
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let shown = Arc::clone(&shown);
+        let done = Arc::clone(&done);
+        let mut master = master.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !done.load(Ordering::Acquire) {
+                let mut pollfd = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll reads and writes the one pollfd it is given.
+                if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                    match master.read(&mut buf) {
+                        Ok(n) if n > 0 => shown.lock().unwrap().extend_from_slice(&buf[..n]),
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
+        })
+    };
+    let text = || String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    let wait_for = |what: &str| {
+        let start = Instant::now();
+        while !text().contains(what) {
+            if start.elapsed() > LIMIT {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    };
+    assert!(wait_for("PROMPT$ "), "no prompt:\n{}", text());
+    let run = format!(
+        "{} run --kernel {} --initramfs {} --rootfs {} --workspace {} --audit-dir {} \
+         --console-log {} -- /bin/sh -c 'echo BG_$((40+2))' & wait $!; echo EXIT_$?\r",
+        env!("CARGO_BIN_EXE_boxcar"),
+        guest.kernel.display(),
+        guest.initramfs.display(),
+        guest.rootfs.display(),
+        scratch.workspace().display(),
+        scratch.path("audit").display(),
+        scratch.path("console.log").display(),
+    );
+    (&master).write_all(run.as_bytes()).unwrap();
+    // `EXIT_` and a digit: the shell's own echo of the line has `EXIT_$?`.
+    let ended = {
+        let start = Instant::now();
+        loop {
+            let now = text();
+            let code = now
+                .match_indices("EXIT_")
+                .any(|(at, _)| now[at + 5..].starts_with(|c: char| c.is_ascii_digit()));
+            if code {
+                break true;
+            }
+            if start.elapsed() > LIMIT {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    thread::sleep(Duration::from_millis(300));
+    let shown_now = text();
+    let _ = (&master).write_all(b"kill -9 %1 2>/dev/null; exit\r");
+    thread::sleep(Duration::from_millis(500));
+    let _ = shell.kill();
+    let _ = shell.wait();
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    eprintln!("kvm_m1 background run: {shown_now:?}");
+    assert!(ended, "the background run did not end:\n{shown_now}");
+    assert!(!shown_now.contains("Stopped"), "{shown_now}");
+    assert!(shown_now.contains("\nBG_42\r"), "{shown_now}");
+    assert!(shown_now.contains("EXIT_0"), "{shown_now}");
+}

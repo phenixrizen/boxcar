@@ -14,6 +14,7 @@
 //! is not this user's own, or that others can enter, is refused, by `run`
 //! and by the lookups alike.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Write};
@@ -214,6 +215,10 @@ pub struct Client {
     path: PathBuf,
     /// Shared with its [`Sender`]s.
     next_id: Arc<AtomicU64>,
+    /// What [`Client::request`] read past while it waited for its response,
+    /// in order: [`Client::next_message`] returns these first, so no event
+    /// is lost to a request.
+    pending: VecDeque<Message>,
 }
 
 /// Sends requests on a [`Client`]'s connection without waiting for their
@@ -264,6 +269,7 @@ impl Client {
             writer,
             path: path.to_owned(),
             next_id: Arc::new(AtomicU64::new(1)),
+            pending: VecDeque::new(),
         };
         let line = client.read_line()?.ok_or_else(|| {
             anyhow!(
@@ -316,12 +322,13 @@ impl Client {
     }
 
     /// Sends `op` with `params` (an object, or null for none) and returns
-    /// its result, skipping the events that come before the response.
+    /// its result. What comes before the response (events, other
+    /// responses) is kept for [`Client::next_message`].
     pub fn request(&mut self, op: &str, params: Value) -> anyhow::Result<Result<Value, ErrorBody>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         send_request(&mut self.writer, &self.path, id, op, params)?;
         loop {
-            match self.next_message()? {
+            match self.read_message()? {
                 None => bail!(
                     "{} closed the connection before answering",
                     self.path.display()
@@ -329,13 +336,22 @@ impl Client {
                 Some(Message::Response(response)) if response.id == id => {
                     return Ok(response.into_result())
                 }
-                Some(_) => {}
+                Some(other) => self.pending.push_back(other),
             }
         }
     }
 
-    /// The next message, or `None` once the server closed the connection.
+    /// The next message (what a request read past first), or `None` once
+    /// the server closed the connection.
     pub fn next_message(&mut self) -> anyhow::Result<Option<Message>> {
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(Some(message));
+        }
+        self.read_message()
+    }
+
+    /// The next message on the wire.
+    fn read_message(&mut self) -> anyhow::Result<Option<Message>> {
         let Some(line) = self.read_line()? else {
             return Ok(None);
         };

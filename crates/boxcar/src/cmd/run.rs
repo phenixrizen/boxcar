@@ -30,7 +30,7 @@ use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, exit_code_for, AU
 use boxcar_vmm::pty::input::{self, LocalInput};
 use boxcar_vmm::pty::out::{self, OutHandle, OutWait, Target};
 use boxcar_vmm::pty::{Mode, PtyHub};
-use boxcar_vmm::stdin::{stdin_is_tty, RawModeGuard};
+use boxcar_vmm::stdin::{stdin_is_foreground_tty, stdin_is_tty, RawModeGuard};
 use boxcar_vmm::vmm::{
     cmdline_size, ConsoleOut, ControlConfig, VmConfig, VmExit, Vmm, CMDLINE_MAX_SIZE,
 };
@@ -190,9 +190,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
     // A command needs no input: the terminal stays as it is.
     let interactive = args.command.is_empty();
-    // In vsock mode stdin goes to the session's terminal: always without a
-    // command, and for a command when stdin is a terminal or with --stdin.
-    let forward_stdin = interactive || stdin_is_tty() || args.stdin;
+    // In vsock mode stdin goes to the session's terminal: a terminal only
+    // while this process is in its foreground (a run started in the
+    // background leaves it to the shell: reading it would stop the run with
+    // SIGTTIN); a pipe or a file without a command, or with --stdin.
+    let forward_stdin = if stdin_is_tty() {
+        stdin_is_foreground_tty()
+    } else {
+        interactive || args.stdin
+    };
     let cfg = VmConfig {
         kernel: args.kernel,
         initramfs: args.initramfs,

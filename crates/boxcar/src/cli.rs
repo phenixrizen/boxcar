@@ -56,7 +56,9 @@ pub enum Command {
     ///
     /// What the session prints shows here, starting with the last 64 KiB
     /// it printed (see `--replay`), and what is typed here goes to the
-    /// session, every key included: several terminals may be attached at
+    /// session, every key included (only while `boxcar attach` is in the
+    /// foreground: one in the background just shows the session): several
+    /// terminals may be attached at
     /// once, and `boxcar run`'s own. The terminal is put in raw mode while
     /// attached and restored after, and the session's terminal takes this
     /// one's size, now and whenever it changes (the latest size any client
@@ -113,7 +115,10 @@ pub enum Command {
     /// escape, 143 after SIGTERM, 129 after SIGHUP and 131 after SIGQUIT.
     /// When stdin is a terminal, the terminal is the session's: every key
     /// goes to the guest, Ctrl-C included; press Ctrl-] twice within a
-    /// second to stop the VM. With the vsock device this holds for a `--
+    /// second to stop the VM. A run started in the background (`boxcar run
+    /// ... &`), or moved there, does not take the terminal: it reads no key
+    /// from it and leaves its settings to the shell; the session's output
+    /// still shows. With the vsock device this holds for a `--
     /// CMD` run too, and input from a pipe or a file goes to the session as
     /// well when no command is given (or with `--stdin`), its end an
     /// end-of-file there; the session's terminal takes this one's size, now

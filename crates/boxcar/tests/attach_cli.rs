@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boxcar_proto::control::{to_line, Hello, PtyDetached, Response};
+use boxcar_proto::control::{to_line, ErrorBody, ErrorCode, Hello, PtyDetached, Response};
 use serde_json::{json, Value};
 
 const SESSION: &str = "01999a8e-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
@@ -34,10 +34,21 @@ enum Terminal {
     DetachSlow,
     /// Runs the script on the stream, then closes it.
     Script(fn(&mut UnixStream)),
+    /// Ends the attach as slow 100 ms after it began, telling a watcher if
+    /// one is there by then; a later `pty.watch` is `not_found`, and
+    /// `pty.resize` takes 300 ms to answer.
+    EndsSlowEarly,
 }
 
-/// The connection that sent `pty.watch`, for the attached one to tell.
-type Watching = Arc<Mutex<Option<UnixStream>>>;
+/// The connection that sent `pty.watch`, for the attached one to tell, and
+/// whether the attach has ended.
+#[derive(Default)]
+struct WatchState {
+    watcher: Option<UnixStream>,
+    ended: bool,
+}
+
+type Watching = Arc<Mutex<WatchState>>;
 
 /// What the fake server saw.
 #[derive(Debug, Default)]
@@ -107,7 +118,7 @@ fn serve(mut stream: UnixStream, terminal: Terminal, watching: &Watching) -> See
                         // The event goes to the watcher, before the end.
                         let deadline = Instant::now() + Duration::from_secs(5);
                         loop {
-                            if let Some(watcher) = watching.lock().unwrap().as_mut() {
+                            if let Some(watcher) = watching.lock().unwrap().watcher.as_mut() {
                                 let event = to_line(&PtyDetached::slow(ATTACH_ID)).unwrap();
                                 let _ = watcher.write_all(&event);
                                 break;
@@ -123,14 +134,36 @@ fn serve(mut stream: UnixStream, terminal: Terminal, watching: &Watching) -> See
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return seen;
                     }
+                    Terminal::EndsSlowEarly => {
+                        thread::sleep(Duration::from_millis(100));
+                        let mut state = watching.lock().unwrap();
+                        state.ended = true;
+                        if let Some(watcher) = state.watcher.as_mut() {
+                            let event = to_line(&PtyDetached::slow(ATTACH_ID)).unwrap();
+                            let _ = watcher.write_all(&event);
+                        }
+                        drop(state);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return seen;
+                    }
                 }
             }
             "pty.resize" => {
+                if matches!(terminal, Terminal::EndsSlowEarly) {
+                    thread::sleep(Duration::from_millis(300));
+                }
                 let _ = stream.write_all(&to_line(&Response::success(id, json!({}))).unwrap());
             }
             "pty.watch" => {
-                let _ = stream.write_all(&to_line(&Response::success(id, json!({}))).unwrap());
-                *watching.lock().unwrap() = Some(stream.try_clone().unwrap());
+                let mut state = watching.lock().unwrap();
+                let response = if state.ended {
+                    let error = ErrorBody::new(ErrorCode::NotFound, "it has ended");
+                    Response::failure(id, error)
+                } else {
+                    state.watcher = Some(stream.try_clone().unwrap());
+                    Response::success(id, json!({}))
+                };
+                let _ = stream.write_all(&to_line(&response).unwrap());
             }
             other => panic!("unexpected op {other}"),
         }
@@ -483,6 +516,76 @@ fn the_detach_keys_work_from_a_terminal_and_it_is_restored() {
     let seen = connections(&seen, 2);
     let typed: Vec<u8> = seen.iter().flat_map(|seen| seen.typed.clone()).collect();
     assert_eq!(typed, b"ab", "{}", describe(&output));
+}
+
+/// From a terminal, `boxcar attach` watches its attach before it sends its
+/// size: an attach the server ends as slow at once (a flooding session)
+/// is still reported, and exits 3, however long the resize takes.
+#[test]
+fn the_attach_is_watched_before_the_resize() {
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let seen = fake_server(&socket, Terminal::EndsSlowEarly);
+    let (master, slave) = {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty writes two new descriptors; the name, termios and
+        // winsize arguments may be null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: both are new descriptors that nothing else owns.
+        unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+    };
+    let size = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads one winsize, alive for the call.
+    assert_eq!(
+        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("attach")
+        .arg("--control")
+        .arg(&socket)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (done, finished) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let output = child.wait_with_output().unwrap();
+        let _ = done.send(());
+        output
+    });
+    finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("boxcar attach did not exit");
+    let output = waiter.join().unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", describe(&output));
+    let seen = connections(&seen, 2);
+    let ops: Vec<&str> = seen
+        .iter()
+        .flat_map(|seen| &seen.requests)
+        .filter(|request| request["op"] != "pty.attach")
+        .map(|request| request["op"].as_str().unwrap())
+        .collect();
+    assert_eq!(ops, ["pty.watch", "pty.resize"], "{}", describe(&output));
+    drop(master);
 }
 
 /// No server: a connection error, exit 1.

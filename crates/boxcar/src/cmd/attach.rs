@@ -3,6 +3,12 @@
 
 //! `boxcar attach`: a running session's terminal, from this one.
 //!
+//! This terminal is read, and put in raw mode, only while `boxcar attach`
+//! is in its foreground process group: one started in the background
+//! (`boxcar attach &`) only shows the session, and one moved there later
+//! stops reading (its stdin thread blocks `SIGTTIN`, so a read fails rather
+//! than stopping it) and leaves the terminal's settings to the shell.
+//!
 //! Two connections to the session's control socket: one asks `pty.attach`
 //! and becomes the terminal's raw bytes, both ways, and nothing else; the
 //! other watches that attach (`pty.watch`, by the id the attach's response
@@ -37,7 +43,10 @@ use anyhow::{anyhow, Context};
 use boxcar_proto::control::{PtyAttached, PTY_DETACHED_SLOW, PTY_SESSION};
 use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, SignalFd, STOP_SIGNALS};
 use boxcar_vmm::pty::out::Target;
-use boxcar_vmm::stdin::{stdin_is_tty, RawModeGuard};
+use boxcar_vmm::stdin::{
+    block_job_control_signals, forget_terminal, is_foreground, stdin_is_foreground_tty,
+    stdin_is_tty, RawModeGuard,
+};
 use serde_json::json;
 
 use crate::cli::AttachArgs;
@@ -58,6 +67,10 @@ const SLOW_EXIT: u8 = 3;
 /// How long, after the stream's end, `boxcar attach` waits for the reason
 /// on the watching connection.
 const REASON_WAIT: Duration = Duration::from_millis(500);
+
+/// How long the stdin thread waits for terminal input before it looks
+/// again at whether `boxcar attach` is still in the foreground.
+const FOREGROUND_STEP: Duration = Duration::from_millis(200);
 
 /// Bytes moved at a time.
 const CHUNK: usize = 16 * 1024;
@@ -165,16 +178,20 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
         .ok()
         .map(|attached| attached.attach_id);
 
+    // Watched first: an attach the server detaches early (a session that
+    // floods it) is still heard of.
+    if let Some(attach_id) = &attach_id {
+        // An attach that has ended already is not found: its stream ends.
+        let _ = control.request("pty.watch", json!({"attach_id": attach_id}))?;
+    }
     let tty = stdin_is_tty();
+    // A terminal is read, and made raw, only from its foreground.
+    let reads_stdin = !tty || stdin_is_foreground_tty();
     if tty {
         if let Some(size) = stdin_terminal_size() {
             // A size the server refuses leaves the session's as it is.
             let _ = control.request("pty.resize", resize_params(size))?;
         }
-    }
-    if let Some(attach_id) = &attach_id {
-        // An attach that has ended already is not found: its stream ends.
-        let _ = control.request("pty.watch", json!({"attach_id": attach_id}))?;
     }
     control.set_timeout(None)?;
     let sender = control.sender()?;
@@ -188,13 +205,17 @@ pub fn run(args: &AttachArgs) -> anyhow::Result<ExitCode> {
     let to_session = stream.try_clone()?;
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
 
-    let terminal = RawModeGuard::enter().context("cannot put the terminal in raw mode")?;
-    {
+    let terminal = if reads_stdin {
+        RawModeGuard::enter().context("cannot put the terminal in raw mode")?
+    } else {
+        None
+    };
+    if reads_stdin {
         let ending = Arc::clone(&ending);
         let ro = args.ro;
         thread::Builder::new()
             .name("attach-stdin".into())
-            .spawn(move || forward_input(stdin, &to_session, ro, &ending))?;
+            .spawn(move || forward_input(stdin, tty, &to_session, ro, &ending))?;
     }
     {
         let ending = Arc::clone(&ending);
@@ -274,7 +295,21 @@ fn copy_out(
 /// Stdin to the session, but for the detach keys, which end the attach;
 /// in read-only mode only the keys count. At the end of stdin, the
 /// session's side of the stream is closed for sending: the output goes on.
-fn forward_input(mut stdin: File, to_session: &UnixStream, ro: bool, ending: &Ending) {
+/// A terminal is read only while `boxcar attach` is in its foreground (see
+/// the module docs): once in the background, the thread stops, and the
+/// attach goes on.
+fn forward_input(
+    mut stdin: File,
+    terminal: bool,
+    to_session: &UnixStream,
+    ro: bool,
+    ending: &Ending,
+) {
+    // A read from the background then fails (EIO) rather than stopping the
+    // process; only this thread's mask changes.
+    let _ = block_job_control_signals();
+    let fd = stdin.as_raw_fd();
+    let in_background = || terminal && !is_foreground(fd);
     let mut keys = DetachKeys::default();
     let mut buf = vec![0u8; CHUNK];
     let send = |bytes: &[u8]| -> bool {
@@ -285,11 +320,21 @@ fn forward_input(mut stdin: File, to_session: &UnixStream, ro: bool, ending: &En
         to_session.write_all(bytes).is_ok()
     };
     loop {
+        if in_background() {
+            forget_terminal();
+            return;
+        }
         // While a Ctrl-P waits for its Ctrl-Q, stdin is read with a
-        // deadline: a lone Ctrl-P is sent once the window has passed.
-        if let Some(deadline) = keys.deadline() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if !readable(&stdin, left) {
+        // deadline: a lone Ctrl-P is sent once the window has passed. A
+        // terminal is waited on in steps, to look at the foreground again.
+        let mut wait = keys
+            .deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if terminal {
+            wait = Some(wait.map_or(FOREGROUND_STEP, |wait| wait.min(FOREGROUND_STEP)));
+        }
+        if let Some(wait) = wait {
+            if !readable(&stdin, wait) {
                 if let Some(byte) = keys.expire(Instant::now()) {
                     if !send(&[byte]) {
                         return;
@@ -297,11 +342,20 @@ fn forward_input(mut stdin: File, to_session: &UnixStream, ro: bool, ending: &En
                 }
                 continue;
             }
+            if in_background() {
+                forget_terminal();
+                return;
+            }
         }
         let n = match stdin.read(&mut buf) {
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
+            Err(error) => {
+                if terminal && error.raw_os_error() == Some(libc::EIO) {
+                    forget_terminal();
+                }
+                return;
+            }
         };
         if n == 0 {
             if let Some(byte) = keys.release() {

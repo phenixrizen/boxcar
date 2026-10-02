@@ -16,16 +16,32 @@
 //! waiting ([`Input::send`]): what the queue has no room for (a session
 //! that reads nothing, a large paste) is dropped and counted, so that the
 //! reads, and the escape, never stop.
+//!
+//! A terminal is read only while `boxcar run` is in its foreground process
+//! group (`boxcar run` forwards it only then: see
+//! [`stdin_is_foreground_tty`](crate::stdin::stdin_is_foreground_tty)).
+//! The thread blocks `SIGTTIN` and `SIGTTOU` for itself, waits for input in
+//! short steps, and looks again before each read: once the process is in
+//! the background (a job moved there by the shell), it stops reading, so it
+//! never takes input meant for the shell nor is stopped by `SIGTTIN`, and
+//! it forgets the terminal's saved settings, which are the shell's to set
+//! now. The session goes on; its output still goes to stdout.
 
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::Input;
 use crate::lifecycle::{StopReason, VmmHandle};
-use crate::stdin::{stdin_is_tty, EscapeDetector};
+use crate::stdin::{
+    block_job_control_signals, forget_terminal, is_foreground, stdin_is_tty, EscapeDetector,
+};
+
+/// How long the thread waits for terminal input before it looks again at
+/// whether the process is still in the foreground.
+const FOREGROUND_STEP: Duration = Duration::from_millis(200);
 
 /// Bytes read at a time.
 const CHUNK: usize = 16 * 1024;
@@ -39,17 +55,59 @@ pub struct LocalInput {
     pub reader: Box<dyn Read + Send>,
     /// It is a terminal: watch for the escape, and send nothing at its end.
     pub tty: bool,
+    /// The terminal's descriptor, to wait on and to look at the foreground
+    /// of; `None` for a reader that is not one.
+    terminal: Option<RawFd>,
 }
 
 impl LocalInput {
+    /// What `reader` gives, a terminal's when `tty` (not one with a
+    /// foreground: a test's).
+    pub fn new(reader: Box<dyn Read + Send>, tty: bool) -> LocalInput {
+        LocalInput {
+            reader,
+            tty,
+            terminal: None,
+        }
+    }
+
     /// The process's stdin, read through a descriptor of its own (std's
     /// lock and buffer stay out of it).
     pub fn stdin() -> io::Result<LocalInput> {
-        let fd = io::stdin().as_fd().try_clone_to_owned()?;
+        let file = File::from(io::stdin().as_fd().try_clone_to_owned()?);
+        let tty = stdin_is_tty();
+        let terminal = tty.then(|| file.as_raw_fd());
         Ok(LocalInput {
-            reader: Box::new(File::from(fd)),
-            tty: stdin_is_tty(),
+            reader: Box::new(file),
+            tty,
+            terminal,
         })
+    }
+
+    /// Waits, a step at a time, until the terminal has input; false once
+    /// the process is in its background (or it cannot be waited on).
+    fn wait_in_foreground(&self) -> bool {
+        let Some(fd) = self.terminal else {
+            return true;
+        };
+        loop {
+            if !is_foreground(fd) {
+                return false;
+            }
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = libc::c_int::try_from(FOREGROUND_STEP.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: poll reads and writes the one pollfd it is given.
+            match unsafe { libc::poll(&mut pollfd, 1, ms) } {
+                0 => {}
+                n if n > 0 => return is_foreground(fd),
+                _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                _ => return false,
+            }
+        }
     }
 }
 
@@ -63,10 +121,18 @@ pub fn forward(input: LocalInput, to: Input, handle: VmmHandle) -> io::Result<Jo
 }
 
 fn forward_all(mut input: LocalInput, to: &Input, handle: &VmmHandle) {
+    // A read from the background then fails (EIO) rather than stopping the
+    // process; only this thread's mask changes.
+    let _ = block_job_control_signals();
     let mut escape = EscapeDetector::default();
     let mut last = None;
     let mut buf = vec![0u8; CHUNK];
     loop {
+        if !input.wait_in_foreground() {
+            // In the background now: the terminal is the shell's.
+            forget_terminal();
+            return;
+        }
         let n = match input.reader.read(&mut buf) {
             Ok(0) => {
                 if !input.tty {
@@ -80,7 +146,12 @@ fn forward_all(mut input: LocalInput, to: &Input, handle: &VmmHandle) {
             }
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
+            Err(error) => {
+                if input.tty && error.raw_os_error() == Some(libc::EIO) {
+                    forget_terminal();
+                }
+                return;
+            }
         };
         let bytes = &buf[..n];
         let sent = if input.tty {
@@ -115,10 +186,7 @@ mod tests {
     fn piped_input_reaches_the_session_then_an_eof_character() {
         let fixture = Fixture::new();
         let (_, _, input) = fixture.hub.attach(Mode::Rw, 0);
-        let local = LocalInput {
-            reader: Box::new(Cursor::new(b"echo hi\nexit".to_vec())),
-            tty: false,
-        };
+        let local = LocalInput::new(Box::new(Cursor::new(b"echo hi\nexit".to_vec())), false);
         forward(local, input.unwrap(), fixture.handle.clone()).unwrap();
         let mut guest = fixture.guest();
         let want = b"echo hi\nexit\x04\x04";
@@ -135,10 +203,7 @@ mod tests {
         let (_, _, input) = fixture.hub.attach(Mode::Rw, 0);
         let mut typed = pattern(300 * 1024);
         typed.push(b'\n');
-        let local = LocalInput {
-            reader: Box::new(Cursor::new(typed.clone())),
-            tty: false,
-        };
+        let local = LocalInput::new(Box::new(Cursor::new(typed.clone())), false);
         forward(local, input.unwrap(), fixture.handle.clone()).unwrap();
         // Only once the queue is full does the terminal open.
         std::thread::sleep(Duration::from_millis(100));
@@ -170,10 +235,7 @@ mod tests {
             }
         }
         let (_, _, input) = fixture.hub.attach(Mode::Rw, 0);
-        let local = LocalInput {
-            reader: Box::new(Typed(vec![b"ls\r", b"\x1d\x1d", b"after"])),
-            tty: true,
-        };
+        let local = LocalInput::new(Box::new(Typed(vec![b"ls\r", b"\x1d\x1d", b"after"])), true);
         let mut guest = fixture.guest();
         forward(local, input.unwrap(), fixture.handle.clone()).unwrap();
         // What came before the escape reached the session; the escape did
@@ -226,10 +288,7 @@ mod tests {
             .collect();
         reads.push(b"\x1d\x1d".to_vec());
         let (_, _, input) = fixture.hub.attach(Mode::Rw, 0);
-        let local = LocalInput {
-            reader: Box::new(Pasted(reads)),
-            tty: true,
-        };
+        let local = LocalInput::new(Box::new(Pasted(reads)), true);
         forward(local, input.unwrap(), fixture.handle.clone()).unwrap();
         let deadline = Instant::now() + LIMIT;
         while fixture.handle.state() != VmState::Stopping {
