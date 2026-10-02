@@ -11,7 +11,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to commits (the tag they stand for in the
+      # comment): a moved tag cannot change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # rust-toolchain.toml is the single source of truth for the compiler
       # version. dtolnay/rust-toolchain does not read it, so read the channel
@@ -20,14 +22,14 @@ jobs:
         id: toolchain
         run: echo "channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           # Keep in step with components and targets in rust-toolchain.toml.
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Format
         run: cargo fmt --all --check
@@ -38,16 +40,52 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Rustdoc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # proto/schema/*.json and proto/testdata/control-v1.jsonl are
       # generated from the types: a change to the types must come with them.
       - name: Schemas and golden vectors are current
         run: cargo xtask schema && git diff --exit-code proto/
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
 
       - name: License and dependency policy
         run: cargo deny check
 
       - name: Static musl guest init
         run: cargo build -p boxcar-init --target x86_64-unknown-linux-musl --profile guest
+
+  # The KVM-gated suite boots real VMs, which GitHub-hosted runners cannot:
+  # it runs only where the repository variable HAS_KVM is "true", on a
+  # self-hosted runner with /dev/kvm, Docker for the kernel build, and the
+  # labels below. `cargo xtask test-kvm` itself skips (exit 0) without
+  # /dev/kvm or the guest artifacts, so the gate is for the minutes, not
+  # for correctness.
+  kvm:
+    if: vars.HAS_KVM == 'true'
+    runs-on: [self-hosted, linux, x64, kvm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Read toolchain channel from rust-toolchain.toml
+        id: toolchain
+        run: echo "channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+
+      - name: Guest artifacts
+        run: |
+          cargo xtask kernel
+          cargo xtask initramfs
+          cargo xtask rootfs alpine
+
+      - name: KVM-gated tests, M2
+        run: cargo xtask test-kvm m2

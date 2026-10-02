@@ -597,10 +597,6 @@ fn default_audit_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) ->
         .or_else(|| absolute(home).map(|home| home.join(".local/share/boxcar")))
 }
 
-/// The directory of the audit dir that holds one directory per session,
-/// `<audit>/sessions/<id>/`, as boxcar-audit's writer lays it out.
-const SESSIONS: &str = "sessions";
-
 /// The audit directory `audit_dir` as an absolute path with every symbolic
 /// link resolved, once it is known that no share of `shares` (real paths
 /// already) reaches its logs: the guest writes to its shares, and must not
@@ -638,7 +634,7 @@ fn exposes_logs(below: &Path) -> bool {
     let parts: Vec<_> = below.components().collect();
     match parts.as_slice() {
         [] => true,
-        [first, rest @ ..] => first.as_os_str() == SESSIONS && rest.len() <= 1,
+        [first, rest @ ..] => first.as_os_str() == boxcar_audit::SESSIONS_DIR && rest.len() <= 1,
     }
 }
 

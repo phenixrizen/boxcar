@@ -225,7 +225,10 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
     syncer: S,
 ) -> io::Result<(AuditSink, WriterHandle)> {
     cfg.validate()?;
-    let session_dir = cfg.data_dir.join("sessions").join(cfg.session_id.as_str());
+    let session_dir = cfg
+        .data_dir
+        .join(crate::SESSIONS_DIR)
+        .join(cfg.session_id.as_str());
     let (segments, resume) = SegmentWriter::open_or_create(&session_dir, &cfg.session_id, syncer)?;
     let index = CheckpointIndex::open(&session_dir, segments.segment(), &resume.checkpoints)?;
 

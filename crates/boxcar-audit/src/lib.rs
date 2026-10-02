@@ -25,6 +25,11 @@
 //! private `segment` module, checkpoints and `checkpoints.jsonl` in
 //! `checkpoint`.
 
+/// The directory under a data directory that holds the sessions' logs:
+/// `<data_dir>/sessions/<session_id>/`. The writer makes it, and the CLI
+/// looks there.
+pub const SESSIONS_DIR: &str = "sessions";
+
 pub mod chain;
 mod checkpoint;
 pub mod reader;

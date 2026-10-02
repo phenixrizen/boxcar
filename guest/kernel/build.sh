@@ -69,12 +69,13 @@ verify_fragment() {
     echo "fragment: all $total applied"
 }
 
-# has_btf FILE: readelf -S lists a .BTF section. The listing goes through a
-# variable because grep -q closing the pipe early would trip pipefail.
+# has_btf FILE: readelf -S lists a section named exactly .BTF (not .BTF_ids
+# or a symbol that merely mentions it). The listing goes through a variable
+# because grep -q closing the pipe early would trip pipefail.
 has_btf() {
     local sections
     sections=$(readelf -S "$1")
-    grep -q '\.BTF' <<<"$sections"
+    grep -Eq '\] \.BTF +' <<<"$sections"
 }
 
 tarball=$CACHE/linux-$KERNEL_VERSION.tar.xz
