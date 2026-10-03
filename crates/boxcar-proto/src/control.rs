@@ -298,6 +298,9 @@ pub struct Status {
     /// The virtio devices present, by slot name in slot order, such as
     /// `fs:root` and `fs:workspace`.
     pub devices: Vec<String>,
+    /// The guest's sensor, ring 1. A server from before it reports none.
+    #[serde(default)]
+    pub sensor: SensorStatus,
 }
 
 /// What the guest's init has reported. The default is nothing yet.
@@ -320,6 +323,40 @@ pub struct AuditStatus {
     pub next_seq: u64,
     /// Whether the writer has failed, which stops the VM.
     pub failed: bool,
+}
+
+/// The guest's sensor (ring 1), as the VMM sees its stream on vsock port
+/// 1026. The default is a VM that runs no sensor.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SensorStatus {
+    pub state: SensorState,
+    /// Heartbeats taken so far.
+    pub heartbeats: u64,
+    /// Host `CLOCK_REALTIME`, in nanoseconds, when the last heartbeat
+    /// arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_ns: Option<u64>,
+}
+
+/// Where the sensor stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SensorState {
+    /// The VM runs no sensor: it has no vsock device, or was started with
+    /// `--no-sensor`.
+    #[default]
+    Off,
+    /// A sensor is expected and has not reported its status yet.
+    Waiting,
+    /// The sensor attached every program and heartbeats.
+    Attached,
+    /// The sensor runs with programs missing; `proc.sensor_status` says
+    /// which.
+    Degraded,
+    /// The sensor's stream ended, or no heartbeat came for 3 s.
+    Silent,
 }
 
 /// The parameters of `stop`.
@@ -1050,6 +1087,11 @@ mod tests {
                 failed: false,
             },
             devices: vec!["fs:root".into(), "fs:workspace".into()],
+            sensor: SensorStatus {
+                state: SensorState::Attached,
+                heartbeats: 61,
+                last_heartbeat_ns: Some(1_700_000_000_000_000_007),
+            },
         };
         let mut wire = json!({
             "state": "running",
@@ -1061,10 +1103,31 @@ mod tests {
             "guest": {"init_ready": true, "session_pid": 7, "exit": {"code": 3, "signal": null}},
             "audit": {"next_seq": 12, "failed": false},
             "devices": ["fs:root", "fs:workspace"],
+            "sensor": {"state": "attached", "heartbeats": 61, "last_heartbeat_ns": 1_700_000_000_000_000_007_u64},
         });
         assert_eq!(serde_json::to_value(&status).unwrap(), wire);
         wire["new_field"] = json!(1);
-        assert_eq!(serde_json::from_value::<Status>(wire).unwrap(), status);
+        assert_eq!(
+            serde_json::from_value::<Status>(wire.clone()).unwrap(),
+            status
+        );
+        // A server from before the sensor reports none: `off`, no heartbeat.
+        wire.as_object_mut().unwrap().remove("sensor");
+        let older = serde_json::from_value::<Status>(wire).unwrap();
+        assert_eq!(older.sensor, SensorStatus::default());
+        assert_eq!(
+            serde_json::to_value(&older.sensor).unwrap(),
+            json!({"state": "off", "heartbeats": 0})
+        );
+        for (state, name) in [
+            (SensorState::Off, "off"),
+            (SensorState::Waiting, "waiting"),
+            (SensorState::Attached, "attached"),
+            (SensorState::Degraded, "degraded"),
+            (SensorState::Silent, "silent"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), json!(name));
+        }
 
         for (state, name) in [
             (VmState::Booting, "booting"),

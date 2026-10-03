@@ -1,7 +1,7 @@
 {"ready":true,"control":"/run/user/1000/boxcar/017f22e2-79b0-7cc3-98c4-dc0c0c07398f/control.sock","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f"}
 {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","capabilities":["pty","audit","policy.net"]}
 {"v":1,"id":1,"op":"status"}
-{"v":1,"id":1,"ok":true,"result":{"audit":{"failed":false,"next_seq":8},"devices":["fs:root","fs:workspace","net","vsock"],"guest":{"exit":null,"init_ready":true,"session_pid":212},"mem_mib":512,"pid":4242,"session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","state":"running","uptime_ms":61500,"vcpus":2}}
+{"v":1,"id":1,"ok":true,"result":{"audit":{"failed":false,"next_seq":8},"devices":["fs:root","fs:workspace","net","vsock"],"guest":{"exit":null,"init_ready":true,"session_pid":212},"mem_mib":512,"pid":4242,"sensor":{"heartbeats":61,"last_heartbeat_ns":1700000000000000000,"state":"attached"},"session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","state":"running","uptime_ms":61500,"vcpus":2}}
 {"v":1,"id":2,"op":"pty.attach","mode":"rw","replay_bytes":65536,"session":"main"}
 {"v":1,"id":2,"ok":true,"result":{"attach_id":"0123456789abcdef0123456789abcdef","raw":true}}
 {"v":1,"id":3,"op":"pty.watch","attach_id":"0123456789abcdef0123456789abcdef","session":"main"}

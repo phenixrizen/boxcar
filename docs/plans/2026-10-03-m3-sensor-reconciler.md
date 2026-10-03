@@ -199,3 +199,29 @@ Made while writing the plan, 2026-10-03:
 - **The sensor binary is separate** (the spec's "two small guest binaries"), held open by init across `switch_root` and started with `fexecve`, so it is never on the audited filesystem and init keeps its three dependencies.
 - **Guest source port 1021** is the sensor's; 1023 and 1022 stay init's.
 - **`kernel.unprivileged_bpf_disabled = 1`** is set by init as a second layer under the LSM guard; the sensor is privileged and unaffected.
+
+### Task 1
+
+- The `sync` payload's Rust type is `ClockSync`: a type named `Sync` would
+  shadow the marker trait wherever the crate's types are glob-imported.
+  The wire name stays `sync`.
+- The sync thread is started by the VMM (`GuestCtl::start_sync`), not by
+  the channel itself, so the channel's unit tests and the PTY hub's keep
+  their exact message sequences; it pings only once the config has been
+  queued (`config_sent`), never between `hello` and `config`. The first
+  ping therefore follows the config within 50 ms; the plan's "right after
+  `hello`" is that.
+- `status.sensor` lands with this task rather than Task 4: the ingest knows
+  the sensor's state as soon as it exists, and a `Status` from an older
+  server reads as `off` (`#[serde(default)]`).
+- Frame limits beyond the plan's: a `proc.memfd` name 256 bytes (the
+  kernel's), a `proc.sensor_status` with at most 32 programs, names 128
+  bytes. The 64 KiB frame cap is checked on the declared length before any
+  byte of the frame is read; no valid frame reaches it, so the cap is
+  tested at the decoder, with the argv and path limits tested on frames.
+- The golden `sensor-v1.jsonl` holds the frames' JSON as lines (one per
+  `proc.*` type) rather than length-prefixed bytes, so it reads like the
+  other golden files; the test re-frames each line.
+- The gated `sync` assertion is in `boot_session`'s graceful-stop test,
+  whose session lives long enough for the pong; the plan named
+  `boot_vsock`, whose console init has no control channel.

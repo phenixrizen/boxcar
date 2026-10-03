@@ -12,12 +12,12 @@
 //! `path_b64` the raw bytes in base64. The other names a payload carries
 //! (`path_at_open`, `target_path`, `from`, `to`, `target`) are lossy only.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
 
 use super::errno::name as errno_name;
-use super::Hash;
+use super::{Hash, Ring};
 use crate::control::StopMode;
 
 /// How one operation ended. Present on every filesystem event that performs
@@ -680,4 +680,258 @@ pub struct SessionStart {
 pub struct SessionExit {
     pub code: Option<i32>,
     pub signal: Option<i32>,
+}
+
+/// `sync`: a pairing of the guest's clock with the host's. The VMM pings
+/// init over the control channel and times the pong: the guest's
+/// `CLOCK_MONOTONIC` when it answered, against the host's at the round
+/// trip's midpoint. `ts_host_ns` stays the one timestamp that joins events
+/// across rings; this says how far the guest's clock stands from the host's,
+/// and how surely.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ClockSync {
+    /// How the pair was taken: `vsock_rtt`.
+    pub method: String,
+    /// The guest's `CLOCK_MONOTONIC` when it answered, in nanoseconds.
+    pub guest_mono_ns: u64,
+    /// The host's `CLOCK_MONOTONIC` at the round trip's midpoint.
+    pub host_mono_ns: u64,
+    /// `host_mono_ns` minus `guest_mono_ns`.
+    pub offset_ns: i64,
+    /// The round trip, in nanoseconds: the pairing is no surer than this.
+    pub rtt_ns: u64,
+}
+
+/// `proc.exec`: a process in the session ran a new program, reported by the
+/// sensor after a successful `execve`. The `subject` is the thread that
+/// called it, which is the process's leader from then on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcExec {
+    /// The calling thread's id and its process's.
+    pub tid: u32,
+    pub tgid: u32,
+    /// The parent process's id.
+    pub ppid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// The program, as the kernel resolved it.
+    pub filename: String,
+    /// The arguments, at most 256 and 16 KiB in all.
+    pub argv: Vec<String>,
+    /// Whether `argv` was cut to fit.
+    pub argv_truncated: bool,
+    /// The process's start time on the guest's clock: with `tgid`, the
+    /// process's identity across pid reuse.
+    pub start_ns: u64,
+    /// The cgroup the process is in: the session's.
+    pub cgroup_id: u64,
+}
+
+/// `proc.fork`: a process in the session made a new process. New threads
+/// are not reported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcFork {
+    pub parent_tid: u32,
+    pub parent_tgid: u32,
+    /// The new process's id (its leader thread's, the same).
+    pub child_pid: u32,
+    /// The new process's start time on the guest's clock.
+    pub child_start_ns: u64,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// `proc.exit`: a thread in the session ended. `group_dead` when it was the
+/// last of its process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcExit {
+    pub tid: u32,
+    pub tgid: u32,
+    /// The kernel's exit code word: the status `wait` reports, signal
+    /// included.
+    pub exit_code: i32,
+    pub group_dead: bool,
+    /// The process's start time, as `proc.exec` and `proc.fork` gave it.
+    pub start_ns: u64,
+}
+
+/// `proc.connect_attempt`: a process asked to connect a socket (the LSM's
+/// `socket_connect`), with the destination as it asked for it. `dst` and
+/// `dst_port` are set for IPv4 and IPv6; another family carries only its
+/// number.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcConnectAttempt {
+    pub tid: u32,
+    pub tgid: u32,
+    /// The address family, as `AF_INET` is 2 and `AF_INET6` 10.
+    pub family: u16,
+    /// The socket's transport, such as `tcp` or `udp`.
+    pub proto: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_port: Option<u16>,
+}
+
+/// `proc.tcp_connect`: the kernel sent a connection's first segment: the
+/// full 4-tuple once the source port was chosen, which is what joins the
+/// flow ring 0 relays (`net.connect`) to the process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcTcpConnect {
+    pub tid: u32,
+    pub tgid: u32,
+    pub src: IpAddr,
+    pub src_port: u16,
+    pub dst: IpAddr,
+    pub dst_port: u16,
+}
+
+/// `proc.memfd`: a process made an anonymous memory file (`memfd_create`):
+/// a place to hold or run bytes the audited filesystem never sees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcMemfd {
+    pub tid: u32,
+    pub tgid: u32,
+    /// The name given, at most 256 bytes.
+    pub name: String,
+    pub flags: u32,
+}
+
+/// `proc.file_open`: one open in `sample`, with the path the kernel
+/// resolved. The only sampled record of ring 1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcFileOpen {
+    pub tid: u32,
+    pub tgid: u32,
+    pub path: String,
+    /// The open's `f_flags`.
+    pub flags: u32,
+    /// The sampling: this record stands for `sample` opens.
+    pub sample: u32,
+}
+
+/// `proc.lsm_deny`: the sensor's self-protection refused something. `hook`
+/// is `bpf` (a `bpf()` call by a process other than the sensor, `detail`
+/// its command number) or `task_kill` (a signal to the sensor, `detail` the
+/// signal number).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcLsmDeny {
+    pub tid: u32,
+    pub tgid: u32,
+    pub hook: String,
+    pub detail: i64,
+}
+
+/// `proc.heartbeat`: the sensor is alive, once a second. The counters are
+/// since it started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcHeartbeat {
+    /// Since the sensor started, on the guest's clock.
+    pub uptime_ns: u64,
+    /// Events the sensor took from the kernel's ring buffer.
+    pub events_emitted: u64,
+    /// Events the kernel could not place in the ring buffer: lost.
+    pub ringbuf_drops: u64,
+    /// Frames written to the stream, heartbeats included.
+    pub frames_sent: u64,
+}
+
+/// `proc.sensor_status`: what the sensor could attach, sent once it has
+/// tried, and again if that changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcSensorStatus {
+    pub phase: SensorPhase,
+    /// Every program the sensor carries, attached or not.
+    pub programs: Vec<ProgramStatus>,
+    /// The guest kernel's release string.
+    pub kernel_release: String,
+    /// Whether the kernel offers its BTF (`/sys/kernel/btf/vmlinux`).
+    pub btf_ok: bool,
+    /// The session cgroup the sensor filters on.
+    pub session_cgroup_id: u64,
+    /// Why the sensor is degraded, when a single reason covers it (such as
+    /// `no_programs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// How much of the sensor runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SensorPhase {
+    /// Every program is attached.
+    Attached,
+    /// Some program is not; `programs` says which, and the reconciler
+    /// skips the rules that need it.
+    Degraded,
+}
+
+/// One of the sensor's programs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProgramStatus {
+    pub name: String,
+    pub attached: bool,
+    /// Why it is not attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `finding`: the reconciler's conclusion from records of both rings, with
+/// the records it read as evidence. Never sampled; a score of 70 or more
+/// is written through to disk at once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Finding {
+    pub category: FindingCategory,
+    /// 0 to 100: how strongly the evidence says the agent hid something.
+    pub score: u8,
+    /// The rule that fired, by name (see docs/reconciler.md).
+    pub rule: String,
+    /// What was seen, in words; at most 512 bytes.
+    pub summary: String,
+    /// The records the rule read, newest last.
+    pub evidence: Vec<Evidence>,
+    /// The span the finding belongs to (M4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    /// Whether a join or clock the rule relied on was weak: the score was
+    /// lowered for it.
+    pub low_confidence: bool,
+}
+
+/// The kinds of finding; see the design's section 7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FindingCategory {
+    UnattributedEffect,
+    SensorSilence,
+    IntentEffectMismatch,
+    IndicatorRemoval,
+    OffBookChannel,
+    OrphanedWork,
+    NetworkAnomaly,
+    PrivilegeProbe,
+    PolicyDenial,
+}
+
+/// A record a finding rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Evidence {
+    pub seq: u64,
+    pub ring: Ring,
 }

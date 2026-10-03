@@ -73,6 +73,7 @@ use crate::devices::{FsDevices, NetDevice, VsockDevice};
 use crate::guest_ctl::{GuestCtl, GuestCtlHandle, CLOSE_DEADLINE};
 use crate::policy::LivePolicy;
 use crate::pty::PtyHub;
+use crate::sensor_ingest::SensorIngest;
 use crate::services::ServiceRegistry;
 use crate::stdin::RawModeGuard;
 use crate::vcpu::VcpuSet;
@@ -335,6 +336,8 @@ pub(crate) struct VmInfo {
     /// The session's terminal (port 1025), when the VM has the vsock
     /// device.
     pub(crate) pty: Option<PtyHub>,
+    /// The sensor stream (port 1026), when the VM has the vsock device.
+    pub(crate) sensor: Option<Arc<SensorIngest>>,
     /// The policy in force: the network policy the net stack reads and
     /// the vsock allowlist, which the control socket's `policy.update`
     /// replaces.
@@ -433,6 +436,11 @@ impl VmmHandle {
                 failed: info.audit.has_failed(),
             },
             devices: info.devices.clone(),
+            sensor: info
+                .sensor
+                .as_ref()
+                .map(|sensor| sensor.status())
+                .unwrap_or_default(),
         }
     }
 
@@ -836,6 +844,10 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
     services
         .register(boxcar_vsock::services::PTY_PORT, pty.service())
         .expect("register the PTY hub");
+    let sensor = SensorIngest::new(sink.clone());
+    services
+        .register(boxcar_vsock::services::SENSOR_PORT, sensor.service())
+        .expect("register the sensor stream");
     let policy = LivePolicy::new(
         Arc::new(arc_swap::ArcSwap::from_pointee(
             boxcar_net::Policy::default(),
@@ -853,6 +865,7 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         services,
         guest,
         pty: Some(pty),
+        sensor: Some(sensor),
         policy: Arc::new(policy),
     };
     let latch = Arc::new(StopLatch::new().expect("stop latch"));
@@ -864,6 +877,63 @@ mod tests {
     use event_manager::SubscriberOps;
 
     use super::*;
+
+    /// `status.sensor` is `waiting` until the sensor connects and says what
+    /// it attached; `off` is for a VM without one, which `test_handle` is
+    /// not.
+    #[test]
+    fn status_reports_the_sensor_once_it_speaks() {
+        use std::io::Write;
+
+        use boxcar_proto::control::SensorState;
+        use boxcar_proto::sensor::{encode, SensorFrame};
+        use boxcar_proto::{Payload, ProcHeartbeat, ProcSensorStatus, SensorPhase};
+        use boxcar_vsock::{ConnMeta, InternalServices};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (handle, writer) = test_handle(tmp.path());
+        assert_eq!(handle.status().sensor.state, SensorState::Waiting);
+        assert_eq!(handle.services().ports(), [1024, 1025, 1026]);
+        let mut sensor = handle
+            .services()
+            .connect(
+                boxcar_vsock::services::SENSOR_PORT,
+                ConnMeta { guest_port: 1021 },
+            )
+            .unwrap();
+        let status = SensorFrame {
+            ts_guest_ns: 1,
+            subject: None,
+            payload: Payload::ProcSensorStatus(ProcSensorStatus {
+                phase: SensorPhase::Attached,
+                programs: Vec::new(),
+                kernel_release: "6.18.54".into(),
+                btf_ok: true,
+                session_cgroup_id: 1,
+                reason: None,
+            }),
+        };
+        let heartbeat = SensorFrame {
+            ts_guest_ns: 2,
+            subject: None,
+            payload: Payload::ProcHeartbeat(ProcHeartbeat {
+                uptime_ns: 2,
+                events_emitted: 0,
+                ringbuf_drops: 0,
+                frames_sent: 1,
+            }),
+        };
+        sensor.write_all(&encode(&status).unwrap()).unwrap();
+        sensor.write_all(&encode(&heartbeat).unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.status().sensor.heartbeats < 1 {
+            assert!(Instant::now() < deadline, "{:?}", handle.status().sensor);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handle.status().sensor.state, SensorState::Attached);
+        drop(sensor);
+        writer.close().unwrap();
+    }
 
     #[test]
     fn exit_codes_and_reasons() {

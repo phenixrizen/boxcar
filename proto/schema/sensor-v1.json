@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "boxcar audit record v1",
-  "description": "One line of a session's audit log: a Record, whose `data` is shaped by its `type` as Payload lists (`type` and `data` side by side). See docs/audit-events.md.",
-  "$ref": "#/definitions/Record",
+  "title": "boxcar sensor stream v1",
+  "description": "One frame on vsock port 1026 from the guest's sensor to the VMM, its length prefix not counted: a SensorFrame, whose `type` and `data` are a `proc.*` record's as the audit Payload shapes them. See docs/audit-events.md.",
+  "$ref": "#/definitions/SensorFrame",
   "definitions": {
     "ArtifactRef": {
       "description": "A file the VMM loaded, identified by where it was and what it held.",
@@ -2496,61 +2496,871 @@
         }
       }
     },
-    "Record": {
-      "description": "One audit record: one line of a session's log.\n\nThe JSON field names are these field names, except that `kind` is `type`. Unset optional fields are left out of the JSON, never written as `null`.",
+    "Ring": {
+      "description": "Which side of the VM boundary made the record: 0 the host, 1 the guest.",
+      "type": "integer",
+      "enum": [
+        0,
+        1
+      ]
+    },
+    "SensorFrame": {
+      "description": "One record from the sensor: the guest's clock when it happened, the process it is about, and the record's `type` and `data`.",
       "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VmmStart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.start"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VmmStop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.stop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMount"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mount"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsCreate"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.create"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.read"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.write"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.unlink"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.rmdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMkdir"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mkdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMknod"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mknod"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsSymlink"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.symlink"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsLink"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.link"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsRename"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.rename"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsSetattr"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.setattr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsFallocate"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.fallocate"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsXattr"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.xattr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsDenied"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.denied"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.readdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Checkpoint"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "checkpoint"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ControlConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "control.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ControlStop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "control.stop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDhcp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.dhcp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDns"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.dns"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetTls"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.tls"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDrop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.drop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetUdp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.udp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VsockConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vsock.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VsockClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vsock.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SessionStart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session.start"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SessionExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/PolicyChanged"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.changed"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ClockSync"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "sync"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExec"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exec"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFork"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.fork"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcConnectAttempt"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.connect_attempt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTcpConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tcp_connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcMemfd"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.memfd"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFileOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.file_open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcLsmDeny"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.lsm_deny"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcHeartbeat"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.heartbeat"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcSensorStatus"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.sensor_status"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Finding"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "finding"
+              ]
+            }
+          }
+        }
+      ],
       "required": [
-        "data",
-        "hash",
-        "prev",
-        "ring",
-        "seq",
-        "session_id",
-        "src",
-        "ts_host_ns",
-        "ts_mono_ns",
-        "type",
-        "v"
+        "ts_guest_ns"
       ],
       "properties": {
-        "data": {
-          "description": "The payload. Its shape is decided by `kind`; see [`Payload`] for the kinds this crate defines."
-        },
-        "hash": {
-          "description": "This record's hash, from `Record::compute_hash`.",
-          "$ref": "#/definitions/Hash"
-        },
-        "prev": {
-          "description": "The `hash` of the previous record, or `genesis_prev` for the first.",
-          "$ref": "#/definitions/Hash"
-        },
-        "ring": {
-          "$ref": "#/definitions/Ring"
-        },
-        "seq": {
-          "description": "The record's position in the session, counting from 1 with no gaps. Only the log writer assigns it.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "span": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/SpanRef"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "src": {
-          "$ref": "#/definitions/Source"
-        },
         "subject": {
-          "description": "The guest process the event is attributed to.",
+          "description": "The thread the record is about, with its user; none for the sensor's own records (heartbeat, status).",
           "anyOf": [
             {
               "$ref": "#/definitions/Subject"
@@ -2561,45 +3371,12 @@
           ]
         },
         "ts_guest_ns": {
-          "description": "The guest's own clock, for events reported from inside the guest. It orders ring 1 events among themselves.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "ts_host_ns": {
-          "description": "Host wall-clock time (`CLOCK_REALTIME`) in nanoseconds since the Unix epoch, taken when the writer received the event. This is the only timestamp that joins events across rings.",
+          "description": "The guest's `CLOCK_MONOTONIC`, in nanoseconds.",
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
-        },
-        "ts_mono_ns": {
-          "description": "Host `CLOCK_MONOTONIC` in nanoseconds, taken at the same moment.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "type": {
-          "description": "The dotted event type, such as `fs.open`.",
-          "type": "string"
-        },
-        "v": {
-          "description": "The schema version, [`SCHEMA_VERSION`].",
-          "type": "integer",
-          "format": "uint8",
           "minimum": 0.0
         }
       }
-    },
-    "Ring": {
-      "description": "Which side of the VM boundary made the record: 0 the host, 1 the guest.",
-      "type": "integer",
-      "enum": [
-        0,
-        1
-      ]
     },
     "SensorPhase": {
       "description": "How much of the sensor runs.",
@@ -2639,11 +3416,6 @@
           "format": "int32"
         }
       }
-    },
-    "SessionId": {
-      "description": "A session id: a UUIDv7 in lowercase hyphenated text.",
-      "type": "string",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     },
     "SessionStart": {
       "description": "`session.start`: the guest's init started the session the VMM's config asked for. Reported by init (ring 1); the record's subject is the session's process.",
@@ -2754,56 +3526,6 @@
         },
         "tag": {
           "description": "The share's tag, such as `root` or `workspace`.",
-          "type": "string"
-        }
-      }
-    },
-    "Source": {
-      "description": "The component that produced a record. On the wire, the lowercase name.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "vmm",
-            "fs",
-            "net",
-            "vsock",
-            "pty",
-            "guest",
-            "sensor",
-            "reconciler",
-            "gateway",
-            "control"
-          ]
-        },
-        {
-          "description": "The guest's session, as its init reports it over the control channel.",
-          "type": "string",
-          "enum": [
-            "session"
-          ]
-        },
-        {
-          "description": "The session's policy, as the control socket changes it.",
-          "type": "string",
-          "enum": [
-            "policy"
-          ]
-        }
-      ]
-    },
-    "SpanRef": {
-      "description": "Where an event sits in a trace.",
-      "type": "object",
-      "required": [
-        "span_id",
-        "trace_id"
-      ],
-      "properties": {
-        "span_id": {
-          "type": "string"
-        },
-        "trace_id": {
           "type": "string"
         }
       }

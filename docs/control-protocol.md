@@ -91,6 +91,9 @@ No parameters. The result:
 | `audit.next_seq` | u64 | The seq the log writer gives its next record. |
 | `audit.failed` | bool | The log writer has failed (which stops the VM). |
 | `devices` | string[] | The virtio devices present, by slot name in slot order: `fs:root`, `fs:workspace`, `net`, `vsock`. |
+| `sensor.state` | `off` / `waiting` / `attached` / `degraded` / `silent` | The guest's sensor (ring 1): `off` for a VM without one (no vsock device, or `--no-sensor`); `waiting` until it says what it attached; `attached` or `degraded` as it said (`proc.sensor_status`); `silent` once its stream ended or no heartbeat came for 3 s. A server from before the sensor sends no `sensor`; read it as `off`. |
+| `sensor.heartbeats` | u64 | Heartbeats taken so far. |
+| `sensor.last_heartbeat_ns` | u64, omitted until the first | Host `CLOCK_REALTIME`, in nanoseconds, when the last heartbeat arrived. |
 
 ### `stop`
 
