@@ -259,3 +259,43 @@ Made while writing the plan, 2026-10-03:
   install nightly-2026-06-01 --profile minimal --component rust-src`
   (rustc 1.98.0-nightly 2026-05-31) and `cargo binstall bpf-linker@0.11.1`.
   rustup updated itself to 1.29.1 on the way. Disk after: 18 GB free.
+
+### Task 3
+
+- The programs read kernel memory through `bpf_probe_read_kernel` at
+  every step rather than dereferencing the BTF pointers directly: the
+  verifier accepts either on these program types, and the helper form
+  cannot fault on a null parent, mm or socket. The one direct address is
+  `&file->f_path` handed to `bpf_d_path`, which must be derived from the
+  hook's argument.
+- argv is read in one `bpf_probe_read_user_buf` of up to 16 KiB straight
+  into the reserved ring buffer record (NUL-separated, as the kernel holds
+  it); userspace splits it. Nothing of that size touches the 512-byte
+  stack.
+- The globals are `static mut` with a non-zero sentinel (`u64::MAX`), so
+  they sit in `.data`, where the loader writes them before load and the
+  compiler cannot fold their initial value; the lane checks `.data` is two
+  u64s, since aya-obj exposes no symbol table.
+- The nightly's `dangerous_implicit_autorefs` lint (an error in this crate)
+  rules out `(*ev).field.method()` and `(*ev).field[..n]`: fields of a
+  reserved record are written through raw pointers or an explicit `&mut`.
+- aya-build runs `cargo build --package` where the build script runs, so
+  `boxcar-sensor`'s `build.rs` changes directory into the eBPF crate first:
+  the crate stays excluded from the workspace and cargo sees it as the
+  package it is; aya-build's target directory is absolute under `OUT_DIR`.
+- `bpf_guard` lets only the sensor's tgid through; `kill_guard` also lets
+  init (tgid 1) and the sensor itself signal the sensor. A signal number of
+  0 (an existence probe) is not refused.
+- The lane cannot see the hook each program attaches to (aya-obj keeps the
+  section name private); it checks the program names and section kinds,
+  and the hook names are checked when the gated tests load the programs
+  in a guest (Task 4).
+- CI's `check` job sets `AYA_BUILD_SKIP=1` for the whole job and builds the
+  sensor for musl with an empty object; the new `ebpf` job installs the
+  pinned nightly, cargo-binstall 1.25.1 by release and checksum, and
+  bpf-linker 0.11.1, then runs `cargo xtask sensor`. The KVM suite was not
+  run for this task: no code a VM runs changed.
+- `deny.toml` allows `Zlib`: `foldhash`, the hasher `hashbrown` 0.17 uses,
+  reached through `aya` and `object`. It is a permissive licence with no
+  requirement beyond keeping the notice in the source; it is the only
+  addition the sensor's dependencies needed.

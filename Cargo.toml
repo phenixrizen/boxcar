@@ -60,10 +60,12 @@ cpio = "0.4"   # xtask only
 tempfile = "3" # dev only
 
 # The user-mode network stack (boxcar-net).
-# The guest sensor (M3): aya loads the eBPF programs in the guest, aya-obj
-# parses the built object on the host for the eBPF lane's checks.
+# The guest sensor (M3): aya loads the eBPF programs in the guest, aya-build
+# builds them from boxcar-sensor's build.rs, aya-obj parses the built object
+# on the host for the eBPF lane's checks.
 aya = "0.14"
 aya-obj = "0.3"
+aya-build = "0.2"
 
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-raw"] }
 socket2 = { version = "0.5", features = ["all"] }

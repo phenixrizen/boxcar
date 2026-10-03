@@ -10,6 +10,7 @@ mod initramfs;
 mod kernel;
 mod rootfs;
 mod schema;
+mod sensor;
 mod test_kvm;
 mod vmlinux;
 
@@ -42,6 +43,10 @@ enum Command {
     /// Fail if target/guest/vmlinux's BTF is not the one the sensor's
     /// bindings were generated from.
     CheckVmlinux,
+    /// Build the guest sensor for the guest target with its eBPF programs
+    /// (needs the pinned nightly and bpf-linker) and check the object: the
+    /// eBPF lane.
+    Sensor,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,6 +58,7 @@ fn main() -> anyhow::Result<()> {
         Command::Schema => schema::run(),
         Command::GenVmlinux => vmlinux::gen(),
         Command::CheckVmlinux => vmlinux::check(),
+        Command::Sensor => sensor::run(),
     }
 }
 

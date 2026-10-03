@@ -8,9 +8,12 @@
 //! `aya::Pod` and turns them into `proc.*` records.
 //!
 //! Sizes are part of the contract between the two sides, which are built by
-//! different toolchains: the tests pin them.
+//! different toolchains: the tests pin them. [`programs`] lists what the
+//! built object must contain.
 
 #![no_std]
+
+pub mod programs;
 
 use core::mem::size_of;
 
