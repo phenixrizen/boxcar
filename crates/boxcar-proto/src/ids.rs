@@ -17,6 +17,14 @@ use uuid::Uuid;
 /// (the genesis `prev` is the blake3 of it), and what names the session
 /// directory. A session id therefore has exactly one accepted spelling:
 /// [`FromStr`] and [`Deserialize`] reject any other spelling of a UUID.
+///
+/// A session id is always made on purpose ([`SessionId::new`]) or parsed:
+/// there is no `Default`, so a struct that holds one cannot get a fresh
+/// session by accident from `..Default::default()`.
+///
+/// ```compile_fail
+/// let _ = boxcar_proto::SessionId::default();
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionId(String);
 
@@ -27,18 +35,15 @@ pub struct ParseSessionIdError;
 
 impl SessionId {
     /// A fresh id from the current time, so ids sort by creation order.
+    // No `Default` on purpose: a session id is never made by accident
+    // (see the type's docs).
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         SessionId(Uuid::now_v7().to_string())
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -65,6 +70,26 @@ impl FromStr for SessionId {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         validate(text)?;
         Ok(SessionId(text.to_owned()))
+    }
+}
+
+/// On the wire a string: a lowercase hyphenated UUID.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for SessionId {
+    fn schema_name() -> String {
+        "SessionId".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        schema.string().pattern =
+            Some("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$".to_owned());
+        schema.metadata().description =
+            Some("A session id: a UUIDv7 in lowercase hyphenated text.".to_owned());
+        schema.into()
     }
 }
 

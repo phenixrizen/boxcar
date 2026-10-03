@@ -24,8 +24,17 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
 cargo deny check
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo xtask schema && git diff --exit-code proto/   # the schemas are current
 cargo xtask test-kvm m1          # needs /dev/kvm and target/guest/*
+cargo xtask test-kvm m2          # the same, plus the tests that reach example.com
 ```
+
+`cargo xtask schema` writes `proto/schema/{control-v1,audit-v1,guest-v1}.json`
+and `proto/testdata/control-v1.jsonl` from the types in `boxcar-proto`; a
+change to a message or record type is committed with them. The protocols
+are described in [docs/control-protocol.md](docs/control-protocol.md) and
+[docs/audit-events.md](docs/audit-events.md).
 
 ## KVM on the dev machine
 
@@ -40,7 +49,12 @@ cargo xtask test-kvm m1          # the KVM-gated tests, once the artifacts below
 which boot real VMs: one at a time, with their output shown, and with
 `BOXCAR_TEST_KERNEL`, `BOXCAR_TEST_INITRAMFS` and `BOXCAR_TEST_ROOTFS` set to
 the artifacts in `target/guest`. Without `/dev/kvm` or an artifact it says
-what is missing and exits 0.
+what is missing and exits 0. `m1` keeps the guest off the network
+(`BOXCAR_TEST_NET=0`: the tests that reach example.com skip); `m2` runs
+those too when the host resolves example.com. GitHub-hosted runners have
+no KVM: CI runs the gated suite only where the repository variable
+`HAS_KVM` is `true` (a self-hosted runner with `/dev/kvm` and the guest
+artifacts built).
 
 ## Guest artifacts
 

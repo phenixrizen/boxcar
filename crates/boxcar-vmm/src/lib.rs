@@ -5,11 +5,17 @@
 
 pub mod arch;
 pub mod cmdline;
+pub mod console;
+pub mod control;
 pub mod devices;
+pub mod guest_ctl;
 pub mod kick;
 pub mod kvm;
 pub mod lifecycle;
 pub mod memory;
+pub mod policy;
+pub mod pty;
+pub mod services;
 pub mod stdin;
 pub mod vcpu;
 pub mod vmm;

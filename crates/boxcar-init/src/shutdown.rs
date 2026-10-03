@@ -39,6 +39,16 @@ pub fn finish(ended: Ended) -> ! {
     reboot_now()
 }
 
+/// What the console says when the session outlived `SIGKILL`.
+pub const UNENDED_LINE: &str = "boxcar: the session did not end after SIGKILL\n";
+
+/// Says on the console that the session did not end (`vsock` mode, a
+/// session stuck in the kernel past `SIGKILL`) and reboots. Never returns.
+pub fn finish_unended() -> ! {
+    let _ = write_console(UNENDED_LINE.as_bytes());
+    reboot_now()
+}
+
 /// Drains the console, flushes filesystems and reboots. Never returns.
 ///
 /// If the reboot syscall itself fails (it cannot for PID 1 in the initial

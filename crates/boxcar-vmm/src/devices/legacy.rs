@@ -23,17 +23,21 @@
 //! (the guest's `ttyS0` console), and an i8042 at `0x60..=0x64` that knows
 //! only the CPU reset command, which is how the guest reboots with
 //! `reboot=k`. Both are vm-superio devices behind [`BusDevice`] adapters.
+//!
+//! The UART's output goes into a [`ConsoleSink`], which never blocks: the
+//! vCPU thread that wrote the byte to the port is never held by the host's
+//! stdout (see [`crate::console`]).
 
-use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use boxcar_virtio::bus::{Bus, BusDevice, BusError};
 use vm_superio::serial::{Error as SerialError, SerialEvents};
 use vm_superio::{I8042Device, Serial, Trigger};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+
+use crate::console::ConsoleSink;
 
 /// COM1's first port.
 pub const COM1_BASE: u64 = 0x3f8;
@@ -67,28 +71,6 @@ impl Deref for EventFdTrigger {
     }
 }
 
-/// Where the guest's serial console output goes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConsoleOut {
-    /// The host's standard output.
-    Stdio,
-    /// A file, created or truncated when the VM is built.
-    File(PathBuf),
-}
-
-/// The stream the UART writes the guest's output to.
-pub type ConsoleWriter = Box<dyn Write + Send>;
-
-impl ConsoleOut {
-    /// Opens the stream: stdout, or the file (created or truncated).
-    pub fn open(&self) -> io::Result<ConsoleWriter> {
-        Ok(match self {
-            ConsoleOut::Stdio => Box::new(io::stdout()),
-            ConsoleOut::File(path) => Box::new(File::create(path)?),
-        })
-    }
-}
-
 /// The UART's event callbacks. Only one matters: when the guest has read the
 /// receive FIFO empty, `buffer_ready` is written so the stdin subscriber can
 /// start reading host input again.
@@ -113,28 +95,24 @@ impl SerialEvents for ConsoleEvents {
     }
 }
 
-type Uart = Serial<EventFdTrigger, ConsoleEvents, ConsoleWriter>;
+type Uart = Serial<EventFdTrigger, ConsoleEvents, ConsoleSink>;
 
 /// COM1. Shared between the PIO bus (the vCPU threads) and the stdin
 /// subscriber (the main thread) behind an `Arc<Mutex>`.
 pub struct SerialDevice {
     uart: Uart,
-    /// Set after the first failed console write, so a closed console is
-    /// reported once rather than once per byte.
-    write_failed: bool,
 }
 
 impl SerialDevice {
     /// A UART writing to `out`, with fresh non-blocking eventfds for its
     /// interrupt and its buffer-ready event.
-    pub fn new(out: ConsoleWriter) -> io::Result<Self> {
+    pub fn new(out: ConsoleSink) -> io::Result<Self> {
         let interrupt = EventFdTrigger(EventFd::new(EFD_NONBLOCK)?);
         let events = ConsoleEvents {
             buffer_ready: EventFd::new(EFD_NONBLOCK)?,
         };
         Ok(SerialDevice {
             uart: Serial::with_events(interrupt, events, out),
-            write_failed: false,
         })
     }
 
@@ -168,11 +146,6 @@ impl SerialDevice {
             }
         }
     }
-
-    /// Flushes the console stream.
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.uart.writer_mut().flush()
-    }
 }
 
 impl BusDevice for SerialDevice {
@@ -186,15 +159,10 @@ impl BusDevice for SerialDevice {
         let (Ok(offset), [value]) = (u8::try_from(offset), data) else {
             return;
         };
-        match self.uart.write(offset, *value) {
-            Ok(()) => {}
-            Err(SerialError::IOError(error)) => {
-                if !self.write_failed {
-                    self.write_failed = true;
-                    tracing::warn!("serial: console output lost: {error}");
-                }
-            }
-            Err(error) => tracing::warn!("serial: {error:?}"),
+        // The sink never fails; what can is the interrupt line, whose
+        // trigger is an eventfd write.
+        if let Err(error) = self.uart.write(offset, *value) {
+            tracing::warn!("serial: {error:?}");
         }
     }
 }
@@ -241,7 +209,7 @@ pub struct LegacyDevices {
 
 impl LegacyDevices {
     /// Both devices, the serial writing to `out`.
-    pub fn new(out: ConsoleWriter) -> io::Result<Self> {
+    pub fn new(out: ConsoleSink) -> io::Result<Self> {
         let reset_evt = EventFd::new(EFD_NONBLOCK)?;
         Ok(LegacyDevices {
             serial: Arc::new(Mutex::new(SerialDevice::new(out)?)),
@@ -255,29 +223,30 @@ impl LegacyDevices {
         pio.insert(self.serial.clone(), COM1_BASE, COM1_LEN)?;
         pio.insert(self.i8042.clone(), I8042_BASE, I8042_LEN)
     }
-
-    /// Flushes the console. Called once the vCPUs have stopped.
-    pub fn close(&self) {
-        let mut serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(error) = serial.flush() {
-            tracing::warn!("serial: cannot flush the console: {error}");
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
+    use std::io::{ErrorKind, Write};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::console::ConsoleWriter;
 
-    /// A console that keeps what the guest wrote, shared with the test.
+    /// A console target that keeps what the guest wrote, shared with the
+    /// test; it stalls in `write` while the test holds `gate`.
     #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
+    struct Captured {
+        gate: Arc<Mutex<()>>,
+        got: Arc<Mutex<Vec<u8>>>,
+    }
 
     impl Write for Captured {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            let _gate = self.gate.lock().unwrap();
+            self.got.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -287,16 +256,17 @@ mod tests {
 
     impl Captured {
         fn text(&self) -> Vec<u8> {
-            self.0.lock().unwrap().clone()
+            self.got.lock().unwrap().clone()
         }
     }
 
-    fn devices_on_a_bus() -> (LegacyDevices, Bus, Captured) {
+    fn devices_on_a_bus() -> (LegacyDevices, Bus, Captured, ConsoleWriter) {
         let out = Captured::default();
-        let devices = LegacyDevices::new(Box::new(out.clone())).unwrap();
+        let (sink, writer) = ConsoleWriter::spawn_with(out.clone()).unwrap();
+        let devices = LegacyDevices::new(sink).unwrap();
         let mut pio = Bus::new();
         devices.attach(&mut pio).unwrap();
-        (devices, pio, out)
+        (devices, pio, out, writer)
     }
 
     /// Nothing is pending on a non-blocking eventfd.
@@ -306,10 +276,15 @@ mod tests {
 
     #[test]
     fn serial_output_written_through_the_pio_bus_reaches_the_console() {
-        let (_devices, pio, out) = devices_on_a_bus();
+        let (_devices, pio, out, writer) = devices_on_a_bus();
         for byte in b"hi\r\n" {
             assert!(pio.write(0x3f8, &[*byte]));
         }
+        // The console is drained by its own thread.
+        assert_eq!(
+            writer.flush_and_join(Duration::from_secs(5)).dropped_bytes,
+            0
+        );
         assert_eq!(out.text(), b"hi\r\n");
 
         // The line status register reports an empty transmitter.
@@ -318,9 +293,40 @@ mod tests {
         assert_eq!(lsr[0] & 0x60, 0x60, "LSR {:#x}", lsr[0]);
     }
 
+    /// The vCPU thread's port write returns while the host's stdout is
+    /// stalled: a paused pipe reader no longer parks a vCPU in `write_all`
+    /// under the serial mutex, which the stop sequence could not free.
+    #[test]
+    fn a_stalled_console_does_not_hold_the_vcpu_in_the_serial_write() {
+        let (devices, pio, out, writer) = devices_on_a_bus();
+        let stall = out.gate.lock().unwrap();
+
+        let pio = Arc::new(pio);
+        let vcpu_pio = pio.clone();
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let start = Instant::now();
+            // Well over the console ring: the guest keeps printing.
+            for i in 0..400_000u32 {
+                vcpu_pio.write(0x3f8, &[b'a' + (i % 26) as u8]);
+            }
+            let _ = done.send(start.elapsed());
+        });
+        let elapsed = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a serial write blocked on the stalled console");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        // The serial mutex is free too: the stdin side can still use it.
+        assert!(devices.serial.try_lock().is_ok());
+
+        drop(stall);
+        let stats = writer.flush_and_join(Duration::from_secs(10));
+        assert!(stats.dropped_bytes > 0);
+    }
+
     #[test]
     fn bytes_enqueued_on_the_shared_serial_are_read_through_the_pio_bus() {
-        let (devices, pio, _out) = devices_on_a_bus();
+        let (devices, pio, _out, _writer) = devices_on_a_bus();
         // Enable the received-data interrupt (IER bit 0).
         assert!(pio.write(0x3f9, &[0x01]));
         assert_eq!(devices.serial.lock().unwrap().enqueue(b"ok"), 2);
@@ -344,7 +350,7 @@ mod tests {
 
     #[test]
     fn i8042_reset_write_fires_the_reset_eventfd() {
-        let (devices, pio, _out) = devices_on_a_bus();
+        let (devices, pio, _out, _writer) = devices_on_a_bus();
         // 0xFE to the data port (0x60) is not a reset.
         assert!(pio.write(0x60, &[0xfe]));
         assert!(is_quiet(&devices.reset_evt));
@@ -363,7 +369,7 @@ mod tests {
 
     #[test]
     fn com1_and_i8042_occupy_their_ports() {
-        let (_devices, pio, _out) = devices_on_a_bus();
+        let (_devices, pio, _out, _writer) = devices_on_a_bus();
         let mut byte = [0u8];
         for port in [0x3f8, 0x3ff, 0x60, 0x64] {
             assert!(pio.read(port, &mut byte), "{port:#x}");

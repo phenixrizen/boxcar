@@ -41,9 +41,11 @@ mod errno;
 mod payloads;
 
 pub use payloads::{
-    ArtifactRef, Attrib, Checkpoint, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
-    FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
-    HashStatus, OpResult, SetAttr, ShareRef, VmmStart, VmmStop,
+    ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
+    FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
+    FsSymlink, FsXattr, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp,
+    OpResult, PolicyChanged, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart,
+    VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -66,6 +68,26 @@ impl Serialize for Ring {
     }
 }
 
+/// On the wire the integer 0 or 1.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Ring {
+    fn schema_name() -> String {
+        "Ring".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::Integer.into()),
+            enum_values: Some(vec![serde_json::json!(0), serde_json::json!(1)]),
+            ..Default::default()
+        };
+        schema.metadata().description = Some(
+            "Which side of the VM boundary made the record: 0 the host, 1 the guest.".to_owned(),
+        );
+        schema.into()
+    }
+}
+
 impl<'de> Deserialize<'de> for Ring {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match u8::deserialize(deserializer)? {
@@ -81,6 +103,7 @@ impl<'de> Deserialize<'de> for Ring {
 
 /// The component that produced a record. On the wire, the lowercase name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     Vmm,
@@ -93,17 +116,35 @@ pub enum Source {
     Reconciler,
     Gateway,
     Control,
+    /// The guest's session, as its init reports it over the control
+    /// channel.
+    Session,
+    /// The session's policy, as the control socket changes it.
+    Policy,
 }
 
 impl Source {
     /// The source of an event kind this crate defines a payload for:
     /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
-    /// device. `None` for every other kind; later milestones add theirs.
+    /// device, `net.*` from the network stack, `vsock.*` from the vsock
+    /// device, `control.*` from the control socket, `session.*` from the
+    /// guest's session, `policy.*` from the policy. `None` for every other
+    /// kind; later milestones add theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
         if kind == "checkpoint" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
         } else if kind.starts_with("fs.") {
             Some(Source::Fs)
+        } else if kind.starts_with("net.") {
+            Some(Source::Net)
+        } else if kind.starts_with("vsock.") {
+            Some(Source::Vsock)
+        } else if kind.starts_with("control.") {
+            Some(Source::Control)
+        } else if kind.starts_with("session.") {
+            Some(Source::Session)
+        } else if kind.starts_with("policy.") {
+            Some(Source::Policy)
         } else {
             None
         }
@@ -112,6 +153,7 @@ impl Source {
 
 /// The guest identity an event is attributed to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Subject {
     pub pid: u32,
     pub uid: u32,
@@ -120,6 +162,7 @@ pub struct Subject {
 
 /// Where an event sits in a trace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SpanRef {
     pub trace_id: String,
     pub span_id: String,
@@ -202,6 +245,25 @@ impl FromStr for Hash {
     }
 }
 
+/// On the wire a string: `b3:` and 64 lowercase hex digits.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Hash {
+    fn schema_name() -> String {
+        "Hash".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        schema.string().pattern = Some("^b3:[0-9a-f]{64}$".to_owned());
+        schema.metadata().description =
+            Some("A blake3 digest: `b3:` followed by 64 lowercase hex digits.".to_owned());
+        schema.into()
+    }
+}
+
 impl Serialize for Hash {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
@@ -233,6 +295,7 @@ impl<'de> Deserialize<'de> for Hash {
 /// The JSON field names are these field names, except that `kind` is `type`.
 /// Unset optional fields are left out of the JSON, never written as `null`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Record {
     /// The schema version, [`SCHEMA_VERSION`].
     pub v: u8,
@@ -306,6 +369,7 @@ pub fn genesis_prev(session_id: &SessionId) -> Hash {
 /// which are the two fields a [`Record`] carries at its top level. New kinds
 /// are additive, and a consumer ignores kinds it does not know.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "data")]
 pub enum Payload {
     #[serde(rename = "vmm.start")]
@@ -350,6 +414,34 @@ pub enum Payload {
     FsReaddir(FsPathOp),
     #[serde(rename = "checkpoint")]
     Checkpoint(Checkpoint),
+    #[serde(rename = "control.connect")]
+    ControlConnect(ControlConnect),
+    #[serde(rename = "control.stop")]
+    ControlStop(ControlStop),
+    #[serde(rename = "net.dhcp")]
+    NetDhcp(NetDhcp),
+    #[serde(rename = "net.dns")]
+    NetDns(NetDns),
+    #[serde(rename = "net.connect")]
+    NetConnect(NetConnect),
+    #[serde(rename = "net.tls")]
+    NetTls(NetTls),
+    #[serde(rename = "net.close")]
+    NetClose(NetClose),
+    #[serde(rename = "net.drop")]
+    NetDrop(NetDrop),
+    #[serde(rename = "net.udp")]
+    NetUdp(NetUdp),
+    #[serde(rename = "vsock.connect")]
+    VsockConnect(VsockConnect),
+    #[serde(rename = "vsock.close")]
+    VsockClose(VsockClose),
+    #[serde(rename = "session.start")]
+    SessionStart(SessionStart),
+    #[serde(rename = "session.exit")]
+    SessionExit(SessionExit),
+    #[serde(rename = "policy.changed")]
+    PolicyChanged(PolicyChanged),
 }
 
 impl Payload {
@@ -378,13 +470,29 @@ impl Payload {
             Payload::FsDenied(_) => "fs.denied",
             Payload::FsReaddir(_) => "fs.readdir",
             Payload::Checkpoint(_) => "checkpoint",
+            Payload::ControlConnect(_) => "control.connect",
+            Payload::ControlStop(_) => "control.stop",
+            Payload::NetDhcp(_) => "net.dhcp",
+            Payload::NetDns(_) => "net.dns",
+            Payload::NetConnect(_) => "net.connect",
+            Payload::NetTls(_) => "net.tls",
+            Payload::NetClose(_) => "net.close",
+            Payload::NetDrop(_) => "net.drop",
+            Payload::NetUdp(_) => "net.udp",
+            Payload::VsockConnect(_) => "vsock.connect",
+            Payload::VsockClose(_) => "vsock.close",
+            Payload::SessionStart(_) => "session.start",
+            Payload::SessionExit(_) => "session.exit",
+            Payload::PolicyChanged(_) => "policy.changed",
         }
     }
 
     /// The source of the record that carries this payload: the VMM for
-    /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, as
-    /// [`Source::from_kind`] says. A new variant does not compile until it
-    /// is given one.
+    /// `vmm.*` and `checkpoint`, the filesystem device for `fs.*`, the
+    /// network stack for `net.*`, the vsock device for `vsock.*`, the
+    /// control socket for `control.*`, the guest's session for `session.*`,
+    /// the policy for `policy.*`, as [`Source::from_kind`] says. A new
+    /// variant does not compile until it is given one.
     pub fn source(&self) -> Source {
         match self {
             Payload::VmmStart(_) | Payload::VmmStop(_) | Payload::Checkpoint(_) => Source::Vmm,
@@ -406,6 +514,17 @@ impl Payload {
             | Payload::FsXattr(_)
             | Payload::FsDenied(_)
             | Payload::FsReaddir(_) => Source::Fs,
+            Payload::ControlConnect(_) | Payload::ControlStop(_) => Source::Control,
+            Payload::NetDhcp(_)
+            | Payload::NetDns(_)
+            | Payload::NetConnect(_)
+            | Payload::NetTls(_)
+            | Payload::NetClose(_)
+            | Payload::NetDrop(_)
+            | Payload::NetUdp(_) => Source::Net,
+            Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
+            Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
+            Payload::PolicyChanged(_) => Source::Policy,
         }
     }
 
@@ -431,13 +550,16 @@ impl Payload {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
     use super::*;
+    use crate::control::StopMode;
     use serde_json::json;
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 21 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 21] = [
+    /// The 34 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 35] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -459,6 +581,20 @@ mod tests {
         "fs.denied",
         "fs.readdir",
         "checkpoint",
+        "control.connect",
+        "control.stop",
+        "net.dhcp",
+        "net.dns",
+        "net.connect",
+        "net.tls",
+        "net.close",
+        "net.drop",
+        "net.udp",
+        "vsock.connect",
+        "vsock.close",
+        "session.start",
+        "session.exit",
+        "policy.changed",
     ];
 
     fn session() -> SessionId {
@@ -538,8 +674,15 @@ mod tests {
                 Payload::VmmStop(VmmStop {
                     reason: "guest_reset".into(),
                     exit_code: Some(0),
+                    console_dropped_bytes: 4096,
+                    stdin_dropped_bytes: 100,
                 }),
-                json!({"reason": "guest_reset", "exit_code": 0}),
+                json!({
+                    "reason": "guest_reset",
+                    "exit_code": 0,
+                    "console_dropped_bytes": 4096,
+                    "stdin_dropped_bytes": 100,
+                }),
             ),
             (
                 Payload::FsMount(FsMount {
@@ -559,6 +702,7 @@ mod tests {
                 Payload::FsOpen(FsOpen {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 7,
                     flags: 0o102,
                     flags_decoded: vec!["O_RDWR".into(), "O_CREAT".into()],
@@ -579,6 +723,7 @@ mod tests {
                 Payload::FsCreate(FsCreate {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 8,
                     mode: 0o644,
                     flags: 0o101,
@@ -597,6 +742,7 @@ mod tests {
                 Payload::FsClose(FsClose {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     path_at_open: "/a/old.txt".into(),
                     fh: 8,
                     bytes_read: 0,
@@ -606,6 +752,7 @@ mod tests {
                     hash_status: HashStatus::Ok,
                     open_seq: Some(41),
                     attrib: Attrib::Caller,
+                    ts_release_ns: 1_700_000_000_000_000_007,
                 }),
                 json!({
                     "mount": "workspace",
@@ -619,12 +766,14 @@ mod tests {
                     "hash_status": "ok",
                     "open_seq": 41,
                     "attrib": "caller",
+                    "ts_release_ns": 1_700_000_000_000_000_007_u64,
                 }),
             ),
             (
                 Payload::FsRead(FsIo {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 7,
                     offset: 4096,
                     len: 512,
@@ -645,6 +794,7 @@ mod tests {
                 Payload::FsWrite(FsIo {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     fh: 7,
                     offset: 0,
                     len: 3,
@@ -665,6 +815,7 @@ mod tests {
                 Payload::FsUnlink(FsPathOp {
                     mount: "workspace".into(),
                     path: "/a/old".into(),
+                    path_b64: None,
                     result: OpResult::ok(),
                 }),
                 json!({"mount": "workspace", "path": "/a/old", "result": {"ok": true}}),
@@ -673,6 +824,7 @@ mod tests {
                 Payload::FsRmdir(FsPathOp {
                     mount: "workspace".into(),
                     path: "/a".into(),
+                    path_b64: None,
                     result: OpResult::errno(39),
                 }),
                 json!({
@@ -685,6 +837,7 @@ mod tests {
                 Payload::FsMkdir(FsMkdir {
                     mount: "workspace".into(),
                     path: "/a/d".into(),
+                    path_b64: None,
                     mode: 0o755,
                     result: OpResult::ok(),
                 }),
@@ -694,6 +847,7 @@ mod tests {
                 Payload::FsMknod(FsMknod {
                     mount: "root".into(),
                     path: "/dev/null".into(),
+                    path_b64: None,
                     mode: 0o020666,
                     rdev: 259,
                     result: OpResult::errno(1),
@@ -710,6 +864,7 @@ mod tests {
                 Payload::FsSymlink(FsSymlink {
                     mount: "workspace".into(),
                     path: "/a/link".into(),
+                    path_b64: None,
                     target: "/etc/passwd".into(),
                     result: OpResult::ok(),
                 }),
@@ -724,6 +879,7 @@ mod tests {
                 Payload::FsLink(FsLink {
                     mount: "workspace".into(),
                     path: "/a/hard".into(),
+                    path_b64: None,
                     target_path: "/a/b.txt".into(),
                     result: OpResult::ok(),
                 }),
@@ -754,6 +910,7 @@ mod tests {
                 Payload::FsSetattr(FsSetattr {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     set: SetAttr {
                         mode: Some(0o600),
                         size: Some(0),
@@ -772,6 +929,7 @@ mod tests {
                 Payload::FsFallocate(FsFallocate {
                     mount: "workspace".into(),
                     path: "/a/big".into(),
+                    path_b64: None,
                     offset: 0,
                     len: 1 << 20,
                     mode: 0,
@@ -790,6 +948,7 @@ mod tests {
                 Payload::FsXattr(FsXattr {
                     mount: "workspace".into(),
                     path: "/a/b.txt".into(),
+                    path_b64: None,
                     name: "user.k".into(),
                     op: "set".into(),
                     result: OpResult::ok(),
@@ -806,6 +965,7 @@ mod tests {
                 Payload::FsDenied(FsDenied {
                     mount: "root".into(),
                     path: "/etc/shadow".into(),
+                    path_b64: None,
                     op: "lookup".into(),
                     errno: 13,
                 }),
@@ -815,6 +975,7 @@ mod tests {
                 Payload::FsReaddir(FsPathOp {
                     mount: "root".into(),
                     path: "/".into(),
+                    path_b64: None,
                     result: OpResult::ok(),
                 }),
                 json!({"mount": "root", "path": "/", "result": {"ok": true}}),
@@ -827,7 +988,202 @@ mod tests {
                 }),
                 json!({"records_since": 1024, "dropped": 0, "root_hash": b3(0x33)}),
             ),
+            (
+                Payload::ControlConnect(ControlConnect {
+                    pid: 4242,
+                    uid: 1000,
+                    verdict: Verdict::Allow,
+                }),
+                json!({"pid": 4242, "uid": 1000, "verdict": "allow"}),
+            ),
+            (
+                Payload::ControlStop(ControlStop {
+                    by_pid: 4242,
+                    mode: StopMode::Graceful,
+                }),
+                json!({"by_pid": 4242, "mode": "graceful"}),
+            ),
+            (
+                Payload::NetDhcp(NetDhcp {
+                    op: "offer".into(),
+                    yiaddr: Ipv4Addr::new(10, 0, 2, 15),
+                }),
+                json!({"op": "offer", "yiaddr": "10.0.2.15"}),
+            ),
+            (
+                Payload::NetDns(NetDns {
+                    txid: 0xbeef,
+                    qname: "example.com".into(),
+                    qtype: 1,
+                    rcode: 0,
+                    answers: vec!["93.184.215.14".into(), "93.184.215.15".into()],
+                    verdict: Verdict::Allow,
+                    rule: Some("allow example.com".into()),
+                }),
+                json!({
+                    "txid": 48879,
+                    "qname": "example.com",
+                    "qtype": 1,
+                    "rcode": 0,
+                    "answers": ["93.184.215.14", "93.184.215.15"],
+                    "verdict": "allow",
+                    "rule": "allow example.com",
+                }),
+            ),
+            (
+                Payload::NetConnect(NetConnect {
+                    flow: 7,
+                    proto: "tcp".into(),
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 43210),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(93, 184, 215, 14), 443),
+                    names: vec!["example.com".into()],
+                    verdict: Verdict::Allow,
+                    rule: Some("allow example.com:443".into()),
+                }),
+                json!({
+                    "flow": 7,
+                    "proto": "tcp",
+                    "src": "10.0.2.15:43210",
+                    "dst": "93.184.215.14:443",
+                    "names": ["example.com"],
+                    "verdict": "allow",
+                    "rule": "allow example.com:443",
+                }),
+            ),
+            (
+                Payload::NetTls(NetTls {
+                    flow: 7,
+                    kind: "tls".into(),
+                    sni: Some("example.com".into()),
+                    alpn: vec!["h2".into(), "http/1.1".into()],
+                    verdict: Verdict::Allow,
+                }),
+                json!({
+                    "flow": 7,
+                    "kind": "tls",
+                    "sni": "example.com",
+                    "alpn": ["h2", "http/1.1"],
+                    "verdict": "allow",
+                }),
+            ),
+            (
+                Payload::NetClose(NetClose {
+                    flow: 7,
+                    tx: 517,
+                    rx: 10_485_760,
+                    dur_ms: 1250,
+                    reason: "fin".into(),
+                }),
+                json!({"flow": 7, "tx": 517, "rx": 10485760, "dur_ms": 1250, "reason": "fin"}),
+            ),
+            (
+                Payload::NetDrop(NetDrop {
+                    reason: "ipv6".into(),
+                    count: 12,
+                }),
+                json!({"reason": "ipv6", "count": 12}),
+            ),
+            (
+                Payload::NetUdp(NetUdp {
+                    flow: 8,
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 5353),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 123),
+                    names: vec!["time.example".into()],
+                    verdict: Verdict::Allow,
+                    rule: Some("allow 192.0.2.0/24:123".into()),
+                }),
+                json!({
+                    "flow": 8,
+                    "src": "10.0.2.15:5353",
+                    "dst": "192.0.2.1:123",
+                    "names": ["time.example"],
+                    "verdict": "allow",
+                    "rule": "allow 192.0.2.0/24:123",
+                }),
+            ),
+            (
+                // Init's control channel: the guest, from a privileged
+                // source port, to the internal service at 1024.
+                Payload::VsockConnect(VsockConnect {
+                    port: 1024,
+                    dir: "guest".into(),
+                    peer: "internal".into(),
+                    src_port: 1023,
+                    verdict: Verdict::Allow,
+                    reason: None,
+                }),
+                json!({
+                    "port": 1024,
+                    "dir": "guest",
+                    "peer": "internal",
+                    "src_port": 1023,
+                    "verdict": "allow",
+                    "reason": null,
+                }),
+            ),
+            (
+                Payload::VsockClose(VsockClose {
+                    port: 1024,
+                    dir: "guest".into(),
+                    tx: 4096,
+                    rx: 10_485_760,
+                }),
+                json!({"port": 1024, "dir": "guest", "tx": 4096, "rx": 10485760}),
+            ),
+            (
+                // What init started, as the VMM asked, and its pid.
+                Payload::SessionStart(SessionStart {
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                    cwd: "/workspace".into(),
+                    uid: 1000,
+                    gid: 1000,
+                    pid: 212,
+                }),
+                json!({
+                    "argv": ["/bin/sh", "-c", "exit 7"],
+                    "cwd": "/workspace",
+                    "uid": 1000,
+                    "gid": 1000,
+                    "pid": 212,
+                }),
+            ),
+            (
+                Payload::SessionExit(SessionExit {
+                    code: Some(7),
+                    signal: None,
+                }),
+                json!({"code": 7, "signal": null}),
+            ),
+            (
+                Payload::PolicyChanged(PolicyChanged {
+                    by_pid: 4242,
+                    version: 2,
+                }),
+                json!({"by_pid": 4242, "version": 2}),
+            ),
         ]
+    }
+
+    /// The other values of the control payloads' enums.
+    #[test]
+    fn control_payloads_spell_deny_and_force() {
+        let deny = Payload::ControlConnect(ControlConnect {
+            pid: 1,
+            uid: 1001,
+            verdict: Verdict::Deny,
+        });
+        assert_eq!(
+            deny.into_parts(),
+            (
+                "control.connect".to_owned(),
+                json!({"pid": 1, "uid": 1001, "verdict": "deny"})
+            )
+        );
+        let force = Payload::ControlStop(ControlStop {
+            by_pid: 1,
+            mode: StopMode::Force,
+        });
+        assert_eq!(force.into_parts().1, json!({"by_pid": 1, "mode": "force"}));
     }
 
     /// Payloads whose optional fields are unset. `Option`s that the schema
@@ -857,13 +1213,21 @@ mod tests {
                 Payload::VmmStop(VmmStop {
                     reason: "vcpu_error".into(),
                     exit_code: None,
+                    console_dropped_bytes: 0,
+                    stdin_dropped_bytes: 0,
                 }),
-                json!({"reason": "vcpu_error", "exit_code": null}),
+                json!({
+                    "reason": "vcpu_error",
+                    "exit_code": null,
+                    "console_dropped_bytes": 0,
+                    "stdin_dropped_bytes": 0,
+                }),
             ),
             (
                 Payload::FsClose(FsClose {
                     mount: "root".into(),
                     path: "/bin/sh".into(),
+                    path_b64: None,
                     path_at_open: "/bin/sh".into(),
                     fh: 1,
                     bytes_read: 1024,
@@ -873,6 +1237,7 @@ mod tests {
                     hash_status: HashStatus::NotHashed,
                     open_seq: None,
                     attrib: Attrib::Handle,
+                    ts_release_ns: 0,
                 }),
                 json!({
                     "mount": "root",
@@ -886,12 +1251,14 @@ mod tests {
                     "hash_status": "not_hashed",
                     "open_seq": null,
                     "attrib": "handle",
+                    "ts_release_ns": 0,
                 }),
             ),
             (
                 Payload::FsSetattr(FsSetattr {
                     mount: "workspace".into(),
                     path: "/a".into(),
+                    path_b64: None,
                     set: SetAttr {
                         atime: Some(1_700_000_000),
                         mtime: Some(-1),
@@ -905,6 +1272,132 @@ mod tests {
                     "set": {"atime": 1700000000, "mtime": -1},
                     "result": {"ok": false, "errno": 1, "err": "EPERM"},
                 }),
+            ),
+            (
+                Payload::NetDns(NetDns {
+                    txid: 1,
+                    qname: "blocked.example".into(),
+                    qtype: 28,
+                    rcode: 3,
+                    answers: Vec::new(),
+                    verdict: Verdict::Deny,
+                    rule: None,
+                }),
+                json!({
+                    "txid": 1,
+                    "qname": "blocked.example",
+                    "qtype": 28,
+                    "rcode": 3,
+                    "answers": [],
+                    "verdict": "deny",
+                    "rule": null,
+                }),
+            ),
+            (
+                Payload::NetConnect(NetConnect {
+                    flow: 9,
+                    proto: "tcp".into(),
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40000),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 22),
+                    names: Vec::new(),
+                    verdict: Verdict::Deny,
+                    rule: None,
+                }),
+                json!({
+                    "flow": 9,
+                    "proto": "tcp",
+                    "src": "10.0.2.15:40000",
+                    "dst": "10.1.2.3:22",
+                    "names": [],
+                    "verdict": "deny",
+                    "rule": null,
+                }),
+            ),
+            (
+                // A plain HTTP request with no Host to read.
+                Payload::NetTls(NetTls {
+                    flow: 9,
+                    kind: "http".into(),
+                    sni: None,
+                    alpn: Vec::new(),
+                    verdict: Verdict::Deny,
+                }),
+                json!({"flow": 9, "kind": "http", "sni": null, "alpn": [], "verdict": "deny"}),
+            ),
+            (
+                // Denied by the policy's default, to an address no DNS
+                // answer named.
+                Payload::NetUdp(NetUdp {
+                    flow: 10,
+                    src: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40001),
+                    dst: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 9),
+                    names: Vec::new(),
+                    verdict: Verdict::Deny,
+                    rule: None,
+                }),
+                json!({
+                    "flow": 10,
+                    "src": "10.0.2.15:40001",
+                    "dst": "198.51.100.9:9",
+                    "names": [],
+                    "verdict": "deny",
+                    "rule": null,
+                }),
+            ),
+            (
+                // An unprivileged guest process trying an internal port.
+                Payload::VsockConnect(VsockConnect {
+                    port: 1025,
+                    dir: "guest".into(),
+                    peer: "internal".into(),
+                    src_port: 50_000,
+                    verdict: Verdict::Deny,
+                    reason: Some("unprivileged".into()),
+                }),
+                json!({
+                    "port": 1025,
+                    "dir": "guest",
+                    "peer": "internal",
+                    "src_port": 50000,
+                    "verdict": "deny",
+                    "reason": "unprivileged",
+                }),
+            ),
+            (
+                // A host process through the vsock socket, to a guest port.
+                Payload::VsockConnect(VsockConnect {
+                    port: 5000,
+                    dir: "host".into(),
+                    peer: "guest".into(),
+                    src_port: 1_073_741_824,
+                    verdict: Verdict::Allow,
+                    reason: None,
+                }),
+                json!({
+                    "port": 5000,
+                    "dir": "host",
+                    "peer": "guest",
+                    "src_port": 1073741824,
+                    "verdict": "allow",
+                    "reason": null,
+                }),
+            ),
+            (
+                Payload::VsockClose(VsockClose {
+                    port: 5000,
+                    dir: "host".into(),
+                    tx: 0,
+                    rx: 0,
+                }),
+                json!({"port": 5000, "dir": "host", "tx": 0, "rx": 0}),
+            ),
+            (
+                // Killed by a signal: no code.
+                Payload::SessionExit(SessionExit {
+                    code: None,
+                    signal: Some(15),
+                }),
+                json!({"code": null, "signal": 15}),
             ),
         ]
     }
@@ -947,6 +1440,24 @@ mod tests {
         }
     }
 
+    /// `console_dropped_bytes` and `stdin_dropped_bytes` came after the first
+    /// logs: a `vmm.stop` without them reads as no dropped bytes.
+    #[test]
+    fn a_vmm_stop_without_the_dropped_byte_counts_reads_as_zero() {
+        let rec = record(
+            "vmm.stop",
+            Source::Vmm,
+            json!({"reason": "guest_reset", "exit_code": 0}),
+        );
+        match Payload::from_record(&rec).unwrap() {
+            Payload::VmmStop(stop) => {
+                assert_eq!(stop.console_dropped_bytes, 0);
+                assert_eq!(stop.stdin_dropped_bytes, 0);
+            }
+            other => panic!("not a vmm.stop: {other:?}"),
+        }
+    }
+
     /// `shares` came after the first logs: a `vmm.start` without it (no
     /// shares, or written before it existed) still reads, as no shares.
     #[test]
@@ -971,6 +1482,16 @@ mod tests {
         for (payload, _) in cases() {
             let expected = if payload.kind().starts_with("fs.") {
                 Source::Fs
+            } else if payload.kind().starts_with("net.") {
+                Source::Net
+            } else if payload.kind().starts_with("vsock.") {
+                Source::Vsock
+            } else if payload.kind().starts_with("control.") {
+                Source::Control
+            } else if payload.kind().starts_with("session.") {
+                Source::Session
+            } else if payload.kind().starts_with("policy.") {
+                Source::Policy
             } else {
                 Source::Vmm
             };
@@ -980,9 +1501,12 @@ mod tests {
         assert_eq!(Source::from_kind("vmm.start"), Some(Source::Vmm));
         assert_eq!(Source::from_kind("fs.open"), Some(Source::Fs));
         assert_eq!(Source::from_kind("checkpoint"), Some(Source::Vmm));
+        assert_eq!(Source::from_kind("control.stop"), Some(Source::Control));
+        assert_eq!(Source::from_kind("net.drop"), Some(Source::Net));
+        assert_eq!(Source::from_kind("vsock.close"), Some(Source::Vsock));
+        assert_eq!(Source::from_kind("session.exit"), Some(Source::Session));
+        assert_eq!(Source::from_kind("policy.changed"), Some(Source::Policy));
         for other in [
-            "net.connect",
-            "vsock.open",
             "proc.exec",
             "finding",
             "",
@@ -990,6 +1514,16 @@ mod tests {
             "fs",
             "fsx.open",
             "checkpoints",
+            "control",
+            "controls.stop",
+            "net",
+            "network.drop",
+            "vsock",
+            "vsocks.close",
+            "session",
+            "sessions.exit",
+            "policy",
+            "policyx.changed",
         ] {
             assert_eq!(Source::from_kind(other), None, "{other:?}");
         }
@@ -997,7 +1531,7 @@ mod tests {
 
     #[test]
     fn from_record_rejects_unknown_kinds_and_malformed_data() {
-        let unknown = record("net.connect", Source::Net, json!({}));
+        let unknown = record("proc.exec", Source::Guest, json!({}));
         assert!(Payload::from_record(&unknown).is_err());
         let missing_fields = record("fs.open", Source::Fs, json!({"mount": "root"}));
         assert!(Payload::from_record(&missing_fields).is_err());
@@ -1373,6 +1907,8 @@ mod tests {
             (Source::Reconciler, "reconciler"),
             (Source::Gateway, "gateway"),
             (Source::Control, "control"),
+            (Source::Session, "session"),
+            (Source::Policy, "policy"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), json!(name));
             assert_eq!(

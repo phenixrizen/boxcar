@@ -7,17 +7,21 @@
 //! behind boxcar's [`VirtioDevice`] trait:
 //!
 //! - device type 26; queue 0 is the high-priority queue (Linux sends FORGET
-//!   and INTERRUPT there), queues 1 to [`NUM_REQUEST_QUEUES`] are the
-//!   request queues, each at most [`QUEUE_MAX_SIZE`] entries;
+//!   and INTERRUPT there), queues 1 to `num_request_queues` (1 to
+//!   [`MAX_REQUEST_QUEUES`], chosen by the VMM as the smaller of the vCPU
+//!   count and 4) are the request queues, each at most [`QUEUE_MAX_SIZE`]
+//!   entries; Linux spreads requests over them by CPU;
 //! - the config space is `tag[36]`, the UTF-8 tag padded with NULs, then
 //!   `num_request_queues`, a little-endian u32 at 0x24. It is read-only;
 //! - the features are `VIRTIO_F_VERSION_1` and `VIRTIO_RING_F_EVENT_IDX`.
 //!   There is no DAX and no shared-memory window, so every read and write
 //!   the guest makes goes through FUSE, and so through the audit.
 //!
-//! Activation checks that every queue is usable, then starts one worker
-//! thread per request queue, named `fs-<tag>-q<N>` after the request queue
-//! it serves; the first worker also serves the high-priority queue. A
+//! Activation checks that every queue is usable, starts the content-hash
+//! threads again if a reset stopped them ([`AuditFs::restart_hashing`]),
+//! then starts one worker thread per request queue, named `fs-<tag>-q<N>`
+//! after the request queue it serves; the first worker also serves the
+//! high-priority queue. A
 //! worker waits on its queues' eventfds and its kill eventfd with an
 //! `EventManager` of its own, drains a queue when the driver kicks it, and
 //! interrupts the guest when the driver wants to hear about used buffers.
@@ -64,8 +68,9 @@ use crate::share::{passthrough_config, FsShareConfig};
 
 /// The virtio device ID of a file system device.
 pub const DEVICE_TYPE: u32 = virtio_bindings::virtio_ids::VIRTIO_ID_FS;
-/// Request queues the device offers, besides the high-priority queue.
-pub const NUM_REQUEST_QUEUES: usize = 1;
+/// The most request queues a device offers, besides the high-priority
+/// queue.
+pub const MAX_REQUEST_QUEUES: u16 = 4;
 /// The largest size of every queue.
 pub const QUEUE_MAX_SIZE: u16 = 1024;
 /// The length of the config space's `tag` field.
@@ -104,11 +109,17 @@ pub enum FsError {
         #[source]
         source: io::Error,
     },
+    /// The request queue count is 0 or over [`MAX_REQUEST_QUEUES`].
+    #[error("{0} request queues: a virtio-fs device has 1 to {MAX_REQUEST_QUEUES}")]
+    RequestQueues(u16),
 }
 
 /// A virtio-fs device serving one share through [`AuditFs`].
 pub struct VirtioFs {
     tag: String,
+    /// Request queues, besides the high-priority queue: 1 to
+    /// [`MAX_REQUEST_QUEUES`].
+    request_queues: u16,
     config: [u8; CONFIG_SIZE],
     fs: Arc<AuditFs<PassthroughFs<()>>>,
     server: Arc<FsServer>,
@@ -118,7 +129,9 @@ pub struct VirtioFs {
 }
 
 impl VirtioFs {
-    /// A device serving `share`, recording into `sink`.
+    /// A device serving `share` with `request_queues` request queues (1 to
+    /// [`MAX_REQUEST_QUEUES`], one worker thread each), recording into
+    /// `sink`.
     ///
     /// The share's directory is opened here (`O_PATH | O_DIRECTORY`) for
     /// the audit to hash closed files beneath; the passthrough itself
@@ -127,8 +140,12 @@ impl VirtioFs {
         share: FsShareConfig,
         sink: AuditSink,
         opts: AuditFsOptions,
+        request_queues: u16,
     ) -> Result<Self, FsError> {
-        let config = config_space(&share.tag)?;
+        if request_queues == 0 || request_queues > MAX_REQUEST_QUEUES {
+            return Err(FsError::RequestQueues(request_queues));
+        }
+        let config = config_space(&share.tag, request_queues)?;
         if share.host_dir.to_str().is_none() {
             return Err(FsError::NonUtf8Dir(share.host_dir));
         }
@@ -147,6 +164,7 @@ impl VirtioFs {
         Ok(VirtioFs {
             metrics: Arc::new(OpcodeCounts::new(&share.tag)),
             tag: share.tag,
+            request_queues,
             config,
             fs,
             server,
@@ -162,6 +180,17 @@ impl VirtioFs {
     /// The requests the device has seen, by opcode.
     pub fn metrics(&self) -> &OpcodeCounts {
         &self.metrics
+    }
+
+    /// Request queues, besides the high-priority queue.
+    pub fn request_queues(&self) -> u16 {
+        self.request_queues
+    }
+
+    /// How many threads hash closed files for the share: 0 after a reset,
+    /// until the next activation starts them again.
+    pub fn hash_threads(&self) -> usize {
+        self.fs.hash_threads()
     }
 
     /// Answers every request the driver has made available on `queue`, as
@@ -183,7 +212,7 @@ impl VirtioDevice for VirtioFs {
     }
 
     fn num_queues(&self) -> usize {
-        1 + NUM_REQUEST_QUEUES
+        1 + usize::from(self.request_queues)
     }
 
     fn queue_max_size(&self, idx: usize) -> u16 {
@@ -244,11 +273,15 @@ impl VirtioDevice for VirtioFs {
             )));
         }
 
+        // A reset stopped the hash threads; closes are hashed off the
+        // reply path again from this activation on.
+        self.fs.restart_hashing();
+
         // Every worker is prepared before any thread starts, so that a
         // failure leaves nothing running.
         let mut queues = queues.into_iter().enumerate();
         let mut hiprio = queues.next();
-        let mut prepared = Vec::with_capacity(NUM_REQUEST_QUEUES);
+        let mut prepared = Vec::with_capacity(usize::from(self.request_queues));
         for (index, queue) in queues {
             let mut served = Vec::with_capacity(2);
             served.extend(hiprio.take());
@@ -310,16 +343,15 @@ impl Drop for VirtioFs {
     }
 }
 
-/// The config space for `tag`.
-fn config_space(tag: &str) -> Result<[u8; CONFIG_SIZE], FsError> {
+/// The config space for `tag` and `request_queues` request queues.
+fn config_space(tag: &str, request_queues: u16) -> Result<[u8; CONFIG_SIZE], FsError> {
     let bytes = tag.as_bytes();
     if bytes.is_empty() || bytes.len() > TAG_LEN || bytes.iter().any(u8::is_ascii_control) {
         return Err(FsError::InvalidTag(tag.to_owned()));
     }
     let mut config = [0; CONFIG_SIZE];
     config[..bytes.len()].copy_from_slice(bytes);
-    let queues = u32::try_from(NUM_REQUEST_QUEUES).unwrap_or(u32::MAX);
-    config[TAG_LEN..].copy_from_slice(&queues.to_le_bytes());
+    config[TAG_LEN..].copy_from_slice(&u32::from(request_queues).to_le_bytes());
     Ok(config)
 }
 
@@ -924,19 +956,21 @@ mod tests {
 
     #[test]
     fn the_config_space_is_the_padded_tag_and_the_queue_count() {
-        let config = config_space("root").unwrap();
+        let config = config_space("root", 1).unwrap();
         assert_eq!(&config[..4], b"root");
         assert!(config[4..TAG_LEN].iter().all(|&b| b == 0));
         assert_eq!(config[TAG_LEN..], 1u32.to_le_bytes());
+        let four = config_space("root", 4).unwrap();
+        assert_eq!(four[TAG_LEN..], 4u32.to_le_bytes());
 
         for bad in ["", "a\nb", "a\0b", &"x".repeat(37)] {
             assert!(
-                matches!(config_space(bad), Err(FsError::InvalidTag(_))),
+                matches!(config_space(bad, 1), Err(FsError::InvalidTag(_))),
                 "{bad:?}"
             );
         }
         // 36 bytes of UTF-8, fewer characters.
         let tag = "é".repeat(18);
-        assert_eq!(&config_space(&tag).unwrap()[..TAG_LEN], tag.as_bytes());
+        assert_eq!(&config_space(&tag, 1).unwrap()[..TAG_LEN], tag.as_bytes());
     }
 }

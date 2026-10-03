@@ -45,6 +45,7 @@ fn write_session(scratch: &Scratch) -> (PathBuf, CloseStats) {
             payload: Payload::FsWrite(FsIo {
                 mount: "workspace".into(),
                 path: format!("/file-{n:06}.txt"),
+                path_b64: None,
                 fh: n,
                 offset: 0,
                 len: 1,

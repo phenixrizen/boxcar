@@ -5,7 +5,8 @@
 //!
 //! One line per check: `OK   <check>`, `FAIL <check>: <hint>` for a required
 //! check that failed, or `MISS <check>: <hint>` for something that is not
-//! there yet or is optional. A final `doctor: <n> failed` line counts the
+//! there yet or is optional, such as an open file limit too low for the
+//! network at its caps. A final `doctor: <n> failed` line counts the
 //! FAIL lines, and the exit code is 1 when there are any.
 
 use std::fmt;
@@ -16,6 +17,8 @@ use std::process::{Command, ExitCode};
 use boxcar_vmm::kvm::{
     Cap, KvmContext, KvmError, KVM_API_VERSION, KVM_DEVICE, KVM_OPEN_HINT, REQUIRED_CAPS,
 };
+
+use super::nofile::{self, Limit};
 
 const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
 
@@ -91,6 +94,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         checks.push(artifact_check(Path::new(path), hint));
     }
     checks.push(pahole_check());
+    checks.push(nofile_check(nofile::current()));
 
     let mut out = io::stdout().lock();
     let failed = write_report(&mut out, &checks)?;
@@ -236,6 +240,26 @@ fn pahole_check() -> Check {
     }
 }
 
+/// The open file limit `boxcar run` gives a VM with a network card (see
+/// [`nofile`]), from the process's limit now: missing, not failed, when it
+/// is below what the network needs at its caps.
+fn nofile_check(limit: io::Result<Limit>) -> Check {
+    match limit {
+        Ok(limit) => {
+            let run = nofile::target(limit);
+            let name = format!(
+                "open file limit {run} for boxcar run (soft {}, hard {})",
+                limit.soft, limit.hard
+            );
+            match nofile::warning(run) {
+                None => Check::ok(name),
+                Some(warning) => Check::missing(name, warning),
+            }
+        }
+        Err(error) => Check::missing("open file limit", format!("cannot read it: {error}")),
+    }
+}
+
 /// Runs `program args...` (an argv array, never a shell string) and returns
 /// its stdout, or a one-line reason it did not succeed.
 fn run_argv(program: &str, args: &[&str]) -> Result<String, String> {
@@ -357,6 +381,31 @@ mod tests {
             check.to_string().ends_with(": run: cargo xtask kernel"),
             "{check}"
         );
+    }
+
+    #[test]
+    fn the_open_file_limit_is_what_boxcar_run_would_set() {
+        let check = nofile_check(Ok(Limit {
+            soft: 1024,
+            hard: 1 << 20,
+        }));
+        assert_eq!(
+            check.to_string(),
+            "OK   open file limit 65536 for boxcar run (soft 1024, hard 1048576)"
+        );
+        let low = nofile_check(Ok(Limit {
+            soft: 1024,
+            hard: 4096,
+        }));
+        assert!(!low.failed(), "a warning, not a failure");
+        let text = low.to_string();
+        assert!(
+            text.starts_with("MISS open file limit 4096 for boxcar run (soft 1024, hard 4096): "),
+            "{text}"
+        );
+        assert!(text.contains("6144"), "{text}");
+        let unread = nofile_check(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!unread.failed());
     }
 
     #[test]

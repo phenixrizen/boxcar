@@ -1,0 +1,36 @@
+[package]
+name = "boxcar-net"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+boxcar-proto = { workspace = true, features = ["hash"] }
+boxcar-audit = { workspace = true }
+# The virtio-net device: the `VirtioDevice` trait, the queue drain, and
+# `boxcar_virtio::limited!`, which keeps guest-triggerable log lines to one
+# a second.
+boxcar-virtio = { workspace = true }
+vm-memory = { workspace = true }
+virtio-queue = { workspace = true }
+virtio-bindings = { workspace = true }
+event-manager = { workspace = true }
+vmm-sys-util = { workspace = true }
+smoltcp = { workspace = true }
+socket2 = { workspace = true }
+# getifaddrs, for the host's own addresses, and the connect errno.
+libc = { workspace = true }
+arc-swap = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+# `boxcar_virtio::testing`: guest memory and register helpers, so the
+# device tests drive the virtio-net device through a transport without KVM.
+boxcar-virtio = { workspace = true, features = ["testing"] }
+# Same exact pin as [dependencies]; `test-utils` only adds the `mock` module
+# the device tests build their rings with, and only for test builds.
+virtio-queue = { workspace = true, features = ["test-utils"] }

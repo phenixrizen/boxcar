@@ -5,7 +5,15 @@
 //! ... -- CMD` on KVM with the guest kernel, the initramfs and the Alpine
 //! rootfs, the console in a file, a fresh audit directory and a fresh
 //! workspace, and the tests read what it leaves behind: its exit code, the
-//! console, the workspace and the session's audit log.
+//! console, its stdout, the workspace and the session's audit log.
+//!
+//! `boxcar run` with shares now has the vsock device, and runs the session
+//! in vsock mode: the session's terminal goes to stdout, the serial console
+//! to `--console-log`, and the run exits with the session's code. The
+//! tests about M1's console session itself (the exit code shown on the
+//! console with the run exiting 0, init's exec failure on the console, the
+//! serial console's last line) run with `--no-vsock`, which keeps it; each
+//! has a vsock counterpart.
 //!
 //! Skips with a printed reason unless `BOXCAR_TEST_KERNEL`,
 //! `BOXCAR_TEST_INITRAMFS` and `BOXCAR_TEST_ROOTFS` are set and `/dev/kvm`
@@ -99,6 +107,8 @@ struct Run {
     status: ExitStatus,
     elapsed: Duration,
     console: String,
+    /// The session's terminal, in vsock mode.
+    stdout: String,
     stderr: String,
 }
 
@@ -121,26 +131,34 @@ impl Run {
             .collect()
     }
 
-    /// Both outputs, for a failed assertion.
+    /// Every output, for a failed assertion.
     fn describe(&self) -> String {
         format!(
-            "{}; after {:?}\nstderr:\n{}\nconsole:\n{}",
-            self.status, self.elapsed, self.stderr, self.console
+            "{}; after {:?}\nstderr:\n{}\nstdout:\n{}\nconsole:\n{}",
+            self.status, self.elapsed, self.stderr, self.stdout, self.console
         )
     }
 }
 
 /// `boxcar run ... -- <command>` in `scratch`, with stdin at /dev/null, the
-/// console in `console.log`, the audit log under `audit/` and `workspace/`
-/// as the workspace. A run past [`LIMIT`] is killed and fails the test.
+/// console in `console.log`, stdout in `stdout.log`, the audit log under
+/// `audit/` and `workspace/` as the workspace. A run past [`LIMIT`] is
+/// killed and fails the test.
 fn boxcar_run(guest: &Guest, scratch: &Scratch, command: &[&str]) -> Run {
-    boxcar_run_with(guest, scratch, command, &[])
+    boxcar_run_with(guest, scratch, &[], command, &[])
 }
 
-/// [`boxcar_run`] with the variables `env` set for boxcar.
+/// [`boxcar_run`] in M1's console mode: `--no-vsock`.
+fn boxcar_run_console(guest: &Guest, scratch: &Scratch, command: &[&str]) -> Run {
+    boxcar_run_with(guest, scratch, &["--no-vsock"], command, &[])
+}
+
+/// [`boxcar_run`] with the flags `flags` before the `--`, and the
+/// variables `env` set for boxcar.
 fn boxcar_run_with(
     guest: &Guest,
     scratch: &Scratch,
+    flags: &[&str],
     command: &[&str],
     env: &[(&str, String)],
 ) -> Run {
@@ -161,6 +179,7 @@ fn boxcar_run_with(
         .arg(scratch.path("audit"))
         .arg("--console-log")
         .arg(&console)
+        .args(flags)
         .arg("--")
         .args(command)
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -187,6 +206,7 @@ fn boxcar_run_with(
         status,
         elapsed: start.elapsed(),
         console: read_lossy(&console),
+        stdout: read_lossy(&scratch.path("stdout.log")),
         stderr: read_lossy(&stderr),
     }
 }
@@ -255,15 +275,16 @@ fn a_command_writes_a_file_the_audit_log_hashes() {
     assert!(subject.pid > 1, "{subject:?}");
 }
 
-/// (b) M1 does not pass the command's exit code on: boxcar exits 0, and
-/// the console says how the session ended.
+/// (b) M1's console session does not pass the command's exit code on:
+/// boxcar exits 0, and the console says how the session ended
+/// (`--no-vsock`).
 #[test]
 fn the_exit_code_shows_on_the_console_and_boxcar_exits_0() {
     let Some(guest) = guest_or_skip("kvm_m1 exit") else {
         return;
     };
     let scratch = Scratch::new();
-    let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "exit 7"]);
+    let run = boxcar_run_console(&guest, &scratch, &["/bin/sh", "-c", "exit 7"]);
     eprintln!("kvm_m1 exit: {} after {:?}", run.status, run.elapsed);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     assert!(
@@ -272,6 +293,28 @@ fn the_exit_code_shows_on_the_console_and_boxcar_exits_0() {
         run.describe()
     );
     run.records();
+}
+
+/// With the vsock device the session's exit code is the run's, and its
+/// output is on stdout, not on the console.
+#[test]
+fn the_sessions_exit_code_is_the_runs() {
+    let Some(guest) = guest_or_skip("kvm_m1 vsock exit") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo hi; exit 7"]);
+    eprintln!("kvm_m1 vsock exit: {} after {:?}", run.status, run.elapsed);
+    assert_eq!(run.status.code(), Some(7), "{}", run.describe());
+    assert_eq!(run.stdout.trim_end(), "hi", "{}", run.describe());
+    assert!(!run.console.contains("hi\r"), "{}", run.describe());
+    let records = run.records();
+    let exit: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.kind == "session.exit")
+        .collect();
+    assert_eq!(exit.len(), 1, "{exit:?}");
+    assert_eq!(exit[0].data["code"], 7, "{exit:?}");
 }
 
 /// (c) Reading a file of the root share is recorded, whatever the answer,
@@ -284,7 +327,12 @@ fn reading_etc_shadow_is_recorded_with_its_guest_pid() {
     let scratch = Scratch::new();
     let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "cat /etc/shadow"]);
     eprintln!("kvm_m1 shadow: {} after {:?}", run.status, run.elapsed);
-    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    // The run exits with cat's code: 1 when the session may not read it.
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "{}",
+        run.describe()
+    );
 
     let records = run.records();
     let opens = about(&records, "fs.open", "root", "/etc/shadow");
@@ -307,7 +355,7 @@ fn a_command_is_found_through_path() {
     let run = boxcar_run(&guest, &scratch, &["ls", "/workspace"]);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     assert!(
-        run.console.contains("from-the-host.txt"),
+        run.stdout.contains("from-the-host.txt"),
         "{}",
         run.describe()
     );
@@ -318,15 +366,17 @@ fn a_command_is_found_through_path() {
     );
 }
 
-/// A command found nowhere: the console says so, and the session exits
-/// 127 as a shell's would.
+/// A command found nowhere: init says so, and the session exits 127 as a
+/// shell's would. On M1's console (`--no-vsock`) both show on the console
+/// and the run exits 0; in vsock mode the failure is on the session's
+/// terminal (stdout) and the run exits 127.
 #[test]
 fn a_missing_command_exits_127() {
     let Some(guest) = guest_or_skip("kvm_m1 missing") else {
         return;
     };
     let scratch = Scratch::new();
-    let run = boxcar_run(&guest, &scratch, &["boxcar-no-such-command", "arg"]);
+    let run = boxcar_run_console(&guest, &scratch, &["boxcar-no-such-command", "arg"]);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     for line in [
         "boxcar-init: exec: boxcar-no-such-command: ENOENT",
@@ -334,10 +384,26 @@ fn a_missing_command_exits_127() {
     ] {
         assert!(run.console.contains(line), "{line}: {}", run.describe());
     }
+
+    let scratch = Scratch::new();
+    let run = boxcar_run(&guest, &scratch, &["boxcar-no-such-command", "arg"]);
+    assert_eq!(run.status.code(), Some(127), "{}", run.describe());
+    assert!(
+        run.stdout
+            .contains("boxcar-init: exec: boxcar-no-such-command: ENOENT"),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        run.console.contains("boxcar: session exited 127"),
+        "{}",
+        run.describe()
+    );
 }
 
 /// The command's last line reaches the console every time: the session's
-/// exit must not hang up the terminal before the serial port has sent it.
+/// exit must not hang up the terminal before the serial port has sent it
+/// (M1's console session, `--no-vsock`).
 #[test]
 fn the_last_line_of_a_command_is_never_lost() {
     let Some(guest) = guest_or_skip("kvm_m1 mark") else {
@@ -346,7 +412,7 @@ fn the_last_line_of_a_command_is_never_lost() {
     let mut lost = Vec::new();
     for run_no in 1..=MARK_RUNS {
         let scratch = Scratch::new();
-        let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
+        let run = boxcar_run_console(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
         assert_eq!(run.status.code(), Some(0), "{}", run.describe());
         if !run.console.contains("MARK_END") {
             eprintln!("kvm_m1 mark: run {run_no} lost it:\n{}", run.console);
@@ -358,6 +424,433 @@ fn the_last_line_of_a_command_is_never_lost() {
         MARK_RUNS - lost.len()
     );
     assert!(lost.is_empty(), "lost in runs {lost:?}");
+}
+
+/// How many times the PTY hub's last-line test runs its command.
+const HUB_MARK_RUNS: usize = 20;
+
+/// The same in vsock mode: init drains the session's PTY to the terminal
+/// stream and waits for the PTY hub to have read it before it reboots, and
+/// `boxcar run` writes out what its own client of the hub holds before it
+/// exits, so the last line is on stdout every time.
+#[test]
+fn the_last_line_reaches_stdout_through_the_pty_hub() {
+    let Some(guest) = guest_or_skip("kvm_m1 hub mark") else {
+        return;
+    };
+    let mut lost = Vec::new();
+    for run_no in 1..=HUB_MARK_RUNS {
+        let scratch = Scratch::new();
+        let run = boxcar_run(&guest, &scratch, &["/bin/sh", "-c", "echo MARK_END"]);
+        assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+        if run.stdout != "MARK_END\r\n" {
+            eprintln!("kvm_m1 hub mark: run {run_no} got {:?}", run.stdout);
+            lost.push(run_no);
+        }
+    }
+    eprintln!(
+        "kvm_m1 hub mark: MARK_END in {} of {HUB_MARK_RUNS} runs",
+        HUB_MARK_RUNS - lost.len()
+    );
+    assert!(lost.is_empty(), "lost in runs {lost:?}");
+}
+
+/// The reviewer's stdout probe as a test: stdout is a non-blocking pipe
+/// (`EAGAIN` once full) whose reader stalls a second while the session
+/// prints 3,000,000 bytes, then reads slowly. Every byte arrives, in order,
+/// and the run exits 0 with nothing said: the stdout writer waits out
+/// `EAGAIN`, the hub holds the session back while `boxcar run`'s own client
+/// is behind (it is never detached and nothing is skipped), and `boxcar
+/// run` writes out what it holds before it exits.
+#[test]
+fn a_slow_non_blocking_stdout_gets_all_of_the_session() {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let Some(guest) = guest_or_skip("kvm_m1 slow stdout") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two descriptors into `fds`.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both are new descriptors that nothing else owns.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: fcntl with integer arguments only.
+    unsafe {
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0
+        );
+    }
+    let script = "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo END_OF_OUTPUT";
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .args(["--", "/bin/sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write_end))
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    let mut reader = File::from(read_end);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("{e}"),
+        }
+        thread::sleep(Duration::from_millis(5));
+        assert!(start.elapsed() < LIMIT, "no end within {LIMIT:?}");
+    }
+    let status = child.wait().unwrap();
+    let stderr = read_lossy(&scratch.path("stderr.log"));
+    let xs = got.iter().filter(|&&b| b == b'x').count();
+    eprintln!(
+        "kvm_m1 slow stdout: {status} after {:?}, {} bytes, {xs} x",
+        start.elapsed(),
+        got.len()
+    );
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(xs, 3_000_000, "{stderr}");
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.ends_with("x\r\nEND_OF_OUTPUT\r\n"), "{stderr}");
+    assert!(!stderr.contains("not delivered"), "{stderr}");
+}
+
+/// The review's slated probe: stdout's reader stalls 6 s while the session
+/// prints 3,000,000 bytes, longer than `boxcar run` waits for a stdout that
+/// takes nothing once the VM has stopped (2 s). The hub holds the session
+/// back meanwhile, so the VM is still running when the reader comes back,
+/// and nothing is lost.
+#[test]
+fn a_stalled_stdout_holds_the_session_and_loses_nothing() {
+    use std::io::Read;
+
+    let Some(guest) = guest_or_skip("kvm_m1 stalled stdout") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let script = "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo END_OF_OUTPUT";
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .args(["--", "/bin/sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(6));
+    let mut got = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut got).unwrap();
+    let status = child.wait().unwrap();
+    let stderr = read_lossy(&scratch.path("stderr.log"));
+    let xs = got.iter().filter(|&&b| b == b'x').count();
+    eprintln!(
+        "kvm_m1 stalled stdout: {status} after {:?}, {} bytes, {xs} x",
+        start.elapsed(),
+        got.len()
+    );
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(xs, 3_000_000, "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&got).ends_with("x\r\nEND_OF_OUTPUT\r\n"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not delivered"), "{stderr}");
+}
+
+/// A terminal pair: the master end for the test, the slave end for boxcar.
+fn openpty() -> (File, File) {
+    use std::os::fd::FromRawFd;
+
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty writes two new descriptors; the name, termios and
+    // winsize arguments may be null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // SAFETY: both are new descriptors that nothing else owns.
+    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+}
+
+/// A terminal's settings, as bytes to compare.
+fn termios_of(file: &File) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: termios is plain data; all zeroes is valid.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes one termios into `t`, alive for the call.
+    assert_eq!(unsafe { libc::tcgetattr(file.as_raw_fd(), &mut t) }, 0);
+    format!(
+        "{} {} {} {} {:?}",
+        t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_cc
+    )
+    .into_bytes()
+}
+
+/// What a run on a terminal of its own left behind.
+struct TerminalRun {
+    status: ExitStatus,
+    /// What the terminal showed.
+    shown: String,
+    stderr: String,
+    /// The terminal's settings are what they were before.
+    restored: bool,
+}
+
+/// `boxcar run ... -- <command>` on a terminal of its own (a PTY pair):
+/// once the terminal shows `ready`, `typed` is typed on it. The run must
+/// end within [`LIMIT`].
+fn run_on_a_terminal(guest: &Guest, command: &[&str], ready: &str, typed: &[u8]) -> TerminalRun {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let scratch = Scratch::new();
+    let (master, slave) = openpty();
+    let before = termios_of(&slave);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .arg("--")
+        .args(command)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    // The terminal's output, read as it comes (the test keeps the slave
+    // open, so the master never reads its end: poll, until told to stop).
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let shown = Arc::clone(&shown);
+        let done = Arc::clone(&done);
+        let mut master = master.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !done.load(Ordering::Acquire) {
+                let mut pollfd = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll reads and writes the one pollfd it is given.
+                if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                    match master.read(&mut buf) {
+                        Ok(n) if n > 0 => shown.lock().unwrap().extend_from_slice(&buf[..n]),
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
+        })
+    };
+    let start = Instant::now();
+    while !String::from_utf8_lossy(&shown.lock().unwrap()).contains(ready) {
+        assert!(start.elapsed() < LIMIT, "never showed {ready:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    (&master).write_all(typed).unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the run did not end; the terminal showed:\n{}",
+                String::from_utf8_lossy(&shown.lock().unwrap())
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    thread::sleep(Duration::from_millis(200));
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    let shown = String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    TerminalRun {
+        status,
+        shown,
+        stderr: read_lossy(&scratch.path("stderr.log")),
+        restored: termios_of(&slave) == before,
+    }
+}
+
+/// A `-- CMD` run whose stdin is a terminal takes the keys: what is typed
+/// on it runs in the session (`-- /bin/sh -l` is interactive), and the
+/// terminal is as it was afterwards.
+#[test]
+fn typing_on_a_terminal_reaches_a_command_session() {
+    let Some(guest) = guest_or_skip("kvm_m1 command on a terminal") else {
+        return;
+    };
+    let run = run_on_a_terminal(
+        &guest,
+        &["/bin/sh", "-l"],
+        "boxcar:",
+        b"echo T_$((3*5)); exit 5\r",
+    );
+    eprintln!(
+        "kvm_m1 command on a terminal: {} {:?}",
+        run.status, run.shown
+    );
+    assert_eq!(run.status.code(), Some(5), "{}\n{}", run.shown, run.stderr);
+    assert!(run.shown.contains("\nT_15\r"), "{}", run.shown);
+    assert!(run.restored, "the terminal was not restored");
+}
+
+/// On a terminal, Ctrl-] twice stops a `-- CMD` run too: exit 130.
+#[test]
+fn the_escape_stops_a_command_session_on_a_terminal() {
+    let Some(guest) = guest_or_skip("kvm_m1 command escape") else {
+        return;
+    };
+    let run = run_on_a_terminal(&guest, &["/bin/sh", "-l"], "boxcar:", b"\x1d\x1d");
+    assert_eq!(
+        run.status.code(),
+        Some(130),
+        "{}\n{}",
+        run.shown,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("stopped from the console"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.restored, "the terminal was not restored");
+}
+
+/// With `--stdin`, a `-- CMD` run sends piped input to the session, and its
+/// end is an end-of-file there. The input is written once the shell shows
+/// its prompt: an end-of-file character that reaches the session's
+/// terminal while it is still in canonical mode, before the shell's line
+/// editor has taken it, is read by the editor as a NUL, not as the end.
+#[test]
+fn piped_stdin_reaches_a_command_session_with_the_stdin_flag() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let Some(guest) = guest_or_skip("kvm_m1 --stdin") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .arg("run")
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initramfs")
+        .arg(&guest.initramfs)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--workspace")
+        .arg(scratch.workspace())
+        .arg("--audit-dir")
+        .arg(scratch.path("audit"))
+        .arg("--console-log")
+        .arg(scratch.path("console.log"))
+        .args(["--stdin", "--", "/bin/sh"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(File::create(scratch.path("stderr.log")).unwrap())
+        .spawn()
+        .unwrap();
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let shown = Arc::clone(&shown);
+        let mut stdout = child.stdout.take().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => shown.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+    };
+    let start = Instant::now();
+    while !String::from_utf8_lossy(&shown.lock().unwrap()).contains("$ ") {
+        assert!(start.elapsed() < LIMIT, "no prompt");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Written, then the pipe's end.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"echo got_$((1+1))\n")
+        .unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the run did not end:\n{}",
+                String::from_utf8_lossy(&shown.lock().unwrap())
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    reader.join().unwrap();
+    let out = String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    let stderr = read_lossy(&scratch.path("stderr.log"));
+    assert_eq!(status.code(), Some(0), "{out}\n{stderr}");
+    assert!(out.contains("\ngot_2\r"), "{out}");
 }
 
 /// A loop of 200 file writes in the workspace, then `AFTER`.
@@ -391,7 +884,7 @@ fn an_audit_log_failure_stops_the_vm_and_exits_3() {
     let scratch = Scratch::new();
     let clean = boxcar_run(&guest, &scratch, &WRITE_LOOP);
     assert_eq!(clean.status.code(), Some(0), "{}", clean.describe());
-    assert!(clean.console.contains("AFTER"), "{}", clean.describe());
+    assert!(clean.stdout.contains("AFTER"), "{}", clean.describe());
     assert_eq!(workspace_files(&scratch), 200);
     let boot = clean
         .records()
@@ -403,13 +896,13 @@ fn an_audit_log_failure_stops_the_vm_and_exits_3() {
     let ok_syncs = boot + 20;
     let scratch = Scratch::new();
     let env = [("BOXCAR_TEST_FAIL_AUDIT_AFTER", ok_syncs.to_string())];
-    let run = boxcar_run_with(&guest, &scratch, &WRITE_LOOP, &env);
+    let run = boxcar_run_with(&guest, &scratch, &[], &WRITE_LOOP, &env);
     eprintln!(
         "kvm_m1 audit failure: {} after {:?}; the boot makes {boot} records",
         run.status, run.elapsed
     );
     assert_eq!(run.status.code(), Some(3), "{}", run.describe());
-    assert!(!run.console.contains("AFTER"), "{}", run.describe());
+    assert!(!run.stdout.contains("AFTER"), "{}", run.describe());
 
     // Every record is followed by its checkpoint, so sync n + 1 is the one
     // after record n + 1, the checkpoint at seq 2n + 2.
@@ -452,5 +945,540 @@ fn an_audit_log_failure_stops_the_vm_and_exits_3() {
     assert!(
         !records.iter().any(|r| r.kind == "vmm.stop"),
         "vmm.stop was refused"
+    );
+}
+
+/// A `-- CMD` run started in the background from an interactive shell does
+/// not take the terminal: it is not in the terminal's foreground process
+/// group, so it neither reads it (which would stop it with `SIGTTIN`) nor
+/// puts it in raw mode, and it runs to its end, its output on the
+/// terminal.
+#[test]
+fn a_run_started_in_the_background_does_not_take_the_terminal() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let Some(guest) = guest_or_skip("kvm_m1 background run") else {
+        return;
+    };
+    if !Path::new("/bin/bash").exists() {
+        eprintln!("skipping kvm_m1 background run: no /bin/bash for an interactive shell");
+        return;
+    }
+    let scratch = Scratch::new();
+    let (master, slave) = openpty();
+    let mut shell = Command::new("/bin/bash");
+    shell
+        .args(["--norc", "--noprofile", "-i"])
+        .env("PS1", "PROMPT$ ")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()));
+    // SAFETY: setsid and the ioctl are async-signal-safe; the terminal on
+    // stdin becomes the new session's controlling terminal, its foreground
+    // the shell's group.
+    unsafe {
+        shell.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut shell = shell.spawn().unwrap();
+    drop(slave);
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let shown = Arc::clone(&shown);
+        let done = Arc::clone(&done);
+        let mut master = master.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !done.load(Ordering::Acquire) {
+                let mut pollfd = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll reads and writes the one pollfd it is given.
+                if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                    match master.read(&mut buf) {
+                        Ok(n) if n > 0 => shown.lock().unwrap().extend_from_slice(&buf[..n]),
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
+        })
+    };
+    let text = || String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    let wait_for = |what: &str| {
+        let start = Instant::now();
+        while !text().contains(what) {
+            if start.elapsed() > LIMIT {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    };
+    assert!(wait_for("PROMPT$ "), "no prompt:\n{}", text());
+    let run = format!(
+        "{} run --kernel {} --initramfs {} --rootfs {} --workspace {} --audit-dir {} \
+         --console-log {} -- /bin/sh -c 'echo BG_$((40+2))' & wait $!; echo EXIT_$?\r",
+        env!("CARGO_BIN_EXE_boxcar"),
+        guest.kernel.display(),
+        guest.initramfs.display(),
+        guest.rootfs.display(),
+        scratch.workspace().display(),
+        scratch.path("audit").display(),
+        scratch.path("console.log").display(),
+    );
+    (&master).write_all(run.as_bytes()).unwrap();
+    // `EXIT_` and a digit: the shell's own echo of the line has `EXIT_$?`.
+    let ended = {
+        let start = Instant::now();
+        loop {
+            let now = text();
+            let code = now
+                .match_indices("EXIT_")
+                .any(|(at, _)| now[at + 5..].starts_with(|c: char| c.is_ascii_digit()));
+            if code {
+                break true;
+            }
+            if start.elapsed() > LIMIT {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    thread::sleep(Duration::from_millis(300));
+    let shown_now = text();
+    let _ = (&master).write_all(b"kill -9 %1 2>/dev/null; exit\r");
+    thread::sleep(Duration::from_millis(500));
+    let _ = shell.kill();
+    let _ = shell.wait();
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    eprintln!("kvm_m1 background run: {shown_now:?}");
+    assert!(ended, "the background run did not end:\n{shown_now}");
+    assert!(!shown_now.contains("Stopped"), "{shown_now}");
+    assert!(shown_now.contains("\nBG_42\r"), "{shown_now}");
+    assert!(shown_now.contains("EXIT_0"), "{shown_now}");
+}
+
+/// An interactive `bash` on a PTY pair that is its controlling terminal,
+/// for the job-control tests. It has no line editing, so that it reads the
+/// terminal in canonical mode: a cooked terminal is what it leaves, and
+/// takes back when a job stops. Its prompt, and the job notices, go to the
+/// terminal (its stderr).
+mod job_shell {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use super::{openpty, LIMIT};
+
+    pub struct JobShell {
+        master: File,
+        slave: File,
+        shell: Child,
+        shown: Arc<Mutex<Vec<u8>>>,
+        done: Arc<AtomicBool>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl JobShell {
+        /// Starts the shell and waits for its first prompt.
+        pub fn start() -> JobShell {
+            let (master, slave) = openpty();
+            let mut command = Command::new("/bin/bash");
+            command
+                .args(["--norc", "--noprofile", "--noediting", "-i"])
+                .env("PS1", "PROMPT$ ")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave.try_clone().unwrap()));
+            // SAFETY: setsid and the ioctl are async-signal-safe; the
+            // terminal on stdin becomes the new session's controlling
+            // terminal, its foreground the shell's group.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let shell = command.spawn().unwrap();
+            let shown = Arc::new(Mutex::new(Vec::new()));
+            let done = Arc::new(AtomicBool::new(false));
+            let reader = {
+                let shown = Arc::clone(&shown);
+                let done = Arc::clone(&done);
+                let mut master = master.try_clone().unwrap();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while !done.load(Ordering::Acquire) {
+                        let mut pollfd = libc::pollfd {
+                            fd: master.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        // SAFETY: poll reads and writes the one pollfd it is given.
+                        if unsafe { libc::poll(&mut pollfd, 1, 50) } > 0 {
+                            match master.read(&mut buf) {
+                                Ok(n) if n > 0 => {
+                                    shown.lock().unwrap().extend_from_slice(&buf[..n]);
+                                }
+                                _ => thread::sleep(Duration::from_millis(10)),
+                            }
+                        }
+                    }
+                })
+            };
+            let started = JobShell {
+                master,
+                slave,
+                shell,
+                shown,
+                done,
+                reader: Some(reader),
+            };
+            assert!(
+                started.wait_for("PROMPT$ ", 0),
+                "no prompt:\n{}",
+                started.text()
+            );
+            started
+        }
+
+        /// Everything the terminal showed so far.
+        pub fn text(&self) -> String {
+            String::from_utf8_lossy(&self.shown.lock().unwrap()).into_owned()
+        }
+
+        /// How much it showed so far, to look only at what follows.
+        pub fn mark(&self) -> usize {
+            self.shown.lock().unwrap().len()
+        }
+
+        /// What it showed after `from`.
+        pub fn since(&self, from: usize) -> String {
+            let shown = self.shown.lock().unwrap();
+            String::from_utf8_lossy(&shown[from.min(shown.len())..]).into_owned()
+        }
+
+        /// Types `bytes` on the terminal.
+        pub fn type_bytes(&self, bytes: &[u8]) {
+            (&self.master).write_all(bytes).unwrap();
+        }
+
+        /// Waits up to [`LIMIT`] for `condition`.
+        pub fn wait_until(&self, mut condition: impl FnMut() -> bool) -> bool {
+            let start = Instant::now();
+            while !condition() {
+                if start.elapsed() > LIMIT {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            true
+        }
+
+        /// Waits up to [`LIMIT`] for the terminal to show `what` after
+        /// `from`.
+        pub fn wait_for(&self, what: &str, from: usize) -> bool {
+            self.wait_until(|| self.since(from).contains(what))
+        }
+
+        fn lflag(&self) -> libc::tcflag_t {
+            // SAFETY: termios is plain data; all zeroes is valid.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: tcgetattr writes one termios into `t`, alive for the call.
+            assert_eq!(
+                unsafe { libc::tcgetattr(self.slave.as_raw_fd(), &mut t) },
+                0
+            );
+            t.c_lflag
+        }
+
+        /// Line editing, echo and signals: as a shell leaves the terminal.
+        pub fn is_cooked(&self) -> bool {
+            let all = libc::ICANON | libc::ECHO | libc::ISIG;
+            self.lflag() & all == all
+        }
+
+        /// None of them: as `boxcar run` leaves it while it forwards keys.
+        pub fn is_raw(&self) -> bool {
+            self.lflag() & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
+        }
+
+        /// The shell's child `boxcar`, once it exists.
+        pub fn job(&self) -> Option<u32> {
+            let shell = self.shell.id();
+            for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                // `pid (comm) state ppid ...`
+                let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+                    continue;
+                };
+                let mut rest = stat[close + 1..].split_whitespace();
+                let (_state, ppid) = (rest.next(), rest.next());
+                if &stat[open + 1..close] == "boxcar" && ppid == Some(&shell.to_string()[..]) {
+                    return Some(pid);
+                }
+            }
+            None
+        }
+    }
+
+    /// The state letter of `pid` (`T`: stopped), `None` once it is gone (a
+    /// zombie the shell has not collected is gone too).
+    pub fn process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let state = stat[stat.rfind(')')? + 1..].trim_start().chars().next()?;
+        (state != 'Z').then_some(state)
+    }
+
+    /// Sends `signal` to `pid`.
+    pub fn signal(pid: u32, signal: libc::c_int) {
+        // SAFETY: kill takes numbers only.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+
+    impl Drop for JobShell {
+        fn drop(&mut self) {
+            if let Some(job) = self.job() {
+                signal(job, libc::SIGKILL);
+            }
+            let _ = self.shell.kill();
+            let _ = self.shell.wait();
+            self.done.store(true, Ordering::Release);
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+
+/// The line that starts a `-- /bin/sh -l` run, for a shell to take.
+fn run_line(guest: &Guest, scratch: &Scratch) -> String {
+    format!(
+        "{} run --kernel {} --initramfs {} --rootfs {} --workspace {} --audit-dir {} \
+         --console-log {} -- /bin/sh -l\r",
+        env!("CARGO_BIN_EXE_boxcar"),
+        guest.kernel.display(),
+        guest.initramfs.display(),
+        guest.rootfs.display(),
+        scratch.workspace().display(),
+        scratch.path("audit").display(),
+        scratch.path("console.log").display(),
+    )
+}
+
+/// The shell's `stty -a`: cooked, as the shell of a stopped job sees it.
+fn assert_stty_is_cooked(shell: &job_shell::JobShell) {
+    let from = shell.mark();
+    shell.type_bytes(b"stty -a; echo SEP_$((20+2))\r");
+    assert!(shell.wait_for("SEP_22", from), "{}", shell.since(from));
+    let stty = shell.since(from);
+    let words: Vec<&str> = stty
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect();
+    for flag in ["icanon", "echo", "isig"] {
+        assert!(
+            words.contains(&flag) && !words.contains(&format!("-{flag}").as_str()),
+            "`stty -a` does not show {flag}:\n{stty}"
+        );
+    }
+}
+
+/// A `-- /bin/sh -l` run on a terminal of an interactive shell, in raw
+/// mode, stopped from outside (`kill -TSTP`: in raw mode Ctrl-Z goes to
+/// the guest): the shell gets a cooked terminal; `bg` keeps it running,
+/// its output on the terminal and no second stop; `fg` puts the terminal
+/// in raw mode again, so that typing reaches the guest and Ctrl-C goes
+/// there too, not to the VM; and the guest's `exit` ends the run with 0.
+#[test]
+fn a_stopped_run_gives_the_terminal_back_and_fg_takes_it_again() {
+    use job_shell::{process_state, signal, JobShell};
+
+    let Some(guest) = guest_or_skip("kvm_m1 stopped run") else {
+        return;
+    };
+    if !Path::new("/bin/bash").exists() {
+        eprintln!("skipping kvm_m1 stopped run: no /bin/bash for an interactive shell");
+        return;
+    }
+    let scratch = Scratch::new();
+    let shell = JobShell::start();
+    shell.type_bytes(run_line(&guest, &scratch).as_bytes());
+    assert!(
+        shell.wait_for("boxcar:", 0),
+        "no guest prompt:\n{}",
+        shell.text()
+    );
+    assert!(
+        shell.wait_until(|| shell.is_raw()),
+        "the terminal is not raw"
+    );
+    let job = shell.job().expect("the shell has no run");
+    // A job of the guest that prints in the background, later.
+    shell.type_bytes(b"(sleep 3; echo LATE_$((6*7))) &\r");
+    thread::sleep(Duration::from_millis(300));
+
+    signal(job, libc::SIGTSTP);
+    assert!(
+        shell.wait_until(|| process_state(job) == Some('T')),
+        "the run was not stopped: {:?}",
+        process_state(job)
+    );
+    assert!(
+        shell.wait_until(|| shell.is_cooked()),
+        "the stopped run left the terminal raw"
+    );
+    assert_stty_is_cooked(&shell);
+
+    // bg: running, in the background, no second stop, output visible.
+    let bg = shell.mark();
+    shell.type_bytes(b"bg\r");
+    assert!(shell.wait_for("LATE_42\r", bg), "{}", shell.since(bg));
+    assert!(
+        matches!(process_state(job), Some('S' | 'R')),
+        "{:?}",
+        process_state(job)
+    );
+    shell.type_bytes(b"echo SHELL_$((6*7))\r");
+    assert!(shell.wait_for("SHELL_42\r", bg), "{}", shell.since(bg));
+    assert!(!shell.since(bg).contains("Stopped"), "{}", shell.since(bg));
+    assert!(
+        shell.is_cooked(),
+        "the run in the background changed the terminal"
+    );
+
+    // fg: raw again; typing and Ctrl-C go to the guest.
+    shell.type_bytes(b"fg\r");
+    assert!(
+        shell.wait_until(|| shell.is_raw()),
+        "fg did not put the terminal in raw mode:\n{}",
+        shell.since(bg)
+    );
+    let fg = shell.mark();
+    shell.type_bytes(b"echo FG_$((3*5))\r");
+    assert!(shell.wait_for("FG_15\r", fg), "{}", shell.since(fg));
+    shell.type_bytes(b"sleep 30\r");
+    thread::sleep(Duration::from_millis(300));
+    shell.type_bytes(b"\x03echo C_$((6*7))\r");
+    assert!(shell.wait_for("C_42\r", fg), "{}", shell.since(fg));
+    assert!(process_state(job).is_some(), "Ctrl-C stopped the VM");
+    shell.type_bytes(b"exit\r");
+    assert!(
+        shell.wait_until(|| process_state(job).is_none()),
+        "the run did not end:\n{}",
+        shell.since(fg)
+    );
+    let end = shell.mark();
+    shell.type_bytes(b"echo EXIT_$?\r");
+    assert!(shell.wait_for("EXIT_0", end), "{}", shell.since(end));
+    assert!(
+        shell.wait_until(|| shell.is_cooked()),
+        "the terminal was not restored"
+    );
+}
+
+/// A Ctrl-Z while the run starts (the terminal is still cooked, so it is
+/// a real `SIGTSTP`), then `bg`: the run is not stopped again by taking the
+/// terminal, which is not its to take (`SIGTTOU`), and the VM boots and
+/// runs in the background; `fg` takes the terminal, raw, and what is typed
+/// reaches the guest, whose `exit` ends the run with 0.
+#[test]
+fn a_ctrl_z_while_the_run_starts_leaves_a_cooked_terminal_and_fg_takes_it_again() {
+    use job_shell::{process_state, JobShell};
+
+    let Some(guest) = guest_or_skip("kvm_m1 ctrl-z at start") else {
+        return;
+    };
+    if !Path::new("/bin/bash").exists() {
+        eprintln!("skipping kvm_m1 ctrl-z at start: no /bin/bash for an interactive shell");
+        return;
+    }
+    let scratch = Scratch::new();
+    let shell = JobShell::start();
+    let from = shell.mark();
+    shell.type_bytes(run_line(&guest, &scratch).as_bytes());
+    let start = Instant::now();
+    let job = loop {
+        if let Some(job) = shell.job() {
+            break job;
+        }
+        assert!(start.elapsed() < LIMIT, "no run:\n{}", shell.text());
+        thread::sleep(Duration::from_millis(1));
+    };
+    // Well before the terminal goes raw (the VM takes 100 ms to build).
+    thread::sleep(Duration::from_millis(20));
+    assert!(shell.is_cooked(), "too late: the terminal was raw already");
+    shell.type_bytes(b"\x1a");
+    assert!(
+        shell.wait_until(|| process_state(job) == Some('T')),
+        "Ctrl-Z did not stop the run: {:?}\n{}",
+        process_state(job),
+        shell.since(from)
+    );
+    assert!(shell.wait_for("Stopped", from), "{}", shell.since(from));
+    assert_stty_is_cooked(&shell);
+
+    // bg: the VM boots and the guest's prompt shows, with no second stop.
+    let bg = shell.mark();
+    shell.type_bytes(b"bg\r");
+    assert!(shell.wait_for("boxcar:", bg), "{}", shell.since(bg));
+    assert!(
+        matches!(process_state(job), Some('S' | 'R')),
+        "{:?}\n{}",
+        process_state(job),
+        shell.since(bg)
+    );
+    assert!(!shell.since(bg).contains("Stopped"), "{}", shell.since(bg));
+    assert!(
+        shell.is_cooked(),
+        "the run in the background changed the terminal"
+    );
+
+    // fg: raw, and typing reaches the guest.
+    shell.type_bytes(b"fg\r");
+    assert!(
+        shell.wait_until(|| shell.is_raw()),
+        "fg did not put the terminal in raw mode:\n{}",
+        shell.since(bg)
+    );
+    let fg = shell.mark();
+    shell.type_bytes(b"echo FG_$((3*5))\r");
+    assert!(shell.wait_for("FG_15\r", fg), "{}", shell.since(fg));
+    shell.type_bytes(b"exit\r");
+    assert!(
+        shell.wait_until(|| process_state(job).is_none()),
+        "the run did not end:\n{}",
+        shell.since(fg)
+    );
+    let end = shell.mark();
+    shell.type_bytes(b"echo EXIT_$?\r");
+    assert!(shell.wait_for("EXIT_0", end), "{}", shell.since(end));
+    assert!(
+        shell.wait_until(|| shell.is_cooked()),
+        "the terminal was not restored"
     );
 }

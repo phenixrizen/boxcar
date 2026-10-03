@@ -48,6 +48,11 @@ fn insert(map: &mut BTreeMap<String, String>, token: &mut String) {
     token.clear();
 }
 
+/// Whether the VM has a network card: the VMM says so with `boxcar.net=1`.
+pub fn net_enabled(args: &BTreeMap<String, String>) -> bool {
+    args.get("net").is_some_and(|value| value == "1")
+}
+
 /// [`parse`] of `/proc/cmdline`. `/proc` must already be mounted.
 pub fn read() -> io::Result<BTreeMap<String, String>> {
     Ok(parse(&fs::read_to_string(PROC_CMDLINE)?))
@@ -135,6 +140,23 @@ mod tests {
             parse("boxcar.a=1\t boxcar.b=2\n\nboxcar.c=3\n"),
             map(&[("a", "1"), ("b", "2"), ("c", "3")])
         );
+    }
+
+    /// The network's setup runs only when the VMM says the VM has a
+    /// network card, with exactly `boxcar.net=1`.
+    #[test]
+    fn the_network_is_on_only_with_boxcar_net_1() {
+        assert!(net_enabled(&parse("boxcar.mode=console boxcar.net=1")));
+        for cmdline in [
+            "boxcar.mode=console",
+            "boxcar.net=0",
+            "boxcar.net",
+            "boxcar.net=yes",
+            "boxcar.net=1 boxcar.net=0",
+            "net=1",
+        ] {
+            assert!(!net_enabled(&parse(cmdline)), "{cmdline}");
+        }
     }
 
     #[test]

@@ -62,6 +62,9 @@ pub enum Error {
     /// The MSR list does not fit in a `kvm_msrs` wrapper.
     #[error("cannot build the MSR list")]
     Msrs(#[source] vmm_sys_util::fam::Error),
+    /// The CPUID list has no room for a leaf 0xB subleaf.
+    #[error("cannot add a topology subleaf to the CPUID list")]
+    Cpuid(#[source] vmm_sys_util::fam::Error),
     /// `KVM_SET_MSRS` stopped before the end of the list.
     #[error("KVM_SET_MSRS set {written} of {expected} MSRs")]
     SetMsrsIncomplete { written: usize, expected: usize },

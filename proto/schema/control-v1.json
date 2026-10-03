@@ -1,0 +1,1018 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "boxcar control protocol v1",
+  "description": "One line of the control socket: the server's Hello, a client's Request, the server's Response, or an event (StateEvent, PtyDetached, AuditEvent, AuditLagged). Each op's parameters and result are defined beside them; see docs/control-protocol.md.",
+  "oneOf": [
+    {
+      "$ref": "#/definitions/Hello"
+    },
+    {
+      "$ref": "#/definitions/Request"
+    },
+    {
+      "$ref": "#/definitions/Response"
+    },
+    {
+      "$ref": "#/definitions/StateEvent"
+    },
+    {
+      "$ref": "#/definitions/PtyDetached"
+    },
+    {
+      "$ref": "#/definitions/AuditEvent_for_Record"
+    },
+    {
+      "$ref": "#/definitions/AuditLagged"
+    }
+  ],
+  "definitions": {
+    "AuditEvent_for_Record": {
+      "description": "`{\"v\":1,\"event\":\"audit\",\"sub\":K,\"rec\":{...}}`: a record of the subscription `sub`, `rec` the record as the log holds it. `R` is [`Record`], or a reference to one to send it without a copy. Never over [`MAX_LINE`]: a record is at most [`MAX_RECORD_BYTES`].\n\n[`MAX_RECORD_BYTES`]: crate::limits::MAX_RECORD_BYTES",
+      "type": "object",
+      "required": [
+        "event",
+        "rec",
+        "sub",
+        "v"
+      ],
+      "properties": {
+        "event": {
+          "description": "`\"audit\"`.",
+          "type": "string"
+        },
+        "rec": {
+          "$ref": "#/definitions/Record"
+        },
+        "sub": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AuditLagged": {
+      "description": "`{\"v\":1,\"event\":\"audit.lagged\",\"sub\":K,\"resume_seq\":R}`: the subscription `sub` fell too far behind for the server to hold its live records, and was dropped from the live stream. The records from `resume_seq` on follow, read back from the log and then live again; those before it were delivered, so nothing is missed.",
+      "type": "object",
+      "required": [
+        "event",
+        "resume_seq",
+        "sub",
+        "v"
+      ],
+      "properties": {
+        "event": {
+          "description": "`\"audit.lagged\"`.",
+          "type": "string"
+        },
+        "resume_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sub": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AuditStatus": {
+      "description": "The session's audit log.",
+      "type": "object",
+      "required": [
+        "failed",
+        "next_seq"
+      ],
+      "properties": {
+        "failed": {
+          "description": "Whether the writer has failed, which stops the VM.",
+          "type": "boolean"
+        },
+        "next_seq": {
+          "description": "The sequence number the writer gives the next record it writes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AuditSubscribeParams": {
+      "description": "The parameters of `audit.subscribe`: `{\"from_seq\":S,\"types\":[\"net.\"], \"pid\":P}`, each optional. The response is [`AuditSubscribed`]; then the connection hears [`AuditEvent`]s, and [`AuditLagged`] when it falls behind, until it closes.",
+      "type": "object",
+      "properties": {
+        "from_seq": {
+          "description": "The first seq wanted: the records from it on, those in the log and then the live ones. 1 when absent; 0 is the same. A seq beyond the log's end waits for the live records from it on.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "pid": {
+          "description": "Only the records attributed to this guest process (`subject.pid`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "types": {
+          "description": "Record types, each a prefix (`\"net.\"`, or a whole type such as `\"fs.write\"`). Absent or empty takes every type.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "AuditSubscribed": {
+      "description": "The result of `audit.subscribe`: `{\"next_seq\":N,\"sub\":K}`.",
+      "type": "object",
+      "required": [
+        "next_seq"
+      ],
+      "properties": {
+        "next_seq": {
+          "description": "The seq the log's next record had when the subscription began: the records below it come from the log, the ones from it on are live.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sub": {
+          "description": "The subscription's id on this connection, counting from 1: the `sub` of its events. A client that does not hold several can ignore it. 0 when a server did not say.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ErrorBody": {
+      "description": "Why a request failed.",
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/ErrorCode"
+        },
+        "message": {
+          "description": "For people; clients act on `code`.",
+          "type": "string"
+        }
+      }
+    },
+    "ErrorCode": {
+      "description": "The error codes, exactly these; on the wire in snake_case.",
+      "oneOf": [
+        {
+          "description": "The line is too long, not UTF-8, not a JSON object, lacks `v`, `id` or `op`, or has parameters that do not fit the op.",
+          "type": "string",
+          "enum": [
+            "bad_request"
+          ]
+        },
+        {
+          "description": "`v` is not [`VERSION`].",
+          "type": "string",
+          "enum": [
+            "unsupported_version"
+          ]
+        },
+        {
+          "description": "The server has no such op.",
+          "type": "string",
+          "enum": [
+            "unknown_op"
+          ]
+        },
+        {
+          "description": "The op cannot be done in the VM's current state.",
+          "type": "string",
+          "enum": [
+            "invalid_state"
+          ]
+        },
+        {
+          "description": "What the op names does not exist.",
+          "type": "string",
+          "enum": [
+            "not_found"
+          ]
+        },
+        {
+          "description": "The server cannot take the op now.",
+          "type": "string",
+          "enum": [
+            "busy"
+          ]
+        },
+        {
+          "description": "The connection sent more than its budget of requests; the request was dropped.",
+          "type": "string",
+          "enum": [
+            "rate_limited"
+          ]
+        },
+        {
+          "description": "The server failed.",
+          "type": "string",
+          "enum": [
+            "internal"
+          ]
+        }
+      ]
+    },
+    "GuestStatus": {
+      "description": "What the guest's init has reported. The default is nothing yet.",
+      "type": "object",
+      "required": [
+        "init_ready"
+      ],
+      "properties": {
+        "exit": {
+          "description": "How the session ended, once it did.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SessionOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "init_ready": {
+          "description": "Whether init has said hello over the guest control channel.",
+          "type": "boolean"
+        },
+        "session_pid": {
+          "description": "The session's process id in the guest, once it started.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Hash": {
+      "description": "A blake3 digest: `b3:` followed by 64 lowercase hex digits.",
+      "type": "string",
+      "pattern": "^b3:[0-9a-f]{64}$"
+    },
+    "Hello": {
+      "description": "The server's first line on every connection it accepts.",
+      "type": "object",
+      "required": [
+        "capabilities",
+        "event",
+        "protocol",
+        "server",
+        "session_id",
+        "v",
+        "versions"
+      ],
+      "properties": {
+        "capabilities": {
+          "description": "The op families the server serves beyond `status` and `stop`, such as `pty`, `audit` and `policy.net`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "event": {
+          "description": "`\"hello\"`.",
+          "type": "string"
+        },
+        "protocol": {
+          "description": "[`PROTOCOL`].",
+          "type": "string"
+        },
+        "server": {
+          "description": "`boxcar/<version>`.",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "versions": {
+          "description": "The versions the server speaks: `[1]`.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        }
+      }
+    },
+    "NetPolicy": {
+      "description": "The network policy as `policy.get` reports it and `policy.update` takes it: `{\"default\":\"deny\",\"allow\":[\"example.com:443\"],\"deny\":[\"10.0.0.0/8\"]}`. Each rule is a target as `boxcar run --allow` takes it: `name[:port]`, `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The policy in force puts every deny before every allow, in the order given, as `boxcar run` orders `--deny` and `--allow`: the first rule that matches decides, so a deny wins over an allow of the same target. A policy file whose allows and denies are interleaved reads back from `policy.get` in this shape, which is the same policy only when no allow before a deny matches what the deny does.",
+      "type": "object",
+      "required": [
+        "default"
+      ],
+      "properties": {
+        "allow": {
+          "description": "The allow rules, as targets, in order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "default": {
+          "description": "The verdict when no rule matches: `allow` or `deny`.",
+          "$ref": "#/definitions/Verdict"
+        },
+        "deny": {
+          "description": "The deny rules, as targets, in order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PolicyUpdateParams": {
+      "description": "The parameters of `policy.update`: `{\"net\":{...},\"vsock\":{...}}`, each optional and each replacing its whole policy when given. The response is [`PolicyUpdated`]; the server records `policy.changed`. A rule that does not parse is a `bad_request` naming it, and nothing changes.",
+      "type": "object",
+      "properties": {
+        "net": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NetPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vsock": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VsockPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "PolicyUpdated": {
+      "description": "The result of `policy.update`: `{\"policy_version\":N}`, the version of the policy now in force.",
+      "type": "object",
+      "required": [
+        "policy_version"
+      ],
+      "properties": {
+        "policy_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "PolicyView": {
+      "description": "The result of `policy.get`: `{\"net\":{...},\"vsock\":{...},\"version\":N}`, the policy in force and its version (1 for the one the VM started with, one more for each `policy.update`).",
+      "type": "object",
+      "required": [
+        "net",
+        "vsock"
+      ],
+      "properties": {
+        "net": {
+          "$ref": "#/definitions/NetPolicy"
+        },
+        "version": {
+          "description": "0 when a server did not say.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "vsock": {
+          "$ref": "#/definitions/VsockPolicy"
+        }
+      }
+    },
+    "PtyAttachParams": {
+      "description": "The parameters of `pty.attach`: `{\"session\":\"main\",\"mode\":\"rw\"|\"ro\", \"replay_bytes\":N}`. The response is [`PtyAttached`], after which the connection is the terminal's bytes, both ways (see [`PtyMode`]), and only those; `replay_bytes` (0 when absent) of the terminal's latest output come first, at most the server's scrollback.",
+      "type": "object",
+      "required": [
+        "mode",
+        "session"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/PtyMode"
+        },
+        "replay_bytes": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "session": {
+          "description": "[`PTY_SESSION`].",
+          "type": "string"
+        }
+      }
+    },
+    "PtyAttached": {
+      "description": "The result of `pty.attach`: `{\"raw\":true,\"attach_id\":\"<hex>\"}`. The attach's id (128 random bits, in hex) is what another connection watches it by ([`PtyWatchParams`]).",
+      "type": "object",
+      "required": [
+        "attach_id",
+        "raw"
+      ],
+      "properties": {
+        "attach_id": {
+          "type": "string"
+        },
+        "raw": {
+          "description": "`true`: the connection is raw from the next byte.",
+          "type": "boolean"
+        }
+      }
+    },
+    "PtyDetached": {
+      "description": "`{\"v\":1,\"event\":\"pty.detached\",\"attach_id\":\"<hex>\",\"reason\":\"slow\"}`: the server detached the attach `attach_id` from the session's terminal. It goes to the connections that watch the attach (`pty.watch`), never into the attached connection itself, which carries only the terminal's bytes: that one just ends, after its last byte. `slow`: the client left more of the terminal's output unread than the server keeps for it, or took none for 30 s.",
+      "type": "object",
+      "required": [
+        "attach_id",
+        "event",
+        "reason",
+        "v"
+      ],
+      "properties": {
+        "attach_id": {
+          "type": "string"
+        },
+        "event": {
+          "description": "`\"pty.detached\"`.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "PtyMode": {
+      "description": "How a client attaches to the session's terminal.",
+      "oneOf": [
+        {
+          "description": "Read and write: what the client sends is typed into the session.",
+          "type": "string",
+          "enum": [
+            "rw"
+          ]
+        },
+        {
+          "description": "Read only: what the client sends is discarded.",
+          "type": "string",
+          "enum": [
+            "ro"
+          ]
+        }
+      ]
+    },
+    "PtyResizeParams": {
+      "description": "The parameters of `pty.resize`: `{\"session\":\"main\",\"rows\":R,\"cols\":C}`, each of `rows` and `cols` from 1 to 65535. The response is `{}`.",
+      "type": "object",
+      "required": [
+        "cols",
+        "rows",
+        "session"
+      ],
+      "properties": {
+        "cols": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "rows": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "session": {
+          "description": "[`PTY_SESSION`].",
+          "type": "string"
+        }
+      }
+    },
+    "PtyWatchParams": {
+      "description": "The parameters of `pty.watch`: `{\"attach_id\":\"<hex>\"}` (with `\"session\":\"main\"`, optionally). The response is `{}`; from then on the connection that sent it hears the attach's [`PtyDetached`].",
+      "type": "object",
+      "required": [
+        "attach_id"
+      ],
+      "properties": {
+        "attach_id": {
+          "type": "string"
+        },
+        "session": {
+          "description": "[`PTY_SESSION`], when given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Ready": {
+      "description": "The one line `boxcar run --ready-fd N` writes to fd N once the control socket is bound: `{\"ready\":true,\"control\":\"<path>\",\"session_id\":\"<id>\"}`.",
+      "type": "object",
+      "required": [
+        "control",
+        "ready",
+        "session_id"
+      ],
+      "properties": {
+        "control": {
+          "description": "The control socket's path.",
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      }
+    },
+    "Record": {
+      "description": "One audit record: one line of a session's log.\n\nThe JSON field names are these field names, except that `kind` is `type`. Unset optional fields are left out of the JSON, never written as `null`.",
+      "type": "object",
+      "required": [
+        "data",
+        "hash",
+        "prev",
+        "ring",
+        "seq",
+        "session_id",
+        "src",
+        "ts_host_ns",
+        "ts_mono_ns",
+        "type",
+        "v"
+      ],
+      "properties": {
+        "data": {
+          "description": "The payload. Its shape is decided by `kind`; see [`Payload`] for the kinds this crate defines."
+        },
+        "hash": {
+          "description": "This record's hash, from `Record::compute_hash`.",
+          "$ref": "#/definitions/Hash"
+        },
+        "prev": {
+          "description": "The `hash` of the previous record, or `genesis_prev` for the first.",
+          "$ref": "#/definitions/Hash"
+        },
+        "ring": {
+          "$ref": "#/definitions/Ring"
+        },
+        "seq": {
+          "description": "The record's position in the session, counting from 1 with no gaps. Only the log writer assigns it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpanRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "src": {
+          "$ref": "#/definitions/Source"
+        },
+        "subject": {
+          "description": "The guest process the event is attributed to.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Subject"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ts_guest_ns": {
+          "description": "The guest's own clock, for events reported from inside the guest. It orders ring 1 events among themselves.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ts_host_ns": {
+          "description": "Host wall-clock time (`CLOCK_REALTIME`) in nanoseconds since the Unix epoch, taken when the writer received the event. This is the only timestamp that joins events across rings.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ts_mono_ns": {
+          "description": "Host `CLOCK_MONOTONIC` in nanoseconds, taken at the same moment.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "type": {
+          "description": "The dotted event type, such as `fs.open`.",
+          "type": "string"
+        },
+        "v": {
+          "description": "The schema version, [`SCHEMA_VERSION`].",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Request": {
+      "description": "A request: `{\"v\":1,\"id\":N,\"op\":\"<op>\", ...params}`.",
+      "type": "object",
+      "required": [
+        "id",
+        "op",
+        "v"
+      ],
+      "properties": {
+        "id": {
+          "description": "Chosen by the client; the response carries it back.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "op": {
+          "type": "string"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Response": {
+      "description": "The answer to one request: `{\"v\":1,\"id\":N,\"ok\":true,\"result\":{...}}` or `{\"v\":1,\"id\":N,\"ok\":false,\"error\":{\"code\":\"...\",\"message\":\"...\"}}`.",
+      "type": "object",
+      "required": [
+        "id",
+        "ok",
+        "v"
+      ],
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ErrorBody"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "description": "The request's `id`, or 0 when the request had none that could be read, or was a long line dropped unread for being over the rate limit.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "result": true,
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Ring": {
+      "description": "Which side of the VM boundary made the record: 0 the host, 1 the guest.",
+      "type": "integer",
+      "enum": [
+        0,
+        1
+      ]
+    },
+    "SessionId": {
+      "description": "A session id: a UUIDv7 in lowercase hyphenated text.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "SessionOutcome": {
+      "description": "How the guest's session ended, as its init reported it: the exit code of the session's process, or the signal that killed it.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "The exit code, when the process exited.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "signal": {
+          "description": "The signal number, when a signal killed the process.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      }
+    },
+    "Source": {
+      "description": "The component that produced a record. On the wire, the lowercase name.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "vmm",
+            "fs",
+            "net",
+            "vsock",
+            "pty",
+            "guest",
+            "sensor",
+            "reconciler",
+            "gateway",
+            "control"
+          ]
+        },
+        {
+          "description": "The guest's session, as its init reports it over the control channel.",
+          "type": "string",
+          "enum": [
+            "session"
+          ]
+        },
+        {
+          "description": "The session's policy, as the control socket changes it.",
+          "type": "string",
+          "enum": [
+            "policy"
+          ]
+        }
+      ]
+    },
+    "SpanRef": {
+      "description": "Where an event sits in a trace.",
+      "type": "object",
+      "required": [
+        "span_id",
+        "trace_id"
+      ],
+      "properties": {
+        "span_id": {
+          "type": "string"
+        },
+        "trace_id": {
+          "type": "string"
+        }
+      }
+    },
+    "StateEvent": {
+      "description": "`{\"v\":1,\"event\":\"state\",\"state\":\"...\"}`: the VM entered `state`.",
+      "type": "object",
+      "required": [
+        "event",
+        "state",
+        "v"
+      ],
+      "properties": {
+        "event": {
+          "description": "`\"state\"`.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/VmState"
+        },
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Status": {
+      "description": "The result of `status`.",
+      "type": "object",
+      "required": [
+        "audit",
+        "devices",
+        "guest",
+        "mem_mib",
+        "pid",
+        "session_id",
+        "state",
+        "uptime_ms",
+        "vcpus"
+      ],
+      "properties": {
+        "audit": {
+          "$ref": "#/definitions/AuditStatus"
+        },
+        "devices": {
+          "description": "The virtio devices present, by slot name in slot order, such as `fs:root` and `fs:workspace`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "guest": {
+          "$ref": "#/definitions/GuestStatus"
+        },
+        "mem_mib": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "pid": {
+          "description": "The VMM's process id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/VmState"
+        },
+        "uptime_ms": {
+          "description": "Milliseconds since the VM was built.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "vcpus": {
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      }
+    },
+    "StopMode": {
+      "description": "How to stop.",
+      "oneOf": [
+        {
+          "description": "Ask the guest to end its session first.",
+          "type": "string",
+          "enum": [
+            "graceful"
+          ]
+        },
+        {
+          "description": "Stop the vCPUs at once.",
+          "type": "string",
+          "enum": [
+            "force"
+          ]
+        }
+      ]
+    },
+    "StopParams": {
+      "description": "The parameters of `stop`.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "`graceful` when absent.",
+          "default": "graceful",
+          "$ref": "#/definitions/StopMode"
+        },
+        "timeout_ms": {
+          "description": "How long a graceful stop waits for the guest; [`DEFAULT_STOP_TIMEOUT_MS`] when absent.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Subject": {
+      "description": "The guest identity an event is attributed to.",
+      "type": "object",
+      "required": [
+        "gid",
+        "pid",
+        "uid"
+      ],
+      "properties": {
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Verdict": {
+      "description": "Whether something was let through.",
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "VmState": {
+      "description": "Where the VM is in its life.",
+      "oneOf": [
+        {
+          "description": "Built; the vCPUs have not started.",
+          "type": "string",
+          "enum": [
+            "booting"
+          ]
+        },
+        {
+          "description": "The vCPUs run.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "A stop trigger fired; the stop sequence runs.",
+          "type": "string",
+          "enum": [
+            "stopping"
+          ]
+        },
+        {
+          "description": "The stop sequence has run.",
+          "type": "string",
+          "enum": [
+            "stopped"
+          ]
+        }
+      ]
+    },
+    "VsockPolicy": {
+      "description": "The vsock policy as `policy.get` reports it and `policy.update` takes it: `{\"allow_ports\":[5000]}`, the host ports a guest connection may reach besides the internal ones (`boxcar run --vsock-allow`).",
+      "type": "object",
+      "properties": {
+        "allow_ports": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        }
+      }
+    }
+  }
+}

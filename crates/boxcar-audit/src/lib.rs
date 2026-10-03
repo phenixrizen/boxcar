@@ -13,7 +13,11 @@
 //!   stamps time, assigns gap-free sequence numbers, chains, writes, rotates
 //!   segments, and checkpoints.
 //! - [`chain`]: [`Chainer`], the sequence and hash rule on its own.
-//! - [`reader`]: [`LogReader`] reads a session back as typed records.
+//! - [`reader`]: [`LogReader`] reads a session back as typed records, and
+//!   a [`Filter`] picks some of them.
+//! - [`subscribe`]: [`AuditSink::subscribe`] streams the records of a log
+//!   from a seq on, past its end into the live ones, with recovery for a
+//!   subscriber that falls behind.
 //! - [`verify`]: [`verify_session`] and [`verify_jsonl`] check a log from its
 //!   raw bytes.
 //!
@@ -21,17 +25,24 @@
 //! private `segment` module, checkpoints and `checkpoints.jsonl` in
 //! `checkpoint`.
 
+/// The directory under a data directory that holds the sessions' logs:
+/// `<data_dir>/sessions/<session_id>/`. The writer makes it, and the CLI
+/// looks there.
+pub const SESSIONS_DIR: &str = "sessions";
+
 pub mod chain;
 mod checkpoint;
 pub mod reader;
 mod segment;
 pub mod sink;
+pub mod subscribe;
 pub mod verify;
 pub mod writer;
 
 pub use chain::{Chainer, PartialRecord};
-pub use reader::LogReader;
+pub use reader::{Filter, LogReader, Records};
 pub use segment::{Fdatasync, Syncer};
 pub use sink::{AuditSink, EmitError, Priority, Submission};
+pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE, REPLAY_YIELD};
 pub use verify::{verify_jsonl, verify_session, VerifyError, VerifyReport};
 pub use writer::{spawn, spawn_with_syncer, CloseStats, WriteFailure, WriterConfig, WriterHandle};

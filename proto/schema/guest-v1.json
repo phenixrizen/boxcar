@@ -1,0 +1,448 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "boxcar guest control channel v1",
+  "description": "One line on vsock port 1024 between the guest's init and the VMM: a GuestMsg (init to the VMM) or a HostMsg (the VMM to init), tagged by `t`.",
+  "oneOf": [
+    {
+      "$ref": "#/definitions/GuestMsg"
+    },
+    {
+      "$ref": "#/definitions/HostMsg"
+    }
+  ],
+  "definitions": {
+    "GuestMsg": {
+      "description": "What init tells the VMM.",
+      "oneOf": [
+        {
+          "description": "Init is up and connected; its first message. The clocks are the guest's `CLOCK_MONOTONIC` and `CLOCK_REALTIME`, in nanoseconds.",
+          "type": "object",
+          "required": [
+            "guest_mono_ns",
+            "guest_real_ns",
+            "init_version",
+            "t"
+          ],
+          "properties": {
+            "guest_mono_ns": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "guest_real_ns": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "init_version": {
+              "type": "string"
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "hello"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The session's process started, with this pid in the guest.",
+          "type": "object",
+          "required": [
+            "pid",
+            "t"
+          ],
+          "properties": {
+            "pid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "session.started"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The session's process ended: its exit code, or the signal that killed it; both `null` only when init could not tell.",
+          "type": "object",
+          "required": [
+            "t"
+          ],
+          "properties": {
+            "code": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "signal": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "session.exited"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The answer to a [`HostMsg::Ping`] with the same `id`.",
+          "type": "object",
+          "required": [
+            "guest_mono_ns",
+            "id",
+            "t"
+          ],
+          "properties": {
+            "guest_mono_ns": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "pong"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A line for the host's log.",
+          "type": "object",
+          "required": [
+            "level",
+            "msg",
+            "t"
+          ],
+          "properties": {
+            "level": {
+              "$ref": "#/definitions/LogLevel"
+            },
+            "msg": {
+              "type": "string"
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "log"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "HostMsg": {
+      "description": "What the VMM tells init.",
+      "oneOf": [
+        {
+          "description": "The session to run: the answer to `hello`.",
+          "type": "object",
+          "required": [
+            "argv",
+            "cols",
+            "cwd",
+            "env",
+            "gid",
+            "hostname",
+            "rows",
+            "sysctls",
+            "t",
+            "term",
+            "uid"
+          ],
+          "properties": {
+            "argv": {
+              "description": "The command and its arguments; the program is looked for on the session's `PATH` unless it holds a `/`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "cols": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "cwd": {
+              "description": "Where the session starts: an absolute path.",
+              "type": "string"
+            },
+            "env": {
+              "description": "The session's whole environment, in order, as `[name, value]` pairs.",
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "maxItems": 2,
+                "minItems": 2
+              }
+            },
+            "gid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "hostname": {
+              "description": "The guest's hostname.",
+              "type": "string"
+            },
+            "rows": {
+              "description": "The terminal's size.",
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "sysctls": {
+              "description": "Kernel settings init writes before the session starts, beside its own fixed ones: `[name, value]` with dotted names, such as `[\"vm.overcommit_memory\", \"1\"]`.",
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "maxItems": 2,
+                "minItems": 2
+              }
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "config"
+              ]
+            },
+            "term": {
+              "description": "The terminal type, the session's `TERM` when `env` has none.",
+              "type": "string"
+            },
+            "uid": {
+              "description": "Who the session runs as.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "The session's terminal changed size.",
+          "type": "object",
+          "required": [
+            "cols",
+            "rows",
+            "t"
+          ],
+          "properties": {
+            "cols": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "rows": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "resize"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Send this signal to the session's process group.",
+          "type": "object",
+          "required": [
+            "sig",
+            "t"
+          ],
+          "properties": {
+            "sig": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "signal"
+              ]
+            }
+          }
+        },
+        {
+          "description": "End the session: `SIGHUP` and `SIGTERM` to its process group, and `SIGKILL` after `grace_ms`; then the guest reboots.",
+          "type": "object",
+          "required": [
+            "grace_ms",
+            "t"
+          ],
+          "properties": {
+            "grace_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "shutdown"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Answer with a [`GuestMsg::Pong`] of the same `id`.",
+          "type": "object",
+          "required": [
+            "id",
+            "t"
+          ],
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "t": {
+              "type": "string",
+              "enum": [
+                "ping"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "LogLevel": {
+      "description": "The level of a [`GuestMsg::Log`].",
+      "type": "string",
+      "enum": [
+        "error",
+        "warn",
+        "info",
+        "debug"
+      ]
+    },
+    "SessionConfig": {
+      "description": "The session init runs: the fields of [`HostMsg::Config`].",
+      "type": "object",
+      "required": [
+        "argv",
+        "cols",
+        "cwd",
+        "env",
+        "gid",
+        "hostname",
+        "rows",
+        "sysctls",
+        "term",
+        "uid"
+      ],
+      "properties": {
+        "argv": {
+          "description": "The command and its arguments; the program is looked for on the session's `PATH` unless it holds a `/`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cols": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "cwd": {
+          "description": "Where the session starts: an absolute path.",
+          "type": "string"
+        },
+        "env": {
+          "description": "The session's whole environment, in order, as `[name, value]` pairs.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "hostname": {
+          "description": "The guest's hostname.",
+          "type": "string"
+        },
+        "rows": {
+          "description": "The terminal's size.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "sysctls": {
+          "description": "Kernel settings init writes before the session starts, beside its own fixed ones: `[name, value]` with dotted names, such as `[\"vm.overcommit_memory\", \"1\"]`.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "term": {
+          "description": "The terminal type, the session's `TERM` when `env` has none.",
+          "type": "string"
+        },
+        "uid": {
+          "description": "Who the session runs as.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

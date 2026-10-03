@@ -19,6 +19,8 @@ boxcar-audit = { path = "crates/boxcar-audit" }
 boxcar-virtio = { path = "crates/boxcar-virtio" }
 boxcar-fs = { path = "crates/boxcar-fs" }
 boxcar-vmm = { path = "crates/boxcar-vmm" }
+boxcar-net = { path = "crates/boxcar-net" }
+boxcar-vsock = { path = "crates/boxcar-vsock" }
 
 # rust-vmm and fuse-backend-rs: exact pins, one coherent vm-memory 0.17 set.
 # crates.io only: no git dependencies and no [patch] sections.
@@ -51,6 +53,15 @@ anyhow = "1"   # binaries and xtask only
 nix = "0.31"   # guest only
 cpio = "0.4"   # xtask only
 tempfile = "3" # dev only
+
+# The user-mode network stack (boxcar-net).
+smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-raw"] }
+socket2 = { version = "0.5", features = ["all"] }
+arc-swap = "1"
+proptest = "1" # dev only
+# JSON Schema generation (`cargo xtask schema`); boxcar-proto's optional
+# `schema` feature, on only for xtask.
+schemars = "0.8"
 
 # Static musl guest init: `cargo build -p boxcar-init --target
 # x86_64-unknown-linux-musl --profile guest`.

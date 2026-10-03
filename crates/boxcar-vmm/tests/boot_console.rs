@@ -152,7 +152,7 @@ fn a_session_command_writes_a_file_the_audit_hashes() {
         "no exit line on the console:\n{output}"
     );
     assert!(
-        matches!(exit, VmExit::GuestReset),
+        matches!(exit, VmExit::GuestReset { .. }),
         "{exit:?}; console:\n{output}"
     );
     // Rust sets SIGPIPE to SIG_IGN in init, and an ignored signal or a

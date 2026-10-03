@@ -7,23 +7,37 @@
 //! Boot order in `Vmm::new`: open KVM and check its capabilities, raise
 //! `RLIMIT_NOFILE`, create the VM with its TSS, in-kernel irqchip and PIT,
 //! map guest memory, load the kernel and the initramfs, create the devices
-//! (the legacy PIO devices, then one virtio-fs device per share in the
-//! fixed slot order), write the command line with a `virtio_mmio.device=`
-//! entry per virtio device, write the zero page and MP table, create and
-//! set up the vCPUs, and record `vmm.start`.
+//! (the legacy PIO devices, then one virtio-fs device per share, the network
+//! card and the vsock device, each in its fixed slot of
+//! [`crate::devices::slots`], the vsock device with the VMM's
+//! [`ServiceRegistry`] behind its internal ports, and in it the guest
+//! control channel ([`GuestCtl`]) at port 1024 and the session's terminal
+//! ([`PtyHub`]) at port 1025), write
+//! the command line with the network's arguments ([`NET_CMDLINE`]) when
+//! there is a network card and a `virtio_mmio.device=` entry for each slot
+//! of the [`DeviceSet`], write the zero page and MP table, create and set up
+//! the vCPUs, record `vmm.start`,
+//! and bind the control socket when the config asks for one, so that a
+//! client can connect while the VM boots (its state is `booting` until
+//! [`Vmm::run`] starts the vCPU threads).
 
 use std::fs::File;
 use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
-use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, ShareRef, VmmStart};
+use boxcar_net::{NetConfig, Policy};
+use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
+use boxcar_vsock::VsockConfig;
 use event_manager::{EventManager, EventSet, Events, MutEventSubscriber, SubscriberOps};
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::{VcpuFd, VmFd};
@@ -39,20 +53,27 @@ pub use crate::arch::x86_64::layout::CMDLINE_MAX_SIZE;
 use crate::arch::x86_64::layout::{CMDLINE_START, HIMEM_START, KVM_TSS_ADDRESS};
 use crate::arch::x86_64::{cpuid, interrupts, msr, regs};
 use crate::cmdline::{build_cmdline, MmioDeviceEntry};
+use crate::console::ConsoleWriter;
+use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
-use crate::devices::{DeviceError, FsDevices, LegacyDevices, FS_TAGS};
+use crate::devices::slots::{present_slots, DeviceSet};
+use crate::devices::{DeviceError, FsDevices, FsOptions, LegacyDevices, NetDevice, VsockDevice};
+use crate::guest_ctl::{GuestCtl, SessionConfig, CLOSE_DEADLINE};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
-    block_stop_signals, record_stop, stop, wait_for_stop, ControlSubscriber, MainLoop, SignalFd,
-    StopLatch, Teardown,
+    block_stop_signals, exit_code_for, record_stop, stop, wait_for_stop, ControlSubscriber,
+    MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
+use crate::policy::LivePolicy;
+use crate::pty::PtyHub;
+use crate::services::ServiceRegistry;
 use crate::stdin::{stdin_is_tty, RawModeGuard, StdinSubscriber};
 use crate::vcpu::VcpuSet;
 
 pub use crate::devices::ConsoleOut;
-pub use crate::lifecycle::{StopReason, VmExit, VmState, VmmHandle};
+pub use crate::lifecycle::{SessionOutcome, StopReason, VmExit, VmState, VmmHandle};
 
 /// The kernel command line every boot starts from.
 pub const BASE_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.dumbkbd lockdown=integrity random.trust_cpu=on quiet loglevel=4 rdinit=/init";
@@ -72,46 +93,73 @@ pub fn base_cmdline(debug_boot: bool) -> String {
     }
 }
 
+/// What the command line says when the VM has a network card, after the
+/// base and before the extras (which can override them): the kernel
+/// configures `eth0` itself as the guest at the stack's fixed addressing
+/// (`boxcar_net::config`), with no DHCP (`off`) and the gateway as its DNS
+/// server; and init writes the guest's resolver configuration.
+pub const NET_CMDLINE: [&str; 2] = [
+    "ip=10.0.2.15::10.0.2.2:255.255.255.0:boxcar:eth0:off:10.0.2.2",
+    "boxcar.net=1",
+];
+
 /// The size, NUL terminator included, of the kernel command line
-/// [`Vmm::new`] writes for a VM with `debug_boot`, `extra` and `fs_shares`
-/// virtio-fs shares, whether or not it fits in the [`CMDLINE_MAX_SIZE`]
-/// bytes the kernel takes: composed from the same parts in the same order
-/// (the base, `extra`, a `virtio_mmio.device=` entry for each share in its
-/// fixed slot), without building the VM. A caller can refuse a command
-/// line that is too long, with its size, before it starts anything.
+/// [`Vmm::new`] writes for a VM with `debug_boot`, `extra` and the devices
+/// in `set`, whether or not it fits in the [`CMDLINE_MAX_SIZE`] bytes the
+/// kernel takes: composed by `kernel_cmdline`, the function `Vmm::new`
+/// uses (the base, [`NET_CMDLINE`] with a network card, `extra`, a
+/// `virtio_mmio.device=` entry for each present slot of the fixed table),
+/// without building the VM. A caller can refuse a command line that is too
+/// long, with its size, before it starts anything. `set` is
+/// [`DeviceSet::from_config`] of the config the VM is built from, or
+/// [`DeviceSet::new`] for a caller that has no [`VmConfig`] yet.
 pub fn cmdline_size(
     debug_boot: bool,
     extra: &[String],
-    fs_shares: usize,
+    set: &DeviceSet,
 ) -> Result<usize, VmmError> {
-    let tags = FS_TAGS.get(..fs_shares).ok_or_else(|| {
-        VmmError::Config(format!(
-            "{fs_shares} virtio-fs shares; there are at most {}",
-            FS_TAGS.len()
-        ))
-    })?;
-    let devices = FsDevices::cmdline_entries_for(&mut SlotAllocator::new()?, tags)?;
-    let (base, extras) = cmdline_parts(debug_boot, extra);
-    Ok(crate::cmdline::cmdline_size(&base, &extras, &devices)?)
+    let (base, extras) = cmdline_parts(debug_boot, extra, set);
+    Ok(crate::cmdline::cmdline_size(
+        &base,
+        &extras,
+        &cmdline_entries(set),
+    )?)
+}
+
+/// The `virtio_mmio.device=` entries of the devices in `set`: one per
+/// present slot of the fixed table, in slot order.
+fn cmdline_entries(set: &DeviceSet) -> Vec<MmioDeviceEntry> {
+    present_slots(set)
+        .iter()
+        .map(|slot| slot.cmdline_entry())
+        .collect()
 }
 
 /// The kernel command line of a VM with `debug_boot`, `extra` and the
-/// virtio-mmio `devices`.
+/// devices in `set`.
 fn kernel_cmdline(
     debug_boot: bool,
     extra: &[String],
-    devices: &[MmioDeviceEntry],
+    set: &DeviceSet,
 ) -> crate::arch::Result<linux_loader::cmdline::Cmdline> {
-    let (base, extras) = cmdline_parts(debug_boot, extra);
-    build_cmdline(&base, &extras, devices)
+    let (base, extras) = cmdline_parts(debug_boot, extra, set);
+    build_cmdline(&base, &extras, &cmdline_entries(set))
 }
 
-/// The base command line and the extra arguments, in order.
-fn cmdline_parts(debug_boot: bool, extra: &[String]) -> (String, Vec<&str>) {
-    (
-        base_cmdline(debug_boot),
-        extra.iter().map(String::as_str).collect(),
-    )
+/// The base command line, and the arguments after it in order: the
+/// network's when `set` has the network card, then `extra`.
+fn cmdline_parts<'a>(
+    debug_boot: bool,
+    extra: &'a [String],
+    set: &DeviceSet,
+) -> (String, Vec<&'a str>) {
+    let net: &[&str] = if set.net { &NET_CMDLINE } else { &[] };
+    let args = net
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .collect();
+    (base_cmdline(debug_boot), args)
 }
 
 /// Guest memory when not configured.
@@ -135,25 +183,65 @@ pub struct VmConfig {
     /// a TTY on stdin and [`VmConfig::stdin`], stdin is forwarded to the
     /// guest.
     pub console: ConsoleOut,
-    /// Whether the guest may read the host's stdin: when it is a TTY and the
-    /// console is on stdout, the terminal goes into raw mode and what is
-    /// typed goes to the guest. Off for a run that needs no input, which
-    /// leaves the terminal as it is.
+    /// Whether the guest's serial console may read the host's stdin: when
+    /// it is a TTY and the console is on stdout, the terminal goes into raw
+    /// mode and what is typed goes to the guest. Off for a run that needs
+    /// no input, which leaves the terminal as it is, and in init's vsock
+    /// mode, where the session's terminal takes the input instead (see
+    /// [`crate::pty`]).
     pub stdin: bool,
     /// Receives `vmm.start` and `vmm.stop`, and every share's records.
     pub audit: AuditSink,
     /// The directories shared with the guest over virtio-fs, in slot order:
-    /// `root`, then `workspace` (see [`crate::devices::FS_TAGS`]).
+    /// none, or `root` then `workspace` (see [`crate::devices::FS_TAGS`]).
     pub fs_shares: Vec<FsShareConfig>,
     /// How much the shares record.
     pub fs_audit: AuditFsOptions,
+    /// The network card's stack, if the VM has one (slot 2): see
+    /// `boxcar_net::NetStack`. The guest's addressing is fixed; the config
+    /// gives the DNS upstreams and the relays' bounds.
+    pub net: Option<NetConfig>,
+    /// What the guest may reach and resolve. The stack reads it at every
+    /// decision; storing a new policy in it (the control server's
+    /// `policy.update`) decides the next query or connection.
+    pub policy: Arc<ArcSwap<Policy>>,
+    /// The vsock device, if the VM has one (slot 3): the guest's CID, the
+    /// host socket (`boxcar run` puts it in the session's state directory,
+    /// beside the control socket), and the host ports a guest connection
+    /// may reach besides the internal ones. See `boxcar_vsock`.
+    pub vsock: Option<VsockConfig>,
+    /// The session the guest control channel sends init when it connects
+    /// (init's `vsock` mode, which needs the vsock device): the command,
+    /// its user, environment and terminal. Unused without the vsock device.
+    pub session: SessionConfig,
+    /// The control socket, if any: see [`ControlConfig`].
+    pub control: Option<ControlConfig>,
+}
+
+/// Where the control socket goes and which session it serves.
+#[derive(Clone, Debug)]
+pub struct ControlConfig {
+    /// The session's state directory, created mode 0700 if missing; the
+    /// socket is `control.sock` in it, mode 0600. Both are removed when
+    /// the VM stops (the directory only when it is empty).
+    pub state_dir: PathBuf,
+    /// The session the hello and `status` name: the audit log's.
+    pub session_id: SessionId,
 }
 
 impl VmConfig {
     /// A config for `kernel` with the defaults: no initramfs,
     /// [`DEFAULT_MEM_MIB`], [`DEFAULT_VCPUS`], no extra arguments, a quiet
-    /// boot, the console on stdio with stdin, and no shares.
+    /// boot, the console on stdio with stdin, no shares, no network card (and
+    /// a policy that denies everything), no vsock device, a login shell as
+    /// this process's user for the session ([`SessionConfig::for_user`]),
+    /// and no control socket.
     pub fn new(kernel: impl Into<PathBuf>, audit: AuditSink) -> Self {
+        // SAFETY: getuid and getgid take no arguments and cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let shell = boxcar_proto::guest::DEFAULT_ARGV
+            .map(str::to_owned)
+            .to_vec();
         VmConfig {
             kernel: kernel.into(),
             initramfs: None,
@@ -166,6 +254,11 @@ impl VmConfig {
             audit,
             fs_shares: Vec::new(),
             fs_audit: AuditFsOptions::default(),
+            net: None,
+            policy: Arc::new(ArcSwap::from_pointee(Policy::default())),
+            vsock: None,
+            session: SessionConfig::for_user(shell, uid, gid),
+            control: None,
         }
     }
 }
@@ -224,6 +317,12 @@ pub enum VmmError {
     Device(#[from] DeviceError),
     #[error("cannot record vmm.start")]
     Audit(#[from] EmitError),
+    #[error("cannot bind the control socket in {}", state_dir.display())]
+    Control {
+        state_dir: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("the main event loop failed")]
     EventLoop(#[source] event_manager::Error),
 }
@@ -248,17 +347,42 @@ pub struct Vmm {
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
     legacy: LegacyDevices,
+    /// The thread that writes the guest's console output; drained and
+    /// joined by the stop sequence, after the devices close and before
+    /// `vmm.stop`.
+    console: ConsoleWriter,
+    /// Console input the stdin subscriber dropped; read for `vmm.stop`.
+    stdin_dropped: Arc<AtomicU64>,
     fs: FsDevices,
+    net: NetDevice,
+    vsock: VsockDevice,
+    /// What the guest may reach: the network card's stack reads it.
+    policy: Arc<ArcSwap<Policy>>,
     latch: Arc<StopLatch>,
+    info: Arc<VmInfo>,
+    /// Closed by the stop sequence, before `vmm.stop`.
+    control: Option<ControlServer>,
+    control_path: Option<PathBuf>,
     audit: AuditSink,
     /// Forward stdin to the console and put the terminal in raw mode.
     interactive: bool,
+    /// A terminal in raw mode that the caller handed over
+    /// ([`Vmm::restore_terminal_on_stop`]), restored by the stop sequence.
+    terminal: Option<RawModeGuard>,
 }
 
 impl Vmm {
     /// Builds the VM described by `cfg`, in the boot order of the module
     /// docs, and records `vmm.start`.
     pub fn new(cfg: VmConfig) -> Result<Vmm, VmmError> {
+        let built = Instant::now();
+        // Before anything is built: a session init would refuse is refused
+        // here, with why, instead of ending in a reset with no report.
+        if cfg.vsock.is_some() {
+            cfg.session
+                .validate()
+                .map_err(|error| VmmError::Config(error.to_string()))?;
+        }
         if cfg.vcpus == 0 {
             return Err(VmmError::Config("a VM needs at least one vCPU".into()));
         }
@@ -299,8 +423,9 @@ impl Vmm {
             None => None,
         };
 
-        let console = cfg.console.open().map_err(VmmError::Console)?;
-        let legacy = LegacyDevices::new(console).map_err(setup("legacy devices"))?;
+        let (sink, console) =
+            ConsoleWriter::spawn(cfg.console.clone()).map_err(VmmError::Console)?;
+        let legacy = LegacyDevices::new(sink).map_err(setup("legacy devices"))?;
         let mut pio = Bus::new();
         legacy.attach(&mut pio)?;
         {
@@ -308,6 +433,7 @@ impl Vmm {
             vm.register_irqfd(serial.interrupt_evt(), COM1_GSI)
                 .map_err(kvm_ioctl("register_irqfd"))?;
         }
+        let set = DeviceSet::from_config(&cfg);
         let mut mmio = Bus::new();
         let mut slots = SlotAllocator::new()?;
         let fs = FsDevices::attach(
@@ -317,10 +443,50 @@ impl Vmm {
             &mut slots,
             &cfg.fs_shares,
             &cfg.audit,
-            cfg.fs_audit,
+            FsOptions::for_vcpus(cfg.fs_audit, cfg.vcpus),
         )?;
+        let net = NetDevice::attach(
+            &vm,
+            &mem,
+            &mut mmio,
+            &mut slots,
+            cfg.net.as_ref(),
+            &cfg.audit,
+            &cfg.policy,
+        )?;
+        // The guest control channel's service and the session's terminal's,
+        // when there is a vsock device.
+        let services = Arc::new(ServiceRegistry::new());
+        let guest = GuestCtl::new(cfg.session.clone(), cfg.audit.clone());
+        let vsock = VsockDevice::attach(
+            &vm,
+            &mem,
+            &mut mmio,
+            &mut slots,
+            cfg.vsock.as_ref(),
+            &cfg.audit,
+            &services,
+        )?;
+        let pty = if vsock.is_attached() {
+            services
+                .register(boxcar_vsock::services::CTL_PORT, guest.service())
+                .map_err(|error| VmmError::Config(error.to_string()))?;
+            let pty = PtyHub::new(guest.handle()).map_err(setup("PTY hub"))?;
+            services
+                .register(boxcar_vsock::services::PTY_PORT, pty.service())
+                .map_err(|error| VmmError::Config(error.to_string()))?;
+            Some(pty)
+        } else {
+            None
+        };
+        // What was attached is what the command line and `status` say.
+        debug_assert_eq!(
+            set,
+            DeviceSet::new(fs.len(), net.is_attached(), vsock.is_attached()),
+            "the devices attached are not DeviceSet::from_config's"
+        );
 
-        let cmdline = kernel_cmdline(cfg.debug_boot, &cfg.cmdline_extra, fs.cmdline_entries())?;
+        let cmdline = kernel_cmdline(cfg.debug_boot, &cfg.cmdline_extra, &set)?;
         load_cmdline(&*mem, GuestAddress(CMDLINE_START), &cmdline).map_err(VmmError::Cmdline)?;
         let cmdline = cmdline
             .as_cstring()
@@ -338,6 +504,30 @@ impl Vmm {
 
         let vcpus = create_vcpus(&kvm, &vm, &mem, cfg.vcpus, entry)?;
         let latch = Arc::new(StopLatch::new().map_err(setup("stop eventfd"))?);
+        let net_wake = match net.policy_wake() {
+            Some(wake) => Some(wake.try_clone().map_err(setup("policy wake"))?),
+            None => None,
+        };
+        let live_policy = LivePolicy::new(Arc::clone(&cfg.policy), net_wake, vsock.allow_ports());
+        let info = Arc::new(VmInfo {
+            session_id: cfg
+                .control
+                .as_ref()
+                .map(|control| control.session_id.to_string())
+                .unwrap_or_default(),
+            built,
+            vcpus: cfg.vcpus,
+            mem_mib: cfg.mem_mib,
+            devices: present_slots(&set)
+                .iter()
+                .map(|slot| slot.id.name().to_owned())
+                .collect(),
+            audit: cfg.audit.clone(),
+            services,
+            guest,
+            pty,
+            policy: Arc::new(live_policy),
+        });
 
         let start = VmmStart {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -361,6 +551,32 @@ impl Vmm {
             priority: Priority::Normal,
         })?;
 
+        // After vmm.start, so the log never has a control.connect before
+        // it; a failure here is recorded like one in `run`.
+        let (control, control_path) = match &cfg.control {
+            None => (None, None),
+            Some(control) => {
+                let handle = VmmHandle::new(latch.clone(), info.clone());
+                let ops = Arc::new(VmmOps::new(handle.clone()));
+                match ControlServer::bind(&control.state_dir, handle, ops) {
+                    Ok((server, path)) => (Some(server), Some(path)),
+                    Err(source) => {
+                        // The guest has not run: nothing was dropped.
+                        let console = console.flush_and_join(CONSOLE_DEADLINE);
+                        let counts = StopCounts {
+                            console_dropped_bytes: console.dropped_bytes,
+                            stdin_dropped_bytes: 0,
+                        };
+                        record_stop(&cfg.audit, "vmm_error", 1, counts);
+                        return Err(VmmError::Control {
+                            state_dir: control.state_dir.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+        };
+
         Ok(Vmm {
             vcpus,
             _vm: vm,
@@ -369,16 +585,44 @@ impl Vmm {
             pio: Arc::new(pio),
             mmio: Arc::new(mmio),
             legacy,
+            console,
+            stdin_dropped: Arc::new(AtomicU64::new(0)),
             fs,
+            net,
+            vsock,
+            policy: cfg.policy,
             latch,
+            info,
+            control,
+            control_path,
             interactive: cfg.stdin && matches!(cfg.console, ConsoleOut::Stdio) && stdin_is_tty(),
+            terminal: None,
             audit: cfg.audit,
         })
     }
 
+    /// Hands over a terminal the caller put in raw mode (`boxcar run`'s,
+    /// attached to the session's terminal through the PTY hub): the stop
+    /// sequence restores it where it restores its own, before anything it
+    /// logs.
+    pub fn restore_terminal_on_stop(&mut self, terminal: RawModeGuard) {
+        self.terminal = Some(terminal);
+    }
+
     /// A handle that can stop the VM from another thread.
     pub fn handle(&self) -> VmmHandle {
-        VmmHandle::new(self.latch.clone())
+        VmmHandle::new(self.latch.clone(), self.info.clone())
+    }
+
+    /// The control socket's path, when the VM has one.
+    pub fn control_path(&self) -> Option<&Path> {
+        self.control_path.as_deref()
+    }
+
+    /// The policy the network card's stack reads ([`VmConfig::policy`]):
+    /// storing a new one in it decides the next query or connection.
+    pub fn policy(&self) -> Arc<ArcSwap<Policy>> {
+        Arc::clone(&self.policy)
     }
 
     /// Runs the VM until it stops, then runs the stop sequence (see
@@ -395,19 +639,42 @@ impl Vmm {
             Ok(started) => started,
             Err(error) => {
                 self.fs.close();
-                record_stop(&self.audit, "vmm_error", 1);
+                self.net.close();
+                self.vsock.close();
+                self.info.guest.close(CLOSE_DEADLINE);
+                if let Some(pty) = &self.info.pty {
+                    pty.close();
+                }
+                let console = self.console.flush_and_join(CONSOLE_DEADLINE);
+                self.latch.mark_stopped();
+                if let Some(control) = self.control.take() {
+                    control.shutdown();
+                }
+                let counts = StopCounts {
+                    console_dropped_bytes: console.dropped_bytes,
+                    stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),
+                };
+                record_stop(&self.audit, "vmm_error", 1, counts);
                 return Err(error);
             }
         };
         let outcome = wait_for_stop(&mut main_loop, &self.latch).map_err(VmmError::EventLoop);
         let (reason, exit_code) = match &outcome {
-            Ok(exit) => (exit.audit_reason(), exit.exit_code()),
+            Ok(exit) => (exit.audit_reason(), exit_code_for(exit)),
             Err(_) => ("vmm_error", 1),
         };
         let teardown = Teardown {
             vcpus,
             fs: &self.fs,
-            devices: &self.legacy,
+            net: &self.net,
+            vsock: &self.vsock,
+            guest: &self.info.guest,
+            pty: self.info.pty.as_ref(),
+            console: self.console,
+            // The main loop is done: this is the final count.
+            stdin_dropped_bytes: self.stdin_dropped.load(Ordering::Relaxed),
+            control: self.control.take(),
+            latch: &self.latch,
             audit: &self.audit,
             terminal,
         };
@@ -415,9 +682,10 @@ impl Vmm {
         outcome
     }
 
-    /// Sets up the main loop, enters raw mode when interactive, and starts
-    /// the vCPU threads, last, so that nothing fallible follows them.
-    fn start(&self, vcpus: Vec<VcpuFd>) -> Result<Started, VmmError> {
+    /// Sets up the main loop, enters raw mode when interactive (or takes
+    /// the terminal the caller handed over), and starts the vCPU threads,
+    /// last, so that nothing fallible follows them.
+    fn start(&mut self, vcpus: Vec<VcpuFd>) -> Result<Started, VmmError> {
         register_kick_handler().map_err(setup("vCPU kick signal handler"))?;
         block_stop_signals().map_err(setup("signal mask"))?;
         let signals = SignalFd::new().map_err(setup("signalfd"))?;
@@ -443,22 +711,28 @@ impl Vmm {
             exited_watch,
             exits,
             self.audit.clone(),
+            Arc::clone(&self.info.guest),
         );
         let fds = control.fds();
         add_subscriber(&mut main_loop, Box::new(control), &fds)?;
 
         let terminal = if self.interactive {
-            let subscriber = StdinSubscriber::new(self.legacy.serial.clone(), self.handle())
-                .map_err(setup("stdin subscriber"))?;
+            let subscriber = StdinSubscriber::new(
+                self.legacy.serial.clone(),
+                self.handle(),
+                self.stdin_dropped.clone(),
+            )
+            .map_err(setup("stdin subscriber"))?;
             let fds = subscriber.fds();
             add_subscriber(&mut main_loop, Box::new(subscriber), &fds)?;
             RawModeGuard::enter().map_err(setup("raw terminal"))?
         } else {
-            None
+            self.terminal.take()
         };
 
         let vcpus = VcpuSet::spawn(vcpus, &self.pio, &self.mmio, &exits_tx, exited)
             .map_err(setup("vCPU threads"))?;
+        self.latch.mark_running();
         Ok(Started {
             main_loop,
             vcpus,
@@ -692,7 +966,12 @@ mod tests {
         for debug_boot in [false, true] {
             let text = two_share_cmdline(debug_boot, &extra);
             assert_eq!(
-                cmdline_size(debug_boot, &strings(&extra), 2).unwrap(),
+                cmdline_size(
+                    debug_boot,
+                    &strings(&extra),
+                    &DeviceSet::new(2, false, false)
+                )
+                .unwrap(),
                 text.len() + 1,
                 "{text}"
             );
@@ -701,7 +980,12 @@ mod tests {
             crate::cmdline::build_cmdline(&base_cmdline(false), &["boxcar.mode=hello"], &[])
                 .unwrap();
         assert_eq!(
-            cmdline_size(false, &strings(&["boxcar.mode=hello"]), 0).unwrap(),
+            cmdline_size(
+                false,
+                &strings(&["boxcar.mode=hello"]),
+                &DeviceSet::new(0, false, false)
+            )
+            .unwrap(),
             hello.as_cstring().unwrap().as_bytes_with_nul().len()
         );
     }
@@ -711,7 +995,8 @@ mod tests {
     #[test]
     fn cmdline_size_measures_a_command_line_over_the_limit() {
         let long = "x".repeat(3000);
-        let size = cmdline_size(false, &strings(&[&long]), 2).unwrap();
+        let size =
+            cmdline_size(false, &strings(&[&long]), &DeviceSet::new(2, false, false)).unwrap();
         // The extra and the space before it, then the NUL terminator.
         let without = two_share_cmdline(false, &[]).len();
         assert_eq!(size, without + 1 + long.len() + 1);
@@ -721,12 +1006,12 @@ mod tests {
     #[test]
     fn cmdline_size_refuses_what_the_vm_would_refuse() {
         assert!(matches!(
-            cmdline_size(false, &strings(&["bad\u{7}"]), 0),
+            cmdline_size(
+                false,
+                &strings(&["bad\u{7}"]),
+                &DeviceSet::new(0, false, false)
+            ),
             Err(VmmError::Arch(crate::arch::Error::Cmdline(_)))
-        ));
-        assert!(matches!(
-            cmdline_size(false, &[], 3),
-            Err(VmmError::Config(_))
         ));
     }
 
@@ -745,6 +1030,128 @@ mod tests {
             .collect();
         assert_eq!(named, [("root", "/r/rootfs"), ("workspace", "/w")]);
         assert!(share_refs(&[]).is_empty());
+    }
+
+    /// The kernel command line of a VM with `set`, as text.
+    fn cmdline_text(extra: &[&str], set: &DeviceSet) -> String {
+        let extra = strings(extra);
+        kernel_cmdline(false, &extra, set)
+            .unwrap()
+            .as_cstring()
+            .unwrap()
+            .into_string()
+            .unwrap()
+    }
+
+    #[test]
+    fn cmdline_size_uses_only_present_slots() {
+        let none = DeviceSet {
+            fs: false,
+            net: false,
+            vsock: false,
+        };
+        let text = cmdline_text(&[], &none);
+        assert!(!text.contains("virtio_mmio.device="), "{text}");
+
+        // Without virtio-fs, net and vsock keep their own slots: the entries
+        // for slots 0 and 1 are not there to be taken over.
+        let set = DeviceSet {
+            fs: false,
+            net: true,
+            vsock: true,
+        };
+        let extra = ["boxcar.mode=hello"];
+        let text = cmdline_text(&extra, &set);
+        assert!(!text.contains("0xc0000000"), "{text}");
+        assert!(!text.contains("0xc0001000"), "{text}");
+        assert!(
+            text.ends_with("virtio_mmio.device=4K@0xc0002000:7 virtio_mmio.device=4K@0xc0003000:8"),
+            "{text}"
+        );
+        assert_eq!(
+            cmdline_size(false, &strings(&extra), &set).unwrap(),
+            text.len() + 1
+        );
+    }
+
+    /// With the net device, the kernel configures eth0 itself (`ip=`, no
+    /// DHCP) and init writes the resolver (`boxcar.net=1`); both follow
+    /// the base, before the extras, which can override them. Without it,
+    /// neither is there.
+    #[test]
+    fn the_network_arguments_come_only_with_the_net_device() {
+        let extra = ["boxcar.mode=console"];
+        let net = DeviceSet::new(2, true, false);
+        let text = cmdline_text(&extra, &net);
+        assert!(
+            text.contains(
+                " rdinit=/init ip=10.0.2.15::10.0.2.2:255.255.255.0:boxcar:eth0:off:10.0.2.2 \
+                 boxcar.net=1 boxcar.mode=console virtio_mmio.device="
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("virtio_mmio.device=4K@0xc0001000:6 virtio_mmio.device=4K@0xc0002000:7"),
+            "{text}"
+        );
+        assert_eq!(
+            cmdline_size(false, &strings(&extra), &net).unwrap(),
+            text.len() + 1
+        );
+
+        // Net without the shares keeps slot 2.
+        let alone = cmdline_text(&["boxcar.mode=hello"], &DeviceSet::new(0, true, false));
+        assert!(alone.contains(" boxcar.net=1 "), "{alone}");
+        assert!(
+            alone.ends_with("boxcar.mode=hello virtio_mmio.device=4K@0xc0002000:7"),
+            "{alone}"
+        );
+
+        for set in [
+            DeviceSet::new(2, false, false),
+            DeviceSet::new(0, false, false),
+            DeviceSet::new(2, false, true),
+        ] {
+            let text = cmdline_text(&extra, &set);
+            assert!(!text.contains("ip="), "{set:?}: {text}");
+            assert!(!text.contains("boxcar.net"), "{set:?}: {text}");
+        }
+    }
+
+    /// The `ip=` argument names the stack's fixed addressing.
+    #[test]
+    fn the_ip_argument_is_the_stacks_addressing() {
+        use boxcar_net::config::{GATEWAY_IP, GUEST_IP, HOSTNAME};
+        let mask = boxcar_net::NetConfig::default().netmask_addr();
+        assert_eq!(
+            NET_CMDLINE[0],
+            format!("ip={GUEST_IP}::{GATEWAY_IP}:{mask}:{HOSTNAME}:eth0:off:{GATEWAY_IP}")
+        );
+        assert_eq!(NET_CMDLINE[1], "boxcar.net=1");
+    }
+
+    /// A session init would refuse is refused before anything is built
+    /// (no KVM needed to see it): a hostname of 65 bytes.
+    #[test]
+    fn a_session_init_would_refuse_is_refused_before_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            tmp.path(),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let mut cfg = VmConfig::new(tmp.path().join("no-such-vmlinux"), sink);
+        cfg.vsock = Some(VsockConfig::new(tmp.path().join("state/vsock.sock")));
+        cfg.session.hostname = "x".repeat(65);
+        match Vmm::new(cfg) {
+            Err(VmmError::Config(message)) => {
+                assert!(message.starts_with("the session's hostname: "), "{message}")
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a 65-byte hostname was accepted"),
+        }
+        assert!(!tmp.path().join("state").exists());
+        writer.close().unwrap();
     }
 
     #[test]

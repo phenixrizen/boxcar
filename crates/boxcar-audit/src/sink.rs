@@ -23,13 +23,16 @@
 //! the writer may make. A refusal is never counted as a drop.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock, PoisonError, RwLock, TryLockError};
 
 use boxcar_proto::{Payload, Ring, SpanRef, Subject};
-use crossbeam_channel::{Sender, TrySendError};
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
+use crate::reader::Filter;
+use crate::subscribe::{Attached, Closed, SubscribeRequest};
 use crate::writer::WriteFailure;
 
 /// How soon a record must be on disk.
@@ -73,11 +76,24 @@ pub enum EmitError {
     Checkpoint,
 }
 
+/// What travels in the writer's channel, in order: an event to record, or a
+/// request to register a subscriber (see [`crate::subscribe`]).
+// The channel's slot was a `Submission` before this enum: boxing the event
+// would add an allocation to every record to save room for the rare request.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Msg {
+    Event(Submission),
+    Subscribe(SubscribeRequest),
+}
+
 /// What the sinks share with the writer.
 #[derive(Debug)]
 pub(crate) struct Shared {
     /// Events `try_emit` dropped because the channel was full.
     pub(crate) dropped: AtomicU64,
+    /// The seq the writer gives the next record it writes. Only the writer
+    /// stores it, after each record it chains.
+    pub(crate) next_seq: AtomicU64,
     /// Set once, by [`Shared::close`]. Each send holds the read lock across
     /// the send itself, so the write lock is granted only when no send is in
     /// flight.
@@ -89,9 +105,11 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new() -> io::Result<Self> {
+    /// `next_seq` is the seq of the first record the writer will write.
+    pub(crate) fn new(next_seq: u64) -> io::Result<Self> {
         Ok(Shared {
             dropped: AtomicU64::new(0),
+            next_seq: AtomicU64::new(next_seq),
             closed: RwLock::new(false),
             failure: OnceLock::new(),
             failure_evt: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
@@ -134,13 +152,40 @@ impl Shared {
 /// writer.
 #[derive(Clone)]
 pub struct AuditSink {
-    tx: Sender<Submission>,
+    tx: Sender<Msg>,
     shared: Arc<Shared>,
 }
 
 impl AuditSink {
-    pub(crate) fn new(tx: Sender<Submission>, shared: Arc<Shared>) -> Self {
+    pub(crate) fn new(tx: Sender<Msg>, shared: Arc<Shared>) -> Self {
         AuditSink { tx, shared }
+    }
+
+    /// Asks the writer, between two records, to register a subscriber with
+    /// a queue of `queue` records, and waits for its answer. The request is
+    /// in order with the events this thread has sent. It does not go
+    /// through the closing gate: it fails when the writer has ended, which
+    /// is when the channel's other end is gone, and one the writer takes
+    /// while it closes is answered like any other.
+    pub(crate) fn attach(&self, filter: &Filter, queue: usize) -> Result<Attached, Closed> {
+        let (sender, receiver) = sync_channel(queue);
+        let lagged = Arc::new(AtomicBool::new(false));
+        let (reply, answered) = bounded(1);
+        let request = SubscribeRequest {
+            sender,
+            filter: filter.clone(),
+            lagged: Arc::clone(&lagged),
+            reply,
+        };
+        self.tx.send(Msg::Subscribe(request)).map_err(|_| Closed)?;
+        // A request the writer never got to is dropped with the channel, and
+        // its reply end with it.
+        let ack = answered.recv().map_err(|_| Closed)?;
+        Ok(Attached {
+            ack,
+            queue: receiver,
+            lagged,
+        })
     }
 
     /// Sends an event, waiting while the channel is full. For events that
@@ -160,7 +205,9 @@ impl AuditSink {
         if *closed {
             return Err(EmitError::Closed);
         }
-        self.tx.send(s).map_err(|_| self.shared.refusal())
+        self.tx
+            .send(Msg::Event(s))
+            .map_err(|_| self.shared.refusal())
     }
 
     /// Sends an event if the channel has room, without waiting, and says
@@ -182,7 +229,7 @@ impl AuditSink {
         if *closed || self.shared.has_failed() {
             return false;
         }
-        match self.tx.try_send(s) {
+        match self.tx.try_send(Msg::Event(s)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 // Relaxed is enough: the writer's final read comes after
@@ -197,6 +244,14 @@ impl AuditSink {
     /// How many events [`try_emit`](Self::try_emit) has dropped so far.
     pub fn dropped(&self) -> u64 {
         self.shared.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The seq the writer will give the next record it writes: 1 for a new
+    /// log, one past its last record for a resumed one. A hint, read
+    /// without waiting: events already accepted but not yet written take
+    /// the seqs from here on.
+    pub fn next_seq(&self) -> u64 {
+        self.shared.next_seq.load(Ordering::Relaxed)
     }
 
     /// Whether the writer thread has failed.
@@ -227,6 +282,13 @@ mod tests {
 
     use super::*;
 
+    fn payload(msg: Msg) -> Payload {
+        match msg {
+            Msg::Event(s) => s.payload,
+            Msg::Subscribe(_) => panic!("not an event"),
+        }
+    }
+
     fn event(n: u64) -> Submission {
         Submission {
             ring: Ring::Host,
@@ -235,6 +297,7 @@ mod tests {
             payload: Payload::FsRead(FsIo {
                 mount: "workspace".into(),
                 path: "/f".into(),
+                path_b64: None,
                 fh: n,
                 offset: 0,
                 len: 1,
@@ -249,7 +312,7 @@ mod tests {
     #[test]
     fn try_emit_does_not_wait_while_close_waits_out_a_blocked_emit() {
         let (tx, rx) = bounded(1);
-        let shared = Arc::new(Shared::new().unwrap());
+        let shared = Arc::new(Shared::new(1).unwrap());
         let sink = AuditSink::new(tx, shared.clone());
         sink.emit(event(0)).unwrap(); // the channel is now full
 
@@ -288,8 +351,8 @@ mod tests {
         assert_eq!(sink.dropped(), 0);
 
         // Draining lets the blocked emit finish, accepted, and close with it.
-        assert_eq!(rx.recv().unwrap().payload, event(0).payload);
-        assert_eq!(rx.recv().unwrap().payload, event(1).payload);
+        assert_eq!(payload(rx.recv().unwrap()), event(0).payload);
+        assert_eq!(payload(rx.recv().unwrap()), event(1).payload);
         assert!(blocked.join().unwrap(), "the blocked emit was accepted");
         closer.join().unwrap();
         assert_eq!(sink.emit(event(3)), Err(EmitError::Closed));

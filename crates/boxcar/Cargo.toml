@@ -15,11 +15,14 @@ anyhow = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 boxcar-proto = { workspace = true, features = ["hash"] }
 boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
+boxcar-net = { workspace = true }
+boxcar-vsock = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }

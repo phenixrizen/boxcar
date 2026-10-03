@@ -4,6 +4,7 @@
 //! The `boxcar` command-line interface.
 
 mod cli;
+mod client;
 mod cmd;
 
 use std::process::ExitCode;
@@ -13,7 +14,7 @@ fn main() -> ExitCode {
     match cmd::run(cli) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("error: {err:#}");
+            cmd::tell(&format!("error: {err:#}"));
             ExitCode::from(1)
         }
     }

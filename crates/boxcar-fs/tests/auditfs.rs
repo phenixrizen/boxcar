@@ -301,6 +301,7 @@ fn create_write_release_records_the_create_then_a_hashed_close() {
             Payload::FsCreate(FsCreate {
                 mount: "workspace".into(),
                 path: "/a.txt".into(),
+                path_b64: None,
                 fh,
                 mode: libc::S_IFREG | 0o644,
                 flags: RW_CREATE,
@@ -315,6 +316,7 @@ fn create_write_release_records_the_create_then_a_hashed_close() {
         FsClose {
             mount: "workspace".into(),
             path: "/a.txt".into(),
+            path_b64: None,
             path_at_open: "/a.txt".into(),
             fh,
             bytes_read: 0,
@@ -324,6 +326,8 @@ fn create_write_release_records_the_create_then_a_hashed_close() {
             hash_status: HashStatus::Ok,
             open_seq: None,
             attrib: Attrib::Caller,
+            // The release's own clock: see fs_close_carries_the_release_time.
+            ts_release_ns: close.ts_release_ns,
         }
     );
     assert_eq!(subject.map(|s| s.pid), Some(42));
@@ -374,6 +378,7 @@ fn mkdir_rename_unlink_record_the_paths_of_the_moment() {
     let path_op = |path: &str, result: OpResult| FsPathOp {
         mount: mount(),
         path: path.into(),
+        path_b64: None,
         result,
     };
     let order = in_order(&events);
@@ -383,6 +388,7 @@ fn mkdir_rename_unlink_record_the_paths_of_the_moment() {
         Payload::FsMkdir(FsMkdir {
             mount: mount(),
             path: "/d".into(),
+            path_b64: None,
             mode: 0o755,
             result: OpResult::ok(),
         })
@@ -608,6 +614,7 @@ fn a_failed_open_of_a_missing_file_is_recorded() {
         FsOpen {
             mount: "workspace".into(),
             path: "/gone.txt".into(),
+            path_b64: None,
             fh: 0,
             flags: libc::O_RDONLY as u32,
             flags_decoded: vec!["O_RDONLY".into()],
@@ -1002,6 +1009,7 @@ fn other_mutations_are_recorded() {
         Payload::FsFallocate(FsFallocate {
             mount: mount(),
             path: "/file".into(),
+            path_b64: None,
             offset: 0,
             len: 4096,
             mode: 0,
@@ -1013,6 +1021,7 @@ fn other_mutations_are_recorded() {
         Payload::FsSymlink(FsSymlink {
             mount: mount(),
             path: "/sym".into(),
+            path_b64: None,
             target: "file".into(),
             result: OpResult::ok(),
         })
@@ -1022,6 +1031,7 @@ fn other_mutations_are_recorded() {
         Payload::FsLink(FsLink {
             mount: mount(),
             path: "/hard".into(),
+            path_b64: None,
             target_path: "/file".into(),
             result: OpResult::ok(),
         })
@@ -1031,6 +1041,7 @@ fn other_mutations_are_recorded() {
         Payload::FsMknod(FsMknod {
             mount: mount(),
             path: "/fifo".into(),
+            path_b64: None,
             mode: libc::S_IFIFO | 0o644,
             rdev: 0,
             result: OpResult::ok(),
@@ -1040,6 +1051,7 @@ fn other_mutations_are_recorded() {
         Payload::FsXattr(FsXattr {
             mount: mount(),
             path: "/file".into(),
+            path_b64: None,
             name: "user.k".into(),
             op: op.into(),
             result: OpResult::ok(),
@@ -1201,6 +1213,7 @@ fn refused_lookups_are_recorded_as_denied() {
             expected.push(FsDenied {
                 mount: "workspace".into(),
                 path: "/locked/secret".into(),
+                path_b64: None,
                 op: "lookup".into(),
                 errno: libc::EACCES,
             });
@@ -1209,6 +1222,7 @@ fn refused_lookups_are_recorded_as_denied() {
             expected.push(FsDenied {
                 mount: "workspace".into(),
                 path: "/missing".into(),
+                path_b64: None,
                 op: "lookup".into(),
                 errno: libc::ENOENT,
             });
@@ -1388,4 +1402,105 @@ fn replies_pass_through_unchanged() {
     assert_eq!(attr.st_ino, entry.attr.st_ino);
     release(&share.fs, entry.inode, fh);
     drop(share.events());
+}
+
+/// `fs.close` carries the time of the release itself (the producer's
+/// `CLOCK_REALTIME`), between the clock before the release and after it,
+/// whatever the hash that completes the record takes.
+#[test]
+fn fs_close_carries_the_release_time() {
+    let share = Share::normal();
+    let (entry, fh) = create(&share.fs, &GUEST, ROOT_ID, "timed.txt");
+    write(&share.fs, entry.inode, fh, b"when");
+    let before = unix_ns();
+    release(&share.fs, entry.inode, fh);
+    let after = unix_ns();
+    // A handle that needs no hash is recorded at once, with its own time.
+    let other = open(&share.fs, entry.inode, libc::O_RDONLY as u32);
+    let before_other = unix_ns();
+    release(&share.fs, entry.inode, other);
+    let after_other = unix_ns();
+
+    let events = share.events();
+    let (hashed, _) = close_of(&events, fh);
+    assert_eq!(hashed.hash_status, HashStatus::Ok);
+    assert!(
+        (before..=after).contains(&hashed.ts_release_ns),
+        "{} not within {before}..={after}",
+        hashed.ts_release_ns
+    );
+    let (plain, _) = close_of(&events, other);
+    assert_eq!(plain.hash_status, HashStatus::NotHashed);
+    assert!(
+        (before_other..=after_other).contains(&plain.ts_release_ns),
+        "{} not within {before_other}..={after_other}",
+        plain.ts_release_ns
+    );
+    assert!(hashed.ts_release_ns <= plain.ts_release_ns);
+}
+
+/// `CLOCK_REALTIME` now, in nanoseconds since the epoch.
+fn unix_ns() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    u64::try_from(now.as_nanos()).unwrap()
+}
+
+/// A name that is not UTF-8 is recorded lossily in `path`, with its bytes
+/// in `path_b64`, on every record that names it: the create, the close,
+/// the unlink. A UTF-8 name has no `path_b64`.
+#[test]
+fn a_non_utf8_name_gets_path_b64() {
+    use base64::Engine as _;
+    let share = Share::normal();
+    let raw = CString::new(b"a\xff".to_vec()).unwrap();
+    let (entry, handle, _, _) = share
+        .fs
+        .create(&GUEST, ROOT_ID, &raw, create_args(RW_CREATE))
+        .expect("create");
+    let fh = handle.unwrap();
+    write(&share.fs, entry.inode, fh, b"bytes");
+    release(&share.fs, entry.inode, fh);
+    // Hashed from its bytes before the name goes.
+    share.fs.flush_hashes();
+    share.fs.unlink(&GUEST, ROOT_ID, &raw).expect("unlink");
+    // A plain name beside it.
+    let (plain, plain_fh) = create(&share.fs, &GUEST, ROOT_ID, "plain.txt");
+    release(&share.fs, plain.inode, plain_fh);
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"/a\xff");
+    let events = share.events();
+    let kinds: Vec<&str> = in_order(&events).iter().map(Payload::kind).collect();
+    assert_eq!(kinds, ["fs.create", "fs.unlink", "fs.create"]);
+    match &events[0].0 {
+        Payload::FsCreate(create) => {
+            assert_eq!(create.path, "/a\u{fffd}");
+            assert_eq!(create.path_b64.as_deref(), Some(b64.as_str()));
+        }
+        other => panic!("{other:?}"),
+    }
+    let (close, _) = close_of(&events, fh);
+    assert_eq!(close.path, "/a\u{fffd}");
+    assert_eq!(close.path_b64.as_deref(), Some(b64.as_str()));
+    assert_eq!(close.path_at_open, "/a\u{fffd}", "lossy only");
+    assert_eq!(close.hash_status, HashStatus::Ok, "the bytes name the file");
+    assert_eq!(close.blake3, Some(b3(b"bytes")));
+    let unlink = events
+        .iter()
+        .find_map(|(p, _)| match p {
+            Payload::FsUnlink(op) => Some(op.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(unlink.path, "/a\u{fffd}");
+    assert_eq!(unlink.path_b64.as_deref(), Some(b64.as_str()));
+    let (plain_close, _) = close_of(&events, plain_fh);
+    assert_eq!(plain_close.path, "/plain.txt");
+    assert_eq!(plain_close.path_b64, None);
+    // And in the log's text: the key is there only when it is set.
+    let text = serde_json::to_string(&Payload::FsClose(plain_close)).unwrap();
+    assert!(!text.contains("path_b64"), "{text}");
+    let text = serde_json::to_string(&Payload::FsClose(close)).unwrap();
+    assert!(text.contains(&format!("\"path_b64\":\"{b64}\"")), "{text}");
 }

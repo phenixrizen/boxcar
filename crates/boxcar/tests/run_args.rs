@@ -19,6 +19,30 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Whether this host lets us open `/dev/kvm` as the VMM does. GitHub's
+/// hosted runners have the device without the right to it.
+fn kvm_is_usable() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+/// Asserts that a run with `--kernel /nonexistent/vmlinux` got past its
+/// arguments and into the VMM: exit code 1, and an error naming the first
+/// thing the VMM could not have, the kernel on a host with KVM, the device
+/// on one without.
+fn assert_reached_the_vmm(output: &Output) {
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
+    let wanted = if kvm_is_usable() {
+        "/nonexistent/vmlinux"
+    } else {
+        "/dev/kvm"
+    };
+    assert!(stderr(output).contains(wanted), "{}", stderr(output));
+}
+
 #[test]
 fn rootfs_is_required_unless_no_fs() {
     let output = boxcar(&["run", "--kernel", "vmlinux"]);
@@ -140,6 +164,8 @@ fn a_command_conflicts_with_no_fs() {
     );
 }
 
+/// With `--no-vsock` the command travels on the kernel command line, which
+/// takes 2048 bytes.
 #[test]
 fn a_command_line_too_long_is_refused_before_a_session_starts() {
     let scratch = tempfile::tempdir().unwrap();
@@ -155,6 +181,7 @@ fn a_command_line_too_long_is_refused_before_a_session_starts() {
         rootfs.to_str().unwrap(),
         "--audit-dir",
         audit.to_str().unwrap(),
+        "--no-vsock",
         "--",
         "/bin/sh",
         "-c",
@@ -165,6 +192,59 @@ fn a_command_line_too_long_is_refused_before_a_session_starts() {
     assert!(text.contains("error: command line too long ("), "{text}");
     assert!(text.contains(" bytes > 2048)"), "{text}");
     assert!(!audit.exists(), "no session was started");
+}
+
+/// With the vsock device the command travels in the control channel's
+/// config: a command the kernel command line could not hold is fine, one
+/// over the channel's 64 KiB is refused before a session starts.
+#[test]
+fn a_command_over_the_control_channels_limit_is_refused_before_a_session_starts() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let script = "echo x; ".repeat(9000);
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("error: the session's config: ")
+            && text.contains("over the control channel's limit of 65536"),
+        "{text}"
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// `--console-log` and `--console-stdout` say different things.
+#[test]
+fn console_log_conflicts_with_console_stdout() {
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--no-fs",
+        "--console-log",
+        "/tmp/c.log",
+        "--console-stdout",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("cannot be used with"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -257,7 +337,7 @@ fn a_separator_with_no_command_is_refused() {
 }
 
 /// An old session's workspace may be shared again: the run gets past the
-/// audit dir check, and fails only for want of a kernel.
+/// audit dir check, and stops only in the VMM.
 #[test]
 fn an_old_session_workspace_can_be_shared_again() {
     let scratch = tempfile::tempdir().unwrap();
@@ -316,4 +396,227 @@ fn a_session_dir_as_the_workspace_is_refused() {
     );
     let sessions = std::fs::read_dir(audit.join("sessions")).unwrap().count();
     assert_eq!(sessions, 1, "no session was started");
+}
+
+/// A policy rule that does not parse exits 2, as a usage error does, naming
+/// the flag and its value, before a session starts.
+#[test]
+fn a_bad_allow_rule_exits_2_before_a_session_starts() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--allow",
+        "example.com",
+        "--allow",
+        "example.com:99999",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "error: --allow \"example.com:99999\": \"99999\" is not a port from 1 to 65535"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// The same for a line of `--policy-file`: the file and the line.
+#[test]
+fn a_bad_policy_file_line_exits_2_naming_the_file_and_line() {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let policy = scratch.path().join("team.policy");
+    std::fs::write(
+        &policy,
+        "# rules\nallow example.com\nallow 10.0.0.0/8 extra\n",
+    )
+    .unwrap();
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--policy-file",
+        policy.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!(
+            "error: --policy-file {} line 3: allow takes one target",
+            policy.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// Without shares the VM has no network unless `--net` asks for one: the
+/// policy and DNS flags are then refused as a usage error, not ignored.
+#[test]
+fn network_policy_flags_without_a_network_exit_2() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let policy = scratch.path().join("team.policy");
+    std::fs::write(&policy, "allow example.com\n").unwrap();
+    for flag in [
+        ["--allow", "example.com"],
+        ["--deny", "example.com"],
+        ["--policy-file", policy.to_str().unwrap()],
+        ["--dns", "9.9.9.9"],
+    ] {
+        let output = boxcar(&[
+            "run",
+            "--kernel",
+            "/nonexistent/vmlinux",
+            "--no-fs",
+            "--audit-dir",
+            audit.to_str().unwrap(),
+            flag[0],
+            flag[1],
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("error: network policy flags need --net"),
+            "{flag:?}: {}",
+            stderr(&output)
+        );
+        assert!(!audit.exists(), "{flag:?}: no session was started");
+    }
+
+    // With --net they are the network's: the run gets past them and fails
+    // only in the VMM, for want of a kernel or of KVM.
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--no-fs",
+        "--net",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--allow",
+        "example.com",
+    ]);
+    assert_reached_the_vmm(&output);
+    assert!(
+        !stderr(&output).contains("need --net"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Without shares the VM has no vsock device unless `--vsock` asks for
+/// one: `--vsock-allow` is then refused as a usage error, not ignored.
+#[test]
+fn vsock_allow_without_a_vsock_device_exits_2() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--no-fs",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--vsock-allow",
+        "5000",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("error: --vsock-allow needs --vsock"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+/// An internal port cannot be allowlisted: it is the VMM's.
+#[test]
+fn vsock_allow_refuses_an_internal_port() {
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "vmlinux",
+        "--no-fs",
+        "--vsock",
+        "--vsock-allow",
+        "1025",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("internal"), "{}", stderr(&output));
+}
+
+/// `--stdin` sends piped input to a `-- CMD` session's terminal, which only
+/// the vsock device has: without it (`--no-vsock`, or no shares) it is a
+/// usage error, before a session starts.
+#[test]
+fn stdin_needs_the_vsock_device() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--no-vsock",
+        "--stdin",
+        "--",
+        "true",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--stdin"), "{}", stderr(&output));
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--no-fs",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--stdin",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--stdin needs the vsock device"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+    // With the vsock device it is taken: the run gets past it and fails
+    // only in the VMM, for want of a kernel or of KVM.
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+        "--stdin",
+        "--",
+        "true",
+    ]);
+    assert_reached_the_vmm(&output);
 }

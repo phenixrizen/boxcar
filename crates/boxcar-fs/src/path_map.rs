@@ -21,11 +21,51 @@
 
 use std::collections::HashMap;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use boxcar_proto::limits::{truncate_utf8, MAX_PATH};
+
 /// The share root's inode, which FUSE fixes at 1.
 pub const ROOT_INO: u64 = 1;
 
 /// Longest chain of parents [`PathMap::path`] follows before giving up.
 const MAX_DEPTH: usize = 4096;
+
+/// A path as a record carries it: the text, and, when the bytes were not
+/// UTF-8, the bytes themselves in base64 (`path_b64`). The text is the
+/// lossy form (`U+FFFD` for each bad byte), cut to [`MAX_PATH`] bytes with
+/// a trailing `…`; the base64 covers at most the first [`MAX_PATH`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathText {
+    pub path: String,
+    pub path_b64: Option<String>,
+}
+
+impl PathText {
+    /// The record form of the path `bytes`.
+    pub fn from_bytes(bytes: &[u8]) -> PathText {
+        let (path, path_b64) = match std::str::from_utf8(bytes) {
+            Ok(text) => (truncate_utf8(text, MAX_PATH).0, None),
+            Err(_) => {
+                let lossy = String::from_utf8_lossy(bytes);
+                let raw = &bytes[..bytes.len().min(MAX_PATH)];
+                (
+                    truncate_utf8(&lossy, MAX_PATH).0,
+                    Some(STANDARD.encode(raw)),
+                )
+            }
+        };
+        PathText { path, path_b64 }
+    }
+
+    /// A path that is UTF-8 already.
+    pub fn utf8(path: impl Into<String>) -> PathText {
+        PathText {
+            path: truncate_utf8(&path.into(), MAX_PATH).0,
+            path_b64: None,
+        }
+    }
+}
 
 /// A host file's identity: `st_dev` and `st_ino`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -278,27 +318,50 @@ impl PathMap {
     /// root is `/`. When the walk up meets an inode the map does not know,
     /// the path starts at that inode, written `<ino:N>`; when it goes deeper
     /// than 4096 parents it is `<ino:N>` of `ino` itself. Names that are not
-    /// UTF-8 are converted lossily.
+    /// UTF-8 are converted lossily; [`path_text`](Self::path_text) keeps
+    /// their bytes as well.
     pub fn path(&self, ino: u64) -> String {
+        String::from_utf8_lossy(&self.raw_path(ino)).into_owned()
+    }
+
+    /// [`path`](Self::path) as a record carries it, with the raw bytes when
+    /// they are not UTF-8, cut to the record's limit.
+    pub fn path_text(&self, ino: u64) -> PathText {
+        PathText::from_bytes(&self.raw_path(ino))
+    }
+
+    /// The path of `name` in the directory at `parent`, as a record carries
+    /// it, for a name the map does not hold (yet).
+    pub fn child_text(&self, parent: u64, name: &[u8]) -> PathText {
+        let mut bytes = self.raw_path(parent);
+        if bytes != b"/" {
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(name);
+        PathText::from_bytes(&bytes)
+    }
+
+    /// The bytes of [`path`](Self::path), before any conversion.
+    fn raw_path(&self, ino: u64) -> Vec<u8> {
         match self.walk(ino) {
-            Walk::Rooted(parts) if parts.is_empty() => "/".to_owned(),
+            Walk::Rooted(parts) if parts.is_empty() => b"/".to_vec(),
             Walk::Rooted(parts) => {
-                let mut path = String::new();
+                let mut path = Vec::new();
                 for part in parts {
-                    path.push('/');
-                    path.push_str(&String::from_utf8_lossy(part));
+                    path.push(b'/');
+                    path.extend_from_slice(part);
                 }
                 path
             }
             Walk::Unknown(unknown, parts) => {
-                let mut path = format!("<ino:{unknown}>");
+                let mut path = format!("<ino:{unknown}>").into_bytes();
                 for part in parts {
-                    path.push('/');
-                    path.push_str(&String::from_utf8_lossy(part));
+                    path.push(b'/');
+                    path.extend_from_slice(part);
                 }
                 path
             }
-            Walk::TooDeep => format!("<ino:{ino}>"),
+            Walk::TooDeep => format!("<ino:{ino}>").into_bytes(),
         }
     }
 
@@ -394,6 +457,63 @@ impl PathMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record's path: the lossy text, and the bytes in base64 only when
+    /// they are not UTF-8; both held to the path limit.
+    #[test]
+    fn path_text_keeps_the_bytes_of_a_name_that_is_not_utf8() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let mut map = PathMap::new();
+        map.insert(ROOT_INO, b"d", 2);
+        map.insert(2, b"a\xff", 3);
+        map.insert(ROOT_INO, "caf\u{e9}".as_bytes(), 4);
+
+        assert_eq!(map.path_text(ROOT_INO), PathText::utf8("/"));
+        assert_eq!(map.path_text(2), PathText::utf8("/d"));
+        assert_eq!(
+            map.path_text(4),
+            PathText::utf8("/caf\u{e9}"),
+            "UTF-8 is not bytes"
+        );
+        assert_eq!(
+            map.path_text(3),
+            PathText {
+                path: "/d/a\u{fffd}".into(),
+                path_b64: Some(b64(b"/d/a\xff")),
+            }
+        );
+        assert_eq!(map.path(3), "/d/a\u{fffd}");
+        // A child that is not in the map yet, under a parent that is.
+        assert_eq!(map.child_text(ROOT_INO, b"new"), PathText::utf8("/new"));
+        assert_eq!(map.child_text(2, b"new"), PathText::utf8("/d/new"));
+        assert_eq!(
+            map.child_text(3, b"x"),
+            PathText {
+                path: "/d/a\u{fffd}/x".into(),
+                path_b64: Some(b64(b"/d/a\xff/x")),
+            }
+        );
+        assert_eq!(
+            map.child_text(2, b"\xfe"),
+            PathText {
+                path: "/d/\u{fffd}".into(),
+                path_b64: Some(b64(b"/d/\xfe")),
+            }
+        );
+        // Under an inode the map does not know.
+        assert_eq!(map.child_text(9, b"a"), PathText::utf8("<ino:9>/a"));
+
+        // Both forms are held to the limit.
+        let long = PathText::from_bytes(&[b'x'; 2 * MAX_PATH]);
+        assert!(long.path.len() <= MAX_PATH && long.path.ends_with('\u{2026}'));
+        assert_eq!(long.path_b64, None);
+        let mut raw = vec![0xff_u8; 2 * MAX_PATH];
+        raw[0] = b'/';
+        let long = PathText::from_bytes(&raw);
+        assert!(long.path.len() <= MAX_PATH && long.path.ends_with('\u{2026}'));
+        assert_eq!(long.path_b64, Some(b64(&raw[..MAX_PATH])));
+    }
 
     const D: u64 = 2;
     const F: u64 = 3;

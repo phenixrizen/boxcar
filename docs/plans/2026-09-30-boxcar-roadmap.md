@@ -46,7 +46,7 @@ boxcar/
 ├── .cargo/config.toml         # alias xtask = "run -p xtask --"
 ├── deny.toml                  # license allowlist; multiple-versions=deny for rust-vmm crates; ban aws-lc-sys
 ├── LICENSE  LICENSE-BSD-3-Clause  NOTICE  CLA.md  CONTRIBUTING.md (DCO)
-├── docs/superpowers/specs/2026-09-29-boxcar-design.md   # the brainstormed design, committed first
+├── docs/specs/2026-09-29-boxcar-design.md   # the brainstormed design, committed first
 ├── docs/{architecture,boot,control-protocol,audit-events,reconciler,ebpf-license,wsl2,perf}.md
 ├── crates/
 │   ├── boxcar/              # bin: run, attach, status, stop, events, policy, audit {verify,record}, doctor
@@ -228,7 +228,7 @@ Sizes: S <= 1 day, M 2–3 days, L 4–7 days. "KVM" steps need `/dev/kvm` and t
 ### M0: repo bootstrap (S)
 
 1. `git clone https://github.com/phenixrizen/boxcar.git /home/nater/go/src/github.com/phenixrizen/boxcar` (empty repo; `git init` + remote if clone refuses). `sudo modprobe kvm_amd && setfacl -m u:$USER:rw /dev/kvm`.
-2. Commit LICENSE (Apache-2.0), LICENSE-BSD-3-Clause, NOTICE (Firecracker, Cloud Hypervisor, vmm-reference, vhost-device attributions), CLA.md, CONTRIBUTING.md (DCO), README stub, and `docs/superpowers/specs/2026-09-29-boxcar-design.md` written from the brainstorm (rings, reconciler, gateway, conductor seam, license reasoning).
+2. Commit LICENSE (Apache-2.0), LICENSE-BSD-3-Clause, NOTICE (Firecracker, Cloud Hypervisor, vmm-reference, vhost-device attributions), CLA.md, CONTRIBUTING.md (DCO), README stub, and `docs/specs/2026-09-29-boxcar-design.md` written from the brainstorm (rings, reconciler, gateway, conductor seam, license reasoning).
 3. Toolchain: `rustup target add x86_64-unknown-linux-musl`, `cargo install cargo-binstall`, `cargo binstall cargo-deny cargo-nextest`.
 
 ### M1: shell on console with audited rootfs (about 3–4 weeks)

@@ -11,6 +11,8 @@ repository.workspace = true
 # init depends on this crate with default features off so it needs no C compiler.
 default = ["hash"]
 hash = ["dep:blake3"]
+# `JsonSchema` on every message and record type, for `cargo xtask schema`.
+schema = ["dep:schemars"]
 
 [dependencies]
 serde = { workspace = true }
@@ -19,3 +21,4 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }

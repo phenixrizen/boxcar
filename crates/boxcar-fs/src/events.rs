@@ -206,15 +206,22 @@ pub(crate) fn clip(text: String) -> String {
     }
 }
 
-/// The path of `name` in the directory at `parent`, for a record.
-pub(crate) fn child_path(parent: &str, name: &[u8]) -> String {
-    let name = String::from_utf8_lossy(name);
-    let path = if parent == "/" {
-        format!("/{name}")
-    } else {
-        format!("{parent}/{name}")
+/// `CLOCK_REALTIME` in nanoseconds since the Unix epoch: the producer's
+/// time on a record (`fs.close`'s `ts_release_ns`). 0 if the clock cannot
+/// be read, which a valid clock id never is.
+pub(crate) fn realtime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    clip(path)
+    // SAFETY: `ts` is a valid, writable timespec for the whole call, and
+    // it is the only memory clock_gettime writes.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } != 0 {
+        return 0;
+    }
+    let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+    let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
+    secs.saturating_mul(1_000_000_000).saturating_add(nanos)
 }
 
 /// A C string from the guest (a symlink target, an xattr name), for a
@@ -286,12 +293,19 @@ mod tests {
     }
 
     #[test]
-    fn child_paths_join_under_the_parent() {
-        assert_eq!(child_path("/", b"a"), "/a");
-        assert_eq!(child_path("/d", b"a"), "/d/a");
-        assert_eq!(child_path("<ino:9>", b"a"), "<ino:9>/a");
-        let long = child_path("/", "x".repeat(2 * MAX_PATH).as_bytes());
-        assert!(long.len() <= MAX_PATH);
-        assert!(long.ends_with('…'));
+    fn the_realtime_clock_reads_as_unix_nanoseconds() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let now = u128::from(realtime_ns());
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        assert!(
+            (before..=after).contains(&now),
+            "{before} <= {now} <= {after}"
+        );
     }
 }

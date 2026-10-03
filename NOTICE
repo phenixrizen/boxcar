@@ -50,12 +50,27 @@ original license text is reproduced in LICENSE-BSD-3-Clause where it applies.
 
   Cloud Hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor)
     Copyright Intel Corporation and contributors. Apache-2.0.
+    Portions Copyright 2018 Amazon.com, Inc. or its affiliates. Apache-2.0.
     Portions Copyright 2017 The Chromium OS Authors. BSD-3-Clause.
     Used for: the vsock connection state machine and Unix muxer, CPUID patching.
     crates/boxcar-vmm/src/arch/x86_64/cpuid.rs is derived from
     arch/src/x86_64/mod.rs (configure_vcpu, update_cpuid_topology) at commit
     853c440425ebe23bcf5fb43d9058bd1d8a0abe2a. Apache-2.0; the Chromium OS
     portions BSD-3-Clause.
+    The vsock connection state machine and Unix muxer are ported from
+    virtio-devices/src/vsock/ at the same commit,
+    853c440425ebe23bcf5fb43d9058bd1d8a0abe2a:
+      crates/boxcar-vsock/src/lib.rs                 from mod.rs
+      crates/boxcar-vsock/src/csm/mod.rs             from csm/mod.rs
+      crates/boxcar-vsock/src/csm/connection.rs      from csm/connection.rs
+      crates/boxcar-vsock/src/csm/txbuf.rs           from csm/txbuf.rs
+      crates/boxcar-vsock/src/unix/mod.rs            from unix/mod.rs
+      crates/boxcar-vsock/src/unix/muxer.rs          from unix/muxer.rs
+      crates/boxcar-vsock/src/unix/muxer_killq.rs    from unix/muxer_killq.rs
+      crates/boxcar-vsock/src/unix/muxer_rxq.rs      from unix/muxer_rxq.rs
+    Apache-2.0 (Intel and Amazon); mod.rs carries Chromium OS portions,
+    BSD-3-Clause. Its packet.rs and device.rs are not ported: boxcar uses
+    rust-vmm's virtio-vsock packet and a device of its own.
 
   rust-vmm virtio-device (https://github.com/rust-vmm/vm-virtio, tag virtio-queue-v0.17.0)
     Copyright 2018 The Chromium OS Authors. Copyright 2020 Amazon.com, Inc. or

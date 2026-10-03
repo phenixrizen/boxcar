@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The boxcar Authors
+
+//! The VMM's own services on vsock: the internal ports.
+//!
+//! Three host ports belong to the VMM rather than to a host socket: 1024
+//! `boxcar.ctl` (the guest control channel), 1025 `boxcar.pty` (the agent's
+//! terminal) and 1026 `boxcar.sensor` (reserved). A guest connection to one
+//! of them is served by [`InternalServices::connect`], and only when it
+//! comes from a guest source port below [`PRIVILEGED_PORT_LIMIT`] (which the
+//! guest kernel lets only a process with `CAP_NET_BIND_SERVICE` in its
+//! initial user namespace bind: init, never the session, which has no
+//! capability even as uid 0, so nothing in the guest but init can pose as
+//! it) and is the first to that port since the device was activated.
+//! Any other guest connection to them is reset and recorded as refused
+//! (see the muxer).
+//!
+//! The first-connection rule holds within one activation of the device, not
+//! for the VM's life. Guest root can unbind and rebind the vsock driver: the
+//! device is reset, which closes every connection, init's included, and the
+//! next activation serves the first privileged connection to each port
+//! again, which root can then make before init does. A service is therefore
+//! asked again after every re-activation, and must decide itself whether to
+//! take a second connection: the guest control channel treats a `hello`
+//! from a later activation as an anomaly.
+
+use std::os::unix::net::UnixStream;
+
+/// `boxcar.ctl`: JSON lines between init and the VMM.
+pub const CTL_PORT: u32 = 1024;
+/// `boxcar.pty`: one JSON header line, then the agent's terminal bytes.
+pub const PTY_PORT: u32 = 1025;
+/// `boxcar.sensor`: reserved for M3.
+pub const SENSOR_PORT: u32 = 1026;
+/// The internal ports, which never reach a host socket.
+pub const INTERNAL_PORTS: [u32; 3] = [CTL_PORT, PTY_PORT, SENSOR_PORT];
+/// Guest source ports below this are privileged: only root binds them.
+pub const PRIVILEGED_PORT_LIMIT: u32 = 1024;
+
+/// Whether `port` is one of the [`INTERNAL_PORTS`].
+pub fn is_internal(port: u32) -> bool {
+    INTERNAL_PORTS.contains(&port)
+}
+
+/// What a service learns of a guest connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnMeta {
+    /// The guest's source port: below [`PRIVILEGED_PORT_LIMIT`].
+    pub guest_port: u32,
+}
+
+/// Why a service did not take a guest connection: the `reason` of the
+/// `vsock.connect` that records the refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deny {
+    /// Nothing serves the port, or the service could not take the
+    /// connection: `no_service`.
+    NoService,
+    /// The service turned the connection down, for this reason, such as
+    /// `reactivated` (a word of lowercase letters and underscores).
+    Refused(&'static str),
+}
+
+/// The VMM's services on the [`INTERNAL_PORTS`].
+pub trait InternalServices: Send + Sync {
+    /// A guest connection to the internal `port`, already found privileged
+    /// and first, from the vsock thread. A service takes it by returning
+    /// its end of a stream (one end of a `UnixStream::pair`, typically,
+    /// whose other end it keeps): the guest's bytes are written to it and
+    /// what the service writes to its own end reaches the guest. An error
+    /// when nothing serves `port` or the service will not take the
+    /// connection: the guest's request is reset and the refusal recorded
+    /// with the [`Deny`]'s reason. It must not block.
+    fn connect(&self, port: u32, meta: ConnMeta) -> Result<UnixStream, Deny>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_internal_ports_are_1024_to_1026() {
+        assert_eq!(INTERNAL_PORTS, [1024, 1025, 1026]);
+        for port in [1023, 1027, 0, 5000, u32::MAX] {
+            assert!(!is_internal(port), "{port}");
+        }
+        assert!(INTERNAL_PORTS.iter().all(|&port| is_internal(port)));
+        assert_eq!(PRIVILEGED_PORT_LIMIT, 1024);
+    }
+}

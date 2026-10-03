@@ -9,7 +9,8 @@
 //! ([`shares`]); `/dev`, `/proc` and `/sys` moved into the new root and the
 //! rest of the API filesystems mounted there ([`api`], [`optional`]); then
 //! the new root made `/`. Everything else, `/tmp` included, is the root
-//! share, which the host audits.
+//! share, which the host audits. With the network, the guest's resolver
+//! configuration follows (`crate::resolver`).
 
 use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
