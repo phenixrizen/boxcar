@@ -247,3 +247,6 @@ commit that made it. Written 2026-10-02.
   kernel named where KVM is usable, the device where it is not). The job
   is kept hermetic (no KVM access, no udev rule) and the VMM's order
   unchanged; `cargo test --workspace` must pass on any Linux box.
+- `sync` is in the plans' M2 type list but no M2 task gives it fields or
+  a producer; the roadmap's M3.1 (`SensorIngest` on vsock 1026, with its
+  `ping/pong` clock offset) does. It is left to M3 and the PR says so.
