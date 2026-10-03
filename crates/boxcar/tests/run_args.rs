@@ -19,6 +19,30 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Whether this host lets us open `/dev/kvm` as the VMM does. GitHub's
+/// hosted runners have the device without the right to it.
+fn kvm_is_usable() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+/// Asserts that a run with `--kernel /nonexistent/vmlinux` got past its
+/// arguments and into the VMM: exit code 1, and an error naming the first
+/// thing the VMM could not have, the kernel on a host with KVM, the device
+/// on one without.
+fn assert_reached_the_vmm(output: &Output) {
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
+    let wanted = if kvm_is_usable() {
+        "/nonexistent/vmlinux"
+    } else {
+        "/dev/kvm"
+    };
+    assert!(stderr(output).contains(wanted), "{}", stderr(output));
+}
+
 #[test]
 fn rootfs_is_required_unless_no_fs() {
     let output = boxcar(&["run", "--kernel", "vmlinux"]);
@@ -313,7 +337,7 @@ fn a_separator_with_no_command_is_refused() {
 }
 
 /// An old session's workspace may be shared again: the run gets past the
-/// audit dir check, and fails only for want of a kernel.
+/// audit dir check, and stops only in the VMM.
 #[test]
 fn an_old_session_workspace_can_be_shared_again() {
     let scratch = tempfile::tempdir().unwrap();
@@ -481,7 +505,7 @@ fn network_policy_flags_without_a_network_exit_2() {
     }
 
     // With --net they are the network's: the run gets past them and fails
-    // only for want of a kernel.
+    // only in the VMM, for want of a kernel or of KVM.
     let output = boxcar(&[
         "run",
         "--kernel",
@@ -493,14 +517,9 @@ fn network_policy_flags_without_a_network_exit_2() {
         "--allow",
         "example.com",
     ]);
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_reached_the_vmm(&output);
     assert!(
         !stderr(&output).contains("need --net"),
-        "{}",
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains("/nonexistent/vmlinux"),
         "{}",
         stderr(&output)
     );
@@ -586,7 +605,7 @@ fn stdin_needs_the_vsock_device() {
     );
     assert!(!audit.exists(), "no session was started");
     // With the vsock device it is taken: the run gets past it and fails
-    // only for want of a kernel.
+    // only in the VMM, for want of a kernel or of KVM.
     let output = boxcar(&[
         "run",
         "--kernel",
@@ -599,10 +618,5 @@ fn stdin_needs_the_vsock_device() {
         "--",
         "true",
     ]);
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("/nonexistent/vmlinux"),
-        "{}",
-        stderr(&output)
-    );
+    assert_reached_the_vmm(&output);
 }

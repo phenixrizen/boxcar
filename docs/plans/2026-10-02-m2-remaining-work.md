@@ -236,3 +236,14 @@ commit that made it. Written 2026-10-02.
   run before it, at the Task 14 commits, passed 115 gated tests with the
   two `kvm_m2` network tests failing on the `net.dhcp` expectation fixed
   here.
+
+### After the PR
+
+- PR #2's `check` job failed two `run_args` tests that let a run get past
+  its flags and asserted it then failed for want of the nonexistent
+  kernel: GitHub's hosted runner has `/dev/kvm` without the right to open
+  it, and the VMM opens the device before it reads the kernel. The tests
+  now assert what a run that reached the VMM does on the host at hand (the
+  kernel named where KVM is usable, the device where it is not). The job
+  is kept hermetic (no KVM access, no udev rule) and the VMM's order
+  unchanged; `cargo test --workspace` must pass on any Linux box.
