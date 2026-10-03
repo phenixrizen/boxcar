@@ -1,4 +1,6 @@
 /target
+# The eBPF crate built by hand in its own directory.
+/crates/boxcar-sensor-ebpf/target/
 /guest/kernel/build/
 *.swp
 .DS_Store
