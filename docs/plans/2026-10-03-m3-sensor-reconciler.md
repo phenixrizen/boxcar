@@ -299,3 +299,45 @@ Made while writing the plan, 2026-10-03:
   reached through `aya` and `object`. It is a permissive licence with no
   requirement beyond keeping the notice in the source; it is the only
   addition the sensor's dependencies needed.
+
+### Task 4
+
+- `proc.sensor_status` carries the sensor's `pid`: the guards protect that
+  process, operators and tests want to name it, and the field is additive
+  (`#[serde(default)]`).
+- The sensor binary doubles as the gated tests' probe (`boxcar-sensor
+  probe-bpf`, `probe-kill [PID]`): a copy in the workspace share is the only
+  static binary a test can put in the guest, and a probe that prints the
+  errno's name is what the tests need. The probes are two small functions;
+  the default run path is untouched.
+- The kernel asks the LSM about a `bpf()` call before it looks at the
+  caller's capabilities, so `bpf_guard` sees every call from the session,
+  root or not, and each is `EPERM` with a `proc.lsm_deny{hook:"bpf"}`; the
+  sysctl stays as a second layer. A uid 0 session has no capabilities (the
+  bounding set is dropped before exec): its `kill` of the sensor passes the
+  kernel's own check and is refused by `kill_guard`, recorded, and it cannot
+  write into the workspace the host user owns, so its probes report on the
+  serial console. The probes wait three seconds first: the sensor needs a
+  moment to attach (below).
+- `kernel.unprivileged_bpf_disabled = 1` has been among init's default
+  sysctls since M1; nothing to add.
+- Init starts the sensor after the cgroups and before it connects the
+  control channel, so the sensor is up before the session's first exec and
+  the host sees the stream before the hello. Attaching takes a moment,
+  though: a session that acts in its first instant may act before the
+  programs are on. Init does not wait for the sensor; the gated tests give
+  the sensor a few seconds, and the reconciler's silence rule covers a sensor
+  that never comes up.
+- The degraded sensor (an empty object) is covered by unit tests of the
+  status path and by the build with `AYA_BUILD_SKIP=1`, not by a gated run:
+  that would need a second initramfs built with a programless sensor, which
+  the tests cannot make cheaply. The plan's `a_degraded_sensor_still_heartbeats`
+  is left out and said so here.
+- The sensor's own diagnostics go to its stderr, which is init's console
+  (the serial log); it reports a program that did not attach once, at start.
+- The sensor's connection is the third privileged guest connection the
+  session tests see (`vsock.connect` 1026 from 1021, beside init's two);
+  `boot_session` expects it now. The `sync` assertion moved from the
+  graceful-stop test, whose VM is stopped well under a second after init
+  is ready, before the first pong can land, to the sensor test whose
+  session runs for seconds.

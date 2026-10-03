@@ -211,6 +211,9 @@ pub struct VmConfig {
     /// beside the control socket), and the host ports a guest connection
     /// may reach besides the internal ones. See `boxcar_vsock`.
     pub vsock: Option<VsockConfig>,
+    /// Whether the guest runs its sensor (ring 1) and the VMM serves its
+    /// stream on vsock port 1026. Nothing without the vsock device.
+    pub sensor: bool,
     /// The session the guest control channel sends init when it connects
     /// (init's `vsock` mode, which needs the vsock device): the command,
     /// its user, environment and terminal. Unused without the vsock device.
@@ -258,6 +261,7 @@ impl VmConfig {
             net: None,
             policy: Arc::new(ArcSwap::from_pointee(Policy::default())),
             vsock: None,
+            sensor: true,
             session: SessionConfig::for_user(shell, uid, gid),
             control: None,
         }
@@ -476,13 +480,18 @@ impl Vmm {
             services
                 .register(boxcar_vsock::services::PTY_PORT, pty.service())
                 .map_err(|error| VmmError::Config(error.to_string()))?;
-            let sensor = SensorIngest::new(cfg.audit.clone());
-            services
-                .register(boxcar_vsock::services::SENSOR_PORT, sensor.service())
-                .map_err(|error| VmmError::Config(error.to_string()))?;
+            let sensor = if cfg.sensor {
+                let sensor = SensorIngest::new(cfg.audit.clone());
+                services
+                    .register(boxcar_vsock::services::SENSOR_PORT, sensor.service())
+                    .map_err(|error| VmmError::Config(error.to_string()))?;
+                Some(sensor)
+            } else {
+                None
+            };
             // The clocks are paired from the first config on.
             guest.start_sync(crate::guest_ctl::SYNC_INTERVAL);
-            (Some(pty), Some(sensor))
+            (Some(pty), sensor)
         } else {
             (None, None)
         };

@@ -467,6 +467,12 @@ pub struct RunArgs {
     /// from), and the socket carries the connection. Default: on with
     /// shares, off with `--no-fs`. The last of `--vsock` and `--no-vsock`
     /// wins.
+    /// Run the guest without its sensor (ring 1 of the audit log): no
+    /// `proc.*` records, and `status` says the sensor is off. Implied by
+    /// --no-vsock, which leaves the sensor no way to reach the host.
+    #[arg(long)]
+    pub no_sensor: bool,
+
     #[arg(long, overrides_with = "no_vsock")]
     pub vsock: bool,
     /// No vsock device: the guest runs M1's console session (see `run`).

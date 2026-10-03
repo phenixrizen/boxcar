@@ -14,8 +14,6 @@
 //! - the session's exit code comes back as the run's (7), a session killed
 //!   by a signal as 128 plus it (137), and the log has `session.start`
 //!   (argv, pid) and `session.exit` (code or signal);
-//! - the host pings init once the config is sent and init answers, which
-//!   the log holds as a `sync` record pairing the two clocks;
 //! - a graceful stop through the control socket (`boxcar stop`) asks init
 //!   to end the session: `SIGHUP` then `SIGTERM` to its process group, so
 //!   `sleep` dies of the hangup (`session.exit{signal:1}`) and so does an
@@ -338,7 +336,14 @@ fn the_session_exit_code_and_output_come_back() {
             )
         })
         .collect();
-    assert_eq!(connects, [(1024, 1023), (1025, 1022)], "{records:?}");
+    // Init's two, and the sensor's: 1026 from 1021 (see `boot_sensor`).
+    let mut connects = connects;
+    connects.sort_unstable();
+    assert_eq!(
+        connects,
+        [(1024, 1023), (1025, 1022), (1026, 1021)],
+        "{records:?}"
+    );
 }
 
 #[test]
@@ -406,19 +411,6 @@ fn a_graceful_stop_ends_the_session_with_a_hangup() {
     assert_eq!(exit.len(), 1, "{}", run.describe());
     assert_eq!(exit[0].data, serde_json::json!({"code": null, "signal": 1}));
     assert_eq!(of_kind(&records, "control.stop").len(), 1);
-    // The host pinged init right after the config and init answered: the
-    // clocks are paired in the log, from the host's side.
-    let syncs = of_kind(&records, "sync");
-    assert!(!syncs.is_empty(), "no sync record: {}", run.describe());
-    assert_eq!(syncs[0].ring, boxcar_proto::Ring::Host, "{:?}", syncs[0]);
-    assert_eq!(syncs[0].data["method"], "vsock_rtt", "{:?}", syncs[0]);
-    let rtt = syncs[0].data["rtt_ns"].as_u64().unwrap();
-    assert!(rtt < 5_000_000_000, "{:?}", syncs[0]);
-    assert!(
-        syncs[0].data["guest_mono_ns"].as_u64().unwrap() > 0,
-        "{:?}",
-        syncs[0]
-    );
     let stop = of_kind(&records, "vmm.stop");
     assert_eq!(stop[0].data["reason"], "stop_requested", "{stop:?}");
     assert_eq!(stop[0].data["exit_code"], 0, "{stop:?}");

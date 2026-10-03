@@ -324,6 +324,7 @@ mod tests {
                 kernel_release: "6.18.54".into(),
                 btf_ok: true,
                 session_cgroup_id: 4242,
+                pid: 77,
                 reason: None,
             }),
         }

@@ -620,3 +620,33 @@ fn stdin_needs_the_vsock_device() {
     ]);
     assert_reached_the_vmm(&output);
 }
+
+/// `--no-sensor` turns ring 1 off; without the vsock device there is no
+/// sensor anyway, and the flag is taken, not refused.
+#[test]
+fn no_sensor_is_taken_with_or_without_the_vsock_device() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit = scratch.path().join("audit");
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    for extra in [&[][..], &["--no-vsock"][..]] {
+        let mut args = vec![
+            "run",
+            "--kernel",
+            "/nonexistent/vmlinux",
+            "--rootfs",
+            rootfs.to_str().unwrap(),
+            "--audit-dir",
+            audit.to_str().unwrap(),
+            "--no-sensor",
+        ];
+        args.extend_from_slice(extra);
+        let output = boxcar(&args);
+        assert_reached_the_vmm(&output);
+        assert!(
+            !stderr(&output).contains("--no-sensor"),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
+    }
+}

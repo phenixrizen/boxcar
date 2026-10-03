@@ -2409,6 +2409,13 @@
         "phase": {
           "$ref": "#/definitions/SensorPhase"
         },
+        "pid": {
+          "description": "The sensor's own process id in the guest, which the guards protect.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "programs": {
           "description": "Every program the sensor carries, attached or not.",
           "type": "array",

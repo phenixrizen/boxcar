@@ -120,7 +120,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let has_shares = rootfs.is_some();
     let share_count = if has_shares { SHARE_COUNT } else { 0 };
     let mode = guest_mode(has_shares, vsock, user.0, user.1);
-    let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command);
+    let sensor = vsock && !args.no_sensor;
+    let cmdline_extra = guest_cmdline(mode, &args.cmdline_extra, &args.command, sensor);
     // The devices the VM will have, derived as `Vmm::new` derives them.
     let devices = DeviceSet::new(share_count, net, vsock);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
@@ -218,6 +219,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         net: net.then(|| net_config(&args.dns)),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
         vsock: vsock.then(|| vsock_config(&state_dir, &args.vsock_allow)),
+        sensor,
         session,
         control: Some(ControlConfig {
             state_dir: state_dir.clone(),
@@ -940,13 +942,22 @@ fn guest_mode(shares: bool, vsock: bool, uid: u32, gid: u32) -> GuestMode {
     }
 }
 
-/// The `boxcar.*` keys for `mode`, then `extra` (`--cmdline-extra`), in
-/// order, then, in console mode, `command` (`-- CMD`), if any, as
-/// `boxcar.cmd`. The user's values come after boxcar's so they win: init
-/// keeps the last of a repeated key. In vsock mode the command, the user
-/// and the rest travel in the control channel's config instead.
-fn guest_cmdline(mode: GuestMode, extra: &[String], command: &[String]) -> Vec<String> {
+/// The `boxcar.*` keys for `mode` (in vsock mode, `boxcar.sensor=0` when the
+/// sensor is off), then `extra` (`--cmdline-extra`), in order, then, in
+/// console mode, `command` (`-- CMD`), if any, as `boxcar.cmd`. The user's
+/// values come after boxcar's so they win: init keeps the last of a repeated
+/// key. In vsock mode the command, the user and the rest travel in the
+/// control channel's config instead.
+fn guest_cmdline(
+    mode: GuestMode,
+    extra: &[String],
+    command: &[String],
+    sensor: bool,
+) -> Vec<String> {
     let mut cmdline = match mode {
+        GuestMode::Vsock if !sensor => {
+            vec!["boxcar.mode=vsock".to_owned(), "boxcar.sensor=0".to_owned()]
+        }
         GuestMode::Vsock => vec!["boxcar.mode=vsock".to_owned()],
         GuestMode::Console { uid, gid } => vec![
             "boxcar.mode=console".to_owned(),
@@ -980,13 +991,31 @@ mod tests {
     }
 
     #[test]
+    fn no_sensor_puts_the_key_on_the_command_line_in_vsock_mode_only() {
+        assert_eq!(
+            guest_cmdline(GuestMode::Vsock, &[], &[], false),
+            ["boxcar.mode=vsock", "boxcar.sensor=0"]
+        );
+        assert_eq!(
+            guest_cmdline(GuestMode::Vsock, &[], &[], true),
+            ["boxcar.mode=vsock"]
+        );
+        // Without the vsock device there is no sensor to turn off.
+        let console = GuestMode::Console { uid: 1, gid: 2 };
+        assert_eq!(
+            guest_cmdline(console, &[], &[], false),
+            ["boxcar.mode=console", "boxcar.uid=1", "boxcar.gid=2"]
+        );
+    }
+
+    #[test]
     fn shares_run_the_console_init_as_the_invoking_user() {
         let mode = GuestMode::Console {
             uid: 1000,
             gid: 1001,
         };
         assert_eq!(
-            guest_cmdline(mode, &[], &[]),
+            guest_cmdline(mode, &[], &[], true),
             ["boxcar.mode=console", "boxcar.uid=1000", "boxcar.gid=1001"]
         );
     }
@@ -996,7 +1025,7 @@ mod tests {
         let mode = GuestMode::Console { uid: 0, gid: 0 };
         let extra = strings(&["boxcar.mode=hello", "loglevel=7"]);
         assert_eq!(
-            guest_cmdline(mode, &extra, &[]),
+            guest_cmdline(mode, &extra, &[], true),
             [
                 "boxcar.mode=console",
                 "boxcar.uid=0",
@@ -1011,7 +1040,7 @@ mod tests {
     fn no_shares_boot_the_hello_init() {
         let extra = strings(&["panic=0"]);
         assert_eq!(
-            guest_cmdline(GuestMode::Hello, &extra, &[]),
+            guest_cmdline(GuestMode::Hello, &extra, &[], true),
             ["boxcar.mode=hello", "panic=0"]
         );
     }
@@ -1027,7 +1056,7 @@ mod tests {
     fn the_command_goes_last_as_boxcar_cmd() {
         let command = strings(&["/bin/sh", "-c", "echo \"a b\" > /workspace/out.txt"]);
         let extra = strings(&["loglevel=7"]);
-        let cmdline = guest_cmdline(CONSOLE, &extra, &command);
+        let cmdline = guest_cmdline(CONSOLE, &extra, &command, true);
         assert_eq!(
             cmdline[..4],
             [
@@ -1049,11 +1078,11 @@ mod tests {
     fn with_vsock_the_command_line_says_only_the_mode() {
         let command = strings(&["/bin/sh", "-c", "exit 7"]);
         assert_eq!(
-            guest_cmdline(GuestMode::Vsock, &[], &command),
+            guest_cmdline(GuestMode::Vsock, &[], &command, true),
             ["boxcar.mode=vsock"]
         );
         assert_eq!(
-            guest_cmdline(GuestMode::Vsock, &strings(&["loglevel=7"]), &[]),
+            guest_cmdline(GuestMode::Vsock, &strings(&["loglevel=7"]), &[], true),
             ["boxcar.mode=vsock", "loglevel=7"]
         );
     }
@@ -1180,7 +1209,7 @@ mod tests {
         let command = strings(&["/bin/sh", "-c", "exit 7"]);
         let with_filler = |len: usize| {
             let extra = vec!["f".repeat(len)];
-            guest_cmdline(CONSOLE, &extra, &command)
+            guest_cmdline(CONSOLE, &extra, &command, true)
         };
         // The filler that makes the command line exactly 2048 bytes, NUL
         // terminator included.
@@ -1198,7 +1227,7 @@ mod tests {
     #[test]
     fn a_long_command_is_refused_with_the_size_it_would_have() {
         let command = strings(&["/bin/sh", "-c", &"echo x; ".repeat(300)]);
-        let cmdline = guest_cmdline(CONSOLE, &[], &command);
+        let cmdline = guest_cmdline(CONSOLE, &[], &command, true);
         let error = check_cmdline_size(false, &cmdline, &devices()).unwrap_err();
         assert_eq!(
             error.to_string(),

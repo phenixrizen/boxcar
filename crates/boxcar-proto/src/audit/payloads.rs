@@ -860,6 +860,9 @@ pub struct ProcSensorStatus {
     pub btf_ok: bool,
     /// The session cgroup the sensor filters on.
     pub session_cgroup_id: u64,
+    /// The sensor's own process id in the guest, which the guards protect.
+    #[serde(default)]
+    pub pid: u32,
     /// Why the sensor is degraded, when a single reason covers it (such as
     /// `no_programs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

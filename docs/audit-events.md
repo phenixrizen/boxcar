@@ -188,7 +188,7 @@ clock, tells a process from a later one with the same pid.
 | `proc.file_open` | `tid`, `tgid`, `path`, `flags`, `sample` | One open in `sample`: the only sampled record of ring 1. |
 | `proc.lsm_deny` | `tid`, `tgid`, `hook` (`bpf` or `task_kill`), `detail` (the `bpf` command, or the signal) | The sensor's self-protection refused a `bpf()` call by another process, or a signal to the sensor. Written through to disk at once. |
 | `proc.heartbeat` | `uptime_ns`, `events_emitted`, `ringbuf_drops`, `frames_sent` | The sensor is alive: once a second, with its counters since it started. `ringbuf_drops` counts events the kernel could not place in the ring buffer: lost. |
-| `proc.sensor_status` | `phase` (`attached` or `degraded`), `programs [{name, attached, error?}]`, `kernel_release`, `btf_ok`, `session_cgroup_id`, `reason` (*omitted* unless one reason covers it) | What the sensor could attach, once it has tried, and again if that changes. |
+| `proc.sensor_status` | `phase` (`attached` or `degraded`), `programs [{name, attached, error?}]`, `kernel_release`, `btf_ok`, `session_cgroup_id`, `pid` (the sensor's own), `reason` (*omitted* unless one reason covers it) | What the sensor could attach, once it has tried, and again if that changes. |
 
 The sensor's stream is framed `[u32 LE len][json]`, each frame the record's
 `type` and `data` with `ts_guest_ns` and `subject` beside them, at most 64

@@ -229,6 +229,7 @@ pub fn sensor_lines() -> Result<Vec<u8>> {
                 kernel_release: "6.18.54".to_owned(),
                 btf_ok: true,
                 session_cgroup_id: 4242,
+                pid: 77,
                 reason: None,
             }),
         ),
