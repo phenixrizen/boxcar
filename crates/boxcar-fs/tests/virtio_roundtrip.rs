@@ -655,6 +655,22 @@ fn thread_names() -> Vec<String> {
         .collect()
 }
 
+/// Whether a thread named `name` is there, giving a thread just spawned a
+/// moment to start and name itself: on a busy two-CPU runner the spawn
+/// returns before the new thread has run at all.
+fn thread_named(name: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if thread_names().iter().any(|n| n == name) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Whether no thread named with `prefix` is left, giving a joined thread
 /// a moment to leave the kernel's task list.
 fn no_thread_with_prefix(prefix: &str) -> bool {
@@ -698,11 +714,7 @@ fn a_worker_serves_the_kicked_queue_and_reset_closes_what_the_guest_left_open() 
     // The worker interrupted the guest and is named after the share.
     assert!(driver.irq.status.load(Ordering::SeqCst) & 1 != 0);
     assert!(driver.irq.evt.read().unwrap() >= 1);
-    assert!(
-        thread_names().iter().any(|n| n == "fs-workspace-q1"),
-        "{:?}",
-        thread_names()
-    );
+    assert!(thread_named("fs-workspace-q1"), "{:?}", thread_names());
 
     // The hiprio queue is served by the same worker.
     let hiprio = queue_mock(&mem, 0);
@@ -824,11 +836,12 @@ fn four_request_queues_serve_requests_concurrently() {
         u32::from(ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK),
         "activated"
     );
-    let names = thread_names();
     for q in 1..=4 {
+        let name = format!("fs-mq-q{q}");
         assert!(
-            names.iter().any(|n| *n == format!("fs-mq-q{q}")),
-            "no worker for queue {q}: {names:?}"
+            thread_named(&name),
+            "no worker for queue {q}: {:?}",
+            thread_names()
         );
     }
 
@@ -901,7 +914,7 @@ fn reactivation_restarts_the_hash_threads() {
     mem.write_obj(0u16, GuestAddress(used.0 + 2)).unwrap();
     driver.handshake(&[0, 1]);
     assert_eq!(driver.hash_threads(), 2, "restarted by the activation");
-    assert!(thread_names().iter().any(|n| n == "fs-rehash-hash0"));
+    assert!(thread_named("fs-rehash-hash0"));
 
     // A truncating open and the reset's close: hashed, by a hash thread.
     offer(&mem, &mock, 0, &init_request(1));

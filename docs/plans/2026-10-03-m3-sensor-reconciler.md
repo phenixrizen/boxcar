@@ -414,3 +414,11 @@ Made while writing the plan, 2026-10-03:
   `smoke`) and `boxcar` (`kvm_m1`, `kvm_m2`, `kvm_m3`) plus the packages'
   unit and CLI tests. Every other command of section 2 was clean at the
   same commit, `cargo xtask sensor` included.
+
+### After the PR
+
+- PR #3's `check` job failed twice on `four_request_queues_serve_requests_concurrently`
+  (an M2 test): it asserted a worker's thread name the instant activation
+  returned, and on the two-CPU runner the fourth worker had not run yet.
+  The presence assertions now wait up to 2 s, as the absence ones already
+  did. The `ebpf` job passed on its first runs.
