@@ -1,0 +1,1 @@
+{"category":"unattributed_effect","score":60,"rule":"no_process","summary":"fs.create of mystery.txt by guest thread 999, which no process the sensor reported owned at the time","evidence":[{"seq":4,"ring":0}],"low_confidence":false}

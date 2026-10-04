@@ -10,6 +10,11 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The stable lane builds the whole tree with the pinned stable toolchain
+    # alone: boxcar-sensor embeds an empty eBPF object here, and the `ebpf`
+    # job below builds the real one.
+    env:
+      AYA_BUILD_SKIP: "1"
     steps:
       # Actions are pinned to commits (the tag they stand for in the
       # comment): a moved tag cannot change what runs here.
@@ -56,8 +61,51 @@ jobs:
       - name: License and dependency policy
         run: cargo deny check
 
-      - name: Static musl guest init
-        run: cargo build -p boxcar-init --target x86_64-unknown-linux-musl --profile guest
+      - name: Static musl guest init and sensor (no programs)
+        run: |
+          cargo build -p boxcar-init --target x86_64-unknown-linux-musl --profile guest
+          cargo build -p boxcar-sensor --target x86_64-unknown-linux-musl --profile guest
+
+  # The eBPF lane: the sensor's programs built for bpfel-unknown-none on the
+  # pinned nightly (crates/boxcar-sensor-ebpf/rust-toolchain.toml names it)
+  # with bpf-linker, embedded into the guest sensor, and the object checked
+  # against the table both sides share. Nothing is loaded: that needs a
+  # guest, which the `kvm` job has.
+  ebpf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Read toolchain channel from rust-toolchain.toml
+        id: toolchain
+        run: echo "channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-unknown-linux-musl
+
+      # Keep in step with crates/boxcar-sensor/build.rs and
+      # crates/boxcar-sensor-ebpf/rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10
+        with:
+          toolchain: nightly-2026-06-01
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      # cargo-binstall by release and checksum, then bpf-linker prebuilt (no
+      # LLVM build). Keep the version in step with CONTRIBUTING.md.
+      - name: Install bpf-linker
+        run: |
+          curl -fsSL -o cargo-binstall.tgz https://github.com/cargo-bins/cargo-binstall/releases/download/v1.25.1/cargo-binstall-x86_64-unknown-linux-musl.tgz
+          echo "8e06c41af972f9922f28c6ae467e41ffa9b0688d563d0aabd0dcbd5244ab849b  cargo-binstall.tgz" | sha256sum -c -
+          tar -xzf cargo-binstall.tgz -C "$HOME/.cargo/bin" cargo-binstall
+          cargo binstall --no-confirm bpf-linker@0.11.1
+          bpf-linker --version
+
+      - name: Build the eBPF programs and check the object
+        run: cargo xtask sensor
 
   # The KVM-gated suite boots real VMs, which GitHub-hosted runners cannot:
   # it runs only where the repository variable HAS_KVM is "true", on a
@@ -87,5 +135,5 @@ jobs:
           cargo xtask initramfs
           cargo xtask rootfs alpine
 
-      - name: KVM-gated tests, M2
-        run: cargo xtask test-kvm m2
+      - name: KVM-gated tests, M3
+        run: cargo xtask test-kvm m3

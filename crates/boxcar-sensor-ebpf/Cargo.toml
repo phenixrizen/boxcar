@@ -1,0 +1,38 @@
+# The guest sensor's eBPF programs. Not a member of the workspace: it builds
+# for bpfel-unknown-none on the pinned nightly, through boxcar-sensor's
+# build.rs (aya-build) or by hand in this directory, and has its own lock
+# file. Its licence differs from the rest of the tree: see
+# docs/ebpf-license.md.
+[package]
+name = "boxcar-sensor-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR GPL-2.0"
+publish = false
+description = "The boxcar guest sensor's eBPF programs"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+boxcar-sensor-common = { path = "../boxcar-sensor-common" }
+
+[[bin]]
+name = "boxcar-sensor"
+path = "src/main.rs"
+
+# The profiles aya's template uses: the verifier wants optimized code with
+# no debug assertions or overflow checks, and one codegen unit.
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1

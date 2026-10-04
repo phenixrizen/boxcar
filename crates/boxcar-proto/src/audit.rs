@@ -41,11 +41,13 @@ mod errno;
 mod payloads;
 
 pub use payloads::{
-    ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
-    FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
-    FsSymlink, FsXattr, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp,
-    OpResult, PolicyChanged, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart,
-    VmmStop, VsockClose, VsockConnect,
+    ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
+    FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
+    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, NetClose,
+    NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp, OpResult, PolicyChanged,
+    ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
+    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit,
+    SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -125,13 +127,14 @@ pub enum Source {
 
 impl Source {
     /// The source of an event kind this crate defines a payload for:
-    /// `vmm.*` and `checkpoint` come from the VMM, `fs.*` from the filesystem
-    /// device, `net.*` from the network stack, `vsock.*` from the vsock
-    /// device, `control.*` from the control socket, `session.*` from the
-    /// guest's session, `policy.*` from the policy. `None` for every other
+    /// `vmm.*`, `checkpoint` and `sync` come from the VMM, `fs.*` from the
+    /// filesystem device, `net.*` from the network stack, `vsock.*` from the
+    /// vsock device, `control.*` from the control socket, `session.*` from
+    /// the guest's session, `policy.*` from the policy, `proc.*` from the
+    /// guest's sensor, `finding` from the reconciler. `None` for every other
     /// kind; later milestones add theirs.
     pub fn from_kind(kind: &str) -> Option<Source> {
-        if kind == "checkpoint" || kind.starts_with("vmm.") {
+        if kind == "checkpoint" || kind == "sync" || kind.starts_with("vmm.") {
             Some(Source::Vmm)
         } else if kind.starts_with("fs.") {
             Some(Source::Fs)
@@ -145,6 +148,10 @@ impl Source {
             Some(Source::Session)
         } else if kind.starts_with("policy.") {
             Some(Source::Policy)
+        } else if kind.starts_with("proc.") {
+            Some(Source::Sensor)
+        } else if kind == "finding" {
+            Some(Source::Reconciler)
         } else {
             None
         }
@@ -442,6 +449,30 @@ pub enum Payload {
     SessionExit(SessionExit),
     #[serde(rename = "policy.changed")]
     PolicyChanged(PolicyChanged),
+    #[serde(rename = "sync")]
+    ClockSync(ClockSync),
+    #[serde(rename = "proc.exec")]
+    ProcExec(ProcExec),
+    #[serde(rename = "proc.fork")]
+    ProcFork(ProcFork),
+    #[serde(rename = "proc.exit")]
+    ProcExit(ProcExit),
+    #[serde(rename = "proc.connect_attempt")]
+    ProcConnectAttempt(ProcConnectAttempt),
+    #[serde(rename = "proc.tcp_connect")]
+    ProcTcpConnect(ProcTcpConnect),
+    #[serde(rename = "proc.memfd")]
+    ProcMemfd(ProcMemfd),
+    #[serde(rename = "proc.file_open")]
+    ProcFileOpen(ProcFileOpen),
+    #[serde(rename = "proc.lsm_deny")]
+    ProcLsmDeny(ProcLsmDeny),
+    #[serde(rename = "proc.heartbeat")]
+    ProcHeartbeat(ProcHeartbeat),
+    #[serde(rename = "proc.sensor_status")]
+    ProcSensorStatus(ProcSensorStatus),
+    #[serde(rename = "finding")]
+    Finding(Finding),
 }
 
 impl Payload {
@@ -484,6 +515,18 @@ impl Payload {
             Payload::SessionStart(_) => "session.start",
             Payload::SessionExit(_) => "session.exit",
             Payload::PolicyChanged(_) => "policy.changed",
+            Payload::ClockSync(_) => "sync",
+            Payload::ProcExec(_) => "proc.exec",
+            Payload::ProcFork(_) => "proc.fork",
+            Payload::ProcExit(_) => "proc.exit",
+            Payload::ProcConnectAttempt(_) => "proc.connect_attempt",
+            Payload::ProcTcpConnect(_) => "proc.tcp_connect",
+            Payload::ProcMemfd(_) => "proc.memfd",
+            Payload::ProcFileOpen(_) => "proc.file_open",
+            Payload::ProcLsmDeny(_) => "proc.lsm_deny",
+            Payload::ProcHeartbeat(_) => "proc.heartbeat",
+            Payload::ProcSensorStatus(_) => "proc.sensor_status",
+            Payload::Finding(_) => "finding",
         }
     }
 
@@ -525,6 +568,18 @@ impl Payload {
             Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
             Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
             Payload::PolicyChanged(_) => Source::Policy,
+            Payload::ClockSync(_) => Source::Vmm,
+            Payload::ProcExec(_)
+            | Payload::ProcFork(_)
+            | Payload::ProcExit(_)
+            | Payload::ProcConnectAttempt(_)
+            | Payload::ProcTcpConnect(_)
+            | Payload::ProcMemfd(_)
+            | Payload::ProcFileOpen(_)
+            | Payload::ProcLsmDeny(_)
+            | Payload::ProcHeartbeat(_)
+            | Payload::ProcSensorStatus(_) => Source::Sensor,
+            Payload::Finding(_) => Source::Reconciler,
         }
     }
 
@@ -558,8 +613,8 @@ mod tests {
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 34 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 35] = [
+    /// The 47 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 47] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -595,6 +650,18 @@ mod tests {
         "session.start",
         "session.exit",
         "policy.changed",
+        "sync",
+        "proc.exec",
+        "proc.fork",
+        "proc.exit",
+        "proc.connect_attempt",
+        "proc.tcp_connect",
+        "proc.memfd",
+        "proc.file_open",
+        "proc.lsm_deny",
+        "proc.heartbeat",
+        "proc.sensor_status",
+        "finding",
     ];
 
     fn session() -> SessionId {
@@ -1161,6 +1228,231 @@ mod tests {
                 }),
                 json!({"by_pid": 4242, "version": 2}),
             ),
+            (
+                Payload::ClockSync(ClockSync {
+                    method: "vsock_rtt".into(),
+                    guest_mono_ns: 5_000_000_000,
+                    host_mono_ns: 7_000_000_250,
+                    offset_ns: 2_000_000_250,
+                    rtt_ns: 500,
+                }),
+                json!({
+                    "method": "vsock_rtt",
+                    "guest_mono_ns": 5_000_000_000_u64,
+                    "host_mono_ns": 7_000_000_250_u64,
+                    "offset_ns": 2_000_000_250_i64,
+                    "rtt_ns": 500,
+                }),
+            ),
+            (
+                Payload::ProcExec(ProcExec {
+                    tid: 212,
+                    tgid: 212,
+                    ppid: 200,
+                    uid: 1000,
+                    gid: 1000,
+                    filename: "/usr/bin/curl".into(),
+                    argv: vec!["curl".into(), "-sS".into(), "https://example.com/".into()],
+                    argv_truncated: false,
+                    start_ns: 12_345_678_901,
+                    cgroup_id: 4242,
+                }),
+                json!({
+                    "tid": 212,
+                    "tgid": 212,
+                    "ppid": 200,
+                    "uid": 1000,
+                    "gid": 1000,
+                    "filename": "/usr/bin/curl",
+                    "argv": ["curl", "-sS", "https://example.com/"],
+                    "argv_truncated": false,
+                    "start_ns": 12_345_678_901_u64,
+                    "cgroup_id": 4242,
+                }),
+            ),
+            (
+                Payload::ProcFork(ProcFork {
+                    parent_tid: 200,
+                    parent_tgid: 200,
+                    child_pid: 212,
+                    child_start_ns: 12_345_678_901,
+                    uid: 1000,
+                    gid: 1000,
+                    thread: false,
+                }),
+                json!({
+                    "parent_tid": 200,
+                    "parent_tgid": 200,
+                    "child_pid": 212,
+                    "child_start_ns": 12_345_678_901_u64,
+                    "uid": 1000,
+                    "gid": 1000,
+                    "thread": false,
+                }),
+            ),
+            (
+                Payload::ProcExit(ProcExit {
+                    tid: 212,
+                    tgid: 212,
+                    exit_code: 0,
+                    group_dead: true,
+                    start_ns: 12_345_678_901,
+                }),
+                json!({
+                    "tid": 212,
+                    "tgid": 212,
+                    "exit_code": 0,
+                    "group_dead": true,
+                    "start_ns": 12_345_678_901_u64,
+                }),
+            ),
+            (
+                Payload::ProcConnectAttempt(ProcConnectAttempt {
+                    tid: 212,
+                    tgid: 212,
+                    family: 2,
+                    proto: "tcp".into(),
+                    dst: Some("93.184.216.34".parse().unwrap()),
+                    dst_port: Some(443),
+                }),
+                json!({
+                    "tid": 212,
+                    "tgid": 212,
+                    "family": 2,
+                    "proto": "tcp",
+                    "dst": "93.184.216.34",
+                    "dst_port": 443,
+                }),
+            ),
+            (
+                Payload::ProcTcpConnect(ProcTcpConnect {
+                    tid: 212,
+                    tgid: 212,
+                    src: "10.0.2.15".parse().unwrap(),
+                    src_port: 40000,
+                    dst: "93.184.216.34".parse().unwrap(),
+                    dst_port: 443,
+                }),
+                json!({
+                    "tid": 212,
+                    "tgid": 212,
+                    "src": "10.0.2.15",
+                    "src_port": 40000,
+                    "dst": "93.184.216.34",
+                    "dst_port": 443,
+                }),
+            ),
+            (
+                Payload::ProcMemfd(ProcMemfd {
+                    tid: 212,
+                    tgid: 212,
+                    name: "payload".into(),
+                    flags: 1,
+                }),
+                json!({"tid": 212, "tgid": 212, "name": "payload", "flags": 1}),
+            ),
+            (
+                Payload::ProcFileOpen(ProcFileOpen {
+                    tid: 212,
+                    tgid: 212,
+                    path: "/dev/shm/x".into(),
+                    flags: 0o100002,
+                    sample: 64,
+                }),
+                json!({
+                    "tid": 212,
+                    "tgid": 212,
+                    "path": "/dev/shm/x",
+                    "flags": 0o100002,
+                    "sample": 64,
+                }),
+            ),
+            (
+                Payload::ProcLsmDeny(ProcLsmDeny {
+                    tid: 212,
+                    tgid: 212,
+                    hook: "bpf".into(),
+                    detail: 5,
+                }),
+                json!({"tid": 212, "tgid": 212, "hook": "bpf", "detail": 5}),
+            ),
+            (
+                Payload::ProcHeartbeat(ProcHeartbeat {
+                    uptime_ns: 61_000_000_000,
+                    events_emitted: 120,
+                    ringbuf_drops: 0,
+                    frames_sent: 181,
+                }),
+                json!({
+                    "uptime_ns": 61_000_000_000_u64,
+                    "events_emitted": 120,
+                    "ringbuf_drops": 0,
+                    "frames_sent": 181,
+                }),
+            ),
+            (
+                Payload::ProcSensorStatus(ProcSensorStatus {
+                    phase: SensorPhase::Attached,
+                    programs: vec![
+                        ProgramStatus {
+                            name: "sched_process_exec".into(),
+                            attached: true,
+                            error: None,
+                        },
+                        ProgramStatus {
+                            name: "file_open".into(),
+                            attached: false,
+                            error: Some("bpf_d_path is not allowed here".into()),
+                        },
+                    ],
+                    kernel_release: "6.18.54".into(),
+                    btf_ok: true,
+                    session_cgroup_id: 4242,
+                    pid: 77,
+                    reason: None,
+                }),
+                json!({
+                    "phase": "attached",
+                    "programs": [
+                        {"name": "sched_process_exec", "attached": true},
+                        {"name": "file_open", "attached": false, "error": "bpf_d_path is not allowed here"},
+                    ],
+                    "kernel_release": "6.18.54",
+                    "btf_ok": true,
+                    "session_cgroup_id": 4242,
+                    "pid": 77,
+                }),
+            ),
+            (
+                Payload::Finding(Finding {
+                    category: FindingCategory::NetworkAnomaly,
+                    score: 60,
+                    rule: "connect_without_dns".into(),
+                    summary:
+                        "pid 212 (curl) connected to 93.184.216.34:443, which no DNS answer named"
+                            .into(),
+                    evidence: vec![
+                        Evidence {
+                            seq: 38,
+                            ring: Ring::Guest,
+                        },
+                        Evidence {
+                            seq: 40,
+                            ring: Ring::Host,
+                        },
+                    ],
+                    span_id: None,
+                    low_confidence: false,
+                }),
+                json!({
+                    "category": "network_anomaly",
+                    "score": 60,
+                    "rule": "connect_without_dns",
+                    "summary": "pid 212 (curl) connected to 93.184.216.34:443, which no DNS answer named",
+                    "evidence": [{"seq": 38, "ring": 1}, {"seq": 40, "ring": 0}],
+                    "low_confidence": false,
+                }),
+            ),
         ]
     }
 
@@ -1492,6 +1784,10 @@ mod tests {
                 Source::Session
             } else if payload.kind().starts_with("policy.") {
                 Source::Policy
+            } else if payload.kind().starts_with("proc.") {
+                Source::Sensor
+            } else if payload.kind() == "finding" {
+                Source::Reconciler
             } else {
                 Source::Vmm
             };
@@ -1506,9 +1802,17 @@ mod tests {
         assert_eq!(Source::from_kind("vsock.close"), Some(Source::Vsock));
         assert_eq!(Source::from_kind("session.exit"), Some(Source::Session));
         assert_eq!(Source::from_kind("policy.changed"), Some(Source::Policy));
+        assert_eq!(Source::from_kind("sync"), Some(Source::Vmm));
+        assert_eq!(Source::from_kind("proc.exec"), Some(Source::Sensor));
+        assert_eq!(Source::from_kind("proc.heartbeat"), Some(Source::Sensor));
+        assert_eq!(Source::from_kind("finding"), Some(Source::Reconciler));
         for other in [
-            "proc.exec",
-            "finding",
+            "tool.open",
+            "llm.request",
+            "proc",
+            "process.exec",
+            "syncs",
+            "findings",
             "",
             "vmm",
             "fs",
@@ -1531,8 +1835,10 @@ mod tests {
 
     #[test]
     fn from_record_rejects_unknown_kinds_and_malformed_data() {
-        let unknown = record("proc.exec", Source::Guest, json!({}));
+        let unknown = record("tool.open", Source::Gateway, json!({}));
         assert!(Payload::from_record(&unknown).is_err());
+        let known_kind_bad_data = record("proc.exec", Source::Sensor, json!({"argv": ["ls"]}));
+        assert!(Payload::from_record(&known_kind_bad_data).is_err());
         let missing_fields = record("fs.open", Source::Fs, json!({"mount": "root"}));
         assert!(Payload::from_record(&missing_fields).is_err());
         let not_an_object = record("vmm.stop", Source::Vmm, json!("stopped"));
@@ -1875,7 +2181,7 @@ mod tests {
     #[test]
     fn a_line_without_optional_fields_parses() {
         let line = format!(
-            r#"{{"v":1,"session_id":"{SESSION}","seq":9,"ring":1,"src":"guest","type":"proc.exec","ts_host_ns":5,"ts_mono_ns":6,"data":{{"argv":["ls"]}},"prev":"{}","hash":"{}"}}"#,
+            r#"{{"v":1,"session_id":"{SESSION}","seq":9,"ring":1,"src":"guest","type":"tool.open","ts_host_ns":5,"ts_mono_ns":6,"data":{{"argv":["ls"]}},"prev":"{}","hash":"{}"}}"#,
             b3(1),
             b3(2)
         );
@@ -1884,7 +2190,7 @@ mod tests {
         assert_eq!(rec.seq, 9);
         assert_eq!(rec.ring, Ring::Guest);
         assert_eq!(rec.src, Source::Guest);
-        assert_eq!(rec.kind, "proc.exec");
+        assert_eq!(rec.kind, "tool.open");
         assert_eq!(rec.data, json!({"argv": ["ls"]}));
         assert_eq!(rec.ts_guest_ns, None);
         assert_eq!(rec.subject, None);

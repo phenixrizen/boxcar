@@ -41,6 +41,7 @@ mod pty;
 mod reaper;
 mod resolver;
 mod search;
+mod sensor;
 mod session;
 mod shutdown;
 mod sysctl;
@@ -163,6 +164,14 @@ impl From<Failed> for VsockFailure {
 fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Option<Ended>, VsockFailure> {
     mounts::mount_shares()?;
     let mounted = mounts::mount_api()?;
+    // The sensor comes from the initramfs, which the root switch puts out of
+    // reach: hold it open across the switch and run it once the cgroups are
+    // there.
+    let sensor = if cmdline::sensor_enabled(args) {
+        sensor::open_binary()
+    } else {
+        None
+    };
     mounts::switch_root()?;
     if cmdline::net_enabled(args) {
         // The session can run without it: a warning, not a reboot.
@@ -172,6 +181,12 @@ fn run_vsock_session(args: &BTreeMap<String, String>) -> Result<Option<Ended>, V
     }
     sysctl::apply();
     let join_cgroup = session::create_cgroups(mounted.cgroup2)?;
+    if let Some(binary) = sensor {
+        // Before the session, so its first exec is seen; before the control
+        // channel, so the host sees the sensor's stream and init's hello in
+        // the order they matter. Never fatal.
+        sensor::start(binary, join_cgroup);
+    }
 
     let mut ctl = ctl::Ctl::connect()?;
     let config = ctl

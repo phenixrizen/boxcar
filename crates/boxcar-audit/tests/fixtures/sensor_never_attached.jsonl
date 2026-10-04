@@ -1,0 +1,1 @@
+{"category":"sensor_silence","score":85,"rule":"never_attached","summary":"the session started, but the sensor said nothing within 5 s: ring 1 is not there","evidence":[{"seq":1,"ring":1}],"low_confidence":false}

@@ -27,6 +27,14 @@
 //! kept, the VMM closes its sending side: init waits for that before it
 //! reboots, so the report is in when the reset arrives. What the guest
 //! sends is logged rate-limited; nothing here logs on the stop path.
+//!
+//! The channel also pairs the clocks. A `ping` carries an id and the host
+//! notes its `CLOCK_MONOTONIC`; init answers `pong` with its own clock, and
+//! the VMM records a `sync` (`ClockSync`): the guest's clock against the
+//! host's at the round trip's midpoint, their difference, and the round
+//! trip. [`GuestCtl::start_sync`] pings on its own once the config is sent
+//! and then every interval ([`SYNC_INTERVAL`] in the VMM); a ping sent by
+//! hand ([`GuestCtlHandle::ping`]) is paired the same way.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -42,7 +50,7 @@ use boxcar_proto::control::{GuestStatus, SessionOutcome};
 use boxcar_proto::guest::{
     decode, encode, GuestMsg, GuestProtoError, HostMsg, LineBuf, LogLevel, MAX_LINE,
 };
-use boxcar_proto::{Payload, Ring, SessionExit, SessionStart, Subject};
+use boxcar_proto::{ClockSync, Payload, Ring, SessionExit, SessionStart, Subject};
 use boxcar_vsock::{ConnMeta, Deny};
 
 use crate::services::Service;
@@ -55,6 +63,15 @@ pub const REACTIVATED: &str = "reactivated";
 /// How long the stop sequence waits for the channel's threads to end once
 /// the vsock device is closed.
 pub const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How often the VMM pings init to pair the clocks.
+pub const SYNC_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How a `sync` record says its pair was taken.
+pub const SYNC_METHOD: &str = "vsock_rtt";
+
+/// How often the sync thread looks whether a ping is due.
+const SYNC_TICK: Duration = Duration::from_millis(50);
 
 /// Lines waiting for the writer; past this, [`GuestCtlHandle::send`] fails.
 const OUTBOX: usize = 64;
@@ -85,8 +102,18 @@ pub struct GuestCtl {
     audit: AuditSink,
     /// Set once the one connection of the VMM's life is taken.
     taken: AtomicBool,
+    /// Set by [`close`](GuestCtl::close): the sync thread ends.
+    closed: AtomicBool,
     next_ping: AtomicU64,
     state: Mutex<State>,
+}
+
+/// A ping on its way.
+#[derive(Clone, Copy)]
+struct Ping {
+    id: u64,
+    /// The host's `CLOCK_MONOTONIC` when it was queued.
+    sent_mono_ns: u64,
 }
 
 #[derive(Default)]
@@ -97,7 +124,9 @@ struct State {
     /// The VMM's end of the channel, to shut down.
     stream: Option<UnixStream>,
     /// The ping sent last and not answered yet.
-    ping: Option<u64>,
+    ping: Option<Ping>,
+    /// The config went to init: pings may follow.
+    config_sent: bool,
     /// The reader and the writer, each with the receiver its end is told on.
     threads: Vec<(JoinHandle<()>, Receiver<()>)>,
 }
@@ -111,9 +140,89 @@ impl GuestCtl {
             session,
             audit,
             taken: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             next_ping: AtomicU64::new(0),
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// Starts the thread that pings init every `interval` once the config
+    /// has gone, so the log has a `sync` early and then regularly. It ends
+    /// with [`close`](GuestCtl::close).
+    pub fn start_sync(self: &Arc<Self>, interval: Duration) {
+        let ctl = Arc::clone(self);
+        let (done, end) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("guest-ctl-sync".into())
+            .spawn(move || {
+                ctl.sync_loop(interval);
+                let _ = done.send(());
+            });
+        match thread {
+            Ok(thread) => self.lock().threads.push((thread, end)),
+            Err(error) => boxcar_virtio::limited!(
+                warn,
+                "guest control channel: cannot start the clock sync: {error}"
+            ),
+        }
+    }
+
+    fn sync_loop(&self, interval: Duration) {
+        let mut last: Option<Instant> = None;
+        while !self.closed.load(Ordering::SeqCst) {
+            let ready = {
+                let state = self.lock();
+                state.outbox.is_some() && state.config_sent
+            };
+            if ready && last.is_none_or(|at| at.elapsed() >= interval) {
+                // A ping that cannot go now is tried again at the next tick.
+                if self.send_ping().is_ok() {
+                    last = Some(Instant::now());
+                }
+            }
+            thread::sleep(SYNC_TICK);
+        }
+    }
+
+    /// Queues a ping and returns its id; the matching pong clears it and
+    /// records a `sync`.
+    fn send_ping(&self) -> Result<u64, SendError> {
+        let id = self.next_ping.fetch_add(1, Ordering::Relaxed) + 1;
+        let line = encode(&HostMsg::Ping { id }).map_err(|_| SendError::TooLong)?;
+        // Before the send, so that a pong cannot come first.
+        let previous = self.lock().ping.replace(Ping {
+            id,
+            sent_mono_ns: monotonic_ns(),
+        });
+        if let Err(error) = self.queue(line) {
+            self.lock().ping = previous;
+            return Err(error);
+        }
+        Ok(id)
+    }
+
+    /// Records the `sync` a pong makes with the ping it answers.
+    fn record_sync(&self, ping: Ping, guest_mono_ns: u64) {
+        let rtt_ns = monotonic_ns().saturating_sub(ping.sent_mono_ns);
+        let host_mono_ns = ping.sent_mono_ns + rtt_ns / 2;
+        let offset_ns =
+            i64::try_from(i128::from(host_mono_ns) - i128::from(guest_mono_ns)).unwrap_or(i64::MAX);
+        let submission = Submission {
+            ring: Ring::Host,
+            ts_guest_ns: None,
+            subject: None,
+            payload: Payload::ClockSync(ClockSync {
+                method: SYNC_METHOD.to_owned(),
+                guest_mono_ns,
+                host_mono_ns,
+                offset_ns,
+                rtt_ns,
+            }),
+            span: None,
+            priority: Priority::Normal,
+        };
+        // A closed or failed log stops the VM by itself.
+        let _ = self.audit.emit(submission);
     }
 
     /// The service for port 1024: takes the first connection, and refuses
@@ -157,6 +266,7 @@ impl GuestCtl {
     /// sequence calls it.
     pub fn close(&self, deadline: Duration) -> bool {
         let deadline = Instant::now() + deadline;
+        self.closed.store(true, Ordering::SeqCst);
         let threads = {
             let mut state = self.lock();
             if let Some(stream) = state.stream.take() {
@@ -290,10 +400,16 @@ impl GuestCtl {
                     let _ = stream.shutdown(Shutdown::Write);
                 }
             }
-            GuestMsg::Pong { id, .. } => {
-                let mut state = self.lock();
-                if state.ping == Some(id) {
-                    state.ping = None;
+            GuestMsg::Pong { id, guest_mono_ns } => {
+                let answered = {
+                    let mut state = self.lock();
+                    match state.ping {
+                        Some(ping) if ping.id == id => state.ping.take(),
+                        _ => None,
+                    }
+                };
+                if let Some(ping) = answered {
+                    self.record_sync(ping, guest_mono_ns);
                 }
             }
             GuestMsg::Log { level, msg } => log_guest(level, &msg),
@@ -314,8 +430,9 @@ impl GuestCtl {
         tracing::debug!("guest control channel: init {version:?} is ready");
         // The VMM validated the config, its size included, before it booted.
         let config = encode(&HostMsg::Config(self.session.clone()));
-        if config.map(|line| self.queue(line)).is_err() {
-            boxcar_virtio::limited!(warn, "guest control channel: cannot send the config");
+        match config.map(|line| self.queue(line)) {
+            Ok(Ok(())) => self.lock().config_sent = true,
+            _ => boxcar_virtio::limited!(warn, "guest control channel: cannot send the config"),
         }
     }
 
@@ -466,17 +583,24 @@ impl GuestCtlHandle {
     }
 
     /// Sends a ping and returns its id; the matching pong clears it (see
-    /// [`GuestCtl::ping_outstanding`]).
+    /// [`GuestCtl::ping_outstanding`]) and records a `sync`.
     pub fn ping(&self) -> Result<u64, SendError> {
-        let id = self.ctl.next_ping.fetch_add(1, Ordering::Relaxed) + 1;
-        // Before the send, so that a pong cannot come first.
-        let previous = self.ctl.lock().ping.replace(id);
-        if let Err(error) = self.send(HostMsg::Ping { id }) {
-            self.ctl.lock().ping = previous;
-            return Err(error);
-        }
-        Ok(id)
+        self.ctl.send_ping()
     }
+}
+
+/// Host `CLOCK_MONOTONIC` in nanoseconds.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid pointer to a timespec, which the call fills.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -554,12 +678,124 @@ mod tests {
     }
 
     fn records(dir: &std::path::Path) -> Vec<Record> {
+        records_of(dir, "session.")
+    }
+
+    fn records_of(dir: &std::path::Path, prefix: &str) -> Vec<Record> {
         LogReader::open(dir)
             .unwrap()
             .records()
             .map(Result::unwrap)
-            .filter(|r| r.kind.starts_with("session."))
+            .filter(|r| r.kind.starts_with(prefix))
             .collect()
+    }
+
+    /// A pong to an outstanding ping pairs the clocks: a `sync` record
+    /// with the guest's clock, the host's at the round trip's midpoint, the
+    /// difference, and the round trip. A pong nobody asked for records
+    /// nothing.
+    #[test]
+    fn ping_pong_becomes_a_sync_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(tmp.path(), SessionId::new())).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let ctl = GuestCtl::new(session(), sink);
+        let handle = ctl.handle();
+        let mut init = FakeInit::connect(&ctl);
+        init.send(&GuestMsg::Hello {
+            init_version: "0.1.0".into(),
+            guest_mono_ns: 1_000,
+            guest_real_ns: 2_000,
+        });
+        assert_eq!(init.recv(), HostMsg::Config(session()));
+
+        init.send(&GuestMsg::Pong {
+            id: 77,
+            guest_mono_ns: 1,
+        });
+        let id = handle.ping().unwrap();
+        assert_eq!(init.recv(), HostMsg::Ping { id });
+        std::thread::sleep(Duration::from_millis(20));
+        init.send(&GuestMsg::Pong {
+            id,
+            guest_mono_ns: 5_000_000_000,
+        });
+        let deadline = Instant::now() + LIMIT;
+        while ctl.ping_outstanding() {
+            assert!(Instant::now() < deadline, "the pong was not seen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(init);
+        assert!(ctl.close(LIMIT));
+        writer.close().unwrap();
+
+        let syncs = records_of(&session_dir, "sync");
+        assert_eq!(syncs.len(), 1, "{syncs:?}");
+        let sync = &syncs[0];
+        assert_eq!(sync.ring, Ring::Host);
+        assert_eq!(sync.src, boxcar_proto::Source::Vmm);
+        assert_eq!(sync.subject, None);
+        assert_eq!(sync.ts_guest_ns, None);
+        let data = &sync.data;
+        assert_eq!(data["method"], "vsock_rtt");
+        assert_eq!(data["guest_mono_ns"], 5_000_000_000_u64);
+        let rtt = data["rtt_ns"].as_u64().unwrap();
+        assert!(
+            (20_000_000..5_000_000_000).contains(&rtt),
+            "the round trip covers the 20 ms wait: {rtt}"
+        );
+        let host_mono = data["host_mono_ns"].as_u64().unwrap();
+        assert_eq!(
+            data["offset_ns"].as_i64().unwrap(),
+            host_mono as i64 - 5_000_000_000_i64
+        );
+    }
+
+    /// With the sync thread started, the channel pings on its own: once
+    /// init is ready, then every interval; each answered ping is a `sync`.
+    /// The thread ends with the channel.
+    #[test]
+    fn the_sync_thread_pings_after_hello_and_every_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(tmp.path(), SessionId::new())).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let ctl = GuestCtl::new(session(), sink);
+        ctl.start_sync(Duration::from_millis(100));
+        let mut init = FakeInit::connect(&ctl);
+        init.send(&GuestMsg::Hello {
+            init_version: "0.1.0".into(),
+            guest_mono_ns: 1_000,
+            guest_real_ns: 2_000,
+        });
+        assert_eq!(init.recv(), HostMsg::Config(session()));
+        let mut ids = Vec::new();
+        let started = Instant::now();
+        while ids.len() < 3 {
+            match init.recv() {
+                HostMsg::Ping { id } => {
+                    ids.push(id);
+                    init.send(&GuestMsg::Pong {
+                        id,
+                        guest_mono_ns: 10 * id,
+                    });
+                }
+                other => panic!("not a ping: {other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "three pings a 100 ms interval apart took {:?}",
+            started.elapsed()
+        );
+        assert!(ids.windows(2).all(|w| w[1] > w[0]), "{ids:?}");
+        drop(init);
+        assert!(ctl.close(LIMIT), "the sync thread ended with the channel");
+        writer.close().unwrap();
+        let syncs = records_of(&session_dir, "sync");
+        assert!(syncs.len() >= 3, "{}", syncs.len());
+        assert_eq!(syncs[2].data["guest_mono_ns"], 10 * ids[2]);
     }
 
     #[test]

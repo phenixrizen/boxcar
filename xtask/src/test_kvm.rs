@@ -55,6 +55,9 @@ enum Milestone {
     /// `policy`), with `BOXCAR_TEST_NET=1` when this host resolves
     /// example.com (else `0`, and they skip saying why).
     M2,
+    /// M3: everything M2 runs, with the sensor in the initramfs and the
+    /// reconciler beside the log, plus the M3 end-to-end tests (`kvm_m3`).
+    M3,
 }
 
 impl Milestone {
@@ -62,6 +65,7 @@ impl Milestone {
         match self {
             Milestone::M1 => "m1",
             Milestone::M2 => "m2",
+            Milestone::M3 => "m3",
         }
     }
 
@@ -70,7 +74,7 @@ impl Milestone {
     fn net_env(self) -> &'static str {
         match self {
             Milestone::M1 => "0",
-            Milestone::M2 => {
+            Milestone::M2 | Milestone::M3 => {
                 if example_com_resolves() {
                     "1"
                 } else {
@@ -100,7 +104,7 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
         return Ok(());
     }
     let net = args.milestone.net_env();
-    if args.milestone == Milestone::M2 && net == "0" {
+    if args.milestone != Milestone::M1 && net == "0" {
         println!("test-kvm m2: this host does not resolve example.com; the network tests skip");
     }
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
@@ -121,7 +125,7 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
 /// The arguments after `cargo` that run `milestone`'s gated tests.
 fn cargo_test_args(milestone: Milestone) -> Vec<OsString> {
     let args: &[&str] = match milestone {
-        Milestone::M1 | Milestone::M2 => &[
+        Milestone::M1 | Milestone::M2 | Milestone::M3 => &[
             "test",
             "-p",
             "boxcar-vmm",
@@ -236,7 +240,19 @@ mod tests {
             strings(cargo_test_args(Milestone::M2)),
             strings(cargo_test_args(Milestone::M1))
         );
-        assert_eq!((Milestone::M1.name(), Milestone::M2.name()), ("m1", "m2"));
+        assert_eq!(
+            (
+                Milestone::M1.name(),
+                Milestone::M2.name(),
+                Milestone::M3.name()
+            ),
+            ("m1", "m2", "m3")
+        );
+        assert_eq!(
+            strings(cargo_test_args(Milestone::M3)),
+            strings(cargo_test_args(Milestone::M2))
+        );
+        assert_eq!(Milestone::M3.net_env(), Milestone::M2.net_env());
         // M1 never reaches the network.
         assert_eq!(Milestone::M1.net_env(), "0");
         assert!(["0", "1"].contains(&Milestone::M2.net_env()));

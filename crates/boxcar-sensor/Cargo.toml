@@ -1,0 +1,26 @@
+[package]
+name = "boxcar-sensor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The boxcar guest sensor: loads the eBPF programs and streams ring 1 records to the VMM over vsock"
+
+# build.rs builds the eBPF programs (crates/boxcar-sensor-ebpf) on the pinned
+# nightly through aya-build and embeds the object. AYA_BUILD_SKIP=1 embeds an
+# empty object instead: the sensor then reports `degraded` and heartbeats.
+
+[dependencies]
+aya = { workspace = true }
+boxcar-proto = { workspace = true }
+boxcar-sensor-common = { workspace = true, features = ["user"] }
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+
+[dev-dependencies]
+aya-obj = { workspace = true }

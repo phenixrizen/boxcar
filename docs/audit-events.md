@@ -7,6 +7,8 @@ Every record is one line of JSON in `<data_dir>/sessions/<session_id>/`
 schema` writes their JSON Schema to `proto/schema/audit-v1.json`. `boxcar
 audit verify` checks a log; `boxcar events` streams a running session's
 records; `proto/testdata/audit-v1.jsonl` is a golden six-record session.
+Records come from two rings: ring 0 is observed on the host, ring 1 is
+reported from inside the guest by its sensor (`proc.*`).
 
 ## The envelope
 
@@ -16,12 +18,12 @@ records; `proto/testdata/audit-v1.jsonl` is a golden six-record session.
 | `session_id` | string | A lowercase hyphenated UUIDv7, the session's. |
 | `seq` | u64 | The record's position in the session, from 1 with no gaps; the single writer assigns it. |
 | `ring` | 0 or 1 | 0: observed on the host, where the guest cannot alter it. 1: reported from inside the guest. |
-| `src` | string | Who made the record: `vmm`, `fs`, `net`, `vsock`, `control`, `session`, `policy` (and, later, `pty`, `guest`, `sensor`, `reconciler`, `gateway`). |
+| `src` | string | Who made the record: `vmm`, `fs`, `net`, `vsock`, `control`, `session`, `policy`, `sensor` (ring 1), `reconciler` (and, later, `pty`, `guest`, `gateway`). |
 | `type` | string | The dotted event type, below. New types are additive; a reader ignores types it does not know. |
 | `ts_host_ns` | u64 | Host `CLOCK_REALTIME`, nanoseconds since the epoch, when the writer took the event. The one timestamp that joins events across rings. |
 | `ts_mono_ns` | u64 | Host `CLOCK_MONOTONIC` at the same moment. |
-| `ts_guest_ns` | u64, optional | The guest's clock, for events reported from inside the guest. |
-| `subject` | `{pid, uid, gid}`, optional | The guest process the event is attributed to. For `fs.*`, the pid is the guest *thread* id from the FUSE header. |
+| `ts_guest_ns` | u64, optional | The guest's `CLOCK_MONOTONIC`, for events reported from inside the guest; `sync` records pair it with the host's clocks. |
+| `subject` | `{pid, uid, gid}`, optional | The guest process the event is attributed to. The pid is the guest *thread* id in both rings: from the FUSE header for `fs.*`, from the sensor for `proc.*`. |
 | `data` | object | The payload, shaped by `type`. |
 | `span` | `{trace_id, span_id}`, optional | Where the event sits in a trace (M4). |
 | `prev` | string | The previous record's `hash`; for the first record, `b3:` + blake3 of the session id's text. |
@@ -158,6 +160,47 @@ session's process (uid and gid as configured).
 |---|---|---|
 | `policy.changed` | `by_pid`, `version` | A control client replaced the session's policy (`policy.update`): the network rules, the vsock allowlist, or both. `version` is 1 for the policy the VM started with, one more for each update; `policy.get` reports it. The flows the new policy denies end with `net.close{reason:"policy"}`. |
 
+## `sync` (host, src `vmm`)
+
+| Type | Fields | When |
+|---|---|---|
+| `sync` | `method` (`vsock_rtt`), `guest_mono_ns`, `host_mono_ns`, `offset_ns`, `rtt_ns` | The VMM pinged init over the control channel and init answered: the guest's `CLOCK_MONOTONIC` when it answered, the host's at the round trip's midpoint, `host_mono_ns - guest_mono_ns`, and the round trip, which bounds how sure the pairing is. The first comes right after the session's config, then one every 10 s. `ts_host_ns` stays the one timestamp that joins events across rings; `sync` says how the guest's `ts_guest_ns` relates to it. |
+
+## `proc.*` (guest, ring 1, src `sensor`)
+
+Reported by the sensor init starts in the guest before privileges drop, over
+vsock port 1026, for processes in the session's cgroup. Every record carries
+`ts_guest_ns`; all but the sensor's own (`proc.heartbeat`,
+`proc.sensor_status`) carry a `subject`, whose pid is the thread. Ring 1 is
+corroboration, not the record: the guest can silence it, and the silence
+shows (the heartbeats stop; `status` says `silent`). `tid` and `tgid` are
+the thread and its process; `start_ns`, the process's start on the guest's
+clock, tells a process from a later one with the same pid.
+
+| Type | Fields | When |
+|---|---|---|
+| `proc.exec` | `tid`, `tgid`, `ppid`, `uid`, `gid`, `filename`, `argv [string]` (256 elements and 16 KiB at most), `argv_truncated`, `start_ns`, `cgroup_id` | A process ran a new program (`execve` succeeded). |
+| `proc.fork` | `parent_tid`, `parent_tgid`, `child_pid`, `child_start_ns`, `uid`, `gid`, `thread` | A process made a new process, or (`thread`) a new thread of its own; the reconciler ties the thread to the process, since `fs.*` records name threads. |
+| `proc.exit` | `tid`, `tgid`, `exit_code` (the kernel's status word), `group_dead`, `start_ns` | A thread ended; `group_dead` when it was its process's last. |
+| `proc.connect_attempt` | `tid`, `tgid`, `family`, `proto`, `dst` (*omitted* unless IPv4 or IPv6), `dst_port` (*omitted* the same) | A process asked to connect a socket, with the destination as asked. |
+| `proc.tcp_connect` | `tid`, `tgid`, `src`, `src_port`, `dst`, `dst_port` | The kernel sent a connection's first segment: the 4-tuple that joins the flow to `net.connect`. |
+| `proc.memfd` | `tid`, `tgid`, `name` (256 bytes at most), `flags` | A process made an anonymous memory file. |
+| `proc.file_open` | `tid`, `tgid`, `path`, `flags`, `sample` | One open in `sample`: the only sampled record of ring 1. |
+| `proc.lsm_deny` | `tid`, `tgid`, `hook` (`bpf` or `task_kill`), `detail` (the `bpf` command, or the signal) | The sensor's self-protection refused a `bpf()` call by another process, or a signal to the sensor. Written through to disk at once. |
+| `proc.heartbeat` | `uptime_ns`, `events_emitted`, `ringbuf_drops`, `frames_sent` | The sensor is alive: once a second, with its counters since it started. `ringbuf_drops` counts events the kernel could not place in the ring buffer: lost. |
+| `proc.sensor_status` | `phase` (`attached` or `degraded`), `programs [{name, attached, error?}]`, `kernel_release`, `btf_ok`, `session_cgroup_id`, `pid` (the sensor's own), `reason` (*omitted* unless one reason covers it) | What the sensor could attach, once it has tried, and again if that changes. |
+
+The sensor's stream is framed `[u32 LE len][json]`, each frame the record's
+`type` and `data` with `ts_guest_ns` and `subject` beside them, at most 64
+KiB; `proto/schema/sensor-v1.json` and `proto/testdata/sensor-v1.jsonl`
+describe it. A frame that is not a sensor's ends the stream.
+
+## `finding` (host, src `reconciler`)
+
+| Type | Fields | When |
+|---|---|---|
+| `finding` | `category` (`unattributed_effect`, `sensor_silence`, `intent_effect_mismatch`, `indicator_removal`, `off_book_channel`, `orphaned_work`, `network_anomaly`, `privilege_probe`, `policy_denial`), `score` (0 to 100), `rule`, `summary` (512 bytes at most), `evidence [{seq, ring}]` (the records the rule read, newest last), `span_id` (*omitted* until M4), `low_confidence` | The reconciler's conclusion from records of both rings. Never sampled; a score of 70 or more is written through to disk at once. The rules are in `docs/reconciler.md`. |
+
 ## Order and durability
 
 Records are chained in the order the single writer took them, which is the
@@ -166,6 +209,7 @@ is first; `vmm.stop` and a closing `checkpoint` are last. A `net.connect`
 precedes its flow's `net.tls` and `net.close`; `net.tls{allow}` is in the
 log before the first held byte reaches the host; `net.udp{allow}` before
 its first datagram does. Every record is on disk by the next checkpoint
-(within 2 s); `vmm.stop` is `fdatasync`ed at once. A writer that fails
+(within 2 s); `vmm.stop`, `proc.lsm_deny` and a `finding` scoring 70 or
+more are `fdatasync`ed at once. A writer that fails
 stops the VM (`boxcar run` exits 3) and cuts the log back to its last
 consistent record; `boxcar audit verify` accepts what is left.

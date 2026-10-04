@@ -29,7 +29,7 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
   events between responses.
 
 ```text
-<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net"]}
+<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","findings"]}
 -> {"v":1,"id":1,"op":"status"}
 <- {"v":1,"id":1,"ok":true,"result":{"state":"running",...}}
 -> {"v":1,"id":2,"op":"stop","mode":"graceful"}
@@ -43,7 +43,7 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
 **Hello** (the server's first line): `v` 1, `event` `"hello"`, `protocol`
 `"boxcar.control"`, `versions` `[1]`, `server` `"boxcar/<version>"`,
 `session_id`, and `capabilities`: the op families served beyond `status`
-and `stop`, today `["pty","audit","policy.net"]`.
+and `stop`, today `["pty","audit","policy.net","findings"]`.
 
 **Request**: `{"v":1,"id":N,"op":"<op>", ...}`. `id` is an unsigned
 64-bit integer the client chooses; every other field is a parameter of the
@@ -91,6 +91,9 @@ No parameters. The result:
 | `audit.next_seq` | u64 | The seq the log writer gives its next record. |
 | `audit.failed` | bool | The log writer has failed (which stops the VM). |
 | `devices` | string[] | The virtio devices present, by slot name in slot order: `fs:root`, `fs:workspace`, `net`, `vsock`. |
+| `sensor.state` | `off` / `waiting` / `attached` / `degraded` / `silent` | The guest's sensor (ring 1): `off` for a VM without one (no vsock device, or `--no-sensor`); `waiting` until it says what it attached; `attached` or `degraded` as it said (`proc.sensor_status`); `silent` once its stream ended or no heartbeat came for 3 s. A server from before the sensor sends no `sensor`; read it as `off`. |
+| `sensor.heartbeats` | u64 | Heartbeats taken so far. |
+| `sensor.last_heartbeat_ns` | u64, omitted until the first | Host `CLOCK_REALTIME`, in nanoseconds, when the last heartbeat arrived. |
 
 ### `stop`
 
@@ -149,8 +152,14 @@ control channel has too much waiting).
 Parameters, each optional: `from_seq` (u64; 1 when absent, and 0 means 1),
 `types` (string[]: type prefixes, at most 32, each 1 to 64 bytes; `"net."`
 takes every `net.*` record, `"fs.write"` that type; absent or empty takes
-every type), `pid` (u32: only records attributed to that guest process). A
-record must pass both filters.
+every type), `pid` (u32: only records attributed to that guest process),
+`min_score` (u8, 0 to 100: only records whose `data.score` is at least
+this; a record without a score passes, so with `types: ["finding"]` it keeps
+the findings that matter). A record must pass every filter given.
+
+Findings (`docs/reconciler.md`) are records like any other: a client that
+wants them pushed subscribes with `types: ["finding"]`; the `findings`
+capability says the server has a reconciler.
 
 The result is `{"next_seq":N,"sub":K}`: `N` is the seq the log's next record
 had when the subscription began (records below it come from the log on

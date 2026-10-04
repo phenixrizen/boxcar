@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use anyhow::{anyhow, Context};
-use boxcar_proto::control::{GuestStatus, Status};
+use boxcar_proto::control::{GuestStatus, SensorState, SensorStatus, Status};
 use serde_json::Value;
 
 use crate::cli::StatusArgs;
@@ -59,6 +59,7 @@ fn table(status: &Status) -> String {
         ("devices", devices),
         ("guest", guest(&status.guest)),
         ("audit", audit),
+        ("sensor", sensor(&status.sensor)),
     ];
     rows.iter()
         .map(|(name, value)| format!("{name:<8} {value}\n"))
@@ -99,6 +100,18 @@ fn uptime(ms: u64) -> String {
     }
 }
 
+/// The `sensor` row: its state, and its heartbeats when it has any to give.
+fn sensor(sensor: &SensorStatus) -> String {
+    let state = serde_json::to_value(sensor.state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    match sensor.state {
+        SensorState::Off => state,
+        _ => format!("{state}, {} heartbeats", sensor.heartbeats),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use boxcar_proto::control::{AuditStatus, SessionOutcome, VmState};
@@ -116,6 +129,7 @@ mod tests {
     #[test]
     fn the_table_has_one_row_per_field() {
         let status = Status {
+            sensor: Default::default(),
             state: VmState::Stopping,
             session_id: "s".into(),
             pid: 9,
@@ -146,7 +160,21 @@ mod tests {
              memory   256 MiB\n\
              devices  none\n\
              guest    init ready, session pid 12, session killed by signal 9\n\
-             audit    next seq 4, failed\n"
+             audit    next seq 4, failed\n\
+             sensor   off\n"
+        );
+        let attached = Status {
+            sensor: SensorStatus {
+                state: SensorState::Attached,
+                heartbeats: 61,
+                last_heartbeat_ns: Some(1),
+            },
+            ..status
+        };
+        assert!(
+            table(&attached).ends_with("sensor   attached, 61 heartbeats\n"),
+            "{}",
+            table(&attached)
         );
     }
 }
