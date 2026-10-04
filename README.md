@@ -165,6 +165,60 @@ boxcar run ... --allow example.com --allow '*.github.com:443' \
   [docs/networking.md](docs/networking.md) for what the network does and
   does not do.
 
+## The sensor
+
+Ring 0 of the log is what the host sees: every file operation, every
+connection, every vsock request, observed where the guest cannot alter it.
+Ring 1 is what the guest reports about itself: a small eBPF sensor that
+init starts from the initramfs before the session's privileges drop, and
+that streams to the VMM over vsock port 1026. It reports, for processes in
+the session's cgroup:
+
+- `proc.exec` (the program and its arguments), `proc.fork` (processes and
+  threads), `proc.exit`;
+- `proc.connect_attempt` (a `connect()` as asked) and `proc.tcp_connect`
+  (the 4-tuple once the port is chosen), which is what ties a connection to
+  a process;
+- `proc.memfd` (anonymous memory files) and a sample of `proc.file_open`;
+- `proc.lsm_deny`: the sensor's own protection refused something, a
+  `bpf()` call or a signal to the sensor;
+- `proc.heartbeat` once a second, and `proc.sensor_status` with what it
+  could attach.
+
+Ring 1 is corroboration, not the record. A guest that is root inside can
+still try to silence it; the silence shows (the heartbeats stop, `boxcar
+status` says `silent`, and the reconciler says so). `boxcar run
+--no-sensor` runs without it; `status.sensor` then says `off`. The
+programs are built on a pinned nightly and embedded in the sensor
+(`CONTRIBUTING.md`, "The eBPF lane"); their licence is `MIT OR GPL-2.0`
+(`docs/ebpf-license.md`).
+
+## Findings
+
+The reconciler reads the log beside the VM, joins the rings (a file
+effect to the process whose thread made it, a flow to the process that
+connected), and writes `finding` records into the same log: a category, a
+score from 0 to 100, the rule, a sentence, and the records it read as
+evidence. The rules are in `docs/reconciler.md`; in short:
+
+| Category | Score | Fires when |
+|---|---|---|
+| `indicator_removal` | 90 | a shell history, a log, `ld.so.preload` or a file under `/root/.ssh` is removed or truncated |
+| `sensor_silence` | 85 | the sensor never reports, or its heartbeats stop while the session keeps acting |
+| `privilege_probe` | 80 | the sensor's guards refuse a `bpf()` call or a signal to the sensor |
+| `off_book_channel` | 75 | `memfd_create`, or an open under `/dev/shm` |
+| `network_anomaly` | 60 to 70 | a connection to an address no DNS answer named; a TLS server name that resolves elsewhere; a DNS rate or entropy spike |
+| `unattributed_effect` | 60 | a file effect by a thread no reported process owns |
+| `policy_denial` | 40 | the policy denied a query, a connection or a vsock request |
+
+```
+boxcar events --type finding --min-score 70      # the ones that matter, live
+boxcar events --type finding                     # all of them
+```
+
+A finding whose join rested on a weak clock pairing, or on records the
+reconciler missed, is marked `low_confidence` and scores 20 lower.
+
 ## Attach
 
 A session's terminal is the runtime's, not your terminal's: `boxcar run`

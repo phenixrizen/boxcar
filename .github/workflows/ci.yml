@@ -135,5 +135,5 @@ jobs:
           cargo xtask initramfs
           cargo xtask rootfs alpine
 
-      - name: KVM-gated tests, M2
-        run: cargo xtask test-kvm m2
+      - name: KVM-gated tests, M3
+        run: cargo xtask test-kvm m3

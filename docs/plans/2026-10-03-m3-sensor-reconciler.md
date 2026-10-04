@@ -389,3 +389,28 @@ Made while writing the plan, 2026-10-03:
   both the fork field and the subscription's `min_score` example, and a
   commit with only the first would not build. The commit message says
   which parts are which.
+
+### Task 6
+
+- The end-to-end harness (artifacts from the environment, the scratch
+  directory, `boxcar run` watched, the other commands, the verified log)
+  moved from `kvm_m2.rs` to `tests/kvm_harness/mod.rs`, which both suites
+  include; the M2 tests are unchanged otherwise.
+- The blocked-download test connects to the address this host resolves
+  `example.com` to, so no DNS record names it and the reconciler's
+  `connect_without_dns` fires beside `policy_denial`; the plan's
+  `blocked.example` does not resolve, and a name the DNS refuses never
+  reaches a connection.
+- The streaming test asks for `--min-score 70` and triggers a history wipe
+  (90) beside the denied download (40 and 60), so exactly one finding is
+  streamed and the lower two are checked in the log.
+- `cargo xtask test-kvm m3` runs the same packages as `m2`, with the same
+  network rule; the milestones differ only in what the artifacts contain.
+  CI's KVM job runs `m3`.
+- Hand-off: `cargo xtask test-kvm m3` on 2026-10-03 at the Task 6 commit:
+  403 tests passed, 0 failed, none skipped (example.com reachable), in the
+  gated suites of `boxcar-vmm` (`boot_hello`, `boot_console`, `boot_smp`,
+  `boot_net`, `boot_vsock`, `boot_session`, `boot_attach`, `boot_sensor`,
+  `smoke`) and `boxcar` (`kvm_m1`, `kvm_m2`, `kvm_m3`) plus the packages'
+  unit and CLI tests. Every other command of section 2 was clean at the
+  same commit, `cargo xtask sensor` included.
