@@ -298,6 +298,11 @@ pub struct EventsArgs {
     /// Only records attributed to the guest process with this pid.
     #[arg(long, value_name = "PID")]
     pub pid: Option<u32>,
+
+    /// Only records whose score is at least this (findings carry one; a
+    /// record without a score passes). 0 to 100.
+    #[arg(long, value_name = "SCORE", value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub min_score: Option<u8>,
 }
 
 #[derive(Debug, Args)]

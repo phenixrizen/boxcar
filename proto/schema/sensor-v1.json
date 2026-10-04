@@ -2246,7 +2246,7 @@
       }
     },
     "ProcFork": {
-      "description": "`proc.fork`: a process in the session made a new process. New threads are not reported.",
+      "description": "`proc.fork`: a process in the session made a new process, or a new thread (`thread`): the reconciler needs both, since the filesystem records name the thread that acted.",
       "type": "object",
       "required": [
         "child_pid",
@@ -2258,13 +2258,13 @@
       ],
       "properties": {
         "child_pid": {
-          "description": "The new process's id (its leader thread's, the same).",
+          "description": "The new process's id (its leader thread's, the same), or the new thread's id.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "child_start_ns": {
-          "description": "The new process's start time on the guest's clock.",
+          "description": "The new task's start time on the guest's clock.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -2283,6 +2283,11 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        },
+        "thread": {
+          "description": "Whether the new task is a thread of the parent's process rather than a process of its own.",
+          "default": false,
+          "type": "boolean"
         },
         "uid": {
           "type": "integer",

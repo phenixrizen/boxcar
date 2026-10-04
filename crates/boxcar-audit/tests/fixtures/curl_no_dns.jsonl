@@ -1,0 +1,1 @@
+{"category":"network_anomaly","score":60,"rule":"connect_without_dns","summary":"wget (pid 212) connected to 93.184.216.34:80 (tcp), an address no DNS answer named in the last minute","evidence":[{"seq":4,"ring":1},{"seq":5,"ring":1},{"seq":6,"ring":0}],"low_confidence":false}

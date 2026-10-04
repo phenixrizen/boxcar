@@ -77,6 +77,7 @@ pub fn run(args: &EventsArgs) -> anyhow::Result<ExitCode> {
         from_seq: args.from,
         types: args.types.clone(),
         pid: args.pid,
+        min_score: args.min_score,
     };
     params
         .check()

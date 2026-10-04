@@ -1,0 +1,2 @@
+{"category":"sensor_silence","score":85,"rule":"heartbeat_lost","summary":"no heartbeat from the sensor for over 3 s while the session kept acting; the last came at seq 4","evidence":[{"seq":4,"ring":1}],"low_confidence":false}
+{"category":"sensor_silence","score":85,"rule":"heartbeat_lost","summary":"no heartbeat from the sensor for over 3 s while the session kept acting; the last came at seq 7","evidence":[{"seq":7,"ring":1}],"low_confidence":false}

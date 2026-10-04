@@ -247,6 +247,7 @@ pub fn sensor_lines() -> Result<Vec<u8>> {
                 child_start_ns: 1_499_990_000,
                 uid: 1000,
                 gid: 1000,
+                thread: false,
             }),
         ),
         frame(
@@ -411,7 +412,9 @@ pub fn control_lines() -> Result<Vec<u8>> {
         out.extend(message.line()?);
         Ok(())
     };
-    let capabilities = ["pty", "audit", "policy.net"].map(str::to_owned).to_vec();
+    let capabilities = ["pty", "audit", "policy.net", "findings"]
+        .map(str::to_owned)
+        .to_vec();
     line(&Ready {
         ready: true,
         control: format!("/run/user/1000/boxcar/{SESSION}/control.sock"),
@@ -491,6 +494,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
             from_seq: Some(1),
             types: vec!["net.".to_owned()],
             pid: Some(212),
+            min_score: Some(70),
         })?,
     ))?;
     line(&Response::success(

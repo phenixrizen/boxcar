@@ -33,6 +33,7 @@ pub const SESSIONS_DIR: &str = "sessions";
 pub mod chain;
 mod checkpoint;
 pub mod reader;
+pub mod reconcile;
 mod segment;
 pub mod sink;
 pub mod subscribe;
@@ -41,6 +42,9 @@ pub mod writer;
 
 pub use chain::{Chainer, PartialRecord};
 pub use reader::{Filter, LogReader, Records};
+pub use reconcile::{
+    Clock, ManualClock, ReconcileConfig, Reconciler, ReconcilerHandle, SystemClock,
+};
 pub use segment::{Fdatasync, Syncer};
 pub use sink::{AuditSink, EmitError, Priority, Submission};
 pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE, REPLAY_YIELD};

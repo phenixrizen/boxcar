@@ -141,14 +141,14 @@ pub struct ExecEvent {
     pub argv: [u8; ARGV_MAX],
 }
 
-/// `Kind::Fork`: a new process (not a new thread). The header is the
-/// parent's.
+/// `Kind::Fork`: a new task: a process, or a thread of the parent's process
+/// (`thread` 1). The header is the parent's.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ForkEvent {
     pub header: Header,
     pub child_pid: u32,
-    pub _pad: u32,
+    pub thread: u32,
     pub child_start_ns: u64,
 }
 

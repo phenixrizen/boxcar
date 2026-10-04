@@ -17,7 +17,9 @@ use std::{env, fs, io};
 
 use anyhow::{bail, Context};
 use arc_swap::ArcSwap;
-use boxcar_audit::{AuditSink, WriterConfig, WriterHandle};
+use boxcar_audit::{
+    AuditSink, ReconcileConfig, Reconciler, SystemClock, WriterConfig, WriterHandle,
+};
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_net::{NetConfig, Policy};
 use boxcar_proto::control::{to_line, Ready};
@@ -233,6 +235,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             ..AuditFsOptions::default()
         },
     };
+    // The reconciler reads the log beside the VM and writes its findings
+    // into it; it ends at `vmm.stop`, or when asked below.
+    let reconciler = Reconciler::spawn(
+        audit.clone(),
+        ReconcileConfig {
+            sensor_expected: sensor,
+            clock: Arc::new(SystemClock),
+        },
+    )
+    .context("cannot start the reconciler")?;
     // The VM's stop sequence resets the virtio-fs devices, which records
     // the closes of files the guest left open, before `run` returns.
     let outcome = match Vmm::new(cfg) {
@@ -278,7 +290,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             Err(error)
         }
     };
-    // Drains every accepted record (vmm.stop included), checkpoints, syncs.
+    // The reconciler's last findings, then the log: drains every accepted
+    // record (vmm.stop included), checkpoints, syncs.
+    if !reconciler.finish(Duration::from_secs(5)) {
+        tell("the reconciler did not finish in time; its last findings may be missing");
+    }
     let closed = writer.close();
     // What follows is said with `tell`: the VM is stopped, and a stderr that
     // is stalled (shared with a console whose reader stopped) must not keep

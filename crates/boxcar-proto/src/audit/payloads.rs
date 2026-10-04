@@ -729,19 +729,25 @@ pub struct ProcExec {
     pub cgroup_id: u64,
 }
 
-/// `proc.fork`: a process in the session made a new process. New threads
-/// are not reported.
+/// `proc.fork`: a process in the session made a new process, or a new
+/// thread (`thread`): the reconciler needs both, since the filesystem
+/// records name the thread that acted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProcFork {
     pub parent_tid: u32,
     pub parent_tgid: u32,
-    /// The new process's id (its leader thread's, the same).
+    /// The new process's id (its leader thread's, the same), or the new
+    /// thread's id.
     pub child_pid: u32,
-    /// The new process's start time on the guest's clock.
+    /// The new task's start time on the guest's clock.
     pub child_start_ns: u64,
     pub uid: u32,
     pub gid: u32,
+    /// Whether the new task is a thread of the parent's process rather than
+    /// a process of its own.
+    #[serde(default)]
+    pub thread: bool,
 }
 
 /// `proc.exit`: a thread in the session ended. `group_dead` when it was the

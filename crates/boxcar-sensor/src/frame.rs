@@ -133,6 +133,7 @@ fn fork(header: &Header, ev: &ForkEvent) -> ProcFork {
         child_start_ns: ev.child_start_ns,
         uid: header.uid,
         gid: header.gid,
+        thread: ev.thread != 0,
     }
 }
 
@@ -384,6 +385,25 @@ mod tests {
             "2001:db8::2".parse::<std::net::IpAddr>().unwrap()
         );
         assert_eq!((connect.src_port, connect.dst_port), (40000, 443));
+    }
+
+    #[test]
+    fn forks_tell_threads_from_processes() {
+        // SAFETY: all-zero bytes are a valid event.
+        let mut ev: boxcar_sensor_common::ForkEvent = unsafe { core::mem::zeroed() };
+        ev.header = header(Kind::Fork);
+        ev.child_pid = 213;
+        ev.child_start_ns = 77;
+        for (flag, is_thread) in [(0u32, false), (1u32, true)] {
+            ev.thread = flag;
+            let frame = frame_from_event(bytes(&ev)).unwrap();
+            let Payload::ProcFork(fork) = frame.payload else {
+                unreachable!()
+            };
+            assert_eq!((fork.parent_tid, fork.parent_tgid), (212, 210));
+            assert_eq!((fork.child_pid, fork.child_start_ns), (213, 77));
+            assert_eq!(fork.thread, is_thread);
+        }
     }
 
     #[test]

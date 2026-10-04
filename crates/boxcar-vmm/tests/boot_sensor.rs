@@ -9,7 +9,8 @@
 //!
 //! - the sensor connects, attaches every program (`proc.sensor_status` says
 //!   `attached`, `btf_ok`, nine programs), heartbeats, and `status.sensor`
-//!   says so while the VM runs;
+//!   says so while the VM runs; init waited for it, so the session's own
+//!   exec is the first thing ring 1 reports about the session;
 //! - the host's ping right after the config is answered, and the log holds
 //!   the clocks' pairing as a `sync` record;
 //! - what the session does shows up as ring 1 records with the guest's
@@ -272,7 +273,7 @@ fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
     let (seen_tx, seen) = mpsc::channel();
     let Some(run) = run(
         Options {
-            argv: &["/bin/sh", "-c", "sleep 3; ls -l / > /dev/null; exit 0"],
+            argv: &["/bin/sh", "-c", "ls -l / > /dev/null; sleep 3; exit 0"],
             user: None,
             sensor: true,
             workspace_files: Vec::new(),
@@ -341,12 +342,24 @@ fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
         syncs[0]
     );
 
-    // The shell forked `sleep` and `ls`; `ls` ran with its arguments and the
-    // shell as its parent, and ended as the last of its process.
+    // Init waited for the sensor before the session: the shell's own exec is
+    // the first ring 1 record of the session, before anything it did.
     let session_pid = of_kind(&records, "session.start")[0].data["pid"]
         .as_u64()
         .unwrap();
     let execs = of_kind(&records, "proc.exec");
+    let shell = execs
+        .iter()
+        .find(|r| r.data["tgid"] == session_pid)
+        .unwrap_or_else(|| {
+            panic!(
+                "no exec of the shell (pid {session_pid}) among {execs:?}\n{}",
+                run.describe()
+            )
+        });
+    assert_eq!(shell.data["argv"][0], "/bin/sh", "{shell:?}");
+    // The shell forked `ls` and `sleep`; `ls` ran with its arguments and the
+    // shell as its parent, and ended as the last of its process.
     let ls = execs
         .iter()
         .find(|r| r.data["argv"][0] == "ls")

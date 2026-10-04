@@ -341,3 +341,51 @@ Made while writing the plan, 2026-10-03:
   graceful-stop test, whose VM is stopped well under a second after init
   is ready, before the first pong can land, to the sensor test whose
   session runs for seconds.
+
+### Task 5
+
+- `proc.fork` reports new threads too (`thread: true`), against the plan's
+  "new threads are not reported": the filesystem records name the thread
+  that acted, and a multi-threaded process (a build tool, a runtime) would
+  otherwise have every effect of its worker threads unattributed. The
+  event struct's padding word became the flag, so its size is unchanged.
+- Init waits for the sensor to say it is attached (a byte on a pipe passed
+  as `--ready-fd`, up to 3 s) before it starts the session. Without the
+  wait the session's own exec and its first actions fall before the
+  programs are on, and the new attribution rule would flag them; with it,
+  the gated test asserts the shell's exec is ring 1's first record about the
+  session. A sensor that is not ready in time, or dies, costs a warning,
+  not the session.
+- The scenario inputs are Rust builders in the test file, type-checked
+  against the payload structs, rather than `input.jsonl` files; only the
+  expected findings are fixtures, blessed with `BOXCAR_BLESS=1` like the
+  other goldens. Recorded inputs would need a guest, which the gated tests
+  cover.
+- `unattributed_effect` holds an effect for 2 s and re-checks it as process
+  records arrive, so an exec that lands after the effect it explains (the
+  two travel different paths) makes no finding; it fires only while the
+  sensor has reported `sched_process_exec`, `sched_process_fork` and
+  `sched_process_exit` attached, and only for effects with a subject
+  (network records have none; TCP flows join by 4-tuple instead and are not
+  judged unattributed in M3).
+- `connect_without_dns` also fires when the stack had no name for the
+  destination (`names` empty) even if the cache did not, and never for the
+  gateway. `policy_denial` covers `net.tls` too, which the plan's list left
+  out. The DNS spike rules fire once and stay quiet for the window.
+- Low confidence: a `sync` round trip over 2 ms, no `sync` for 30 s while
+  ring 1 heartbeats, or a subscription gap in the last minute; it marks the
+  findings that rest on a cross-ring join (`no_process`,
+  `connect_without_dns`, `heartbeat_lost`) and takes 20 points.
+- `findings` is the capability's name; findings reach clients as `audit`
+  events, with `min_score` on `audit.subscribe` (0 to 100) and `boxcar
+  events --min-score`.
+- The reconciler is started by `boxcar run` beside the writer and asked to
+  finish (5 s) before the writer closes; it also ends by itself at
+  `vmm.stop` after a last look at the timers. `vmm.stop` ends the silence
+  rules too, so a stopping VM makes no findings about a sensor that went
+  away with it.
+- The thread flag and init's wait for the sensor landed in the reconciler's
+  commit rather than one of their own: the regenerated schema file carries
+  both the fork field and the subscription's `min_score` example, and a
+  commit with only the first would not build. The commit message says
+  which parts are which.

@@ -530,6 +530,10 @@ pub struct AuditSubscribeParams {
     /// Only the records attributed to this guest process (`subject.pid`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Only records whose `data.score` is at least this (findings carry
+    /// one; a record without a score passes). 0 to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<u8>,
 }
 
 impl AuditSubscribeParams {
@@ -549,6 +553,11 @@ impl AuditSubscribeParams {
                     "a type prefix is 1 to {MAX_AUDIT_TYPE_LEN} bytes, not {}",
                     prefix.len()
                 ));
+            }
+        }
+        if let Some(score) = self.min_score {
+            if score > 100 {
+                return Err(format!("min_score {score}: 0 to 100"));
             }
         }
         Ok(())
@@ -1390,19 +1399,26 @@ mod tests {
         assert_eq!(none.check(), Ok(()));
         assert_eq!(serde_json::to_value(&none).unwrap(), json!({}));
 
-        let all: AuditSubscribeParams = serde_json::from_value(
-            json!({"from_seq": 0, "types": ["net.", "fs.write"], "pid": 42, "extra": 1}),
-        )
+        let all: AuditSubscribeParams = serde_json::from_value(json!({
+            "from_seq": 0, "types": ["net.", "fs.write"], "pid": 42, "min_score": 70, "extra": 1,
+        }))
         .unwrap();
         assert_eq!(
-            (all.from_seq, all.types.as_slice(), all.pid),
+            (all.from_seq, all.types.as_slice(), all.pid, all.min_score),
             (
                 Some(0),
                 ["net.".to_owned(), "fs.write".to_owned()].as_slice(),
-                Some(42)
+                Some(42),
+                Some(70)
             )
         );
         assert_eq!(all.check(), Ok(()));
+        assert_eq!(serde_json::to_value(&all).unwrap()["min_score"], json!(70));
+        // The score is 0 to 100: 101 parses as a u8 and fails the check.
+        let over: AuditSubscribeParams = serde_json::from_value(json!({"min_score": 101})).unwrap();
+        assert!(over.check().is_err());
+        let top: AuditSubscribeParams = serde_json::from_value(json!({"min_score": 100})).unwrap();
+        assert_eq!(top.check(), Ok(()));
 
         for bad in [
             json!({"from_seq": -1}),
@@ -1411,6 +1427,8 @@ mod tests {
             json!({"pid": 4294967296u64}),
             json!({"types": "net."}),
             json!({"types": [1]}),
+            json!({"min_score": 256}),
+            json!({"min_score": -1}),
         ] {
             assert!(
                 serde_json::from_value::<AuditSubscribeParams>(bad.clone()).is_err(),

@@ -180,7 +180,7 @@ clock, tells a process from a later one with the same pid.
 | Type | Fields | When |
 |---|---|---|
 | `proc.exec` | `tid`, `tgid`, `ppid`, `uid`, `gid`, `filename`, `argv [string]` (256 elements and 16 KiB at most), `argv_truncated`, `start_ns`, `cgroup_id` | A process ran a new program (`execve` succeeded). |
-| `proc.fork` | `parent_tid`, `parent_tgid`, `child_pid`, `child_start_ns`, `uid`, `gid` | A process made a new process. New threads are not reported. |
+| `proc.fork` | `parent_tid`, `parent_tgid`, `child_pid`, `child_start_ns`, `uid`, `gid`, `thread` | A process made a new process, or (`thread`) a new thread of its own; the reconciler ties the thread to the process, since `fs.*` records name threads. |
 | `proc.exit` | `tid`, `tgid`, `exit_code` (the kernel's status word), `group_dead`, `start_ns` | A thread ended; `group_dead` when it was its process's last. |
 | `proc.connect_attempt` | `tid`, `tgid`, `family`, `proto`, `dst` (*omitted* unless IPv4 or IPv6), `dst_port` (*omitted* the same) | A process asked to connect a socket, with the destination as asked. |
 | `proc.tcp_connect` | `tid`, `tgid`, `src`, `src_port`, `dst`, `dst_port` | The kernel sent a connection's first segment: the 4-tuple that joins the flow to `net.connect`. |

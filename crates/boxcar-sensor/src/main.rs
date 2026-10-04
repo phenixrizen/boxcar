@@ -13,6 +13,11 @@
 //! at all still connects and heartbeats, so its silence always means
 //! something. The stream's end (the VMM closed it) ends the sensor.
 //!
+//! Init hands over a pipe (`--ready-fd`) and waits for a byte on it before
+//! it starts the session, so the session's first exec is already seen; the
+//! byte goes out once the programs are attached, or once it is clear they
+//! will not be.
+//!
 //! `boxcar-sensor probe-bpf` and `probe-kill [PID]` are for the gated
 //! tests ([`probe`]).
 
@@ -68,6 +73,34 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--ready-fd=<n>`: where init waits for a byte once the programs are
+/// attached, if it does.
+fn ready_fd(args: &[String]) -> Result<Option<i32>, SensorError> {
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--ready-fd=") {
+            return value
+                .parse()
+                .map(Some)
+                .map_err(|_| SensorError::Args(format!("--ready-fd={value}: not a number")));
+        }
+    }
+    Ok(None)
+}
+
+/// Tells init the programs are on (or that they will not be): one byte,
+/// then the pipe closes.
+fn say_ready(fd: Option<i32>) {
+    let Some(fd) = fd else {
+        return;
+    };
+    // SAFETY: write and close take the descriptor init handed over; nothing
+    // else here uses it.
+    unsafe {
+        libc::write(fd, c"1".as_ptr().cast(), 1);
+        libc::close(fd);
+    }
+}
+
 /// `--session-cgroup=<id>`, or the inode of the session cgroup.
 fn session_cgroup(args: &[String]) -> Result<u64, SensorError> {
     for arg in args {
@@ -118,7 +151,14 @@ fn write_frame(out: &mut std::fs::File, frame: &SensorFrame) -> Result<(), Senso
 
 fn run(args: &[String]) -> Result<(), SensorError> {
     let cgroup = session_cgroup(args)?;
-    let mut out = vsock::connect().map_err(SensorError::Connect)?;
+    let ready = ready_fd(args)?;
+    let mut out = match vsock::connect() {
+        Ok(out) => out,
+        Err(error) => {
+            say_ready(ready);
+            return Err(SensorError::Connect(error));
+        }
+    };
     let pid = std::process::id();
     let facts = Facts {
         btf_ok: std::path::Path::new(BTF_PATH).exists(),
@@ -127,6 +167,8 @@ fn run(args: &[String]) -> Result<(), SensorError> {
         pid,
     };
     let loaded = load::load(cgroup, u64::from(pid));
+    // Attached, or as attached as it gets: init may start the session.
+    say_ready(ready);
     let mut heartbeat = Heartbeat::new(Instant::now());
     write_frame(
         &mut out,

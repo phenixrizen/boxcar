@@ -1278,6 +1278,7 @@ mod tests {
                     child_start_ns: 12_345_678_901,
                     uid: 1000,
                     gid: 1000,
+                    thread: false,
                 }),
                 json!({
                     "parent_tid": 200,
@@ -1286,6 +1287,7 @@ mod tests {
                     "child_start_ns": 12_345_678_901_u64,
                     "uid": 1000,
                     "gid": 1000,
+                    "thread": false,
                 }),
             ),
             (

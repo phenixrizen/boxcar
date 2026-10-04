@@ -1,0 +1,1 @@
+{"category":"indicator_removal","score":90,"rule":"indicator_removal","summary":"sh (pid 300) removed /home/agent/.ash_history, a shell history","evidence":[{"seq":4,"ring":1},{"seq":5,"ring":0}],"low_confidence":false}
