@@ -349,6 +349,20 @@ impl Policy {
         })
     }
 
+    /// Whether any `inspect` line could name a connection to `dst` the
+    /// guest knows by `names`: a network line holding the address on the
+    /// port, or a domain line matching one of the names on the port. The
+    /// relay then reads the connection's first bytes for the name it
+    /// shows, which [`inspects`](Self::inspects) decides on.
+    pub fn may_inspect(&self, dst: SocketAddrV4, names: &[String]) -> bool {
+        self.inspect.iter().any(|line| match &line.target {
+            Target::Domain { pattern, port } => {
+                on_port(*port, dst.port()) && names.iter().any(|name| name_matches(pattern, name))
+            }
+            Target::Cidr { net, port } => on_port(*port, dst.port()) && net.contains(*dst.ip()),
+        })
+    }
+
     /// The `inspect` line, if any, that names a connection to `dst` whose
     /// first bytes showed `name` (its TLS server name or HTTP `Host`): the
     /// first domain line matching the name on the port, or the first
@@ -1161,6 +1175,15 @@ mod tests {
             text(Policy::default().inspects(Some("a.test"), at([1, 2, 3, 4], 443))),
             None
         );
+        // Before the name is known: by the DNS names or the address.
+        let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(p.may_inspect(
+            at([203, 0, 113, 5], 443),
+            &names(&["cdn.example", "api.example.com"])
+        ));
+        assert!(!p.may_inspect(at([203, 0, 113, 5], 8443), &names(&["api.example.com"])));
+        assert!(p.may_inspect(at([127, 0, 0, 1], 8443), &[]));
+        assert!(!p.may_inspect(at([203, 0, 113, 5], 443), &[]));
     }
 
     #[test]

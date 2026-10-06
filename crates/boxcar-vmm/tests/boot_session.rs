@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use boxcar_audit::{verify_session, LogReader, WriterConfig};
 use boxcar_fs::{CachePolicyKind, FsShareConfig};
-use boxcar_net::SessionCa;
+use boxcar_net::{InspectConfig, SessionCa};
 use boxcar_proto::guest::HostMsg;
 use boxcar_proto::{Record, SessionId};
 use boxcar_vmm::guest_ctl::SessionConfig;
@@ -201,6 +201,9 @@ fn run_with(
     ca: Option<Arc<SessionCa>>,
     during: impl FnOnce(Beside) + Send + 'static,
 ) -> Option<Run> {
+    let inspect = ca.as_ref().map(|ca| {
+        Arc::new(InspectConfig::new(Arc::clone(ca), InspectConfig::host_roots(&[])).unwrap())
+    });
     let (kernel, initramfs, rootfs) = guest_or_skip(TEST)?;
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -230,7 +233,7 @@ fn run_with(
             state_dir: state.clone(),
             session_id: SessionId::new(),
         }),
-        inspect_ca: ca,
+        inspect,
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();

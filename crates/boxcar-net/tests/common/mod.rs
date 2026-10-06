@@ -8,6 +8,8 @@
 // Each test file uses its own part of this.
 #![allow(dead_code)]
 
+pub mod rig;
+
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::RawFd;
@@ -38,6 +40,7 @@ pub struct Harness {
     /// The stack's DNS upstream, on 127.0.0.1: nothing answers the stack
     /// unless the test does, and no query leaves the host.
     pub upstream: UdpSocket,
+    pub sink: boxcar_audit::AuditSink,
     writer: WriterHandle,
     _dir: TempDir,
 }
@@ -49,6 +52,28 @@ pub fn harness() -> Harness {
 
 pub fn harness_with(policy: Policy) -> Harness {
     harness_config(policy, |_| {})
+}
+
+/// A stack with the gate: flows the policy's `inspect` lines name have
+/// their TLS ended in the stack and their plaintext sent to `observer`.
+pub fn harness_gate(
+    policy: Policy,
+    gate: Option<(Arc<boxcar_net::InspectConfig>, boxcar_net::gate::Observer)>,
+) -> Harness {
+    let mut h = harness_config(policy, |_| {});
+    // The stack is rebuilt with the gate from the same pieces.
+    let stack = NetStack::new(
+        NetConfig {
+            dns_upstreams: vec![h.upstream.local_addr().unwrap()],
+            ..NetConfig::default()
+        },
+        h.sink.clone(),
+        Arc::clone(&h.policy),
+    )
+    .unwrap()
+    .with_inspect(gate);
+    h.stack = stack;
+    h
 }
 
 /// A stack whose config `change` adjusts from the default (the DNS
@@ -65,11 +90,12 @@ pub fn harness_config(policy: Policy, change: impl FnOnce(&mut NetConfig)) -> Ha
     change(&mut cfg);
     cfg.dns_upstreams = vec![upstream.local_addr().unwrap()];
     let policy = Arc::new(ArcSwap::from_pointee(policy));
-    let stack = NetStack::new(cfg, sink, Arc::clone(&policy)).unwrap();
+    let stack = NetStack::new(cfg, sink.clone(), Arc::clone(&policy)).unwrap();
     Harness {
         stack,
         policy,
         upstream,
+        sink,
         writer,
         _dir: dir,
     }

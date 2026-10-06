@@ -352,6 +352,7 @@ impl Log {
                 sni: Some(sni.into()),
                 alpn: vec!["h2".into()],
                 verdict: Verdict::Allow,
+                inspect: false,
             }),
         )
     }

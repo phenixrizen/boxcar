@@ -73,6 +73,8 @@ aya-build = "0.2"
 # assembly through `cc` on the host only, as blake3 does.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
+# The host's trust store, for the upstream leg.
+rustls-native-certs = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17"
 # Certificate validity (rcgen takes `time` types); the PEM is written here.

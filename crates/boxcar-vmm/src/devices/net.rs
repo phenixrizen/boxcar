@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
-use boxcar_net::{NetConfig, Policy, VirtioNet};
+use boxcar_net::{InspectConfig, NetConfig, Policy, VirtioNet};
 use boxcar_virtio::bus::Bus;
 use boxcar_virtio::{DeviceContext, MmioSlot, MmioTransport, SlotAllocator, VirtioDevice};
 use kvm_ioctls::VmFd;
@@ -23,6 +23,15 @@ use super::DeviceError;
 /// The virtio-net device behind its transport.
 pub type NetTransport = MmioTransport<VirtioNet>;
 
+/// What the network card is built from: the stack's config, where it
+/// records, the policy it reads, and the gate when the session inspects.
+pub struct NetSetup<'a> {
+    pub cfg: &'a NetConfig,
+    pub audit: &'a AuditSink,
+    pub policy: &'a Arc<ArcSwap<Policy>>,
+    pub inspect: Option<Arc<InspectConfig>>,
+}
+
 /// The VM's network card, if it has one.
 #[derive(Default)]
 pub struct NetDevice {
@@ -32,27 +41,32 @@ pub struct NetDevice {
 }
 
 impl NetDevice {
-    /// With `cfg`, creates the virtio-net device, whose stack records into
-    /// `audit` and reads `policy` at every decision: its fixed slot
+    /// With a `setup`, creates the virtio-net device, whose stack records
+    /// into its `audit` and reads its `policy` at every decision: its fixed slot
     /// reserved from `slots`, the eventfds and IRQ trigger registered with
     /// KVM (an ioeventfd for each queue on the slot's QueueNotify, the
     /// irqfd on its GSI), and the transport on `mmio` at the slot's base.
-    /// Without `cfg`, there is no device and the slot stays empty.
+    /// Without a setup, there is no device and the slot stays empty.
     pub fn attach(
         vm: &VmFd,
         mem: &Arc<GuestMemoryMmap>,
         mmio: &mut Bus,
         slots: &mut SlotAllocator,
-        cfg: Option<&NetConfig>,
-        audit: &AuditSink,
-        policy: &Arc<ArcSwap<Policy>>,
+        setup: Option<NetSetup<'_>>,
     ) -> Result<NetDevice, DeviceError> {
-        let Some(cfg) = cfg else {
+        let Some(NetSetup {
+            cfg,
+            audit,
+            policy,
+            inspect,
+        }) = setup
+        else {
             return Ok(NetDevice::default());
         };
         let slot = reserve(slots)?;
-        let device = VirtioNet::new(cfg.clone(), audit.clone(), Arc::clone(policy))
-            .map_err(DeviceError::Net)?;
+        let device =
+            VirtioNet::with_inspect(cfg.clone(), audit.clone(), Arc::clone(policy), inspect)
+                .map_err(DeviceError::Net)?;
         let policy_wake = device
             .policy_wake()
             .try_clone()

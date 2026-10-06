@@ -186,6 +186,9 @@ pub enum ConfigError {
     NoDnsUpstream,
     #[error("no DNS upstream could be given a socket: {0}")]
     DnsUpstream(String),
+    /// The gate's observer thread could not be started: the error's text.
+    #[error("cannot start the gate's observer thread: {0}")]
+    Observer(String),
     #[error("{0}")]
     TcpLimits(&'static str),
     #[error("{0}")]

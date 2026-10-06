@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use smoltcp::iface::SocketHandle;
 
 use super::TCP_TOKEN_BASE;
+use crate::gate::{Inspect, Observed};
 use crate::stack::Interest;
 
 /// Flow ids stay below this (2^62), which keeps the TCP and UDP token
@@ -80,6 +81,9 @@ pub enum FlowState {
     Gating,
     /// Moving bytes both ways.
     Relaying,
+    /// An inspected TLS flow: the gate's two legs are handshaking, or
+    /// moving plaintext between them ([`Flow::inspect`]).
+    Inspecting,
     /// Over, for this `net.close` reason (already recorded): its smoltcp
     /// socket is sending the guest a reset, and then the flow goes. A flow
     /// that ended because the guest sent data after its FIN keeps its host
@@ -135,6 +139,27 @@ pub struct Flow {
     pub opened: Instant,
     /// What the gate holds, while the flow is [`FlowState::Gating`].
     pub gate: Option<GateBuf>,
+    /// Whether a domain rule allowed the flow, so the gate must see the
+    /// name it asks for (a flow read only for inspection needs none).
+    pub gated: bool,
+    /// The gate's two TLS legs, while the flow is
+    /// [`FlowState::Inspecting`].
+    pub inspect: Option<Box<Inspect>>,
+    /// The `inspect` line that named the flow, for its records.
+    pub inspect_rule: Option<String>,
+    /// The flow's `net.inspect` has been made.
+    pub inspect_recorded: bool,
+    /// The observer has been told the flow is open (`Message::Open`), so it
+    /// is told when the flow closes.
+    pub observe_open: bool,
+    /// An inspected plain HTTP flow: its bytes go to the observer as they
+    /// are relayed.
+    pub observe_plain: bool,
+    /// What the observer has been given and owed.
+    pub observed: Observed,
+    /// Plaintext bytes the observer's channel had no room for since the
+    /// relay last counted them.
+    pub observe_dropped: u64,
     /// Guest bytes taken out of the smoltcp socket and not yet written to
     /// the host, written ahead of what the socket still holds: the gated
     /// bytes after a pass, and what the guest sent before its FIN (taken
@@ -186,7 +211,7 @@ impl Flow {
     ) -> Flow {
         // `TcpLimits::check` keeps the timeout to a day.
         let deadline = now.checked_add(gate_timeout).unwrap_or(now);
-        let gate = pending.gated.then(|| GateBuf::new(deadline));
+        let gate = (pending.gated || pending.inspectable).then(|| GateBuf::new(deadline));
         // The parked frame was classified as a TCP SYN, so it reads.
         let isn = crate::frame::tcp_seq(&pending.syn).unwrap_or(0);
         Flow {
@@ -204,6 +229,14 @@ impl Flow {
             rx: 0,
             opened: pending.opened,
             gate,
+            gated: pending.gated,
+            inspect: None,
+            inspect_rule: None,
+            inspect_recorded: false,
+            observe_open: false,
+            observe_plain: false,
+            observed: Observed::default(),
+            observe_dropped: 0,
             tail: Vec::new(),
             socket,
             last_active: now,
@@ -254,6 +287,9 @@ pub struct Pending {
     pub opened: Instant,
     /// Whether a domain rule allowed it: the flow will be gated.
     pub gated: bool,
+    /// Whether an `inspect` line may name it: its first bytes are read for
+    /// the name they show even when a network rule allowed it.
+    pub inspectable: bool,
     /// What the net thread watches the host socket for.
     pub(crate) watched: Interest,
 }
@@ -468,6 +504,7 @@ mod tests {
             syn: Vec::new(),
             opened,
             gated: false,
+            inspectable: false,
             watched: Interest::default(),
         }
     }

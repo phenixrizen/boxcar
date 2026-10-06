@@ -58,6 +58,10 @@ enum Milestone {
     /// M3: everything M2 runs, with the sensor in the initramfs and the
     /// reconciler beside the log, plus the M3 end-to-end tests (`kvm_m3`).
     M3,
+    /// M4: everything M3 runs, plus the M4 end-to-end tests (`kvm_m4`):
+    /// the model traffic gate, with inspected flows to example.com and to
+    /// test upstreams on the loopback.
+    M4,
 }
 
 impl Milestone {
@@ -66,6 +70,7 @@ impl Milestone {
             Milestone::M1 => "m1",
             Milestone::M2 => "m2",
             Milestone::M3 => "m3",
+            Milestone::M4 => "m4",
         }
     }
 
@@ -74,7 +79,7 @@ impl Milestone {
     fn net_env(self) -> &'static str {
         match self {
             Milestone::M1 => "0",
-            Milestone::M2 | Milestone::M3 => {
+            Milestone::M2 | Milestone::M3 | Milestone::M4 => {
                 if example_com_resolves() {
                     "1"
                 } else {
@@ -125,7 +130,7 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
 /// The arguments after `cargo` that run `milestone`'s gated tests.
 fn cargo_test_args(milestone: Milestone) -> Vec<OsString> {
     let args: &[&str] = match milestone {
-        Milestone::M1 | Milestone::M2 | Milestone::M3 => &[
+        Milestone::M1 | Milestone::M2 | Milestone::M3 | Milestone::M4 => &[
             "test",
             "-p",
             "boxcar-vmm",
@@ -253,6 +258,13 @@ mod tests {
             strings(cargo_test_args(Milestone::M2))
         );
         assert_eq!(Milestone::M3.net_env(), Milestone::M2.net_env());
+        // M4 runs the same packages and names itself too.
+        assert_eq!(
+            strings(cargo_test_args(Milestone::M4)),
+            strings(cargo_test_args(Milestone::M3))
+        );
+        assert_eq!(Milestone::M4.name(), "m4");
+        assert_eq!(Milestone::M4.net_env(), Milestone::M3.net_env());
         // M1 never reaches the network.
         assert_eq!(Milestone::M1.net_env(), "0");
         assert!(["0", "1"].contains(&Milestone::M2.net_env()));

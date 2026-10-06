@@ -66,13 +66,13 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// `m1` and `m2` are the milestones with gated tests.
+    /// `m1` to `m4` are the milestones with gated tests.
     #[test]
-    fn test_kvm_takes_m1_m2_and_m3() {
-        assert!(Cli::try_parse_from(["xtask", "test-kvm", "m1"]).is_ok());
-        assert!(Cli::try_parse_from(["xtask", "test-kvm", "m2"]).is_ok());
-        assert!(Cli::try_parse_from(["xtask", "test-kvm", "m3"]).is_ok());
-        for bad in [&["xtask", "test-kvm", "m4"][..], &["xtask", "test-kvm"]] {
+    fn test_kvm_takes_m1_to_m4() {
+        for milestone in ["m1", "m2", "m3", "m4"] {
+            assert!(Cli::try_parse_from(["xtask", "test-kvm", milestone]).is_ok());
+        }
+        for bad in [&["xtask", "test-kvm", "m5"][..], &["xtask", "test-kvm"]] {
             let error = Cli::try_parse_from(bad).err().unwrap();
             assert_eq!(error.exit_code(), 2, "{bad:?}: {error}");
         }

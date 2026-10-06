@@ -123,13 +123,17 @@ pub enum DropReason {
     /// guest's address. (DHCP, answered by the gateway itself, may come
     /// from any address.)
     SrcSpoof,
+    /// Plaintext of an inspected flow the observer's channel had no room
+    /// for: the flow went on at the relay's pace, the observer's copy has
+    /// a hole (counted in bytes, not frames).
+    Observe,
     /// Anything else: an unknown protocol, or a malformed frame.
     Other,
 }
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 13] = [
+    pub const ALL: [DropReason; 14] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
@@ -142,6 +146,7 @@ impl DropReason {
         DropReason::QueueFull,
         DropReason::TcpPendingFull,
         DropReason::SrcSpoof,
+        DropReason::Observe,
         DropReason::Other,
     ];
 
@@ -160,6 +165,7 @@ impl DropReason {
             DropReason::QueueFull => "queue_full",
             DropReason::TcpPendingFull => "tcp_pending_full",
             DropReason::SrcSpoof => "src_spoof",
+            DropReason::Observe => "observe",
             DropReason::Other => "other",
         }
     }
@@ -406,6 +412,7 @@ pub(crate) mod tests {
                 "queue_full",
                 "tcp_pending_full",
                 "src_spoof",
+                "observe",
                 "other"
             ]
         );

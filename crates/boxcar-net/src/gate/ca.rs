@@ -241,6 +241,28 @@ impl SessionCa {
     }
 }
 
+/// The `CERTIFICATE` blocks of `pem`, as DER; blocks that do not decode
+/// are left out, and anything that is not a certificate block is ignored.
+pub fn pem_certificates(pem: &str) -> Vec<CertificateDer<'static>> {
+    let mut certs = Vec::new();
+    let mut body: Option<String> = None;
+    for line in pem.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN CERTIFICATE-----" {
+            body = Some(String::new());
+        } else if line == "-----END CERTIFICATE-----" {
+            if let Some(text) = body.take() {
+                if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(text) {
+                    certs.push(CertificateDer::from(der));
+                }
+            }
+        } else if let Some(text) = body.as_mut() {
+            text.push_str(line);
+        }
+    }
+    certs
+}
+
 /// `der` as a PEM `CERTIFICATE` block: base64 in lines of 64.
 pub fn pem_certificate(der: &[u8]) -> String {
     let body = base64::engine::general_purpose::STANDARD.encode(der);
@@ -367,6 +389,28 @@ mod tests {
             .decode(body)
             .unwrap();
         assert_eq!(der, ca.cert_der().as_ref());
+    }
+
+    /// The PEM the CA writes reads back as its DER; other blocks and
+    /// noise are passed over.
+    #[test]
+    fn pem_certificates_reads_what_pem_certificate_writes() {
+        let ca = make_ca();
+        let other = make_ca();
+        let text = format!(
+            "# roots\n{}-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n{}junk\n",
+            ca.pem(),
+            other.pem()
+        );
+        let certs = pem_certificates(&text);
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0], *ca.cert_der());
+        assert_eq!(certs[1], *other.cert_der());
+        assert!(pem_certificates("").is_empty());
+        assert!(
+            pem_certificates("-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n")
+                .is_empty()
+        );
     }
 
     #[test]

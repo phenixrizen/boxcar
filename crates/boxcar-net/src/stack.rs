@@ -66,6 +66,7 @@ use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{self, ForwardError, Forwarder, Pending, Received};
 use crate::dns::{self as dns, parse};
 use crate::frame::{self, classify, Dispatch, DNS_PORT};
+use crate::gate::{InspectConfig, Observer};
 use crate::policy::{Policy, Verdict};
 use crate::tcp::flow::FlowIds;
 use crate::tcp::relay::Relay;
@@ -137,6 +138,10 @@ pub struct NetStack {
     host_addrs: HostAddrs,
     /// smoltcp's time zero.
     epoch: Instant,
+    /// The gate: the session CA and the upstream trust store, when the
+    /// session inspects, and the channel to the observer.
+    inspect: Option<Arc<InspectConfig>>,
+    observer: Option<Observer>,
 }
 
 impl NetStack {
@@ -207,7 +212,19 @@ impl NetStack {
             ids,
             host_addrs: HostAddrs::system(),
             epoch,
+            inspect: None,
+            observer: None,
         })
+    }
+
+    /// The stack with the gate: `inspect` signs the leaves and verifies the
+    /// real hosts, `observer` takes the plaintext. Without it, `inspect`
+    /// lines name nothing.
+    pub fn with_inspect(mut self, gate: Option<(Arc<InspectConfig>, Observer)>) -> Self {
+        let (inspect, observer) = gate.unzip();
+        self.inspect = inspect;
+        self.observer = observer;
+        self
     }
 
     /// The handle the stack reads its policy through; storing a new
@@ -520,6 +537,8 @@ impl NetStack {
             host_addrs: &mut self.host_addrs,
             now,
             stamp: smoltcp_time(self.epoch, now),
+            inspect: self.inspect.as_ref(),
+            observer: self.observer.as_ref(),
         };
         Parts {
             tcp: &mut self.tcp,
@@ -745,6 +764,9 @@ pub(crate) struct Ctx<'a> {
     /// Now, on the stack's clock and on smoltcp's.
     pub(crate) now: Instant,
     pub(crate) stamp: SmolInstant,
+    /// The gate, when the session inspects.
+    pub(crate) inspect: Option<&'a Arc<InspectConfig>>,
+    pub(crate) observer: Option<&'a Observer>,
 }
 
 impl Ctx<'_> {
@@ -755,7 +777,12 @@ impl Ctx<'_> {
 
     /// Counts a guest frame dropped for `reason`.
     pub(crate) fn drop_frame(&mut self, reason: DropReason) {
-        if let Some(counted) = self.drops.count(reason, self.now) {
+        self.count_dropped(reason, 1);
+    }
+
+    /// Counts `n` drops for `reason` (bytes, for the observer's).
+    pub(crate) fn count_dropped(&mut self, reason: DropReason, n: u64) {
+        if let Some(counted) = self.drops.count_many(reason, n, self.now) {
             audit::try_emit(self.sink, Payload::NetDrop(counted));
         }
     }

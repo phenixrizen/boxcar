@@ -21,7 +21,7 @@ use boxcar_audit::{
     AuditSink, ReconcileConfig, Reconciler, SystemClock, WriterConfig, WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
-use boxcar_net::{NetConfig, Policy, SessionCa};
+use boxcar_net::{InspectConfig, NetConfig, Policy, SessionCa};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
@@ -117,8 +117,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let audit_dir = check_audit_dir(&audit_dir, &named)?;
 
     let session_id = SessionId::new();
-    // A session that inspects has a CA, whose key stays in this process.
-    let inspect_ca = session_ca(&policy, &session_id)?;
+    // A session that inspects has a CA, whose key stays in this process,
+    // and a trust store for the real hosts: the host's own.
+    let inspect = match session_ca(&policy, &session_id)? {
+        Some(ca) => Some(Arc::new(
+            InspectConfig::new(ca, InspectConfig::host_roots(&test_upstream_roots()))
+                .context("cannot set up the gate")?,
+        )),
+        None => None,
+    };
     let user = invoking_user();
     // clap requires --rootfs unless --no-fs.
     let has_shares = rootfs.is_some();
@@ -138,7 +145,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         terminal_size(stdin_terminal_size()),
     );
     // The guest is told to trust the CA: the certificate, never the key.
-    session.ca_pem = inspect_ca.as_ref().map(|ca| ca.pem().to_owned());
+    session.ca_pem = inspect.as_ref().map(|gate| gate.ca().pem().to_owned());
     if mode == GuestMode::Vsock {
         session.validate()?;
     }
@@ -231,7 +238,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             state_dir: state_dir.clone(),
             session_id: session_id.clone(),
         }),
-        inspect_ca,
+        inspect,
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -459,6 +466,26 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Policy, String>> {
     };
     let file = file.as_ref().map(|(path, text)| (*path, text.as_str()));
     Ok(build_policy(file, &args.deny, &args.allow, &args.inspect))
+}
+
+/// Root certificates the gated tests add to the upstream trust store, from
+/// the PEM file `BOXCAR_TEST_UPSTREAM_ROOTS` names: a test upstream on the
+/// loopback with a certificate of its own. Only a `kvm-tests` build reads
+/// the variable; a file that cannot be read adds nothing.
+#[cfg(feature = "kvm-tests")]
+fn test_upstream_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    match env::var_os("BOXCAR_TEST_UPSTREAM_ROOTS") {
+        Some(path) => fs::read_to_string(path)
+            .map(|text| boxcar_net::gate::ca::pem_certificates(&text))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// A release build trusts the host's store and nothing else.
+#[cfg(not(feature = "kvm-tests"))]
+fn test_upstream_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    Vec::new()
 }
 
 /// The session's CA when `policy` has an `inspect` line: made now, for

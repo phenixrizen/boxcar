@@ -30,6 +30,35 @@ pub const DEFAULT_SHA256: &str = "27694aaa55fd7a9e3ef596e0ad4eb66802308bb20172b1
 /// Where Alpine releases are published.
 const MIRROR: &str = "https://dl-cdn.alpinelinux.org/alpine";
 
+/// A package from the release's `main` repository, pinned by its SHA-256.
+pub struct Package {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub sha256: &'static str,
+}
+
+/// What the minirootfs lacks for TLS: busybox's `wget` hands HTTPS to
+/// `ssl_client`, which needs OpenSSL's libraries. The gated tests reach
+/// HTTPS hosts through the gate with them. Pinned for [`DEFAULT_VERSION`]'s
+/// branch; another release gets the bare minirootfs.
+pub const TLS_PACKAGES: [Package; 3] = [
+    Package {
+        name: "libcrypto3",
+        version: "3.5.9-r0",
+        sha256: "3f5825ced5fde1c66a5376a3f6076b3c08538ad52d9ef23f069857e212d9175a",
+    },
+    Package {
+        name: "libssl3",
+        version: "3.5.9-r0",
+        sha256: "6801c740b9760b5b08da8db6367ebc18b2cc4dbaf371f7148429538b8bb04e23",
+    },
+    Package {
+        name: "ssl_client",
+        version: "1.37.0-r20",
+        sha256: "11b2a5f91caf8eb5daa9a0bc2586f93545de62897f3a704fd49533e1654b7a68",
+    },
+];
+
 /// The only architecture the guest has.
 const ARCH: &str = "x86_64";
 
@@ -104,9 +133,36 @@ fn run_alpine(version: &str) -> Result<()> {
         "{} has SHA-256 {actual}, expected {expected}",
         tarball.display()
     );
+    let packages: &[Package] = if version == DEFAULT_VERSION {
+        &TLS_PACKAGES
+    } else {
+        eprintln!("warning: Alpine {version} gets no TLS client: the packages are pinned for {DEFAULT_VERSION}");
+        &[]
+    };
+    let mut apks = Vec::new();
+    for package in packages {
+        let apk = cache_dir.join(apk_name(package));
+        let url = apk_url(version, package)?;
+        if !apk.exists() || sha256_of_file(&apk)? != package.sha256 {
+            download(&url, &apk)?;
+        }
+        let actual = sha256_of_file(&apk)?;
+        ensure!(
+            actual == package.sha256,
+            "{} has SHA-256 {actual}, expected {}",
+            apk.display(),
+            package.sha256
+        );
+        apks.push(apk);
+    }
 
     let out = guest_dir.join("rootfs-alpine");
-    unpack(&tarball, &out, &metadata(version, &url, &expected))?;
+    unpack(
+        &tarball,
+        &apks,
+        &out,
+        &metadata(version, &url, &expected, packages),
+    )?;
     println!(
         "rootfs: {} (Alpine {version} {ARCH}, sha256 {expected})",
         out.display()
@@ -137,6 +193,20 @@ fn branch(version: &str) -> Result<String> {
 /// `alpine-minirootfs-<version>-x86_64.tar.gz`.
 fn tarball_name(version: &str) -> String {
     format!("alpine-minirootfs-{version}-{ARCH}.tar.gz")
+}
+
+/// `<name>-<version>.apk`.
+fn apk_name(package: &Package) -> String {
+    format!("{}-{}.apk", package.name, package.version)
+}
+
+/// Where `package` is on `version`'s branch of the `main` repository.
+fn apk_url(version: &str, package: &Package) -> Result<String> {
+    Ok(format!(
+        "{MIRROR}/{}/main/{ARCH}/{}",
+        branch(version)?,
+        apk_name(package)
+    ))
 }
 
 /// Where the tarball of `version` is published.
@@ -255,9 +325,35 @@ fn tar_args(tarball: &Path, dir: &Path) -> Vec<OsString> {
     args
 }
 
+/// The arguments after `tar` that unpack the files of the package `apk`
+/// (an apk is concatenated gzip tar streams: the signature, the package
+/// info, the files) into `dir`, leaving the signature, `.PKGINFO` and
+/// any install scripts out.
+fn apk_tar_args(apk: &Path, dir: &Path) -> Vec<OsString> {
+    let mut args = tar_args(apk, dir);
+    args.extend(
+        [
+            "--exclude=.SIGN.*",
+            "--exclude=.PKGINFO",
+            "--exclude=.pre-*",
+            "--exclude=.post-*",
+            "--exclude=.trigger",
+            // apk's per-file checksums ride in pax headers tar does not know.
+            "--warning=no-unknown-keyword",
+        ]
+        .map(OsString::from),
+    );
+    args
+}
+
 /// What `etc/boxcar-rootfs.json` says about the rootfs.
-fn metadata(version: &str, url: &str, sha256: &str) -> serde_json::Value {
+fn metadata(version: &str, url: &str, sha256: &str, packages: &[Package]) -> serde_json::Value {
+    let packages: Vec<serde_json::Value> = packages
+        .iter()
+        .map(|p| serde_json::json!({"name": p.name, "version": p.version, "sha256": p.sha256}))
+        .collect();
     serde_json::json!({
+        "packages": packages,
         "distro": "alpine",
         "version": version,
         "arch": ARCH,
@@ -269,7 +365,12 @@ fn metadata(version: &str, url: &str, sha256: &str) -> serde_json::Value {
 /// Unpacks `tarball` into `out`, replacing what is there, with `metadata` in
 /// `etc/boxcar-rootfs.json`. The tree is built beside `out` and moved into
 /// place once complete, so a failure leaves any previous rootfs as it was.
-fn unpack(tarball: &Path, out: &Path, metadata: &serde_json::Value) -> Result<()> {
+fn unpack(
+    tarball: &Path,
+    apks: &[PathBuf],
+    out: &Path,
+    metadata: &serde_json::Value,
+) -> Result<()> {
     let partial = with_suffix(out, ".partial");
     if partial.exists() {
         fs::remove_dir_all(&partial).with_context(|| format!("remove {}", partial.display()))?;
@@ -280,6 +381,14 @@ fn unpack(tarball: &Path, out: &Path, metadata: &serde_json::Value) -> Result<()
         .status()
         .context("failed to start tar")?;
     ensure!(status.success(), "tar failed: {status}");
+    // The packages' files over the base; their metadata stays out.
+    for apk in apks {
+        let status = Command::new("tar")
+            .args(apk_tar_args(apk, &partial))
+            .status()
+            .context("failed to start tar")?;
+        ensure!(status.success(), "tar {} failed: {status}", apk.display());
+    }
     open_tmp_dirs(&partial)?;
 
     let json = partial.join("etc/boxcar-rootfs.json");
@@ -437,18 +546,49 @@ mod tests {
     }
 
     #[test]
-    fn the_metadata_names_the_release_and_its_hash() {
+    fn the_metadata_names_the_release_its_hash_and_its_packages() {
         let url = tarball_url(DEFAULT_VERSION).unwrap();
         assert_eq!(
-            metadata(DEFAULT_VERSION, &url, DEFAULT_SHA256),
+            metadata(DEFAULT_VERSION, &url, DEFAULT_SHA256, &[]),
             serde_json::json!({
                 "distro": "alpine",
                 "version": "3.22.6",
                 "arch": "x86_64",
                 "url": url,
                 "sha256": DEFAULT_SHA256,
+                "packages": [],
             })
         );
+        let with = metadata(DEFAULT_VERSION, &url, DEFAULT_SHA256, &TLS_PACKAGES);
+        let packages = with["packages"].as_array().unwrap();
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[2]["name"], "ssl_client");
+        assert_eq!(packages[2]["version"], TLS_PACKAGES[2].version);
+    }
+
+    /// The TLS packages come from the release branch's main repository,
+    /// pinned, and unpack without their signatures and metadata.
+    #[test]
+    fn the_tls_packages_are_pinned_and_unpack_without_their_metadata() {
+        assert_eq!(
+            apk_url("3.22.6", &TLS_PACKAGES[0]).unwrap(),
+            format!(
+                "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/libcrypto3-{}.apk",
+                TLS_PACKAGES[0].version
+            )
+        );
+        for package in &TLS_PACKAGES {
+            assert_eq!(package.sha256.len(), 64, "{}", package.name);
+            assert!(package.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        let args = strings(apk_tar_args(
+            Path::new("/c/ssl_client-1.apk"),
+            Path::new("/r"),
+        ));
+        assert!(args.contains(&"--exclude=.PKGINFO".to_owned()));
+        assert!(args.contains(&"--exclude=.SIGN.*".to_owned()));
+        assert!(args.contains(&"--no-same-owner".to_owned()));
+        assert_eq!(args[..3], ["--extract", "--gzip", "--file"]);
     }
 
     fn mode(path: &Path) -> u32 {

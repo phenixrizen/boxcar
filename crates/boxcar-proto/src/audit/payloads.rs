@@ -561,6 +561,38 @@ pub struct NetTls {
     /// `http`.
     pub alpn: Vec<String>,
     pub verdict: Verdict,
+    /// Whether the policy's `inspect` lines name this flow, so the gate
+    /// ends its TLS (a `net.inspect` follows) or, for plain HTTP, observes
+    /// it as it is. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inspect: bool,
+}
+
+/// `net.inspect`: the gate ended an inspected flow's TLS, or could not. On
+/// `ok`, the record precedes every byte of plaintext relayed; on anything
+/// else, nothing was relayed and the flow's `net.close` says `inspect`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct NetInspect {
+    /// The `flow` of the flow's `net.connect`.
+    pub flow: u64,
+    /// The server name the guest asked for, or `null` for a flow to an
+    /// address (a network `inspect` line).
+    pub sni: Option<String>,
+    /// The application protocol both legs agreed on (`h2`, `http/1.1`),
+    /// or `null` for none or on failure.
+    pub alpn: Option<String>,
+    /// The TLS version the guest leg speaks (`1.3`, `1.2`), or `null` on
+    /// failure.
+    pub version: Option<String>,
+    /// `ok`; `upstream_untrusted` (the real host's certificate is not one
+    /// the host's store vouches for); `upstream_failed` (its handshake
+    /// failed otherwise); `guest_rejected` (the guest refused the leaf, or
+    /// closed during the handshake); `timeout` (the handshakes outran the
+    /// gate's time).
+    pub result: String,
+    /// The `inspect` line that named the flow, as written.
+    pub rule: Option<String>,
 }
 
 /// `net.close`: a flow ended.

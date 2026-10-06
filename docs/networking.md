@@ -33,6 +33,21 @@ README's "Networking and policy".
   both ways with back-pressure: a host that stops reading closes the
   guest's window, a guest that stops reading stops the host read. A guest
   silent for 60 s while waited on ends its flow (`timeout`).
+- Inspection (`--inspect RULE`, `inspect` lines in a policy file): a
+  connection an allow rule admitted, whose first bytes show a name (or,
+  for a network rule, whose destination) an `inspect` line names, is
+  watched. A TLS connection ends in the runtime: the real host is reached
+  with the runtime's own TLS and checked against the host's trust store,
+  the guest gets a certificate for the name signed by the session's CA
+  (init puts the CA in the guest's store and names it in the session's
+  environment), and the plaintext is relayed unchanged both ways with a
+  copy to the observer (`net.inspect`). A plain HTTP connection is
+  observed as it is. A host the store does not vouch for, a guest that
+  refuses the leaf, or handshakes slower than the gate's 5 s end the
+  connection with nothing relayed (`net.inspect` says which,
+  `net.close{reason:"inspect"}`). The agent keeps its own credential;
+  nothing is injected. A connection read for inspection that shows
+  neither TLS nor HTTP is relayed untouched after the gate's limit.
 - UDP: the first datagram of a 5-tuple is decided (`net.udp`) and gets a
   connected host socket; a domain `allow` admits no UDP (nothing in a
   datagram shows a name: `builtin:udp-needs-cidr`), so UDP needs a CIDR

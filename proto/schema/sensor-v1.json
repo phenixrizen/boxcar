@@ -1068,6 +1068,54 @@
         }
       }
     },
+    "NetInspect": {
+      "description": "`net.inspect`: the gate ended an inspected flow's TLS, or could not. On `ok`, the record precedes every byte of plaintext relayed; on anything else, nothing was relayed and the flow's `net.close` says `inspect`.",
+      "type": "object",
+      "required": [
+        "flow",
+        "result"
+      ],
+      "properties": {
+        "alpn": {
+          "description": "The application protocol both legs agreed on (`h2`, `http/1.1`), or `null` for none or on failure.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "result": {
+          "description": "`ok`; `upstream_untrusted` (the real host's certificate is not one the host's store vouches for); `upstream_failed` (its handshake failed otherwise); `guest_rejected` (the guest refused the leaf, or closed during the handshake); `timeout` (the handshakes outran the gate's time).",
+          "type": "string"
+        },
+        "rule": {
+          "description": "The `inspect` line that named the flow, as written.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sni": {
+          "description": "The server name the guest asked for, or `null` for a flow to an address (a network `inspect` line).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The TLS version the guest leg speaks (`1.3`, `1.2`), or `null` on failure.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "NetTls": {
       "description": "`net.tls`: the gate's reading of a flow's first bytes, the name they asked for, and whether the flow was let through on it. The gate reads the flows a domain rule allowed: a TLS ClientHello's server name, or a plain HTTP request's `Host`.",
       "type": "object",
@@ -1090,6 +1138,10 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "inspect": {
+          "description": "Whether the policy's `inspect` lines name this flow, so the gate ends its TLS (a `net.inspect` follows) or, for plain HTTP, observes it as it is. Omitted when false.",
+          "type": "boolean"
         },
         "kind": {
           "description": "What the first bytes were read as: `tls` (a ClientHello, bytes that began like one, or none at all) or `http` (anything else, read as a plain HTTP request).",
@@ -1663,6 +1715,24 @@
               "type": "string",
               "enum": [
                 "net.tls"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetInspect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.inspect"
               ]
             }
           }
@@ -3002,6 +3072,24 @@
               "type": "string",
               "enum": [
                 "net.tls"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetInspect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.inspect"
               ]
             }
           }

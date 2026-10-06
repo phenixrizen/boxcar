@@ -57,7 +57,7 @@ pub use audit::DropReason;
 pub use config::{ConfigError, NetConfig};
 pub use device::VirtioNet;
 pub use frame::Dispatch;
-pub use gate::{LeafTarget, SessionCa};
+pub use gate::{InspectConfig, LeafTarget, SessionCa};
 pub use policy::{Inspect, Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};
 pub use tcp::{TcpLimits, TCP_TOKEN_BASE};

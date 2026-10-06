@@ -103,6 +103,8 @@ use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 use vmm_sys_util::timerfd::TimerFd;
 
 use crate::config::{ConfigError, NetConfig};
+use crate::gate::observe::ObserverThread;
+use crate::gate::{InspectConfig, Observer};
 use crate::policy::Policy;
 use crate::stack::{FdChange, Interest, NetStack, QUEUE_CAP};
 use crate::tcp::flow::FlowIds;
@@ -217,6 +219,12 @@ pub struct VirtioNet {
     counters: Arc<NetCounters>,
     /// The net thread; `None` when the device is not activated.
     worker: Option<WorkerHandle>,
+    /// The gate, when the session inspects: every stack the device builds
+    /// gets it, and the one `gate-observe` thread takes their plaintext
+    /// for the device's life.
+    inspect: Option<Arc<InspectConfig>>,
+    observer: Option<Observer>,
+    observer_thread: Option<ObserverThread>,
 }
 
 impl VirtioNet {
@@ -229,9 +237,32 @@ impl VirtioNet {
         sink: AuditSink,
         policy: Arc<ArcSwap<Policy>>,
     ) -> Result<VirtioNet, ConfigError> {
+        VirtioNet::with_inspect(cfg, sink, policy, None)
+    }
+
+    /// [`VirtioNet::new`] with the gate: with `inspect`, flows the policy's
+    /// `inspect` lines name have their TLS ended in the stack and their
+    /// plaintext observed by the `gate-observe` thread, started here.
+    pub fn with_inspect(
+        cfg: NetConfig,
+        sink: AuditSink,
+        policy: Arc<ArcSwap<Policy>>,
+        inspect: Option<Arc<InspectConfig>>,
+    ) -> Result<VirtioNet, ConfigError> {
         let ids = FlowIds::default();
+        let (observer, observer_thread) = match &inspect {
+            Some(_) => {
+                let (observer, rx) = Observer::channel();
+                let thread = ObserverThread::spawn(rx)
+                    .map_err(|error| ConfigError::Observer(error.to_string()))?;
+                (Some(observer), Some(thread))
+            }
+            None => (None, None),
+        };
+        let gate = inspect.clone().zip(observer.clone());
         let spare =
-            NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?;
+            NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?
+                .with_inspect(gate);
         let wake = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)
             .map_err(|error| ConfigError::Wake(error.to_string()))?;
         Ok(VirtioNet {
@@ -244,6 +275,9 @@ impl VirtioNet {
             ids,
             counters: Arc::new(NetCounters::default()),
             worker: None,
+            inspect,
+            observer,
+            observer_thread,
         })
     }
 
@@ -266,12 +300,13 @@ impl VirtioNet {
     fn take_stack(&mut self) -> Result<NetStack, ConfigError> {
         match self.spare.take() {
             Some(stack) => Ok(stack),
-            None => NetStack::with_flow_ids(
+            None => Ok(NetStack::with_flow_ids(
                 self.cfg.clone(),
                 self.sink.clone(),
                 Arc::clone(&self.policy),
                 self.ids.clone(),
-            ),
+            )?
+            .with_inspect(self.inspect.clone().zip(self.observer.clone()))),
         }
     }
 }
@@ -376,8 +411,20 @@ impl VirtioDevice for VirtioNet {
 
 impl Drop for VirtioNet {
     fn drop(&mut self) {
-        // No thread may outlive the device.
+        // No thread may outlive the device: the net thread first, then the
+        // observer, which ends once the last sender (the stacks') is gone.
         self.reset();
+        self.spare = None;
+        self.observer = None;
+        if let Some(thread) = self.observer_thread.take() {
+            if !thread.join(JOIN_LIMIT) {
+                boxcar_virtio::limited!(
+                    warn,
+                    "virtio-net: the observer thread did not stop within {JOIN_LIMIT:?}; leaving it \
+                     behind"
+                );
+            }
+        }
     }
 }
 

@@ -228,3 +228,80 @@ Made while writing the plan, 2026-10-06:
 - The gated test is in `boot_session` (the VMM's `VmConfig`), beside the
   session tests, with the CA made by the test; `boxcar run --inspect` is
   covered by unit tests here and by the M4 gated suite from Task 2 on.
+
+### Task 2
+
+- **Which flows the gate reads.** A flow a network rule allowed is not
+  gated today (its first bytes go straight through). When the policy has
+  an `inspect` line that could name the flow (`Policy::may_inspect`: a
+  network line holding the destination, or a domain line matching one of
+  the DNS names the guest had for it), its first bytes are read too, and
+  `Policy::inspects` decides on what they show. Such a flow needs no name
+  to pass (`gated` on the flow says whether a domain rule requires one),
+  and gets a `net.tls` only when it is inspected. A read-for-inspection
+  flow that shows neither TLS nor HTTP is relayed untouched after the
+  gate's byte or time limit, as any gated flow that shows no name would be
+  denied: the delay is the gate's 5 s at worst, accepted.
+- **rustls's full plaintext buffer is back-pressure, not an error.**
+  `read_tls` refuses more TLS bytes with an `io::ErrorKind::Other` error
+  while 16 KiB of decrypted plaintext wait unread. The gate takes it as
+  "no room": the host socket is not read, and the guest's bytes stay in
+  the smoltcp socket (closing its window), until the relay has moved some
+  plaintext on. Each leg's writer has a 64 KiB limit for the same reason.
+- **The host's TLS close ends the host side.** After the upstream's
+  `close_notify` the gate reads nothing more from it, so the socket's EOF
+  is never seen; the flow counts the host as done when its TLS close is in
+  and every byte it sent has gone to the guest leg.
+- **`net.close.tx` and `rx` count wire bytes** (TLS records) for an
+  inspected flow, as for any flow; the plaintext sizes are the observer's
+  (`http.*`, Task 3).
+- **The observer thread belongs to the device.** `VirtioNet` starts
+  `gate-observe` when the session has a gate, gives every stack it builds
+  the same sender, and joins the thread (5 s at most) when the device is
+  dropped, after the net thread: the thread ends when the last sender is
+  gone. `boxcar run` does not join it separately, as the plan said; the
+  VMM's own stop order covers it.
+- **The observer is told `Open` before any plaintext**, and `Close` only
+  after an `Open`: a flow that failed its handshakes was never announced.
+- **The test rig moved** from `tests/tcp.rs` into `tests/common/rig.rs`,
+  so `tests/inspect.rs` drives a real TLS handshake (a rustls client over
+  the rig's smoltcp interface) through the stack to a TLS upstream on the
+  loopback: the stack-level test checks the whole `net.connect`,
+  `net.tls{inspect}`, `net.inspect{ok}`, `net.close{fin}` sequence, the
+  plaintext both ways and the observer's copy, as the plan asked, with
+  real TLS rather than synthetic frames.
+- **`cargo xtask test-kvm m4` lands now** (the same packages as `m3`, with
+  `kvm_m4`), so the gated tests of this task can run; the plan put it in
+  Task 7, which adds the Debian guest to it.
+- **A test upstream's root** reaches the gate through
+  `BOXCAR_TEST_UPSTREAM_ROOTS` (a PEM file), read by `boxcar run` only
+  under the `kvm-tests` feature; `gate::ca::pem_certificates` decodes it.
+  The CLI crate takes `rustls-pki-types` as a dependency for the type.
+- **Loopback upstreams in the gated tests** are reached with
+  `--allow 127.0.0.0/8:PORT` (the exact private range lifts its built-in
+  denial; loopback is not one of the host's own addresses) and
+  `--inspect 127.0.0.1:PORT`.
+- **The Alpine guest gets a TLS client.** The minirootfs has busybox's
+  `wget` but not the `ssl_client` helper it hands HTTPS to, nor OpenSSL's
+  libraries, so no gated test could reach an HTTPS host. `cargo xtask
+  rootfs alpine` now adds `libcrypto3`, `libssl3` and `ssl_client` from
+  the release branch's `main` repository (3.5.9-r0, 3.5.9-r0 and
+  1.37.0-r20 on 2026-10-06), pinned by SHA-256 like the minirootfs and
+  unpacked without their signatures and metadata; the rootfs's
+  `etc/boxcar-rootfs.json` lists them. Another Alpine release gets the
+  bare minirootfs, with a warning.
+- **A test upstream on this host is reached by the host's own address**,
+  not the loopback, which inside the guest is the guest's own: the test
+  finds the address the host sends out through (a UDP socket connected to
+  a documentation address, nothing sent) and allows it with two rules,
+  the private range it is in named exactly and the address itself, which
+  lift the built-in and the host-local denials. A host with no such
+  address skips the test.
+- **busybox's `ssl_client` names the address as its server name** when
+  given one; the untrusted-upstream test accepts that or none.
+- **One look at an inspected flow makes up to four rounds** of host I/O,
+  TLS phases and guest output while each moves something: a
+  `close_notify` or relayed data a step queues goes out in the same call,
+  rather than waiting for a host event that, with nothing left to read,
+  never comes. Without it a guest's FIN left the flow open until the VM
+  stopped (`net.close{reason:"shutdown"}` instead of `fin`).

@@ -27,7 +27,10 @@ thiserror = { workspace = true }
 # The gate (M4): the session CA and its leaves, and the TLS legs.
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+rustls-native-certs = { workspace = true }
 rcgen = { workspace = true }
+# The observer's channel: the net thread never waits on it.
+crossbeam-channel = { workspace = true }
 ring = { workspace = true }
 time = { workspace = true }
 # The CA's PEM and its fingerprint's hex.

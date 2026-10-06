@@ -44,7 +44,7 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
     FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, NetClose,
-    NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp, OpResult, PolicyChanged,
+    NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged,
     ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
     ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit,
     SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
@@ -433,6 +433,8 @@ pub enum Payload {
     NetConnect(NetConnect),
     #[serde(rename = "net.tls")]
     NetTls(NetTls),
+    #[serde(rename = "net.inspect")]
+    NetInspect(NetInspect),
     #[serde(rename = "net.close")]
     NetClose(NetClose),
     #[serde(rename = "net.drop")]
@@ -507,6 +509,7 @@ impl Payload {
             Payload::NetDns(_) => "net.dns",
             Payload::NetConnect(_) => "net.connect",
             Payload::NetTls(_) => "net.tls",
+            Payload::NetInspect(_) => "net.inspect",
             Payload::NetClose(_) => "net.close",
             Payload::NetDrop(_) => "net.drop",
             Payload::NetUdp(_) => "net.udp",
@@ -562,6 +565,7 @@ impl Payload {
             | Payload::NetDns(_)
             | Payload::NetConnect(_)
             | Payload::NetTls(_)
+            | Payload::NetInspect(_)
             | Payload::NetClose(_)
             | Payload::NetDrop(_)
             | Payload::NetUdp(_) => Source::Net,
@@ -614,7 +618,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 47] = [
+    const KINDS: [&str; 48] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -642,6 +646,7 @@ mod tests {
         "net.dns",
         "net.connect",
         "net.tls",
+        "net.inspect",
         "net.close",
         "net.drop",
         "net.udp",
@@ -1126,6 +1131,7 @@ mod tests {
                     sni: Some("example.com".into()),
                     alpn: vec!["h2".into(), "http/1.1".into()],
                     verdict: Verdict::Allow,
+                    inspect: true,
                 }),
                 json!({
                     "flow": 7,
@@ -1133,6 +1139,25 @@ mod tests {
                     "sni": "example.com",
                     "alpn": ["h2", "http/1.1"],
                     "verdict": "allow",
+                    "inspect": true,
+                }),
+            ),
+            (
+                Payload::NetInspect(NetInspect {
+                    flow: 7,
+                    sni: Some("example.com".into()),
+                    alpn: Some("h2".into()),
+                    version: Some("1.3".into()),
+                    result: "ok".into(),
+                    rule: Some("inspect example.com:443".into()),
+                }),
+                json!({
+                    "flow": 7,
+                    "sni": "example.com",
+                    "alpn": "h2",
+                    "version": "1.3",
+                    "result": "ok",
+                    "rule": "inspect example.com:443",
                 }),
             ),
             (
@@ -1616,8 +1641,21 @@ mod tests {
                     sni: None,
                     alpn: Vec::new(),
                     verdict: Verdict::Deny,
+                    inspect: false,
                 }),
                 json!({"flow": 9, "kind": "http", "sni": null, "alpn": [], "verdict": "deny"}),
+            ),
+            (
+                // An upstream the host's store does not vouch for, to an address.
+                Payload::NetInspect(NetInspect {
+                    flow: 9,
+                    sni: None,
+                    alpn: None,
+                    version: None,
+                    result: "upstream_untrusted".into(),
+                    rule: None,
+                }),
+                json!({"flow": 9, "sni": null, "alpn": null, "version": null, "result": "upstream_untrusted", "rule": null}),
             ),
             (
                 // Denied by the policy's default, to an address no DNS
