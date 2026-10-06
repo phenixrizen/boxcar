@@ -23,7 +23,8 @@ use boxcar_proto::control::{
     self, to_line, AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, ErrorBody,
     ErrorCode, Hello, NetPolicy, PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams,
     PtyAttached, PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Ready, Request, Response,
-    SensorState, SensorStatus, StateEvent, Status, StopMode, StopParams, VmState, VsockPolicy,
+    SensorState, SensorStatus, SpanEntry, SpanList, SpanListParams, StateEvent, Status, StopMode,
+    StopParams, VmState, VsockPolicy,
 };
 use boxcar_proto::guest::{GuestMsg, HostMsg, SessionConfig};
 use boxcar_proto::sensor::SensorFrame;
@@ -131,6 +132,8 @@ pub fn control_schema() -> RootSchema {
         SchemaGenerator::subschema_for::<PolicyView>,
         SchemaGenerator::subschema_for::<PolicyUpdateParams>,
         SchemaGenerator::subschema_for::<PolicyUpdated>,
+        SchemaGenerator::subschema_for::<SpanListParams>,
+        SchemaGenerator::subschema_for::<SpanList>,
         SchemaGenerator::subschema_for::<Ready>,
     ] {
         define(&mut gen);
@@ -412,9 +415,16 @@ pub fn control_lines() -> Result<Vec<u8>> {
         out.extend(message.line()?);
         Ok(())
     };
-    let capabilities = ["pty", "audit", "policy.net", "policy.inspect", "findings"]
-        .map(str::to_owned)
-        .to_vec();
+    let capabilities = [
+        "pty",
+        "audit",
+        "policy.net",
+        "policy.inspect",
+        "findings",
+        "spans",
+    ]
+    .map(str::to_owned)
+    .to_vec();
     line(&Ready {
         ready: true,
         control: format!("/run/user/1000/boxcar/{SESSION}/control.sock"),
@@ -580,6 +590,36 @@ pub fn control_lines() -> Result<Vec<u8>> {
     }
 
     line(&Request::new(
+        17,
+        "span.list",
+        serde_json::to_value(SpanListParams { active_only: false })?,
+    ))?;
+    line(&Response::success(
+        17,
+        serde_json::to_value(SpanList {
+            spans: vec![
+                SpanEntry {
+                    span_id: "toolu_02".to_owned(),
+                    tool_name: "Write".to_owned(),
+                    opened_seq: 61,
+                    closed_seq: None,
+                    procs: 0,
+                    effects: 1,
+                    worst_score: 0,
+                },
+                SpanEntry {
+                    span_id: "toolu_01".to_owned(),
+                    tool_name: "Bash".to_owned(),
+                    opened_seq: 40,
+                    closed_seq: Some(58),
+                    procs: 2,
+                    effects: 3,
+                    worst_score: 55,
+                },
+            ],
+        })?,
+    ))?;
+    line(&Request::new(
         16,
         "stop",
         serde_json::to_value(StopParams {
@@ -641,6 +681,9 @@ mod tests {
             "PolicyView",
             "PolicyUpdateParams",
             "PolicyUpdated",
+            "SpanListParams",
+            "SpanList",
+            "SpanEntry",
             "Ready",
             "Record",
             "SensorStatus",
@@ -686,6 +729,7 @@ mod tests {
             "Finding",
             "FindingCategory",
             "Evidence",
+            "SpanEffects",
         ] {
             assert!(audit.definitions.contains_key(name), "audit: {name}");
         }

@@ -342,6 +342,9 @@ pub(crate) struct VmInfo {
     /// the vsock allowlist, which the control socket's `policy.update`
     /// replaces.
     pub(crate) policy: Arc<LivePolicy>,
+    /// The reconciler's span index, which `span.list` reads, when the run
+    /// gave one.
+    pub(crate) spans: Option<boxcar_audit::SpanIndex>,
 }
 
 /// Stops a VM from another thread, and reports its status. Cheap to clone.
@@ -458,6 +461,12 @@ impl VmmHandle {
     /// socket's `policy.get` and `policy.update`).
     pub fn policy(&self) -> &LivePolicy {
         &self.info.policy
+    }
+
+    /// The reconciler's span index (the control socket's `span.list`),
+    /// when the run keeps one.
+    pub fn spans(&self) -> Option<&boxcar_audit::SpanIndex> {
+        self.info.spans.as_ref()
     }
 
     /// The services on the internal vsock ports, where the guest control
@@ -867,6 +876,7 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         pty: Some(pty),
         sensor: Some(sensor),
         policy: Arc::new(policy),
+        spans: Some(boxcar_audit::SpanIndex::new()),
     };
     let latch = Arc::new(StopLatch::new().expect("stop latch"));
     (VmmHandle::new(latch, Arc::new(info)), writer)

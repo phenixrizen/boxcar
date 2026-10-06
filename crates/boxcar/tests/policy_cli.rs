@@ -67,7 +67,14 @@ fn fake_server(
         let hello = Hello::new(
             "boxcar/fake",
             SESSION,
-            strings(&["pty", "audit", "policy.net", "policy.inspect", "findings"]),
+            strings(&[
+                "pty",
+                "audit",
+                "policy.net",
+                "policy.inspect",
+                "findings",
+                "spans",
+            ]),
         );
         stream.write_all(&to_line(&hello).unwrap()).unwrap();
         let reader = BufReader::new(stream.try_clone().unwrap());

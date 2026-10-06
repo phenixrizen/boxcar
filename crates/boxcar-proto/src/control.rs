@@ -788,6 +788,47 @@ pub struct PolicyUpdated {
     pub policy_version: u64,
 }
 
+/// The most entries `span.list` returns.
+pub const MAX_SPAN_LIST: usize = 1024;
+
+/// The parameters of `span.list`: `{"active_only":true}` for the spans
+/// still open; the default, or no parameters, lists the closed ones too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SpanListParams {
+    #[serde(default)]
+    pub active_only: bool,
+}
+
+/// One tool span as `span.list` reports it: the reconciler's index entry,
+/// kept current while the span is open and once more when it closes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SpanEntry {
+    /// The provider's tool use id.
+    pub span_id: String,
+    pub tool_name: String,
+    /// The seq of the `tool.open`.
+    pub opened_seq: u64,
+    /// The seq of the `tool.close`; absent while the span is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_seq: Option<u64>,
+    /// How many processes and effect records the span holds so far.
+    pub procs: u32,
+    pub effects: u32,
+    /// The highest score of a finding inside the span; 0 with none.
+    pub worst_score: u8,
+}
+
+/// The result of `span.list`: `{"spans":[...]}`, newest first, at most
+/// [`MAX_SPAN_LIST`] entries. Empty on a VM whose session has no spans
+/// yet, and on one with no reconciler index.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SpanList {
+    pub spans: Vec<SpanEntry>,
+}
+
 /// The one line `boxcar run --ready-fd N` writes to fd N once the control
 /// socket is bound: `{"ready":true,"control":"<path>","session_id":"<id>"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1425,6 +1466,51 @@ mod tests {
             serde_json::to_value(PolicyUpdated { policy_version: 2 }).unwrap(),
             json!({"policy_version": 2})
         );
+    }
+
+    #[test]
+    fn span_list_messages_have_their_documented_shape() {
+        let none: SpanListParams = serde_json::from_value(json!({})).unwrap();
+        assert!(!none.active_only, "the default lists closed spans too");
+        let active: SpanListParams = serde_json::from_value(json!({"active_only": true})).unwrap();
+        assert!(active.active_only);
+        assert_eq!(
+            serde_json::to_value(SpanListParams { active_only: true }).unwrap(),
+            json!({"active_only": true})
+        );
+
+        let list = SpanList {
+            spans: vec![
+                SpanEntry {
+                    span_id: "toolu_02".into(),
+                    tool_name: "Write".into(),
+                    opened_seq: 61,
+                    closed_seq: None,
+                    procs: 0,
+                    effects: 1,
+                    worst_score: 0,
+                },
+                SpanEntry {
+                    span_id: "toolu_01".into(),
+                    tool_name: "Bash".into(),
+                    opened_seq: 40,
+                    closed_seq: Some(58),
+                    procs: 2,
+                    effects: 3,
+                    worst_score: 55,
+                },
+            ],
+        };
+        let wire = json!({"spans": [
+            {"span_id": "toolu_02", "tool_name": "Write", "opened_seq": 61,
+             "procs": 0, "effects": 1, "worst_score": 0},
+            {"span_id": "toolu_01", "tool_name": "Bash", "opened_seq": 40, "closed_seq": 58,
+             "procs": 2, "effects": 3, "worst_score": 55},
+        ]});
+        assert_eq!(serde_json::to_value(&list).unwrap(), wire);
+        let back: SpanList = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, list);
+        assert_eq!(MAX_SPAN_LIST, 1024);
     }
 
     #[test]

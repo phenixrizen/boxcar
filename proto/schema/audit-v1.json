@@ -2557,6 +2557,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/SpanEffects"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "span.effects"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/Finding"
             },
             "type": {
@@ -3349,6 +3367,73 @@
           ]
         }
       ]
+    },
+    "SpanEffects": {
+      "description": "`span.effects`: what a tool span held when it closed, or when the VM stopped with it still open: the processes the reconciler attributed to it and the records of their effects. A membership record: the effects themselves are never edited.",
+      "type": "object",
+      "required": [
+        "effects",
+        "opened_seq",
+        "procs",
+        "span_id",
+        "tool_name",
+        "truncated"
+      ],
+      "properties": {
+        "closed_seq": {
+          "description": "The seq of the `tool.close`; `null` for a span still open at `vmm.stop`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "effects": {
+          "description": "The seqs of the records attributed to the span, ascending: the `proc.exec` of each process, and the `fs.*` and `net.connect` records their work made; at most 4096.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "executor_tgid": {
+          "description": "The process that made the model request the span came from: the one a `proc.tls_io` write named, else the session's root process; `null` when neither is known.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "opened_seq": {
+          "description": "The seq of the `tool.open`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "procs": {
+          "description": "The processes attributed to the span, by tgid, in join order; at most 1024.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        },
+        "span_id": {
+          "description": "The provider's tool use id, the span's id in every record's `span`.",
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether a process or an effect was left out for the limits.",
+          "type": "boolean"
+        }
+      }
     },
     "SpanRef": {
       "description": "Where an event sits in a trace.",

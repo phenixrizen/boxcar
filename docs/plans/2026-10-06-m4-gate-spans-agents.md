@@ -373,3 +373,47 @@ Made while writing the plan, 2026-10-06:
   whole** (a truncated body, a lost chunk, a flow closed mid-reply) gets
   its `llm.*` record with `degraded` set rather than no record, so a
   reader can tell a call that was made from one that was not.
+
+### Task 5
+
+- **The agent is in no span.** The session root (`session.start.pid`),
+  and a span's executor once one is named, never join a span: a `Write`
+  tool's `fs.create` comes from the agent itself, so an effect by a
+  process in no span joins the only open span, or the write tool span
+  whose declared path it touches, while the agent's own connections (its
+  model requests) join nothing. Without this the root's own exec, held
+  for a late `tool.open`, joined the first `Write` span and was reported
+  as orphaned work.
+- **"Equals" became "carries"** for the argv join: Claude Code's Bash
+  tool runs `bash -c "eval '<command>' < /dev/null && pwd -P >| ..."`, so
+  the shell's `-c` command is compared after whitespace is collapsed and
+  quotes and backslashes dropped, and matches when it is the declared
+  command or contains it; the whole argv must still equal the declared
+  one (Codex's `["bash","-lc",...]` as an array). The `argv` rule judges
+  only an exec that is a shell given `-c` (the form a shell tool spawns),
+  joined by ancestry alone, and fires once a span: the agent's own helper
+  processes (a `git` run by the runtime while one Bash span is open) are
+  attributed without a finding.
+- **`span.effects.effects` holds the `proc.exec` seqs** of the span's
+  processes besides their ring 0 effects: `procs` gives tgids, which pid
+  reuse makes ambiguous, and a reader of the record should reach every
+  record it rests on by seq.
+- **The executor stays the session root in this task.** `proc.tls_io` is
+  Task 6's payload, so the `tls_io`-to-`llm.request` join that names the
+  executor, and the plan's `a_tls_write_names_the_executor` fixture, move
+  to Task 6 with the payload; `Span.executor` and `is_agent` are in place
+  for it.
+- **`fs.unlink` counts as a write for `phantom_write`**, since an
+  `apply_patch` that deletes a file produces only an unlink; `fs.open`
+  joins no span (the close carries what the open led to), and
+  `fs.setattr` and `fs.mkdir` join without counting as writes.
+- **The reconciler's `observe`/`on_tick` still return findings**, and
+  the span records are drained with `Reconciler::take_records` after
+  each step, so M3's scenarios and fixtures are unchanged; the span
+  scenarios check both streams in production order (`check_all`). The
+  envelope's `span` is set on findings inside a span and on
+  `span.effects`, with the session id read from the records as the
+  trace id.
+- **`orphaned_work` needs the exit program** (`sched_process_exit`
+  attached): without exits nothing says who still runs. `span.list`
+  accepts no parameters at all as the default.

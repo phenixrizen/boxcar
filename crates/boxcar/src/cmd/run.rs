@@ -18,7 +18,7 @@ use std::{env, fs, io};
 use anyhow::{bail, Context};
 use arc_swap::ArcSwap;
 use boxcar_audit::{
-    AuditSink, ReconcileConfig, Reconciler, SystemClock, WriterConfig, WriterHandle,
+    AuditSink, ReconcileConfig, Reconciler, SpanIndex, SystemClock, WriterConfig, WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_net::{InspectConfig, NetConfig, Policy, SessionCa};
@@ -117,6 +117,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let audit_dir = check_audit_dir(&audit_dir, &named)?;
 
     let session_id = SessionId::new();
+    // The tool spans the reconciler keeps and `boxcar spans` lists.
+    let spans = SpanIndex::new();
     // A session that inspects has a CA, whose key stays in this process,
     // and a trust store for the real hosts: the host's own.
     let inspect = match session_ca(&policy, &session_id)? {
@@ -239,6 +241,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             session_id: session_id.clone(),
         }),
         inspect,
+        spans: Some(spans.clone()),
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -248,12 +251,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         },
     };
     // The reconciler reads the log beside the VM and writes its findings
-    // into it; it ends at `vmm.stop`, or when asked below.
+    // and span records into it; it ends at `vmm.stop`, or when asked
+    // below. Its span index is what the control socket's `span.list`
+    // reads.
     let reconciler = Reconciler::spawn(
         audit.clone(),
         ReconcileConfig {
             sensor_expected: sensor,
             clock: Arc::new(SystemClock),
+            spans: Some(spans),
         },
     )
     .context("cannot start the reconciler")?;

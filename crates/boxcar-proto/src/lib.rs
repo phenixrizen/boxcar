@@ -39,8 +39,8 @@ pub use audit::{
     NetDrop, NetInspect, NetTls, NetUdp, OpResult, ParseHashError, Payload, PolicyChanged,
     ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
     ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, Record, Ring, SensorPhase,
-    SessionExit, SessionStart, SetAttr, ShareRef, Source, SpanRef, Subject, ToolClose, ToolOpen,
-    Verdict, VmmStart, VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
+    SessionExit, SessionStart, SetAttr, ShareRef, Source, SpanEffects, SpanRef, Subject, ToolClose,
+    ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

@@ -29,7 +29,7 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
   events between responses.
 
 ```text
-<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings"]}
+<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings","spans"]}
 -> {"v":1,"id":1,"op":"status"}
 <- {"v":1,"id":1,"ok":true,"result":{"state":"running",...}}
 -> {"v":1,"id":2,"op":"stop","mode":"graceful"}
@@ -43,8 +43,10 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
 **Hello** (the server's first line): `v` 1, `event` `"hello"`, `protocol`
 `"boxcar.control"`, `versions` `[1]`, `server` `"boxcar/<version>"`,
 `session_id`, and `capabilities`: the op families served beyond `status`
-and `stop`, today `["pty","audit","policy.net","policy.inspect","findings"]`
-(`policy.inspect`: the network policy carries `inspect` lines).
+and `stop`, today
+`["pty","audit","policy.net","policy.inspect","findings","spans"]`
+(`policy.inspect`: the network policy carries `inspect` lines; `spans`:
+`span.list` is served).
 
 **Request**: `{"v":1,"id":N,"op":"<op>", ...}`. `id` is an unsigned
 64-bit integer the client chooses; every other field is a parameter of the
@@ -242,6 +244,24 @@ over 1024 ports; a rule that does not parse, named as
 `vsock.allow_ports[0]`), `invalid_state` (`net` on a VM without a network
 card, `vsock` on one without a vsock device).
 
+### `span.list`
+
+Parameters: `active_only`, optional, `false` by default. The result is the
+session's tool spans (docs/reconciler.md), newest first, at most 1024:
+
+```json
+{"spans":[{"span_id":"toolu_02","tool_name":"Write","opened_seq":61,"procs":0,"effects":1,"worst_score":0},
+          {"span_id":"toolu_01","tool_name":"Bash","opened_seq":40,"closed_seq":58,"procs":2,"effects":3,"worst_score":55}]}
+```
+
+`span_id` is the provider's tool use id, `opened_seq` the seq of the
+`tool.open` and `closed_seq` that of the `tool.close`, absent while the span
+is open; `procs` and `effects` count what the reconciler has attributed to
+it so far, and `worst_score` is the highest score of a finding inside it, 0
+with none. With `active_only` only the open spans are listed. The list is
+empty before the first tool call, and on a VM run without the reconciler's
+index. `boxcar spans [--active] [--json]` prints it.
+
 ## Events
 
 | Event | Fields | When |
@@ -263,3 +283,4 @@ card, `vsock` on one without a vsock device).
 | `pty.attach` replay | 256 KiB scrollback; 64 KiB input queue; 1 MiB output backlog |
 | `audit.subscribe` | 4 a connection; 32 type prefixes of 1 to 64 bytes; 16384 live records queued a subscription |
 | `policy.update` | 4096 rules of 1 to 512 bytes; 1024 vsock ports, each 1027 or more |
+| `span.list` | 1024 entries, newest first |

@@ -238,11 +238,12 @@ that span (`span.effects`, docs/reconciler.md).
 | `tool.open` | `flow`, `stream`, `tool_use_id`, `tool_name`, `args_b3`, `args_summary`, `args` (the arguments as JSON when at most 8 KiB; omitted otherwise) | The model's reply asked for a tool: in a stream, as soon as the call's arguments are whole; in a document, at its end. The span opens. |
 | `llm.response` | `flow`, `stream`, `provider`, `model`, `stop_reason`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `text_bytes`, `text_b3`, `tool_uses`, `dur_ms`, `degraded` | The reply ended (the stream's end, the document's end, or over WebSocket the `response.completed`); `degraded` says what cut it short (`stream_unfinished`, `stream_error`, `block_unfinished`, `call_unfinished`, `event_json`, `response_json`, `body_truncated`, `flow_closed`). |
 
-## `finding` (host, src `reconciler`)
+## `span.*` and `finding` (host, src `reconciler`)
 
 | Type | Fields | When |
 |---|---|---|
-| `finding` | `category` (`unattributed_effect`, `sensor_silence`, `intent_effect_mismatch`, `indicator_removal`, `off_book_channel`, `orphaned_work`, `network_anomaly`, `privilege_probe`, `policy_denial`), `score` (0 to 100), `rule`, `summary` (512 bytes at most), `evidence [{seq, ring}]` (the records the rule read, newest last), `span_id` (*omitted* until M4), `low_confidence` | The reconciler's conclusion from records of both rings. Never sampled; a score of 70 or more is written through to disk at once. The rules are in `docs/reconciler.md`. |
+| `span.effects` | `span_id`, `tool_name`, `opened_seq`, `closed_seq` (or null), `executor_tgid` (the process behind the model request, else the session root; or null), `procs [u32]` (tgids, at most 1024), `effects [u64]` (seqs, ascending, at most 4096: each process's `proc.exec` and the `fs.*` and `net.connect` records of their work), `truncated` | A tool span closed (its `tool.close` came), or the VM stopped with it open (`closed_seq` null). A membership record: what the reconciler attributed to the span (`docs/reconciler.md`); the effects themselves are never edited. The envelope's `span` names the span. |
+| `finding` | `category` (`unattributed_effect`, `sensor_silence`, `intent_effect_mismatch`, `indicator_removal`, `off_book_channel`, `orphaned_work`, `network_anomaly`, `privilege_probe`, `policy_denial`), `score` (0 to 100), `rule`, `summary` (512 bytes at most), `evidence [{seq, ring}]` (the records the rule read, newest last), `span_id` (set inside a span, omitted otherwise; the envelope's `span` then names it too), `low_confidence` | The reconciler's conclusion from records of both rings. Never sampled; a score of 70 or more is written through to disk at once. The rules are in `docs/reconciler.md`. |
 
 ## Order and durability
 

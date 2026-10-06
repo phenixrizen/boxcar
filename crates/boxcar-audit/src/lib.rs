@@ -43,7 +43,7 @@ pub mod writer;
 pub use chain::{Chainer, PartialRecord};
 pub use reader::{Filter, LogReader, Records};
 pub use reconcile::{
-    Clock, ManualClock, ReconcileConfig, Reconciler, ReconcilerHandle, SystemClock,
+    Clock, ManualClock, ReconcileConfig, Reconciler, ReconcilerHandle, SpanIndex, SystemClock,
 };
 pub use segment::{Fdatasync, Syncer};
 pub use sink::{AuditSink, EmitError, Priority, Submission};

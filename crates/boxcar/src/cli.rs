@@ -193,6 +193,21 @@ pub enum Command {
     /// `--vsock-allow`. Every vsock connection is in the audit log.
     // Boxed: the run's arguments are most of the enum's size.
     Run(Box<RunArgs>),
+    /// List a running session's tool spans.
+    ///
+    /// A span is one tool call the model asked for: it opens when the gate
+    /// reads the tool use in the model's reply (`tool.open`) and closes
+    /// when the agent sends the result back (`tool.close`). The reconciler
+    /// attributes the processes and effects in between to it. Prints one
+    /// line per span, newest first: the span id, the tool, `open` or
+    /// `closed` with the seqs of its records, how many processes and
+    /// effect records it holds, and the worst score of a finding inside
+    /// it. `--active` keeps the open ones; `--json` prints the list as the
+    /// control socket returns it. The session is the one `--control` or
+    /// SESSION_ID names, or the only one running.
+    ///
+    /// Exits 0, or 1 when the control socket cannot be reached.
+    Spans(SpansArgs),
     /// Show a running VM's status.
     ///
     /// Asks the session's control socket and prints a short table, or with
@@ -310,6 +325,18 @@ pub struct StatusArgs {
     #[command(flatten)]
     pub session: SessionArgs,
     /// Print the status as one JSON object.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SpansArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// Only the spans still open.
+    #[arg(long)]
+    pub active: bool,
+    /// Print the list as one JSON object.
     #[arg(long)]
     pub json: bool,
 }

@@ -1086,6 +1086,36 @@ pub struct ToolClose {
     pub result_summary: String,
 }
 
+/// `span.effects`: what a tool span held when it closed, or when the VM
+/// stopped with it still open: the processes the reconciler attributed to
+/// it and the records of their effects. A membership record: the effects
+/// themselves are never edited.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SpanEffects {
+    /// The provider's tool use id, the span's id in every record's `span`.
+    pub span_id: String,
+    pub tool_name: String,
+    /// The seq of the `tool.open`.
+    pub opened_seq: u64,
+    /// The seq of the `tool.close`; `null` for a span still open at
+    /// `vmm.stop`.
+    pub closed_seq: Option<u64>,
+    /// The process that made the model request the span came from: the
+    /// one a `proc.tls_io` write named, else the session's root process;
+    /// `null` when neither is known.
+    pub executor_tgid: Option<u32>,
+    /// The processes attributed to the span, by tgid, in join order; at
+    /// most 1024.
+    pub procs: Vec<u32>,
+    /// The seqs of the records attributed to the span, ascending: the
+    /// `proc.exec` of each process, and the `fs.*` and `net.connect`
+    /// records their work made; at most 4096.
+    pub effects: Vec<u64>,
+    /// Whether a process or an effect was left out for the limits.
+    pub truncated: bool,
+}
+
 /// `finding`: the reconciler's conclusion from records of both rings, with
 /// the records it read as evidence. Never sampled; a score of 70 or more
 /// is written through to disk at once.

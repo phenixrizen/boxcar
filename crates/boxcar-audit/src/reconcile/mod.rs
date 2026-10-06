@@ -24,6 +24,13 @@
 //! wait) run on a [`Clock`] the tests pause; the records' own `ts_host_ns`
 //! orders everything else.
 //!
+//! Tool spans (`spans`): a `tool.open` from the gate opens one, the
+//! `tool.close` in the agent's next request closes it, and the processes
+//! and effects between them are attributed to it; the span's membership
+//! is written as `span.effects` at close and, for a span still open, at
+//! `vmm.stop`. Findings inside a span carry its id, and the [`SpanIndex`]
+//! the control socket's `span.list` reads is kept current.
+//!
 //! The thread ends with the log (the subscription's end), at `vmm.stop`
 //! after a last tick, or when [`ReconcilerHandle::finish`] asks.
 
@@ -31,6 +38,7 @@ pub mod clock;
 mod dns;
 mod paths;
 mod rules;
+pub mod spans;
 mod state;
 
 use std::io;
@@ -39,12 +47,14 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use boxcar_proto::{Finding, Payload, Record, Ring};
+use boxcar_proto::{Finding, Payload, Record, Ring, SpanEffects, SpanRef};
 
 use crate::sink::{AuditSink, Priority, Submission};
 use crate::subscribe::{Item, Next};
 use crate::Filter;
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use spans::SpanIndex;
+use spans::Spans;
 use state::State;
 
 /// How often the timers are looked at while nothing arrives.
@@ -75,34 +85,52 @@ pub struct ReconcileConfig {
     /// Whether the VM runs a sensor: without one, its silence is no finding.
     pub sensor_expected: bool,
     pub clock: Arc<dyn Clock>,
+    /// The index `span.list` reads, kept current when given.
+    pub spans: Option<SpanIndex>,
 }
 
 /// The reconciler's state machine: feed it records and ticks, take the
-/// findings. [`Reconciler::spawn`] runs it on a thread off the log.
+/// findings and the span records. [`Reconciler::spawn`] runs it on a
+/// thread off the log.
 pub struct Reconciler {
     cfg: ReconcileConfig,
     state: State,
+    spans: Spans,
 }
 
 impl Reconciler {
     pub fn new(cfg: ReconcileConfig) -> Reconciler {
+        let spans = Spans::new(cfg.spans.clone());
         Reconciler {
             cfg,
             state: State::default(),
+            spans,
         }
     }
 
     /// Reads one record and returns the findings it leads to.
     pub fn observe(&mut self, record: &Record) -> Vec<Finding> {
-        if record.kind == "finding" {
+        if record.kind == "finding" || record.kind.starts_with("span.") {
             return Vec::new();
         }
-        rules::observe(&mut self.state, &self.cfg, record)
+        rules::observe(&mut self.state, &mut self.spans, &self.cfg, record)
     }
 
     /// Looks at the timers at host time `now_ns`.
     pub fn on_tick(&mut self, now_ns: u64) -> Vec<Finding> {
-        rules::on_tick(&mut self.state, &self.cfg, now_ns)
+        rules::on_tick(&mut self.state, &mut self.spans, &self.cfg, now_ns)
+    }
+
+    /// The `span.effects` records made since the last call: a span's
+    /// membership at its close, or at `vmm.stop` while still open.
+    pub fn take_records(&mut self) -> Vec<SpanEffects> {
+        self.spans.take_records()
+    }
+
+    /// The session's id, once a record has shown it: the trace id of the
+    /// spans.
+    pub fn session_id(&self) -> Option<&str> {
+        self.state.session_id.as_deref()
     }
 
     /// The subscription saw a gap (it lagged and resumed): what it did not
@@ -148,34 +176,72 @@ fn run(sink: AuditSink, cfg: ReconcileConfig, stop: &AtomicBool) {
             Ok(Next::Idle) => reconciler.on_tick(clock.now_ns()),
             Ok(Next::End) | Err(_) => break,
         };
-        for finding in findings {
-            if emit(&sink, finding).is_err() {
-                return;
-            }
+        if emit_all(&sink, &mut reconciler, findings).is_err() {
+            return;
         }
         if reconciler.stopped() {
-            for finding in reconciler.on_tick(clock.now_ns()) {
-                let _ = emit(&sink, finding);
-            }
+            let findings = reconciler.on_tick(clock.now_ns());
+            let _ = emit_all(&sink, &mut reconciler, findings);
             break;
         }
     }
 }
 
-/// Writes one finding into the log; waits for room.
-fn emit(sink: &AuditSink, finding: Finding) -> Result<(), crate::EmitError> {
+/// Writes the findings and the span records made so far into the log.
+fn emit_all(
+    sink: &AuditSink,
+    reconciler: &mut Reconciler,
+    findings: Vec<Finding>,
+) -> Result<(), crate::EmitError> {
+    let trace_id = reconciler.session_id().unwrap_or_default().to_owned();
+    for finding in findings {
+        emit(sink, finding, &trace_id)?;
+    }
+    for effects in reconciler.take_records() {
+        emit_span(sink, effects, &trace_id)?;
+    }
+    Ok(())
+}
+
+/// Writes one finding into the log; waits for room. One inside a span
+/// carries the span in its envelope too.
+fn emit(sink: &AuditSink, finding: Finding, trace_id: &str) -> Result<(), crate::EmitError> {
     let priority = if finding.score >= CRITICAL_SCORE {
         Priority::Critical
     } else {
         Priority::Normal
     };
+    let span = finding.span_id.as_ref().map(|span_id| SpanRef {
+        trace_id: trace_id.to_owned(),
+        span_id: span_id.clone(),
+    });
     sink.emit(Submission {
         ring: Ring::Host,
         ts_guest_ns: None,
         subject: None,
         payload: Payload::Finding(finding),
-        span: None,
+        span,
         priority,
+    })
+}
+
+/// Writes one `span.effects` into the log; waits for room.
+fn emit_span(
+    sink: &AuditSink,
+    effects: SpanEffects,
+    trace_id: &str,
+) -> Result<(), crate::EmitError> {
+    let span = SpanRef {
+        trace_id: trace_id.to_owned(),
+        span_id: effects.span_id.clone(),
+    };
+    sink.emit(Submission {
+        ring: Ring::Host,
+        ts_guest_ns: None,
+        subject: None,
+        payload: Payload::SpanEffects(effects),
+        span: Some(span),
+        priority: Priority::Normal,
     })
 }
 

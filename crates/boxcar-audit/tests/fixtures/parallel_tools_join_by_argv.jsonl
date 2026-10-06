@@ -1,0 +1,2 @@
+{"type":"span.effects","data":{"span_id":"toolu_a","tool_name":"Bash","opened_seq":4,"closed_seq":14,"executor_tgid":100,"procs":[320],"effects":[7,10,11],"truncated":false}}
+{"type":"span.effects","data":{"span_id":"toolu_b","tool_name":"Bash","opened_seq":5,"closed_seq":15,"executor_tgid":100,"procs":[310],"effects":[6,8,9],"truncated":false}}

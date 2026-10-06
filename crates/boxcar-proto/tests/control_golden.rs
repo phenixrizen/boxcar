@@ -12,11 +12,12 @@ use std::path::Path;
 use boxcar_proto::control::{
     parse_request, AuditEvent, AuditLagged, AuditSubscribeParams, ErrorCode, Hello,
     PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams, PtyAttached, PtyDetached,
-    PtyResizeParams, PtyWatchParams, Ready, Response, StateEvent, Status, StopParams, MAX_LINE,
+    PtyResizeParams, PtyWatchParams, Ready, Response, SpanList, SpanListParams, StateEvent, Status,
+    StopParams, MAX_LINE,
 };
 use serde_json::Value;
 
-const OPS: [&str; 8] = [
+const OPS: [&str; 9] = [
     "status",
     "stop",
     "pty.attach",
@@ -25,6 +26,7 @@ const OPS: [&str; 8] = [
     "audit.subscribe",
     "policy.get",
     "policy.update",
+    "span.list",
 ];
 const EVENTS: [&str; 5] = ["hello", "state", "pty.detached", "audit", "audit.lagged"];
 const CODES: [ErrorCode; 8] = [
@@ -76,6 +78,13 @@ fn check_op(op: &str, params: &Value, result: &Value) {
             as_::<PolicyUpdateParams>("policy.update params", params);
             as_::<PolicyUpdated>("policy.update result", result);
         }
+        "span.list" => {
+            as_::<SpanListParams>("span.list params", params);
+            as_::<SpanList>("span.list result", result);
+            let list: SpanList = serde_json::from_value(result.clone()).unwrap();
+            assert_eq!(list.spans.len(), 2);
+            assert!(list.spans[0].closed_seq.is_none() && list.spans[1].closed_seq.is_some());
+        }
         other => panic!("an op the protocol does not have: {other}"),
     }
 }
@@ -103,7 +112,14 @@ fn every_golden_line_parses_as_what_it_is_and_everything_appears() {
                     assert_eq!(hello.versions, [1]);
                     assert_eq!(
                         hello.capabilities,
-                        ["pty", "audit", "policy.net", "policy.inspect", "findings"]
+                        [
+                            "pty",
+                            "audit",
+                            "policy.net",
+                            "policy.inspect",
+                            "findings",
+                            "spans"
+                        ]
                     );
                 }
                 "state" => {

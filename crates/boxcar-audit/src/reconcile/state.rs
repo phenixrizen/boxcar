@@ -86,6 +86,10 @@ pub struct Flow {
     pub proto: String,
     pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
+    /// The names the stack had for the destination.
+    pub names: Vec<String>,
+    /// The policy let it through.
+    pub allowed: bool,
     /// The process whose `proc.tcp_connect` matched, once one did.
     pub proc_key: Option<ProcKey>,
     pub proc_seq: Option<u64>,
@@ -143,6 +147,9 @@ pub struct State {
     pub sensor_connects: VecDeque<SensorConnect>,
     pub sensor: Sensor,
     pub dns: DnsCache,
+    /// The session's id, from the first record: the trace id of every
+    /// span.
+    pub session_id: Option<String>,
     /// Host time and seq of `session.start`.
     pub session_start: Option<(u64, u64)>,
     /// Host time of the last ring 0 effect (fs or net).

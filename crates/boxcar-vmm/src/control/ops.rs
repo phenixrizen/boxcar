@@ -139,8 +139,8 @@ use std::time::Duration;
 
 use boxcar_proto::control::{
     ErrorBody, ErrorCode, PolicyUpdateParams, PolicyUpdated, PtyAttachParams, PtyAttached,
-    PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Request, Status, StopMode, StopParams,
-    PTY_SESSION,
+    PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Request, SpanList, SpanListParams,
+    Status, StopMode, StopParams, PTY_SESSION,
 };
 use boxcar_proto::{Payload, PolicyChanged};
 use serde::de::DeserializeOwned;
@@ -341,6 +341,7 @@ impl Ops for VmmOps {
             "audit.subscribe" => audit::subscribe(self.handle.audit(), conn, req, self.audit),
             "policy.get" => self.policy_get(),
             "policy.update" => self.policy_update(conn, req),
+            "span.list" => self.span_list(req),
             _ => Err(ErrorBody::unknown_op(&req.op)),
         }
     }
@@ -352,6 +353,7 @@ impl Ops for VmmOps {
             "policy.net".to_owned(),
             "policy.inspect".to_owned(),
             "findings".to_owned(),
+            "spans".to_owned(),
         ]
     }
 }
@@ -448,6 +450,23 @@ impl VmmOps {
             .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
     }
 
+    /// `span.list`: the reconciler's index, newest first; empty on a VM
+    /// without one.
+    fn span_list(&self, req: &Request) -> Result<Value, ErrorBody> {
+        let params: SpanListParams = if req.params.is_null() {
+            SpanListParams::default()
+        } else {
+            params(req)?
+        };
+        let spans = self
+            .handle
+            .spans()
+            .map(|index| index.list(params.active_only))
+            .unwrap_or_default();
+        serde_json::to_value(SpanList { spans })
+            .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
+    }
+
     /// `policy.update`: checked and swapped by [`crate::policy::LivePolicy`],
     /// then recorded as `policy.changed`, attributed to the client.
     fn policy_update(&self, conn: &ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
@@ -504,7 +523,7 @@ mod tests {
     use std::time::Duration;
 
     use boxcar_audit::{Priority, Submission};
-    use boxcar_proto::control::{to_line, ErrorCode, Hello, VmState};
+    use boxcar_proto::control::{to_line, ErrorCode, Hello, SpanEntry, VmState};
     use boxcar_proto::guest::HostMsg;
     use boxcar_proto::{Attrib, FsIo, NetDrop, OpResult, Payload, Record, Ring, Subject, Verdict};
 
@@ -521,7 +540,14 @@ mod tests {
         assert_eq!(ops.status(), handle.status());
         assert_eq!(
             ops.capabilities(),
-            ["pty", "audit", "policy.net", "policy.inspect", "findings"]
+            [
+                "pty",
+                "audit",
+                "policy.net",
+                "policy.inspect",
+                "findings",
+                "spans"
+            ]
         );
 
         let mut conn = ConnCtx::new(1, 0);
@@ -646,7 +672,14 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net", "policy.inspect", "findings"])
+            json!([
+                "pty",
+                "audit",
+                "policy.net",
+                "policy.inspect",
+                "findings",
+                "spans"
+            ])
         );
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
         assert_eq!(response["result"]["raw"], true, "{response}");
@@ -972,7 +1005,14 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net", "policy.inspect", "findings"])
+            json!([
+                "pty",
+                "audit",
+                "policy.net",
+                "policy.inspect",
+                "findings",
+                "spans"
+            ])
         );
 
         // The response comes first, though the log has records to send.
@@ -1224,7 +1264,14 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net", "policy.inspect", "findings"])
+            json!([
+                "pty",
+                "audit",
+                "policy.net",
+                "policy.inspect",
+                "findings",
+                "spans"
+            ])
         );
         let before = wire.request("policy.get", Value::Null);
         assert_eq!(
@@ -1289,6 +1336,55 @@ mod tests {
     /// update that names nothing is a bad request that names what is
     /// wrong, and the policy and its version stay as they were, with
     /// nothing recorded.
+    #[test]
+    fn span_list_reads_the_index() {
+        let fixture = Fixture::new();
+        let ops = VmmOps::new(fixture.handle.clone());
+        let mut conn = ConnCtx::new(1, 0);
+        let empty = ops
+            .dispatch(&mut conn, &Request::new(1, "span.list", Value::Null))
+            .unwrap();
+        assert_eq!(empty, json!({"spans": []}));
+
+        let index = fixture
+            .handle
+            .spans()
+            .expect("the test handle has an index");
+        let entry = |id: &str, closed: Option<u64>| SpanEntry {
+            span_id: id.to_owned(),
+            tool_name: "Bash".to_owned(),
+            opened_seq: 10,
+            closed_seq: closed,
+            procs: 1,
+            effects: 2,
+            worst_score: 0,
+        };
+        index.update(entry("toolu_01", Some(20)));
+        index.update(entry("toolu_02", None));
+        let all = ops
+            .dispatch(&mut conn, &Request::new(2, "span.list", json!({})))
+            .unwrap();
+        let all: SpanList = serde_json::from_value(all).unwrap();
+        assert_eq!(all.spans.len(), 2);
+        assert_eq!(all.spans[0].span_id, "toolu_02", "newest first");
+        let active = ops
+            .dispatch(
+                &mut conn,
+                &Request::new(3, "span.list", json!({"active_only": true})),
+            )
+            .unwrap();
+        let active: SpanList = serde_json::from_value(active).unwrap();
+        assert_eq!(active.spans.len(), 1);
+        assert_eq!(active.spans[0].span_id, "toolu_02");
+        let bad = ops
+            .dispatch(
+                &mut conn,
+                &Request::new(4, "span.list", json!({"active_only": "yes"})),
+            )
+            .unwrap_err();
+        assert_eq!(bad.code, ErrorCode::BadRequest);
+    }
+
     #[test]
     fn policy_update_refuses_a_malformed_rule_naming_it() {
         let fixture = Fixture::new();

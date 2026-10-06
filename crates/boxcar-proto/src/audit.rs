@@ -48,7 +48,7 @@ pub use payloads::{
     NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit,
     ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
     ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef,
-    ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -155,7 +155,7 @@ impl Source {
         } else if kind.starts_with("http.") || kind.starts_with("llm.") || kind.starts_with("tool.")
         {
             Some(Source::Gate)
-        } else if kind == "finding" {
+        } else if kind == "finding" || kind.starts_with("span.") {
             Some(Source::Reconciler)
         } else {
             None
@@ -490,6 +490,8 @@ pub enum Payload {
     ToolOpen(ToolOpen),
     #[serde(rename = "tool.close")]
     ToolClose(ToolClose),
+    #[serde(rename = "span.effects")]
+    SpanEffects(SpanEffects),
     #[serde(rename = "finding")]
     Finding(Finding),
 }
@@ -552,6 +554,7 @@ impl Payload {
             Payload::LlmResponse(_) => "llm.response",
             Payload::ToolOpen(_) => "tool.open",
             Payload::ToolClose(_) => "tool.close",
+            Payload::SpanEffects(_) => "span.effects",
             Payload::Finding(_) => "finding",
         }
     }
@@ -612,7 +615,7 @@ impl Payload {
             | Payload::LlmResponse(_)
             | Payload::ToolOpen(_)
             | Payload::ToolClose(_) => Source::Gate,
-            Payload::Finding(_) => Source::Reconciler,
+            Payload::SpanEffects(_) | Payload::Finding(_) => Source::Reconciler,
         }
     }
 
@@ -647,7 +650,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 54] = [
+    const KINDS: [&str; 55] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -701,6 +704,7 @@ mod tests {
         "llm.response",
         "tool.open",
         "tool.close",
+        "span.effects",
         "finding",
     ];
 
@@ -1631,6 +1635,23 @@ mod tests {
                 }),
             ),
             (
+                Payload::SpanEffects(SpanEffects {
+                    span_id: "toolu_01".into(),
+                    tool_name: "Bash".into(),
+                    opened_seq: 40,
+                    closed_seq: Some(58),
+                    executor_tgid: Some(212),
+                    procs: vec![230, 231],
+                    effects: vec![41, 44, 52],
+                    truncated: false,
+                }),
+                json!({
+                    "span_id": "toolu_01", "tool_name": "Bash", "opened_seq": 40,
+                    "closed_seq": 58, "executor_tgid": 212, "procs": [230, 231],
+                    "effects": [41, 44, 52], "truncated": false,
+                }),
+            ),
+            (
                 Payload::Finding(Finding {
                     category: FindingCategory::NetworkAnomaly,
                     score: 60,
@@ -1689,6 +1710,23 @@ mod tests {
     /// does not mark skip-if-none travel as explicit nulls.
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
+            (
+                Payload::SpanEffects(SpanEffects {
+                    span_id: "call_x".into(),
+                    tool_name: "shell".into(),
+                    opened_seq: 40,
+                    closed_seq: None,
+                    executor_tgid: None,
+                    procs: Vec::new(),
+                    effects: Vec::new(),
+                    truncated: false,
+                }),
+                json!({
+                    "span_id": "call_x", "tool_name": "shell", "opened_seq": 40,
+                    "closed_seq": null, "executor_tgid": null, "procs": [], "effects": [],
+                    "truncated": false,
+                }),
+            ),
             (
                 Payload::ToolOpen(ToolOpen {
                     flow: 8,
@@ -2069,7 +2107,7 @@ mod tests {
                 Source::Policy
             } else if payload.kind().starts_with("proc.") {
                 Source::Sensor
-            } else if payload.kind() == "finding" {
+            } else if payload.kind() == "finding" || payload.kind().starts_with("span.") {
                 Source::Reconciler
             } else if payload.kind().starts_with("http.")
                 || payload.kind().starts_with("llm.")
@@ -2094,6 +2132,7 @@ mod tests {
         assert_eq!(Source::from_kind("proc.exec"), Some(Source::Sensor));
         assert_eq!(Source::from_kind("proc.heartbeat"), Some(Source::Sensor));
         assert_eq!(Source::from_kind("finding"), Some(Source::Reconciler));
+        assert_eq!(Source::from_kind("span.effects"), Some(Source::Reconciler));
         for other in [
             "tools.open",
             "llms.request",

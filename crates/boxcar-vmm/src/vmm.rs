@@ -228,6 +228,9 @@ pub struct VmConfig {
     /// real hosts. `session.ca_pem` (set by `boxcar run`) carries the CA's
     /// certificate to the guest. The key never leaves this process.
     pub inspect: Option<Arc<InspectConfig>>,
+    /// The reconciler's span index, when the run keeps one: the control
+    /// socket's `span.list` reads it.
+    pub spans: Option<boxcar_audit::SpanIndex>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -273,6 +276,7 @@ impl VmConfig {
             session: SessionConfig::for_user(shell, uid, gid),
             control: None,
             inspect: None,
+            spans: None,
         }
     }
 }
@@ -556,6 +560,7 @@ impl Vmm {
             pty,
             sensor,
             policy: Arc::new(live_policy),
+            spans: cfg.spans.clone(),
         });
 
         let start = VmmStart {

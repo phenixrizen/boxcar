@@ -887,6 +887,84 @@
         }
       ]
     },
+    "SpanEntry": {
+      "description": "One tool span as `span.list` reports it: the reconciler's index entry, kept current while the span is open and once more when it closes.",
+      "type": "object",
+      "required": [
+        "effects",
+        "opened_seq",
+        "procs",
+        "span_id",
+        "tool_name",
+        "worst_score"
+      ],
+      "properties": {
+        "closed_seq": {
+          "description": "The seq of the `tool.close`; absent while the span is open.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "effects": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "opened_seq": {
+          "description": "The seq of the `tool.open`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "procs": {
+          "description": "How many processes and effect records the span holds so far.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "span_id": {
+          "description": "The provider's tool use id.",
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "worst_score": {
+          "description": "The highest score of a finding inside the span; 0 with none.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SpanList": {
+      "description": "The result of `span.list`: `{\"spans\":[...]}`, newest first, at most [`MAX_SPAN_LIST`] entries. Empty on a VM whose session has no spans yet, and on one with no reconciler index.",
+      "type": "object",
+      "required": [
+        "spans"
+      ],
+      "properties": {
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SpanEntry"
+          }
+        }
+      }
+    },
+    "SpanListParams": {
+      "description": "The parameters of `span.list`: `{\"active_only\":true}` for the spans still open; the default, or no parameters, lists the closed ones too.",
+      "type": "object",
+      "properties": {
+        "active_only": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
     "SpanRef": {
       "description": "Where an event sits in a trace.",
       "type": "object",
