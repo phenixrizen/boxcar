@@ -139,9 +139,11 @@ impl Sensor {
         self.attached.contains(program)
     }
 
-    /// Whether `tid` is one of the sensor's own threads.
+    /// Whether `tid` is boxcar's own in the guest: the sensor's threads,
+    /// or init (pid 1), whose reads of the shares (the trust store it
+    /// binds) are nobody's work either.
     pub fn is_own(&self, tid: u32) -> bool {
-        self.pid == Some(tid) || self.threads.contains(&tid)
+        tid == 1 || self.pid == Some(tid) || self.threads.contains(&tid)
     }
 
     /// Whether every program the exec/fork/exit joins need is attached.

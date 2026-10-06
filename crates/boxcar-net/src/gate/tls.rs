@@ -211,6 +211,33 @@ impl std::fmt::Debug for Inspect {
     }
 }
 
+/// The name the upstream is reached and verified as, and the leaf the
+/// guest gets: the server name the guest showed, or, when it showed an
+/// address as its name (busybox's `ssl_client` does) or none, the
+/// destination's address, which a client checks against an address in
+/// the certificate, not a name.
+fn leaf_target(
+    name: Option<&str>,
+    dst: Ipv4Addr,
+) -> Result<(ServerName<'static>, LeafTarget), &'static str> {
+    match name {
+        Some(name) => match name.parse::<Ipv4Addr>() {
+            Ok(ip) => Ok((
+                ServerName::IpAddress(IpAddr::V4(ip).into()),
+                LeafTarget::Ip(ip),
+            )),
+            Err(_) => Ok((
+                ServerName::try_from(name.to_owned()).map_err(|_| "guest_rejected")?,
+                LeafTarget::Name(name.to_owned()),
+            )),
+        },
+        None => Ok((
+            ServerName::IpAddress(IpAddr::V4(dst).into()),
+            LeafTarget::Ip(dst),
+        )),
+    }
+}
+
 impl Inspect {
     /// Starts inspecting a flow to `dst` whose ClientHello `hello` named
     /// `name` (or nothing) and offered `alpn`: the upstream connection is
@@ -223,16 +250,7 @@ impl Inspect {
         alpn: &[String],
         hello: &[u8],
     ) -> Result<Inspect, &'static str> {
-        let (server_name, target) = match &name {
-            Some(name) => (
-                ServerName::try_from(name.clone()).map_err(|_| "guest_rejected")?,
-                LeafTarget::Name(name.clone()),
-            ),
-            None => (
-                ServerName::IpAddress(IpAddr::V4(dst).into()),
-                LeafTarget::Ip(dst),
-            ),
-        };
+        let (server_name, target) = leaf_target(name.as_deref(), dst)?;
         let mut client = cfg.client.clone();
         client.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
         let mut host =
@@ -636,6 +654,20 @@ fn classify_upstream(error: &rustls::Error) -> &'static str {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn an_address_shown_as_the_name_gets_an_address_leaf() {
+        let dst: Ipv4Addr = "192.0.2.9".parse().unwrap();
+        let (server, leaf) = leaf_target(Some("192.0.2.9"), dst).unwrap();
+        assert!(matches!(server, ServerName::IpAddress(_)));
+        assert_eq!(leaf, LeafTarget::Ip(dst));
+        let (server, leaf) = leaf_target(Some("api.example"), dst).unwrap();
+        assert!(matches!(server, ServerName::DnsName(_)));
+        assert_eq!(leaf, LeafTarget::Name("api.example".into()));
+        let (_, leaf) = leaf_target(None, dst).unwrap();
+        assert_eq!(leaf, LeafTarget::Ip(dst));
+        assert!(leaf_target(Some("not a name"), dst).is_err());
+    }
+
     use std::io::{Read, Write};
     use std::net::{SocketAddr, SocketAddrV4, TcpListener};
     use std::thread;

@@ -178,6 +178,9 @@ pub enum ConfigError {
     /// text.
     #[error("cannot make the policy wake eventfd: {0}")]
     Wake(String),
+    /// The dump's file or thread could not be made.
+    #[error("the dump: {0}")]
+    Dump(String),
     #[error("host name {0:?} is not 1 to 63 ASCII letters, digits and hyphens")]
     Hostname(String),
     #[error("the network interface has no room for {0}")]

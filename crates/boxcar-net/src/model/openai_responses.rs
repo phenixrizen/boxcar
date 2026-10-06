@@ -47,29 +47,36 @@ pub fn request_value(json: &Value) -> (RequestInfo, Vec<ToolClose>) {
         tools: Vec::new(),
         max_tokens: u64_of(json.get("max_output_tokens")),
     };
-    if let Some(tools) = json.get("tools").and_then(Value::as_array) {
-        info.tools = tools
-            .iter()
-            .filter_map(|t| {
-                t.get("name")
-                    .or_else(|| t.get("type"))
-                    .and_then(Value::as_str)
-            })
-            .take(64)
+    let tool_name = |t: &Value| {
+        t.get("name")
+            .or_else(|| t.get("type"))
+            .and_then(Value::as_str)
             .map(str::to_owned)
-            .collect();
+    };
+    if let Some(tools) = json.get("tools").and_then(Value::as_array) {
+        info.tools = tools.iter().filter_map(tool_name).take(64).collect();
     }
     let mut closes = Vec::new();
     if let Some(items) = items {
         for item in items {
-            if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
-                continue;
+            match item.get("type").and_then(Value::as_str) {
+                // Codex declares its tools as namespaces in an input item.
+                Some("additional_tools") => {
+                    if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                        info.tools
+                            .extend(tools.iter().filter_map(tool_name).take(64));
+                        info.tools.truncate(64);
+                    }
+                }
+                Some("function_call_output") | Some("custom_tool_call_output") => {
+                    let Some(id) = item.get("call_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let output = item.get("output").cloned().unwrap_or(Value::Null);
+                    closes.push(tool_close(id, &output, false));
+                }
+                _ => {}
             }
-            let Some(id) = item.get("call_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let output = item.get("output").cloned().unwrap_or(Value::Null);
-            closes.push(tool_close(id, &output, false));
         }
     }
     (info, closes)
@@ -97,7 +104,7 @@ pub fn response_value(json: &Value) -> (ResponseInfo, Vec<ToolOpen>) {
                         }
                     }
                 }
-                Some("function_call") => opens.push(item_open(item)),
+                Some("function_call") | Some("custom_tool_call") => opens.push(item_open(item)),
                 _ => {}
             }
         }
@@ -130,7 +137,9 @@ fn usage_of(usage: Option<&Value>) -> ResponseInfo {
     }
 }
 
-/// A whole `function_call` item as a span's open.
+/// A whole `function_call` item (JSON `arguments`) or `custom_tool_call`
+/// item (free text `input`, as Codex's `exec` tool takes it) as a span's
+/// open.
 fn item_open(item: &Value) -> ToolOpen {
     let id = item
         .get("call_id")
@@ -140,9 +149,18 @@ fn item_open(item: &Value) -> ToolOpen {
     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = item
         .get("arguments")
+        .or_else(|| item.get("input"))
         .and_then(Value::as_str)
         .unwrap_or("{}");
     tool_open_text(id, name, arguments)
+}
+
+/// Whether an output item is a tool call of either kind.
+fn is_call(item: Option<&Value>) -> bool {
+    matches!(
+        item.and_then(|i| i.get("type")).and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    )
 }
 
 /// A function call under way in a stream, by its output index.
@@ -198,8 +216,7 @@ impl Stream {
             }
             "response.output_item.added" => {
                 let item = data.get("item");
-                if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
-                {
+                if is_call(item) {
                     let index = u64_of(data.get("output_index")).unwrap_or(0);
                     let call = self.calls.entry(index).or_default();
                     call.item_id = item
@@ -218,14 +235,14 @@ impl Stream {
                         .unwrap_or("")
                         .to_owned();
                     if let Some(args) = item
-                        .and_then(|i| i.get("arguments"))
+                        .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
                         .and_then(Value::as_str)
                     {
                         call.arguments = args.to_owned();
                     }
                 }
             }
-            "response.function_call_arguments.delta" => {
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                     self.calls
@@ -235,18 +252,21 @@ impl Stream {
                         .push_str(delta);
                 }
             }
-            "response.function_call_arguments.done" => {
+            "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 let call = self.calls.entry(index).or_default();
-                if let Some(args) = data.get("arguments").and_then(Value::as_str) {
+                if let Some(args) = data
+                    .get("arguments")
+                    .or_else(|| data.get("input"))
+                    .and_then(Value::as_str)
+                {
                     call.arguments = args.to_owned();
                 }
             }
             "response.output_item.done" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 let item = data.get("item");
-                if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
-                {
+                if is_call(item) {
                     let mut call = self.calls.remove(&index).unwrap_or_default();
                     if let Some(id) = item.and_then(|i| i.get("call_id")).and_then(Value::as_str) {
                         call.call_id = id.to_owned();
@@ -255,7 +275,7 @@ impl Stream {
                         call.name = name.to_owned();
                     }
                     if let Some(args) = item
-                        .and_then(|i| i.get("arguments"))
+                        .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
                         .and_then(Value::as_str)
                     {
                         call.arguments = args.to_owned();
@@ -340,6 +360,38 @@ mod tests {
             data: data.to_owned(),
             id: None,
         }
+    }
+
+    /// Codex's tools: a `custom_tool_call` whose input is free text, built
+    /// from its deltas, opens at its item's end with the text as the
+    /// summary and no inline arguments; its `custom_tool_call_output`
+    /// closes it; the namespaces an `additional_tools` item declares are
+    /// the tools offered.
+    #[test]
+    fn custom_tool_calls_open_from_their_input_and_their_outputs_close() {
+        let mut stream = Stream::new();
+        let mut opens = Vec::new();
+        opens.extend(stream.value(&serde_json::json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_c", "name": "exec", "input": ""}})));
+        opens.extend(stream.value(&serde_json::json!({"type": "response.custom_tool_call_input.delta", "output_index": 1, "delta": "text(await tools.exec_command({cmd:\"echo"})));
+        opens.extend(stream.value(&serde_json::json!({"type": "response.custom_tool_call_input.delta", "output_index": 1, "delta": " hi\",workdir:\"/workspace\"}));"})));
+        assert!(opens.is_empty(), "not whole yet");
+        opens.extend(stream.value(&serde_json::json!({"type": "response.custom_tool_call_input.done", "output_index": 1, "input": "text(await tools.exec_command({cmd:\"echo hi\",workdir:\"/workspace\"}));"})));
+        opens.extend(stream.value(&serde_json::json!({"type": "response.output_item.done", "output_index": 1, "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_c", "name": "exec", "input": "text(await tools.exec_command({cmd:\"echo hi\",workdir:\"/workspace\"}));", "status": "completed"}})));
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].tool_use_id, "call_c");
+        assert_eq!(opens[0].tool_name, "exec");
+        assert_eq!(opens[0].args, None, "free text is no JSON");
+        assert!(opens[0].args_summary.contains("cmd:\"echo hi\""));
+        let (info, _) = stream.finish();
+        assert_eq!(info.tool_uses, 1);
+
+        let (info, closes) = request(br#"{"model":"m","stream":true,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions"},{"type":"namespace","name":"clock"}]},{"type":"custom_tool_call_output","call_id":"call_c","output":[{"type":"input_text","text":"Script completed\nOutput:\nhi\n"}]}]}"#).unwrap();
+        assert_eq!(info.tools, ["functions", "clock"]);
+        assert_eq!(info.messages, 2);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].tool_use_id, "call_c");
+        assert_eq!(closes[0].status, "ok");
+        assert!(closes[0].result_summary.contains("hi"));
     }
 
     #[test]

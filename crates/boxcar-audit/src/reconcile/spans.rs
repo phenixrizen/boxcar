@@ -17,8 +17,10 @@
 //! - A process forked or exec'd by a span's process joins that span.
 //! - A filesystem effect joins the span of its process. One by a process
 //!   in no span (the agent's own work, as for a `Write` tool) joins the
-//!   only open span, or the write tool span whose declared path it
-//!   touches; one that joins nothing waits for its process to join.
+//!   only open write tool span, or the write tool span whose declared
+//!   path it touches; a shell tool's work is its process's, and the
+//!   agent's own housekeeping meanwhile is nobody's. One that joins
+//!   nothing waits for its process to join.
 //! - A `net.connect` joins the span of the process its `proc.tcp_connect`
 //!   named, once the two have met.
 //! - The executor of a span is the process whose `proc.tls_io` write,
@@ -65,7 +67,14 @@ const EXECUTOR_SLACK_BYTES: u64 = 1024;
 /// and requests kept waiting for each other.
 const MAX_EXECUTORS: usize = 256;
 /// The tools that run a shell command the agent declares.
-const SHELL_TOOLS: [&str; 5] = ["Bash", "bash", "shell", "exec_command", "local_shell"];
+const SHELL_TOOLS: [&str; 6] = [
+    "Bash",
+    "bash",
+    "shell",
+    "exec_command",
+    "local_shell",
+    "exec",
+];
 /// The tools that declare a file they write.
 const WRITE_TOOLS: [&str; 5] = ["Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"];
 /// Programs whose `-c` argument is the command they run.
@@ -191,10 +200,14 @@ impl Span {
         Span {
             id: open.tool_use_id.clone(),
             tool_name: open.tool_name.clone(),
-            declared: args.and_then(|args| declared_command(&open.tool_name, args)),
-            paths: args
-                .map(|args| declared_paths(&open.tool_name, args))
-                .unwrap_or_default(),
+            declared: match args {
+                Some(args) => declared_command(&open.tool_name, args),
+                None => declared_command_text(&open.tool_name, &open.args_summary),
+            },
+            paths: match args {
+                Some(args) => declared_paths(&open.tool_name, args),
+                None => declared_paths_text(&open.tool_name, &open.args_summary),
+            },
             args_text,
             opened: (seq, ts),
             closed: None,
@@ -883,24 +896,28 @@ impl Spans {
     }
 
     /// A filesystem effect by no span's process: the agent's own. It
-    /// joins the only open span, or the write tool span whose declared
-    /// path it touches.
+    /// joins the only open write tool span, or the write tool span whose
+    /// declared path it touches; a shell tool's work is its process's.
     fn take_agent_effect(&mut self, kind: &EffectKind, seq: u64) -> bool {
         if !matches!(kind, EffectKind::Fs { .. }) {
             return false;
         }
-        let id = match self.open.as_slice() {
+        let writers: Vec<&String> = self
+            .open
+            .iter()
+            .filter(|id| self.spans.get(*id).is_some_and(Span::is_write_tool))
+            .collect();
+        let id = match writers.as_slice() {
             [] => return false,
-            [only] => only.clone(),
+            [only] => (*only).clone(),
             many => {
-                let Some(id) = many.iter().find(|id| {
-                    self.spans
-                        .get(*id)
-                        .is_some_and(|span| span.is_write_tool() && span.touches(kind))
-                }) else {
+                let Some(id) = many
+                    .iter()
+                    .find(|id| self.spans.get(**id).is_some_and(|span| span.touches(kind)))
+                else {
                     return false;
                 };
-                id.clone()
+                (*id).clone()
             }
         };
         self.push_effect(
@@ -1223,6 +1240,37 @@ fn declared_command(tool_name: &str, args: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// The command a shell tool declared when its arguments were free text
+/// (Codex's `exec` tool takes `tools.exec_command({cmd:"...", ...})`),
+/// read from the arguments' summary: the quoted string after `cmd:` or
+/// `command:` (with or without quotes around the name), normalized.
+fn declared_command_text(tool_name: &str, text: &str) -> Option<String> {
+    if !SHELL_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    let at = ["\"cmd\":", "cmd:", "\"command\":", "command:"]
+        .iter()
+        .filter_map(|key| text.find(key).map(|at| at + key.len()))
+        .min()?;
+    let rest = text[at..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut command = String::new();
+    let mut chars = rest.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    command.push(next);
+                }
+            }
+            '"' => break,
+            _ => command.push(ch),
+        }
+    }
+    let command = normalize(&command);
+    (!command.is_empty()).then_some(command)
+}
+
 /// The paths a write tool declared, as (mount, path without its leading
 /// slash): `file_path`, `notebook_path`, `path` or `filename`, and for
 /// `apply_patch` the files its patch adds, updates or deletes.
@@ -1241,6 +1289,27 @@ fn declared_paths(tool_name: &str, args: &Value) -> Vec<(String, String)> {
         .or_else(|| args.get("patch"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    paths.extend(patch_paths(patch));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The paths a write tool declared in free text (an `apply_patch` whose
+/// input is the patch itself).
+fn declared_paths_text(tool_name: &str, text: &str) -> Vec<(String, String)> {
+    if !WRITE_TOOLS.contains(&tool_name) {
+        return Vec::new();
+    }
+    let mut paths = patch_paths(text);
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The files a patch adds, updates or deletes.
+fn patch_paths(patch: &str) -> Vec<(String, String)> {
+    let mut paths = Vec::new();
     for line in patch.lines() {
         for prefix in ["*** Add File: ", "*** Update File: ", "*** Delete File: "] {
             if let Some(path) = line.strip_prefix(prefix) {
@@ -1248,8 +1317,6 @@ fn declared_paths(tool_name: &str, args: &Value) -> Vec<(String, String)> {
             }
         }
     }
-    paths.sort();
-    paths.dedup();
     paths
 }
 
@@ -1370,6 +1437,28 @@ mod tests {
         );
         assert_eq!(declared_command("Read", &json!({"command": "ls"})), None);
         assert_eq!(declared_command("Bash", &json!({"timeout": 5})), None);
+    }
+
+    #[test]
+    fn a_declared_command_is_read_from_free_text_arguments() {
+        let text = "text(await tools.exec_command({cmd:\"echo  hi > \\\"a b\\\"\",workdir:\"/workspace\",max_output_tokens:1000}));";
+        assert_eq!(
+            declared_command_text("exec", text),
+            Some("echo hi > a b".to_owned())
+        );
+        assert_eq!(
+            declared_command_text("shell", "{\"command\": \"ls -la\"}"),
+            Some("ls -la".to_owned())
+        );
+        assert_eq!(declared_command_text("Read", "cmd:\"ls\""), None);
+        assert_eq!(declared_command_text("exec", "no command here"), None);
+        assert_eq!(
+            declared_paths_text(
+                "apply_patch",
+                "*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch"
+            ),
+            vec![("workspace".to_owned(), "src/main.rs".to_owned())]
+        );
     }
 
     #[test]

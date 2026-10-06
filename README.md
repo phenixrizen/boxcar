@@ -165,6 +165,85 @@ boxcar run ... --allow example.com --allow '*.github.com:443' \
   [docs/networking.md](docs/networking.md) for what the network does and
   does not do.
 
+## Watching the model traffic
+
+`--inspect RULE` (written like `--allow`, which must still admit the
+connection) watches the guest's traffic to a destination: a TLS
+connection ends in boxcar, which reaches the real host with its own TLS,
+checked against the host's trust store, hands the guest a certificate
+from the session's own CA (init puts it in the guest's trust store and
+names it in the environment Node, Python, curl and git read), and relays
+the plaintext unchanged both ways with a copy to an observer. The
+observer records every HTTP exchange (`http.request`, `http.response`)
+and the model APIs it knows, the Anthropic Messages API and OpenAI's
+chat and responses APIs, as `llm.request` and `llm.response`; each tool
+use in a reply opens a span (`tool.open`) that the tool result in the
+next request closes (`tool.close`), and the reconciler attributes the
+processes and effects in between to it (`span.effects`, `boxcar spans`)
+and judges them (`intent_effect_mismatch`, `orphaned_work`).
+
+```bash
+boxcar run --rootfs R --workspace W --allow api.anthropic.com:443 \
+    --inspect api.anthropic.com:443 -- claude -p 'List the files here'
+boxcar spans            # the tool calls so far, newest first
+```
+
+No text is ever recorded inline: prompts, replies and tool results appear
+as sizes and hashes, and in scrubbed summaries of at most 512 bytes; tool
+arguments are kept whole up to 8 KiB. Credential headers' values are
+dropped at the parser and reach no record, summary or dump. The agent
+keeps its own credential; boxcar never holds or injects one. The whole
+of it is in [docs/gate.md](docs/gate.md).
+
+## Running Claude Code and Codex inside
+
+The agents need glibc, a Node, and their own account logins. `cargo xtask
+rootfs debian` builds a Debian guest (`target/guest/rootfs-debian`) with
+Claude Code twice (the native build as `claude-native`, the npm build as
+`claude`) and Codex, at pinned versions. A credential goes into the
+session's environment with `--env`, over the control channel and into no
+record; the gate inspects the model's host and the policy admits the
+account's other endpoints:
+
+```bash
+boxcar run --rootfs target/guest/rootfs-debian --workspace W \
+    --inspect api.anthropic.com:443 --allow api.anthropic.com:443 \
+    --allow platform.claude.com:443 --allow claude.ai:443 \
+    --env CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
+    -- claude-native -p 'Run: echo hello > hello.txt' --allowedTools Bash
+
+boxcar run --rootfs target/guest/rootfs-debian --workspace W \
+    --inspect api.openai.com:443 --inspect chatgpt.com:443 \
+    --allow api.openai.com:443 --allow chatgpt.com:443 \
+    --allow auth.openai.com:443 --allow '*.oaiusercontent.com:443' \
+    --env CODEX_HOME=/workspace/.codex \
+    -- codex exec --skip-git-repo-check 'Run: echo hello > hello.txt'
+```
+
+(`claude setup-token` makes a Claude Code token; Codex reads `auth.json`
+under `CODEX_HOME`, copied into the workspace here. A Codex account login
+talks to `chatgpt.com`, an API key to `api.openai.com`; both are
+inspected above.) Afterwards `boxcar
+spans` lists the tool calls, and the log holds, for the Bash call, the
+exec of the shell with that command and the close of the file it wrote,
+in one chain. The gated tests `claude_code_native_runs_a_bash_tool_inside`,
+`claude_code_under_node_runs_a_bash_tool_inside` and
+`codex_runs_a_shell_tool_inside` do exactly this, and skip without the
+Debian guest or a credential.
+
+## Dump mode
+
+`boxcar run --dump DIR` writes a debugging dump of the network beside the
+log: `frames.pcap` with every frame the guest sent and every frame it was
+given (open it with Wireshark or `tcpdump -r`), and for inspected flows
+each decoded exchange as `http/<flow>-<stream>.req` and `.resp` (the
+start line, the headers the observer kept, the decoded body with
+secret-looking fields scrubbed) and, for one upgraded to WebSocket, its
+messages as `.ws`. DIR is made 0700, its files 0600, and it
+may be neither a share nor inside one. The dump is an aid, not part of
+the audit log: nothing in it is hashed or chained. Filesystem traffic has
+its own dump, `--audit-level verbose`.
+
 ## The sensor
 
 Ring 0 of the log is what the host sees: every file operation, every

@@ -231,6 +231,10 @@ pub struct VmConfig {
     /// The reconciler's span index, when the run keeps one: the control
     /// socket's `span.list` reads it.
     pub spans: Option<boxcar_audit::SpanIndex>,
+    /// The dump directory (`boxcar run --dump`), when the run has one:
+    /// the network's frames, and the inspected flows' plaintext and
+    /// exchanges, go there. A debugging aid, not part of the log.
+    pub dump: Option<boxcar_net::DumpDir>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -277,6 +281,7 @@ impl VmConfig {
             control: None,
             inspect: None,
             spans: None,
+            dump: None,
         }
     }
 }
@@ -473,6 +478,7 @@ impl Vmm {
                 audit: &cfg.audit,
                 policy: &cfg.policy,
                 inspect: cfg.inspect.clone(),
+                dump: cfg.dump.clone(),
             }),
         )?;
         // The guest control channel's service and the session's terminal's,

@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use boxcar_audit::AuditSink;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
+use crate::dump::DumpDir;
+
 use super::exchange::Observation;
 
 /// The most plaintext bytes one message carries.
@@ -237,6 +239,7 @@ impl ObserverThread {
         rx: Receiver<Message>,
         sink: AuditSink,
         trace_id: String,
+        dump: Option<DumpDir>,
     ) -> io::Result<ObserverThread> {
         let (stopped, done) = mpsc::channel::<()>();
         let thread = thread::Builder::new()
@@ -244,7 +247,7 @@ impl ObserverThread {
             .spawn(move || {
                 // Dropped when the thread ends, however it ends.
                 let _stopped = stopped;
-                run(rx, &sink, &trace_id);
+                run(rx, &sink, &trace_id, dump.as_ref());
             })?;
         Ok(ObserverThread { done, thread })
     }
@@ -264,7 +267,7 @@ impl ObserverThread {
 /// emit (a full writer stalls this thread, never the net thread). At the
 /// end, when the senders are gone, what is still open is recorded as it
 /// stands.
-fn run(rx: Receiver<Message>, sink: &AuditSink, trace_id: &str) {
+fn run(rx: Receiver<Message>, sink: &AuditSink, trace_id: &str, dump: Option<&DumpDir>) {
     let mut flows: HashMap<u64, Observation> = HashMap::new();
     let mut out = Vec::new();
     loop {
@@ -278,7 +281,8 @@ fn run(rx: Receiver<Message>, sink: &AuditSink, trace_id: &str) {
             }) => {
                 flows.insert(
                     flow,
-                    Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id),
+                    Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id)
+                        .with_dump(dump.cloned()),
                 );
             }
             Ok(Message::Data { flow, dir, bytes }) => {
@@ -451,7 +455,7 @@ mod tests {
         .unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         let (observer, rx) = Observer::channel();
-        let thread = ObserverThread::spawn(rx, sink, "trace-test".into()).unwrap();
+        let thread = ObserverThread::spawn(rx, sink, "trace-test".into(), None).unwrap();
         assert_eq!(
             observer.send(Message::Open {
                 flow: 1,

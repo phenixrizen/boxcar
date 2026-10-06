@@ -52,9 +52,11 @@ processes and ring 0 effects to the span:
   from. The agent itself is in no span.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
-  tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`) whose
-  declared `command` (or `cmd`, a string or an array joined with spaces)
-  the exec carries, which is the shell's `-c` command being the declared
+  tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)
+  whose declared `command` (or `cmd`, a string or an array joined with
+  spaces; for a free-text tool such as Codex's `exec`, the quoted string
+  after `cmd:` or `command:` in the arguments' summary) the exec
+  carries, which is the shell's `-c` command being the declared
   one or containing it (Claude Code wraps it in `eval '...' < /dev/null
   && pwd -P >| ...`), or the whole argv being the declared one, after
   whitespace is collapsed and quotes dropped; else as the only open span.
@@ -65,9 +67,11 @@ processes and ring 0 effects to the span:
   `fs.mkdir` and `fs.setattr` join the span of the thread's process, and
   `net.connect` the span of the process its `proc.tcp_connect` named. A
   filesystem effect by a process in no span is the agent's own work (a
-  `Write` tool writes from the agent): it joins the only open span, or the
-  write tool span (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`,
-  `apply_patch`) whose declared path it touches. An effect that joins
+  `Write` tool writes from the agent): it joins the only open write tool
+  span (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `apply_patch`), or
+  the write tool span whose declared path it touches; a shell tool's work
+  is its process's, and what the agent itself writes meanwhile (Codex
+  installs plugins in the background) is nobody's. An effect that joins
   nothing waits 2 s for its process to join a span. The agent's own
   connections join no span.
 - **The record.** At the close, and at `vmm.stop` for a span still open,

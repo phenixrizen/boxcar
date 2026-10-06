@@ -21,6 +21,7 @@ use std::time::Instant;
 use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
 
 use super::Direction;
+use crate::dump::{self, DumpDir};
 use crate::http::{BodySink, Connection, Event, Headers, SseEvent, SseParser, Version};
 use crate::model::Tracker;
 
@@ -83,6 +84,9 @@ pub struct Exchange {
     request_degraded: Option<&'static str>,
     pub response: Option<ResponseHead>,
     pub response_body: Option<BodySink>,
+    /// The heads as the dump writes them, when there is a dump.
+    request_head_text: Option<String>,
+    response_head_text: Option<String>,
     sse: Option<SseParser>,
     /// The event stream's events, as they complete: the model parsers
     /// take them.
@@ -108,6 +112,8 @@ impl Exchange {
             request_degraded: None,
             response: None,
             response_body: None,
+            request_head_text: None,
+            response_head_text: None,
             sse: None,
             sse_events: Vec::new(),
             sse_count: 0,
@@ -135,6 +141,8 @@ pub struct Observation {
     conn: Connection,
     exchanges: HashMap<u32, Exchange>,
     model: Tracker,
+    /// Where each decoded exchange is written, when the session dumps.
+    dump: Option<DumpDir>,
 }
 
 impl Observation {
@@ -156,7 +164,55 @@ impl Observation {
             conn: Connection::new(alpn),
             exchanges: HashMap::new(),
             model: Tracker::new(flow, trace_id.to_owned()),
+            dump: None,
         }
+    }
+
+    /// The observation with the dump: each exchange's decoded request and
+    /// response are written to `http/<flow>-<stream>.req` and `.resp`.
+    pub fn with_dump(mut self, dump: Option<DumpDir>) -> Observation {
+        self.dump = dump;
+        self
+    }
+
+    /// Writes one side of an exchange to the dump, if there is one. A
+    /// failure is the dump's alone.
+    fn dump_side(&self, exchange: &Exchange, request: bool) {
+        let Some(dir) = &self.dump else {
+            return;
+        };
+        let (head, body, content_type) = if request {
+            (
+                &exchange.request_head_text,
+                &exchange.request_body,
+                exchange
+                    .request
+                    .as_ref()
+                    .and_then(|r| r.content_type.clone()),
+            )
+        } else {
+            (
+                &exchange.response_head_text,
+                &exchange.response_body,
+                exchange
+                    .response
+                    .as_ref()
+                    .and_then(|r| r.content_type.clone()),
+            )
+        };
+        let Some(head) = head else {
+            return;
+        };
+        let body = body.as_ref().map(BodySink::kept).unwrap_or_default();
+        let _ = dump::write_exchange(
+            dir,
+            self.flow,
+            exchange.stream,
+            request,
+            head,
+            content_type.as_deref(),
+            body,
+        );
     }
 
     /// The exchanges under way, by stream.
@@ -220,6 +276,15 @@ impl Observation {
                     exchange.request_started = now;
                     exchange.request_body =
                         Some(BodySink::new(headers.content_encoding().as_deref()));
+                    if self.dump.is_some() {
+                        let start = format!(
+                            "{method} {} HTTP/{}",
+                            path.as_deref().unwrap_or("*"),
+                            version.as_str()
+                        );
+                        exchange.request_head_text =
+                            Some(dump::head_text(&start, headers.visible()));
+                    }
                     exchange.request =
                         Some(request_head(method, authority, path, version, &headers));
                     let path = exchange.request.as_ref().and_then(|r| r.path.clone());
@@ -239,6 +304,7 @@ impl Observation {
                         if let Some(sink) = exchange.request_body.as_mut() {
                             sink.finish();
                         }
+                        self.dump_side(&exchange, true);
                         if !exchange.request_recorded && exchange.request.is_some() {
                             out.push(Emit::plain(self.request_record(&mut exchange)));
                         }
@@ -270,6 +336,11 @@ impl Observation {
                         content_type,
                         content_encoding: headers.content_encoding(),
                     });
+                    if self.dump.is_some() {
+                        let start = format!("HTTP/{} {status}", self.conn.version().as_str());
+                        exchange.response_head_text =
+                            Some(dump::head_text(&start, headers.visible()));
+                    }
                     self.model.response_head(stream, status, &headers);
                 }
                 Event::ResponseBody { stream, bytes } => {
@@ -299,6 +370,7 @@ impl Observation {
                                 exchange.sse_count += (exchange.sse_events.len() - before) as u64;
                             }
                         }
+                        self.dump_side(&exchange, false);
                         if !exchange.response_recorded && exchange.response.is_some() {
                             out.push(Emit::plain(self.response_record(&mut exchange, now)));
                         }
@@ -320,6 +392,16 @@ impl Observation {
                     text,
                     payload,
                 } => {
+                    if let Some(dump_dir) = &self.dump {
+                        let _ = dump::append_ws(
+                            dump_dir,
+                            self.flow,
+                            stream,
+                            dir.as_str(),
+                            text,
+                            &payload,
+                        );
+                    }
                     if let Some(exchange) = self.exchanges.get_mut(&stream) {
                         exchange.last_response_at = now;
                         exchange.ws_count += 1;
@@ -330,6 +412,7 @@ impl Observation {
                 Event::WsClosed { stream } => {
                     if let Some(mut exchange) = self.exchanges.remove(&stream) {
                         exchange.last_response_at = now;
+                        self.dump_side(&exchange, false);
                         if !exchange.response_recorded && exchange.response.is_some() {
                             out.push(Emit::plain(self.response_record(&mut exchange, now)));
                         }

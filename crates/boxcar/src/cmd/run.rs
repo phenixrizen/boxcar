@@ -21,7 +21,7 @@ use boxcar_audit::{
     AuditSink, ReconcileConfig, Reconciler, SpanIndex, SystemClock, WriterConfig, WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
-use boxcar_net::{InspectConfig, NetConfig, Policy, SessionCa};
+use boxcar_net::{DumpDir, InspectConfig, NetConfig, Policy, SessionCa};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
@@ -115,6 +115,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .flatten()
         .collect();
     let audit_dir = check_audit_dir(&audit_dir, &named)?;
+    if !net && args.dump.is_some() {
+        tell("error: --dump needs --net: without a network there is nothing to dump");
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let dump = dump_dir(args.dump.as_deref(), &named)?;
 
     let session_id = SessionId::new();
     // The tool spans the reconciler keeps and `boxcar spans` lists.
@@ -148,6 +153,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     );
     // The guest is told to trust the CA: the certificate, never the key.
     session.ca_pem = inspect.as_ref().map(|gate| gate.ca().pem().to_owned());
+    // --env, after the defaults: a later name wins in the guest.
+    session.env.extend(args.env.iter().cloned());
     if mode == GuestMode::Vsock {
         session.validate()?;
     }
@@ -242,6 +249,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }),
         inspect,
         spans: Some(spans.clone()),
+        dump,
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -698,6 +706,18 @@ fn check_audit_dir(audit_dir: &Path, shares: &[&Path]) -> anyhow::Result<PathBuf
         }
     }
     Ok(audit)
+}
+
+/// The dump directory `dir` names, made and checked against the shares
+/// (`DumpDir::prepare`: not a share, not inside one, holding none); none
+/// without `--dump`.
+fn dump_dir(dir: Option<&Path>, shares: &[&Path]) -> anyhow::Result<Option<DumpDir>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    DumpDir::prepare(dir, shares)
+        .map(Some)
+        .with_context(|| format!("--dump {}", dir.display()))
 }
 
 /// Whether a share at `below`, a path relative to the audit dir, holds
@@ -1514,6 +1534,26 @@ mod tests {
         fn check(&self, audit: &Path) -> anyhow::Result<PathBuf> {
             check_audit_dir(audit, &[&self.at("root"), &self.at("workspace")])
         }
+    }
+
+    #[test]
+    fn the_dump_dir_is_made_0700_beside_the_shares_and_refused_inside_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("workspace");
+        fs::create_dir(&share).unwrap();
+        let share = fs::canonicalize(&share).unwrap();
+        assert!(dump_dir(None, &[&share]).unwrap().is_none());
+        let dir = tmp.path().join("dump");
+        let made = dump_dir(Some(&dir), &[&share]).unwrap().unwrap();
+        assert_eq!(
+            fs::metadata(made.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(made.path().join("http").is_dir());
+        let inside = dump_dir(Some(&share.join("dump")), &[&share]);
+        assert!(inside.is_err(), "{inside:?}");
+        assert!(inside.unwrap_err().to_string().contains("--dump"));
     }
 
     #[test]

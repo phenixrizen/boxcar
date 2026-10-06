@@ -488,3 +488,75 @@ Made while writing the plan, 2026-10-06:
   whichever is first, and judges it then with the process named; the
   finding's content is the same, and the `policy_denial` fixture's order
   changed by one line.
+
+### Task 7
+
+- **The dump holds no raw plaintext.** The plan's `flows/<flow>.c2s` and
+  `.s2c` files would have held the request as sent, credential headers
+  included, which section 3 forbids for a dump file; so the dump writes
+  the decoded exchanges only (`http/<flow>-<stream>.req` and `.resp`:
+  the start line, the headers the observer kept, the body), and scrubs
+  the body as the summaries are scrubbed: a JSON body through
+  `redact::scrub`, a form body (the shape of an OAuth token exchange) by
+  its credential fields' names. `frames.pcap` is the raw frames, which
+  are ciphertext for an inspected flow.
+- **The Debian guest is built from a Dockerfile fed on stdin** with an
+  empty context, so nothing of the tree reaches the daemon; the image
+  is `debian:trixie-slim` by digest, Claude Code is 2.1.290 (the version
+  the development machine ran) both native and under Node, and Codex is
+  0.159.0 (the same). The native installer takes the version as its
+  argument; the installer's own state under `/root` is removed so a
+  session starts clean. `docker export` is unpacked as the invoking
+  user, device nodes left out. The native installer removes an npm
+  `claude` it finds, so it runs before npm's install, and Debian's Node
+  (20) is too old for Claude Code 2.1 (it wants 22), so Node 22.23.3 goes
+  in from nodejs.org by tarball, checked against its published SHA-256.
+- **Codex's credential is read from `CODEX_HOME`, or `~/.codex`** when
+  that is unset, which is Codex's own default: the plan named only the
+  variable, and the machine has the file where Codex keeps it. The
+  Claude Code test takes `CLAUDE_CODE_OAUTH_TOKEN` alone (`claude
+  setup-token` makes one); it does not read the credentials file Claude
+  Code keeps for itself. Both tests skip, saying why, without them, and
+  neither prints a value: the absence assertions look for the token's
+  value, and for Codex the longest string in its `auth.json`.
+- **`cargo xtask rootfs debian` is not in CI.** The agent tests skip
+  without the guest or a credential, CI never has a credential, and the
+  build pulls npm packages and a binary from the network; the kvm job
+  runs `test-kvm m4` on the stock artifacts.
+- **`--dump` needs the network** like the policy flags, and is refused
+  without it; `--env` adds to the session's defaults, a later name
+  winning in the guest, and refuses a name with whitespace or a NUL.
+- **The dump's exchange files hold the decoded body up to 16 MiB**, the
+  observer's own limit, and a body past it is cut, as the record says
+  `body_truncated`.
+- **Codex on an account login speaks the Responses API over a WebSocket
+  to `chatgpt.com`**, not to `api.openai.com`: the test and the README
+  inspect both. Its model calls showed three things the gate lacked. The
+  WebSocket inflater stopped once every input byte was in and dropped
+  the output the inflater still held when its buffer had filled, so a
+  message over a few tens of KiB came out short and the next one began
+  in the middle; it now drains until the inflater leaves room to spare,
+  and a test feeds two 480 KiB compressed messages in relay-sized
+  chunks. Codex's tool calls are `custom_tool_call` items whose `input`
+  is free text (`text(await tools.exec_command({cmd:"...",...}))`) with
+  `custom_tool_call_input.delta`/`.done` events and
+  `custom_tool_call_output` results: the parser opens and closes them as
+  it does function calls, with the text as the summary and no inline
+  arguments; its tools are declared as namespaces in an
+  `additional_tools` input item, which `llm.request.tools` now lists.
+  The span's declared command is read from the free text (`cmd:"..."`),
+  and `exec` joins the shell tools. Codex also asks for a content host
+  (`*.oaiusercontent.com`) the plugin listing points at, again and again
+  when denied, enough for `dns_rate`; the test and the README allow it.
+- **Init's reads are boxcar's own.** Init binds the trust store it builds
+  over `/etc/ssl/certs/ca-certificates.crt`, which ring 0 records as a
+  read by pid 1 that no process the sensor reports owns; pid 1 joins the
+  sensor's threads in what the reconciler leaves alone.
+- **The agent's own writes join write tool spans only.** Codex installs
+  its plugins in the background while a shell tool runs, and those
+  hundreds of files under `.codex/plugins` landed in the `exec` span as
+  the agent's own effects (Task 5's rule gave them to the only open
+  span). A shell tool's work is its process's, which the span already
+  holds; so an effect by a process in no span joins the only open write
+  tool span, or the write tool span whose path it touches, and nothing
+  else.

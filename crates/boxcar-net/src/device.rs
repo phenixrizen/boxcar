@@ -103,6 +103,7 @@ use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 use vmm_sys_util::timerfd::TimerFd;
 
 use crate::config::{ConfigError, NetConfig};
+use crate::dump::{DumpDir, DumpThread, FrameDump};
 use crate::gate::observe::ObserverThread;
 use crate::gate::{InspectConfig, Observer};
 use crate::policy::Policy;
@@ -225,6 +226,10 @@ pub struct VirtioNet {
     inspect: Option<Arc<InspectConfig>>,
     observer: Option<Observer>,
     observer_thread: Option<ObserverThread>,
+    /// The frame dump (`--dump`), when the session has one: every stack
+    /// the device builds feeds it, and the one `dump` thread writes.
+    dump: Option<FrameDump>,
+    dump_thread: Option<DumpThread>,
 }
 
 impl VirtioNet {
@@ -249,21 +254,44 @@ impl VirtioNet {
         policy: Arc<ArcSwap<Policy>>,
         inspect: Option<Arc<InspectConfig>>,
     ) -> Result<VirtioNet, ConfigError> {
+        VirtioNet::with_dump(cfg, sink, policy, inspect, None)
+    }
+
+    /// [`VirtioNet::with_inspect`] with the dump: with `dump`, every frame
+    /// either way goes to its `frames.pcap` through the `dump` thread,
+    /// started here, and the observer writes the inspected flows'
+    /// plaintext and exchanges into it.
+    pub fn with_dump(
+        cfg: NetConfig,
+        sink: AuditSink,
+        policy: Arc<ArcSwap<Policy>>,
+        inspect: Option<Arc<InspectConfig>>,
+        dump: Option<DumpDir>,
+    ) -> Result<VirtioNet, ConfigError> {
         let ids = FlowIds::default();
         let (observer, observer_thread) = match &inspect {
             Some(gate) => {
                 let (observer, rx) = Observer::channel();
                 let trace_id = gate.ca().session_id().to_owned();
-                let thread = ObserverThread::spawn(rx, sink.clone(), trace_id)
+                let thread = ObserverThread::spawn(rx, sink.clone(), trace_id, dump.clone())
                     .map_err(|error| ConfigError::Observer(error.to_string()))?;
                 (Some(observer), Some(thread))
+            }
+            None => (None, None),
+        };
+        let (frame_dump, dump_thread) = match &dump {
+            Some(dir) => {
+                let (frames, thread) =
+                    FrameDump::start(dir).map_err(|error| ConfigError::Dump(error.to_string()))?;
+                (Some(frames), Some(thread))
             }
             None => (None, None),
         };
         let gate = inspect.clone().zip(observer.clone());
         let spare =
             NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?
-                .with_inspect(gate);
+                .with_inspect(gate)
+                .with_dump(frame_dump.clone());
         let wake = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)
             .map_err(|error| ConfigError::Wake(error.to_string()))?;
         Ok(VirtioNet {
@@ -279,6 +307,8 @@ impl VirtioNet {
             inspect,
             observer,
             observer_thread,
+            dump: frame_dump,
+            dump_thread,
         })
     }
 
@@ -307,7 +337,8 @@ impl VirtioNet {
                 Arc::clone(&self.policy),
                 self.ids.clone(),
             )?
-            .with_inspect(self.inspect.clone().zip(self.observer.clone()))),
+            .with_inspect(self.inspect.clone().zip(self.observer.clone()))
+            .with_dump(self.dump.clone())),
         }
     }
 }
@@ -423,6 +454,16 @@ impl Drop for VirtioNet {
                     warn,
                     "virtio-net: the observer thread did not stop within {JOIN_LIMIT:?}; leaving it \
                      behind"
+                );
+            }
+        }
+        // The dump thread ends once the last sender (the stacks') is gone.
+        self.dump = None;
+        if let Some(thread) = self.dump_thread.take() {
+            if !thread.join(JOIN_LIMIT) {
+                boxcar_virtio::limited!(
+                    warn,
+                    "virtio-net: the dump thread did not stop within {JOIN_LIMIT:?}; leaving it behind"
                 );
             }
         }

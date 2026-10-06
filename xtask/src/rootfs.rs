@@ -14,8 +14,9 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
@@ -62,6 +63,52 @@ pub const TLS_PACKAGES: [Package; 3] = [
 /// The only architecture the guest has.
 const ARCH: &str = "x86_64";
 
+/// The agents' guest: Debian trixie, by digest.
+pub const DEBIAN_IMAGE: &str =
+    "debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f";
+/// The Claude Code version the guest gets, native (`claude-native`) and
+/// under Node (`claude`).
+pub const CLAUDE_CODE_VERSION: &str = "2.1.290";
+/// The Codex version the guest gets (`codex`).
+pub const CODEX_VERSION: &str = "0.159.0";
+/// The Node the npm builds run on: Claude Code 2.1 wants 22 or later, and
+/// Debian trixie ships 20, so the official build goes in by tarball,
+/// checked against its published SHA-256.
+pub const NODE_VERSION: &str = "22.23.3";
+pub const NODE_SHA256: &str = "df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de";
+/// The image the Debian build makes.
+const DEBIAN_TAG: &str = "boxcar-guest-debian";
+
+/// The Dockerfile of the agents' guest: the base by digest, the tools the
+/// agents need, Node by tarball at a pinned version (checked against its
+/// SHA-256), the native Claude Code build first (its installer removes an
+/// npm `claude` it finds, so the npm builds come after), its installer
+/// state removed so that a session starts clean, then Claude Code and
+/// Codex from npm at pinned versions, and a check that all three commands
+/// are there.
+pub fn debian_dockerfile() -> String {
+    format!(
+        "FROM {DEBIAN_IMAGE}\n\
+         ENV DEBIAN_FRONTEND=noninteractive\n\
+         RUN apt-get update \\\n \
+          && apt-get install -y --no-install-recommends ca-certificates curl git procps xz-utils \\\n \
+          && rm -rf /var/lib/apt/lists/*\n\
+         RUN curl -fsSL https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-linux-x64.tar.xz -o /tmp/node.tar.xz \\\n \
+          && echo \"{NODE_SHA256}  /tmp/node.tar.xz\" | sha256sum -c - \\\n \
+          && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \\\n \
+          && rm /tmp/node.tar.xz\n\
+         RUN curl -fsSL https://claude.ai/install.sh | bash -s -- {CLAUDE_CODE_VERSION} \\\n \
+          && cp /root/.local/share/claude/versions/{CLAUDE_CODE_VERSION} /usr/local/bin/claude-native \\\n \
+          && chmod 0755 /usr/local/bin/claude-native \\\n \
+          && rm -rf /root/.local/share/claude /root/.local/state/claude /root/.cache/claude \\\n \
+                    /root/.local/bin/claude /root/.claude /root/.claude.json\n\
+         RUN npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} @openai/codex@{CODEX_VERSION} \\\n \
+          && npm cache clean --force\n\
+         RUN test -x /usr/local/bin/claude-native && test -x /usr/local/bin/claude && test -x /usr/local/bin/codex\n\
+         RUN mkdir -p /workspace && chmod 1777 /tmp\n"
+    )
+}
+
 /// Arguments of `cargo xtask rootfs`.
 #[derive(Args)]
 pub struct RootfsArgs {
@@ -74,6 +121,10 @@ enum Distro {
     /// Download, verify and unpack an Alpine minirootfs into
     /// target/guest/rootfs-alpine.
     Alpine(AlpineArgs),
+    /// Build the agents' guest with Docker into target/guest/rootfs-debian:
+    /// Debian trixie with Claude Code (the native build as `claude-native`,
+    /// the npm build as `claude`) and Codex, at pinned versions.
+    Debian,
 }
 
 #[derive(Args)]
@@ -88,7 +139,122 @@ struct AlpineArgs {
 pub fn run(args: &RootfsArgs) -> Result<()> {
     match &args.distro {
         Distro::Alpine(alpine) => run_alpine(&alpine.version),
+        Distro::Debian => run_debian(),
     }
+}
+
+/// Builds the Debian image and unpacks its filesystem, as the invoking
+/// user, into `target/guest/rootfs-debian`.
+fn run_debian() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("xtask manifest directory has no parent")?;
+    let guest_dir = root.join("target/guest");
+    let context = root.join("target/rootfs-cache/debian-context");
+    for dir in [&guest_dir, &context] {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    // The Dockerfile goes in on stdin; the context is an empty directory,
+    // so nothing of the tree is sent to the daemon.
+    let mut build = Command::new("docker")
+        .args(["build", "-t", DEBIAN_TAG, "-f", "-"])
+        .arg(&context)
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to start docker build")?;
+    if let Some(mut stdin) = build.stdin.take() {
+        stdin
+            .write_all(debian_dockerfile().as_bytes())
+            .context("write the Dockerfile to docker build")?;
+    }
+    let status = build.wait().context("docker build")?;
+    ensure!(status.success(), "docker build failed: {status}");
+
+    let created = Command::new("docker")
+        .args(["create", DEBIAN_TAG])
+        .output()
+        .context("failed to start docker create")?;
+    ensure!(
+        created.status.success(),
+        "docker create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let container = String::from_utf8_lossy(&created.stdout).trim().to_owned();
+    ensure!(!container.is_empty(), "docker create named no container");
+
+    let out = guest_dir.join("rootfs-debian");
+    let partial = with_suffix(&out, ".partial");
+    if partial.exists() {
+        fs::remove_dir_all(&partial).with_context(|| format!("remove {}", partial.display()))?;
+    }
+    fs::create_dir(&partial).with_context(|| format!("create {}", partial.display()))?;
+    let unpacked = export_into(&container, &partial);
+    let _ = Command::new("docker").args(["rm", &container]).output();
+    unpacked?;
+    open_tmp_dirs(&partial)?;
+    let json = partial.join("etc/boxcar-rootfs.json");
+    let mut text = serde_json::to_string_pretty(&serde_json::json!({
+        "distro": "debian",
+        "image": DEBIAN_IMAGE,
+        "arch": ARCH,
+        "claude_code": CLAUDE_CODE_VERSION,
+        "codex": CODEX_VERSION,
+        "node": NODE_VERSION,
+    }))?;
+    text.push('\n');
+    fs::write(&json, text).with_context(|| format!("write {}", json.display()))?;
+    if out.exists() {
+        fs::remove_dir_all(&out).with_context(|| format!("remove {}", out.display()))?;
+    }
+    fs::rename(&partial, &out).with_context(|| format!("rename to {}", out.display()))?;
+    println!(
+        "rootfs: {} (Debian trixie {ARCH}, Claude Code {CLAUDE_CODE_VERSION} native and npm, \
+         Codex {CODEX_VERSION})",
+        out.display()
+    );
+    Ok(())
+}
+
+/// `docker export` of `container` unpacked into `dir` as this user: the
+/// device nodes (which a user cannot make) left out, ownership and modes
+/// as tar sets them for a user.
+fn export_into(container: &str, dir: &Path) -> Result<()> {
+    let mut export = Command::new("docker")
+        .args(["export", container])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to start docker export")?;
+    let stdout = export
+        .stdout
+        .take()
+        .context("docker export has no stdout")?;
+    let status = Command::new("tar")
+        .args(export_tar_args(dir))
+        .stdin(stdout)
+        .status()
+        .context("failed to start tar")?;
+    let exported = export.wait().context("docker export")?;
+    ensure!(exported.success(), "docker export failed: {exported}");
+    ensure!(status.success(), "tar failed: {status}");
+    Ok(())
+}
+
+/// The arguments after `tar` that unpack a `docker export` stream from
+/// stdin into `dir`.
+fn export_tar_args(dir: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--extract".into(), "--file".into(), "-".into()];
+    args.push("--directory".into());
+    args.push(dir.into());
+    args.extend(
+        [
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--exclude=dev/*",
+            "--exclude=.dockerenv",
+        ]
+        .map(OsString::from),
+    );
+    args
 }
 
 /// Downloads, verifies and unpacks Alpine `version`.
@@ -440,6 +606,49 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_debian_guest_is_pinned_and_holds_both_agents() {
+        let dockerfile = debian_dockerfile();
+        assert!(dockerfile.starts_with(&format!("FROM {DEBIAN_IMAGE}\n")));
+        assert!(DEBIAN_IMAGE.contains("@sha256:"), "pinned by digest");
+        for needle in [
+            &format!("@anthropic-ai/claude-code@{CLAUDE_CODE_VERSION}"),
+            &format!("@openai/codex@{CODEX_VERSION}"),
+            &format!("install.sh | bash -s -- {CLAUDE_CODE_VERSION}"),
+            "/usr/local/bin/claude-native",
+            "ca-certificates curl git procps xz-utils",
+            &format!("node-v{NODE_VERSION}-linux-x64.tar.xz"),
+            &format!("{NODE_SHA256}  /tmp/node.tar.xz"),
+            "test -x /usr/local/bin/claude-native && test -x /usr/local/bin/claude",
+            "mkdir -p /workspace",
+        ] {
+            assert!(dockerfile.contains(needle), "{needle}\n{dockerfile}");
+        }
+        // The native installer runs before npm's install, which it would
+        // otherwise undo.
+        assert!(
+            dockerfile.find("install.sh").unwrap() < dockerfile.find("npm install -g").unwrap()
+        );
+        let args: Vec<String> = export_tar_args(Path::new("/r/partial"))
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--extract",
+                "--file",
+                "-",
+                "--directory",
+                "/r/partial",
+                "--no-same-owner",
+                "--no-same-permissions",
+                "--exclude=dev/*",
+                "--exclude=.dockerenv",
+            ]
+        );
+    }
+
     use super::*;
 
     fn strings(args: Vec<OsString>) -> Vec<String> {

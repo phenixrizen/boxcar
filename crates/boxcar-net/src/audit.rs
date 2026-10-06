@@ -145,13 +145,16 @@ pub enum DropReason {
     /// for: the flow went on at the relay's pace, the observer's copy has
     /// a hole (counted in bytes, not frames).
     Observe,
+    /// A frame the dump's queue had no room for (`--dump`): the dump has
+    /// a hole, the guest's traffic went on.
+    Dump,
     /// Anything else: an unknown protocol, or a malformed frame.
     Other,
 }
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 14] = [
+    pub const ALL: [DropReason; 15] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
@@ -165,6 +168,7 @@ impl DropReason {
         DropReason::TcpPendingFull,
         DropReason::SrcSpoof,
         DropReason::Observe,
+        DropReason::Dump,
         DropReason::Other,
     ];
 
@@ -184,6 +188,7 @@ impl DropReason {
             DropReason::TcpPendingFull => "tcp_pending_full",
             DropReason::SrcSpoof => "src_spoof",
             DropReason::Observe => "observe",
+            DropReason::Dump => "dump",
             DropReason::Other => "other",
         }
     }
@@ -431,6 +436,7 @@ pub(crate) mod tests {
                 "tcp_pending_full",
                 "src_spoof",
                 "observe",
+                "dump",
                 "other"
             ]
         );

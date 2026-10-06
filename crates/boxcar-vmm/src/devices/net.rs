@@ -30,6 +30,8 @@ pub struct NetSetup<'a> {
     pub audit: &'a AuditSink,
     pub policy: &'a Arc<ArcSwap<Policy>>,
     pub inspect: Option<Arc<InspectConfig>>,
+    /// The dump directory, when the run has one.
+    pub dump: Option<boxcar_net::DumpDir>,
 }
 
 /// The VM's network card, if it has one.
@@ -59,14 +61,20 @@ impl NetDevice {
             audit,
             policy,
             inspect,
+            dump,
         }) = setup
         else {
             return Ok(NetDevice::default());
         };
         let slot = reserve(slots)?;
-        let device =
-            VirtioNet::with_inspect(cfg.clone(), audit.clone(), Arc::clone(policy), inspect)
-                .map_err(DeviceError::Net)?;
+        let device = VirtioNet::with_dump(
+            cfg.clone(),
+            audit.clone(),
+            Arc::clone(policy),
+            inspect,
+            dump,
+        )
+        .map_err(DeviceError::Net)?;
         let policy_wake = device
             .policy_wake()
             .try_clone()

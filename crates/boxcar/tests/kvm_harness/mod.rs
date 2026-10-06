@@ -121,6 +121,9 @@ pub struct Running<'a> {
     pub scratch: &'a Scratch,
     pub started: Instant,
     pub command: Vec<String>,
+    /// How long the run may take before it is killed: [`LIMIT`] unless
+    /// [`Running::with_limit`] says more (an agent's run takes minutes).
+    pub limit: Duration,
 }
 
 /// What a `boxcar run` left behind.
@@ -168,7 +171,20 @@ pub fn start<'a>(
     flags: &[&str],
     command: &[&str],
 ) -> Running<'a> {
+    start_env(guest, scratch, flags, command, &[])
+}
+
+/// [`start`] with `env` set in `boxcar run`'s own environment (not the
+/// session's: that is `--env`).
+pub fn start_env<'a>(
+    guest: &Guest,
+    scratch: &'a Scratch,
+    flags: &[&str],
+    command: &[&str],
+    env: &[(&str, &Path)],
+) -> Running<'a> {
     let child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .envs(env.iter().map(|(name, value)| (*name, *value)))
         .arg("run")
         .arg("--kernel")
         .arg(&guest.kernel)
@@ -195,6 +211,7 @@ pub fn start<'a>(
         scratch,
         started: Instant::now(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
+        limit: LIMIT,
     }
 }
 
@@ -209,13 +226,20 @@ impl Running<'_> {
     }
 
     /// Fails the test if the run has taken longer than [`LIMIT`].
+    /// The run with `limit` as its time limit.
+    pub fn with_limit(mut self, limit: Duration) -> Self {
+        self.limit = limit;
+        self
+    }
+
     pub fn check_time(&mut self) {
-        if self.started.elapsed() > LIMIT {
+        if self.started.elapsed() > self.limit {
             let _ = self.child.kill();
             let _ = self.child.wait();
             panic!(
-                "boxcar run -- {:?} did not get there within {LIMIT:?}; console:\n{}\nstderr:\n{}",
+                "boxcar run -- {:?} did not get there within {:?}; console:\n{}\nstderr:\n{}",
                 self.command,
+                self.limit,
                 read_lossy(&self.scratch.path("console.log")),
                 self.stderr()
             );

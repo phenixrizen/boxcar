@@ -151,6 +151,9 @@ struct Artifacts {
     kernel: PathBuf,
     initramfs: PathBuf,
     rootfs: PathBuf,
+    /// The agents' guest (`cargo xtask rootfs debian`), which only the
+    /// agent tests need: they skip without it.
+    debian: PathBuf,
 }
 
 impl Artifacts {
@@ -160,16 +163,22 @@ impl Artifacts {
             kernel: guest_dir.join("vmlinux"),
             initramfs: guest_dir.join("initramfs.cpio"),
             rootfs: guest_dir.join("rootfs-alpine"),
+            debian: guest_dir.join("rootfs-debian"),
         }
     }
 
-    /// The variables that tell the tests where they are.
-    fn env(&self) -> [(&'static str, PathBuf); 3] {
-        [
+    /// The variables that tell the tests where they are; the Debian guest
+    /// is named only when it has been built.
+    fn env(&self) -> Vec<(&'static str, PathBuf)> {
+        let mut env = vec![
             ("BOXCAR_TEST_KERNEL", self.kernel.clone()),
             ("BOXCAR_TEST_INITRAMFS", self.initramfs.clone()),
             ("BOXCAR_TEST_ROOTFS", self.rootfs.clone()),
-        ]
+        ];
+        if self.debian.is_dir() {
+            env.push(("BOXCAR_TEST_ROOTFS_DEBIAN", self.debian.clone()));
+        }
+        env
     }
 }
 
@@ -274,6 +283,7 @@ mod tests {
     fn the_tests_are_told_where_the_artifacts_are() {
         let guest = Artifacts::under(Path::new("/r/target/guest"));
         let vars = guest.env();
+        assert_eq!(vars.len(), 3, "no Debian guest at /r: not named");
         let env: Vec<(&str, &Path)> = vars
             .iter()
             .map(|(var, path)| (*var, path.as_path()))
@@ -292,6 +302,30 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn the_debian_guest_is_named_once_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest = Artifacts::under(dir.path());
+        assert!(guest
+            .env()
+            .iter()
+            .all(|(var, _)| *var != "BOXCAR_TEST_ROOTFS_DEBIAN"));
+        fs::create_dir(dir.path().join("rootfs-debian")).unwrap();
+        let vars = guest.env();
+        assert_eq!(
+            vars.last().map(|(var, path)| (*var, path.clone())),
+            Some((
+                "BOXCAR_TEST_ROOTFS_DEBIAN",
+                dir.path().join("rootfs-debian")
+            ))
+        );
+        // Not required: the agent tests skip without it.
+        fs::write(dir.path().join("vmlinux"), b"").unwrap();
+        fs::write(dir.path().join("initramfs.cpio"), b"").unwrap();
+        fs::create_dir(dir.path().join("rootfs-alpine")).unwrap();
+        assert_eq!(missing(&guest, Ok(())), None);
     }
 
     #[test]

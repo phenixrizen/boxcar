@@ -218,9 +218,9 @@ fn inflate(side: &mut WsDir, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
     };
     let mut input = payload.to_vec();
     input.extend_from_slice(&DEFLATE_TAIL);
-    let mut out = Vec::with_capacity(input.len() * 2);
+    let mut out = Vec::with_capacity(input.len() * 4 + 1024);
     let mut consumed = 0;
-    while consumed < input.len() {
+    loop {
         if out.len() == out.capacity() {
             out.reserve(32 * 1024);
         }
@@ -233,6 +233,11 @@ fn inflate(side: &mut WsDir, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
             return Err("ws_message_too_large");
         }
         if status == Status::StreamEnd {
+            break;
+        }
+        // The inflater may hold output it had no room to write: it is
+        // done only once every input byte is in and it left room to spare.
+        if consumed >= input.len() && out.len() < out.capacity() {
             break;
         }
     }
@@ -446,6 +451,54 @@ mod tests {
 
     /// permessage-deflate: messages inflate, with the context kept across
     /// them unless the side gave it up.
+    /// Messages far larger than one TLS record, compressed with the
+    /// context kept, fed in the chunks the relay would hand over: each
+    /// comes out whole and exact, and so does the next one, which the
+    /// compressor wrote against the first's window.
+    #[test]
+    fn large_compressed_messages_survive_chunked_feeding() {
+        let mut text = String::from("{\"type\":\"response.create\",\"instructions\":\"");
+        for i in 0..6000u32 {
+            text.push_str(&format!(
+                "line {i} of the instructions, with words that repeat and words that do not {}; ",
+                i * 7919 % 1013
+            ));
+        }
+        text.push_str("\",\"input\":[]}");
+        let first = text.as_bytes();
+        let second = text.replace("response.create", "response.completed");
+        let second = second.as_bytes();
+        let mut compressor = Compress::new(Compression::default(), false);
+        let a = deflate(&mut compressor, first);
+        let b = deflate(&mut compressor, second);
+        assert!(
+            a.len() > 16 * 1024 || first.len() > 100 * 1024,
+            "{} {}",
+            a.len(),
+            first.len()
+        );
+        let mut ws = Ws::new(
+            3,
+            &["permessage-deflate; client_max_window_bits".to_owned()],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let wire = [
+            build(true, true, OP_TEXT, Some([9, 8, 7, 6]), &a),
+            build(true, true, OP_TEXT, Some([1, 1, 2, 3]), &b),
+        ]
+        .concat();
+        for chunk in wire.chunks(16 * 1024 - 37) {
+            ws.feed(Direction::ToHost, chunk, &mut out);
+        }
+        let got = messages(&out);
+        assert_eq!(got.len(), 2, "{out:?}");
+        assert_eq!(got[0].2.len(), first.len());
+        assert!(got[0].2 == first, "the first message differs");
+        assert_eq!(got[1].2.len(), second.len());
+        assert!(got[1].2 == second, "the second message differs");
+    }
+
     #[test]
     fn permessage_deflate_with_and_without_context_takeover() {
         let first = b"{\"type\":\"response.create\",\"input\":\"hello hello hello\"}";

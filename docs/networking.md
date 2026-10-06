@@ -47,7 +47,9 @@ README's "Networking and policy".
   connection with nothing relayed (`net.inspect` says which,
   `net.close{reason:"inspect"}`). The agent keeps its own credential;
   nothing is injected. A connection read for inspection that shows
-  neither TLS nor HTTP is relayed untouched after the gate's limit.
+  neither TLS nor HTTP is relayed untouched after the gate's limit. What
+  the gate records, and `--dump DIR` for looking at the traffic by hand,
+  are in [gate.md](gate.md).
 - UDP: the first datagram of a 5-tuple is decided (`net.udp`) and gets a
   connected host socket; a domain `allow` admits no UDP (nothing in a
   datagram shows a name: `builtin:udp-needs-cidr`), so UDP needs a CIDR

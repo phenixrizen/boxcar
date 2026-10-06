@@ -65,6 +65,7 @@ use crate::config::{ConfigError, NetConfig};
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{self, ForwardError, Forwarder, Pending, Received};
 use crate::dns::{self as dns, parse};
+use crate::dump::FrameDump;
 use crate::frame::{self, classify, Dispatch, DNS_PORT};
 use crate::gate::{InspectConfig, Observer};
 use crate::policy::{Policy, Verdict};
@@ -142,6 +143,9 @@ pub struct NetStack {
     /// session inspects, and the channel to the observer.
     inspect: Option<Arc<InspectConfig>>,
     observer: Option<Observer>,
+    /// The frame dump (`--dump`): every frame either way, copied without
+    /// waiting.
+    dump: Option<FrameDump>,
 }
 
 impl NetStack {
@@ -214,6 +218,7 @@ impl NetStack {
             epoch,
             inspect: None,
             observer: None,
+            dump: None,
         })
     }
 
@@ -224,6 +229,14 @@ impl NetStack {
         let (inspect, observer) = gate.unzip();
         self.inspect = inspect;
         self.observer = observer;
+        self
+    }
+
+    /// The stack with the frame dump: every frame the guest sends and
+    /// every frame it is given is copied to it, never waiting; one the
+    /// dump has no room for is counted (`net.drop{reason:"dump"}`).
+    pub fn with_dump(mut self, dump: Option<FrameDump>) -> Self {
+        self.dump = dump;
         self
     }
 
@@ -269,6 +282,9 @@ impl NetStack {
     /// address it no longer has is told so).
     pub fn push_guest_frame(&mut self, frame: &[u8]) {
         let now = Instant::now();
+        if self.dump.as_ref().is_some_and(|dump| !dump.push(frame)) {
+            self.drop_frame(DropReason::Dump, now);
+        }
         let dispatch = classify(frame, self.cfg.gateway);
         if self.spoofed(&dispatch) {
             return self.drop_frame(DropReason::SrcSpoof, now);
@@ -322,9 +338,13 @@ impl NetStack {
         }
     }
 
-    /// The next frame for the guest, if any.
+    /// The next frame for the guest, if any; a copy goes to the dump.
     pub fn pop_host_frame(&mut self) -> Option<Vec<u8>> {
-        self.pipe.to_guest.pop_front()
+        let frame = self.pipe.to_guest.pop_front()?;
+        if self.dump.as_ref().is_some_and(|dump| !dump.push(&frame)) {
+            self.drop_frame(DropReason::Dump, Instant::now());
+        }
+        Some(frame)
     }
 
     /// How many frames wait for the guest: at most [`QUEUE_CAP`]. The

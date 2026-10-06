@@ -1406,8 +1406,7 @@ fn the_sensors_own_reads_are_not_unattributed() {
     let spans = spans_of(&out);
     assert_eq!(
         spans[0].effects,
-        [5, 8],
-        "the unknown thread's write joined the only open span as the agent's own; the sensor's \
-         reads joined nothing"
+        [5],
+        "neither the sensor's reads nor the unknown thread's write joined a shell tool's span"
     );
 }
