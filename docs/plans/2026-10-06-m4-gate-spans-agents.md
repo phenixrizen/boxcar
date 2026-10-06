@@ -345,3 +345,31 @@ Made while writing the plan, 2026-10-06:
   lagging subscription, under load) and failed on the score; alone it
   passes. The verification runs of this plan keep the machine to the
   gated suite while it runs.
+
+### Task 4
+
+- **The streaming flag is `streaming`**, not `stream`: `stream` on every
+  gate record is the HTTP stream id the exchange was read from.
+- **The provider is chosen by the request's path alone** (`/v1/messages`,
+  `/chat/completions`, `/responses`, with any prefix), not the host: the
+  APIs keep their paths behind gateways and proxies, and a session's
+  `inspect` lines already say which hosts are watched.
+- **Tool results are the ones the agent just added**: the `tool_result`
+  blocks of an Anthropic request's last message, the `role: tool`
+  messages after the last assistant turn of a chat request, every
+  `function_call_output` item of a responses request. Earlier turns'
+  results were recorded when they were first sent.
+- **The trace id is the session id**, which the CA carries
+  (`SessionCa::session_id`) and the observer thread is given; the span id
+  is the provider's tool use id. `tool.open` and `tool.close` carry the
+  span in the envelope; `llm.*` records do not.
+- **Fixtures are inline**, from the providers' public API documentation:
+  the parsers' tests hold the request and reply JSON and the event
+  streams as literals, and the observer-level tests frame them as
+  HTTP/1.1 and WebSocket bytes; there are no recorded files. The plan's
+  blessed fixture files were not needed for the records' shapes, which
+  the protocol crate's round-trip cases pin.
+- **A model API call through an exchange the observer could not read
+  whole** (a truncated body, a lost chunk, a flow closed mid-reply) gets
+  its `llm.*` record with `degraded` set rather than no record, so a
+  reader can tell a call that was made from one that was not.

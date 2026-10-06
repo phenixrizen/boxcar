@@ -44,11 +44,11 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
     FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
-    HttpResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp,
-    OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
-    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus,
-    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop,
-    VsockClose, VsockConnect,
+    HttpResponse, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop,
+    NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit,
+    ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
+    ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef,
+    ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -482,6 +482,14 @@ pub enum Payload {
     HttpRequest(HttpRequest),
     #[serde(rename = "http.response")]
     HttpResponse(HttpResponse),
+    #[serde(rename = "llm.request")]
+    LlmRequest(LlmRequest),
+    #[serde(rename = "llm.response")]
+    LlmResponse(LlmResponse),
+    #[serde(rename = "tool.open")]
+    ToolOpen(ToolOpen),
+    #[serde(rename = "tool.close")]
+    ToolClose(ToolClose),
     #[serde(rename = "finding")]
     Finding(Finding),
 }
@@ -540,6 +548,10 @@ impl Payload {
             Payload::ProcSensorStatus(_) => "proc.sensor_status",
             Payload::HttpRequest(_) => "http.request",
             Payload::HttpResponse(_) => "http.response",
+            Payload::LlmRequest(_) => "llm.request",
+            Payload::LlmResponse(_) => "llm.response",
+            Payload::ToolOpen(_) => "tool.open",
+            Payload::ToolClose(_) => "tool.close",
             Payload::Finding(_) => "finding",
         }
     }
@@ -594,7 +606,12 @@ impl Payload {
             | Payload::ProcLsmDeny(_)
             | Payload::ProcHeartbeat(_)
             | Payload::ProcSensorStatus(_) => Source::Sensor,
-            Payload::HttpRequest(_) | Payload::HttpResponse(_) => Source::Gate,
+            Payload::HttpRequest(_)
+            | Payload::HttpResponse(_)
+            | Payload::LlmRequest(_)
+            | Payload::LlmResponse(_)
+            | Payload::ToolOpen(_)
+            | Payload::ToolClose(_) => Source::Gate,
             Payload::Finding(_) => Source::Reconciler,
         }
     }
@@ -630,7 +647,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 50] = [
+    const KINDS: [&str; 54] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -680,6 +697,10 @@ mod tests {
         "proc.sensor_status",
         "http.request",
         "http.response",
+        "llm.request",
+        "llm.response",
+        "tool.open",
+        "tool.close",
         "finding",
     ];
 
@@ -1529,6 +1550,87 @@ mod tests {
                 }),
             ),
             (
+                Payload::LlmRequest(LlmRequest {
+                    flow: 7,
+                    stream: 1,
+                    provider: "anthropic".into(),
+                    model: Some("claude-fable-5-1".into()),
+                    streaming: true,
+                    messages: 3,
+                    system_b3: Some(format!("b3:{}", "ef".repeat(32))),
+                    tools: vec!["Bash".into(), "Write".into()],
+                    max_tokens: Some(4096),
+                    body_bytes: 9012,
+                    body_b3: Some(format!("b3:{}", "ab".repeat(32))),
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7, "stream": 1, "provider": "anthropic",
+                    "model": "claude-fable-5-1", "streaming": true, "messages": 3,
+                    "system_b3": format!("b3:{}", "ef".repeat(32)),
+                    "tools": ["Bash", "Write"], "max_tokens": 4096,
+                    "body_bytes": 9012, "body_b3": format!("b3:{}", "ab".repeat(32)),
+                    "degraded": null,
+                }),
+            ),
+            (
+                Payload::LlmResponse(LlmResponse {
+                    flow: 7,
+                    stream: 1,
+                    provider: "anthropic".into(),
+                    model: Some("claude-fable-5-1".into()),
+                    stop_reason: Some("tool_use".into()),
+                    input_tokens: Some(1200),
+                    output_tokens: Some(80),
+                    cache_read_tokens: Some(1000),
+                    text_bytes: 64,
+                    text_b3: Some(format!("b3:{}", "12".repeat(32))),
+                    tool_uses: 1,
+                    dur_ms: 2100,
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7, "stream": 1, "provider": "anthropic",
+                    "model": "claude-fable-5-1", "stop_reason": "tool_use",
+                    "input_tokens": 1200, "output_tokens": 80, "cache_read_tokens": 1000,
+                    "text_bytes": 64, "text_b3": format!("b3:{}", "12".repeat(32)),
+                    "tool_uses": 1, "dur_ms": 2100, "degraded": null,
+                }),
+            ),
+            (
+                Payload::ToolOpen(ToolOpen {
+                    flow: 7,
+                    stream: 1,
+                    tool_use_id: "toolu_01".into(),
+                    tool_name: "Bash".into(),
+                    args_b3: Some(format!("b3:{}", "34".repeat(32))),
+                    args_summary: "{\"command\":\"ls -la\"}".into(),
+                    args: Some(json!({"command": "ls -la"})),
+                }),
+                json!({
+                    "flow": 7, "stream": 1, "tool_use_id": "toolu_01", "tool_name": "Bash",
+                    "args_b3": format!("b3:{}", "34".repeat(32)),
+                    "args_summary": "{\"command\":\"ls -la\"}",
+                    "args": {"command": "ls -la"},
+                }),
+            ),
+            (
+                Payload::ToolClose(ToolClose {
+                    flow: 7,
+                    stream: 3,
+                    tool_use_id: "toolu_01".into(),
+                    status: "ok".into(),
+                    result_bytes: 2048,
+                    result_b3: Some(format!("b3:{}", "56".repeat(32))),
+                    result_summary: "total 0".into(),
+                }),
+                json!({
+                    "flow": 7, "stream": 3, "tool_use_id": "toolu_01", "status": "ok",
+                    "result_bytes": 2048, "result_b3": format!("b3:{}", "56".repeat(32)),
+                    "result_summary": "total 0",
+                }),
+            ),
+            (
                 Payload::Finding(Finding {
                     category: FindingCategory::NetworkAnomaly,
                     score: 60,
@@ -1587,6 +1689,21 @@ mod tests {
     /// does not mark skip-if-none travel as explicit nulls.
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
+            (
+                Payload::ToolOpen(ToolOpen {
+                    flow: 8,
+                    stream: 1,
+                    tool_use_id: "call_x".into(),
+                    tool_name: "shell".into(),
+                    args_b3: None,
+                    args_summary: String::new(),
+                    args: None,
+                }),
+                json!({
+                    "flow": 8, "stream": 1, "tool_use_id": "call_x", "tool_name": "shell",
+                    "args_b3": null, "args_summary": "",
+                }),
+            ),
             (
                 Payload::HttpRequest(HttpRequest {
                     flow: 8,

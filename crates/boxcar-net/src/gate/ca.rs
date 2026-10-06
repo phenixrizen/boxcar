@@ -87,6 +87,7 @@ struct Leaves {
 /// The session's CA: its key (never exported), its certificate, and the
 /// leaves it signed.
 pub struct SessionCa {
+    session_id: String,
     issuer: Issuer<'static, KeyPair>,
     cert: CertificateDer<'static>,
     pem: String,
@@ -133,6 +134,7 @@ impl SessionCa {
         let pem = pem_certificate(&der);
         let fingerprint = hex::encode(ring::digest::digest(&ring::digest::SHA256, &der));
         Ok(SessionCa {
+            session_id: session_id.to_owned(),
             issuer: Issuer::new(params, key),
             cert: der,
             pem,
@@ -144,6 +146,11 @@ impl SessionCa {
                 order: VecDeque::new(),
             }),
         })
+    }
+
+    /// The session the CA was made for: the trace id of the gate's spans.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// The CA's certificate as PEM: one `CERTIFICATE` block, and no key.

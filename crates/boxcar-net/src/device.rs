@@ -251,9 +251,10 @@ impl VirtioNet {
     ) -> Result<VirtioNet, ConfigError> {
         let ids = FlowIds::default();
         let (observer, observer_thread) = match &inspect {
-            Some(_) => {
+            Some(gate) => {
                 let (observer, rx) = Observer::channel();
-                let thread = ObserverThread::spawn(rx, sink.clone())
+                let trace_id = gate.ca().session_id().to_owned();
+                let thread = ObserverThread::spawn(rx, sink.clone(), trace_id)
                     .map_err(|error| ConfigError::Observer(error.to_string()))?;
                 (Some(observer), Some(thread))
             }

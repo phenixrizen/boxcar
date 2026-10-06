@@ -233,14 +233,18 @@ pub struct ObserverThread {
 impl ObserverThread {
     /// Starts the thread on `rx`, recording into `sink`. It ends when
     /// every [`Observer`] is gone and the channel is drained.
-    pub fn spawn(rx: Receiver<Message>, sink: AuditSink) -> io::Result<ObserverThread> {
+    pub fn spawn(
+        rx: Receiver<Message>,
+        sink: AuditSink,
+        trace_id: String,
+    ) -> io::Result<ObserverThread> {
         let (stopped, done) = mpsc::channel::<()>();
         let thread = thread::Builder::new()
             .name("gate-observe".into())
             .spawn(move || {
                 // Dropped when the thread ends, however it ends.
                 let _stopped = stopped;
-                run(rx, &sink);
+                run(rx, &sink, &trace_id);
             })?;
         Ok(ObserverThread { done, thread })
     }
@@ -260,7 +264,7 @@ impl ObserverThread {
 /// emit (a full writer stalls this thread, never the net thread). At the
 /// end, when the senders are gone, what is still open is recorded as it
 /// stands.
-fn run(rx: Receiver<Message>, sink: &AuditSink) {
+fn run(rx: Receiver<Message>, sink: &AuditSink, trace_id: &str) {
     let mut flows: HashMap<u64, Observation> = HashMap::new();
     let mut out = Vec::new();
     loop {
@@ -274,7 +278,7 @@ fn run(rx: Receiver<Message>, sink: &AuditSink) {
             }) => {
                 flows.insert(
                     flow,
-                    Observation::new(flow, dst, name, alpn.as_deref(), tls),
+                    Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id),
                 );
             }
             Ok(Message::Data { flow, dir, bytes }) => {
@@ -295,16 +299,16 @@ fn run(rx: Receiver<Message>, sink: &AuditSink) {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        for payload in out.drain(..) {
-            crate::audit::record(sink, payload);
+        for emit in out.drain(..) {
+            crate::audit::record_in_span(sink, emit.payload, emit.span);
         }
     }
     let now = Instant::now();
     for (_, mut observation) in flows.drain() {
         observation.close(now, &mut out);
     }
-    for payload in out.drain(..) {
-        crate::audit::record(sink, payload);
+    for emit in out.drain(..) {
+        crate::audit::record_in_span(sink, emit.payload, emit.span);
     }
 }
 
@@ -447,7 +451,7 @@ mod tests {
         .unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         let (observer, rx) = Observer::channel();
-        let thread = ObserverThread::spawn(rx, sink).unwrap();
+        let thread = ObserverThread::spawn(rx, sink, "trace-test".into()).unwrap();
         assert_eq!(
             observer.send(Message::Open {
                 flow: 1,

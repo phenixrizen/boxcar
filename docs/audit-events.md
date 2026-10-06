@@ -216,6 +216,28 @@ HTTP/1.1's requests in order on the flow.
 | `http.request` | `flow`, `stream`, `version` (`1.1` or `2`), `method`, `authority`, `path` (cut at 4096 bytes), `content_type`, `content_encoding`, `content_length`, `user_agent` (cut at 512), `body_bytes` (decoded), `body_b3`, `body_truncated`, `degraded` | A request's body ended (or could not: `degraded` says why: `lost` (the observer's channel had no room), `incomplete`, `flow_closed`, `content_encoding` (a coding the observer does not decode: the raw body is hashed), `content_decode`, or a parser's reason). |
 | `http.response` | `flow`, `stream`, `status`, `content_type`, `content_encoding`, `body_bytes`, `body_b3`, `body_truncated`, `sse_events` (events of a `text/event-stream` body), `ws_messages` (messages of a WebSocket stream, both ways), `dur_ms` (the request's first byte to the response's last, as the observer took them), `degraded` | A response ended; for a WebSocket stream, when it closed. |
 
+## `llm.*` and `tool.*` (host, src `gate`)
+
+The model APIs the gate knows, read from the exchanges above: the
+Anthropic Messages API (`/v1/messages`), OpenAI Chat Completions
+(`/chat/completions`) and OpenAI Responses (`/responses`, as JSON, as an
+event stream, or over WebSocket), chosen by the request's path whatever
+the host. Bodies are read tolerantly: unknown fields and events are passed
+over, and a body that does not read degrades the record, never the flow.
+Text is never inline: prompts, replies and tool results appear as sizes
+and blake3 hashes, and in summaries of at most 512 bytes, scrubbed. A
+`tool.open` and the `tool.close` that answers it carry the envelope's
+`span`: `trace_id` is the session id, `span_id` the provider's tool use
+id; the reconciler attributes the processes and effects between them to
+that span (`span.effects`, docs/reconciler.md).
+
+| Type | Fields | When |
+|---|---|---|
+| `llm.request` | `flow`, `stream`, `provider` (`anthropic`, `openai_chat`, `openai_responses`), `model`, `streaming`, `messages` (count), `system_b3`, `tools [string]` (names, at most 64), `max_tokens`, `body_bytes`, `body_b3`, `degraded` | A request's body ended; over WebSocket, a `response.create` message came. The `tool.close`s it carried follow it. |
+| `tool.close` | `flow`, `stream`, `tool_use_id`, `status` (`ok` or `error`), `result_bytes`, `result_b3`, `result_summary` | The request carried a tool result (`tool_result`, a `role: tool` message, a `function_call_output`): the span closes. |
+| `tool.open` | `flow`, `stream`, `tool_use_id`, `tool_name`, `args_b3`, `args_summary`, `args` (the arguments as JSON when at most 8 KiB; omitted otherwise) | The model's reply asked for a tool: in a stream, as soon as the call's arguments are whole; in a document, at its end. The span opens. |
+| `llm.response` | `flow`, `stream`, `provider`, `model`, `stop_reason`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `text_bytes`, `text_b3`, `tool_uses`, `dur_ms`, `degraded` | The reply ended (the stream's end, the document's end, or over WebSocket the `response.completed`); `degraded` says what cut it short (`stream_unfinished`, `stream_error`, `block_unfinished`, `call_unfinished`, `event_json`, `response_json`, `body_truncated`, `flow_closed`). |
+
 ## `finding` (host, src `reconciler`)
 
 | Type | Fields | When |

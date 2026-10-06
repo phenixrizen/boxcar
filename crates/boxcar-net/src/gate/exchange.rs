@@ -7,7 +7,9 @@
 //! records when they end. Bodies are decoded, hashed and kept by
 //! [`BodySink`]; event streams are split and counted; WebSocket messages
 //! are counted. The model parsers (`crate::model`) read the same
-//! exchanges, through [`Observation::exchanges`].
+//! exchanges, through [`Observation::exchanges`]; the model tracker
+//! ([`crate::model::Tracker`]) reads them as they end, for `llm.*` and
+//! `tool.*`.
 //!
 //! Times are the observer's: when it took the bytes, which is when they
 //! moved unless it fell behind.
@@ -16,10 +18,34 @@ use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::time::Instant;
 
-use boxcar_proto::{HttpRequest, HttpResponse, Payload};
+use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
 
 use super::Direction;
 use crate::http::{BodySink, Connection, Event, Headers, SseEvent, SseParser, Version};
+use crate::model::Tracker;
+
+/// A record the observer made, with the span it belongs to, if any.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Emit {
+    pub payload: Payload,
+    pub span: Option<SpanRef>,
+}
+
+impl Emit {
+    pub fn plain(payload: Payload) -> Emit {
+        Emit {
+            payload,
+            span: None,
+        }
+    }
+
+    pub fn in_span(payload: Payload, span: SpanRef) -> Emit {
+        Emit {
+            payload,
+            span: Some(span),
+        }
+    }
+}
 
 /// The most bytes of a path kept in a record.
 pub const PATH_CUT: usize = 4096;
@@ -108,6 +134,7 @@ pub struct Observation {
     pub tls: bool,
     conn: Connection,
     exchanges: HashMap<u32, Exchange>,
+    model: Tracker,
 }
 
 impl Observation {
@@ -119,6 +146,7 @@ impl Observation {
         name: Option<String>,
         alpn: Option<&str>,
         tls: bool,
+        trace_id: &str,
     ) -> Observation {
         Observation {
             flow,
@@ -127,6 +155,7 @@ impl Observation {
             tls,
             conn: Connection::new(alpn),
             exchanges: HashMap::new(),
+            model: Tracker::new(flow, trace_id.to_owned()),
         }
     }
 
@@ -137,24 +166,25 @@ impl Observation {
 
     /// Plaintext that moved in `dir`, taken at `now`: the records it
     /// completes go to `out`.
-    pub fn data(&mut self, dir: Direction, bytes: &[u8], now: Instant, out: &mut Vec<Payload>) {
+    pub fn data(&mut self, dir: Direction, bytes: &[u8], now: Instant, out: &mut Vec<Emit>) {
         let mut events = Vec::new();
         self.conn.feed(dir, bytes, &mut events);
         self.handle(events, now, out);
     }
 
     /// A hole in `dir`'s plaintext.
-    pub fn lost(&mut self, dir: Direction, now: Instant, out: &mut Vec<Payload>) {
+    pub fn lost(&mut self, dir: Direction, now: Instant, out: &mut Vec<Emit>) {
         let mut events = Vec::new();
         self.conn.lost(dir, &mut events);
         self.handle(events, now, out);
     }
 
     /// The flow ended: what is open is recorded as it stands.
-    pub fn close(&mut self, now: Instant, out: &mut Vec<Payload>) {
+    pub fn close(&mut self, now: Instant, out: &mut Vec<Emit>) {
         let mut events = Vec::new();
         self.conn.finish(&mut events);
         self.handle(events, now, out);
+        self.model.close(now, out);
         let mut open: Vec<u32> = self.exchanges.keys().copied().collect();
         open.sort_unstable();
         for stream in open {
@@ -163,16 +193,16 @@ impl Observation {
             };
             if exchange.request.is_some() && !exchange.request_recorded {
                 exchange.request_degraded.get_or_insert("flow_closed");
-                out.push(self.request_record(&mut exchange));
+                out.push(Emit::plain(self.request_record(&mut exchange)));
             }
             if exchange.response.is_some() && !exchange.response_recorded {
                 exchange.response_degraded.get_or_insert("flow_closed");
-                out.push(self.response_record(&mut exchange, now));
+                out.push(Emit::plain(self.response_record(&mut exchange, now)));
             }
         }
     }
 
-    fn handle(&mut self, events: Vec<Event>, now: Instant, out: &mut Vec<Payload>) {
+    fn handle(&mut self, events: Vec<Event>, now: Instant, out: &mut Vec<Emit>) {
         for event in events {
             match event {
                 Event::RequestHead {
@@ -192,6 +222,8 @@ impl Observation {
                         Some(BodySink::new(headers.content_encoding().as_deref()));
                     exchange.request =
                         Some(request_head(method, authority, path, version, &headers));
+                    let path = exchange.request.as_ref().and_then(|r| r.path.clone());
+                    self.model.request_head(stream, path.as_deref(), now);
                 }
                 Event::RequestBody { stream, bytes } => {
                     if let Some(sink) = self
@@ -208,8 +240,9 @@ impl Observation {
                             sink.finish();
                         }
                         if !exchange.request_recorded && exchange.request.is_some() {
-                            out.push(self.request_record(&mut exchange));
+                            out.push(Emit::plain(self.request_record(&mut exchange)));
                         }
+                        self.model.request_end(stream, &exchange, out);
                         self.exchanges.insert(stream, exchange);
                     }
                 }
@@ -237,6 +270,7 @@ impl Observation {
                         content_type,
                         content_encoding: headers.content_encoding(),
                     });
+                    self.model.response_head(stream, status, &headers);
                 }
                 Event::ResponseBody { stream, bytes } => {
                     if let Some(exchange) = self.exchanges.get_mut(&stream) {
@@ -250,6 +284,7 @@ impl Observation {
                             sse.feed(&decoded, &mut exchange.sse_events);
                             exchange.sse_count += (exchange.sse_events.len() - before) as u64;
                         }
+                        self.model.response_body(stream, exchange, out);
                     }
                 }
                 Event::ResponseEnd { stream } => {
@@ -265,8 +300,9 @@ impl Observation {
                             }
                         }
                         if !exchange.response_recorded && exchange.response.is_some() {
-                            out.push(self.response_record(&mut exchange, now));
+                            out.push(Emit::plain(self.response_record(&mut exchange, now)));
                         }
+                        self.model.response_end(stream, &exchange, now, out);
                         if !exchange.done() {
                             self.exchanges.insert(stream, exchange);
                         }
@@ -276,6 +312,7 @@ impl Observation {
                     if let Some(exchange) = self.exchanges.get_mut(&stream) {
                         exchange.upgraded = true;
                     }
+                    self.model.upgraded(stream);
                 }
                 Event::WsMessage {
                     stream,
@@ -286,6 +323,7 @@ impl Observation {
                     if let Some(exchange) = self.exchanges.get_mut(&stream) {
                         exchange.last_response_at = now;
                         exchange.ws_count += 1;
+                        self.model.ws_message(stream, dir, text, &payload, now, out);
                         exchange.ws_messages.push((dir, text, payload));
                     }
                 }
@@ -293,7 +331,7 @@ impl Observation {
                     if let Some(mut exchange) = self.exchanges.remove(&stream) {
                         exchange.last_response_at = now;
                         if !exchange.response_recorded && exchange.response.is_some() {
-                            out.push(self.response_record(&mut exchange, now));
+                            out.push(Emit::plain(self.response_record(&mut exchange, now)));
                         }
                     }
                 }
@@ -311,6 +349,7 @@ impl Observation {
                                 exchange.response_degraded.get_or_insert(reason);
                             }
                         }
+                        self.model.degraded(stream, reason);
                     }
                 }
             }
@@ -441,6 +480,7 @@ mod tests {
             Some("api.example".into()),
             alpn,
             true,
+            "trace-test",
         )
     }
 
@@ -451,18 +491,18 @@ mod tests {
         let t0 = Instant::now();
         obs.data(
             Direction::ToHost,
-            b"POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nUser-Agent: claude-cli/2.1\r\nAuthorization: Bearer x\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}",
+            b"POST /v1/complete HTTP/1.1\r\nHost: api.example\r\nUser-Agent: claude-cli/2.1\r\nAuthorization: Bearer x\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}",
             t0,
             &mut out,
         );
         assert_eq!(out.len(), 1, "{out:?}");
-        match &out[0] {
+        match &out[0].payload {
             Payload::HttpRequest(r) => {
                 assert_eq!((r.flow, r.stream), (5, 1));
                 assert_eq!(r.version, "1.1");
                 assert_eq!(r.method, "POST");
                 assert_eq!(r.authority.as_deref(), Some("api.example"));
-                assert_eq!(r.path.as_deref(), Some("/v1/messages"));
+                assert_eq!(r.path.as_deref(), Some("/v1/complete"));
                 assert_eq!(r.content_type.as_deref(), Some("application/json"));
                 assert_eq!(r.content_length, Some(13));
                 assert_eq!(r.user_agent.as_deref(), Some("claude-cli/2.1"));
@@ -492,7 +532,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(out.len(), 2, "{out:?}");
-        match &out[1] {
+        match &out[1].payload {
             Payload::HttpResponse(r) => {
                 assert_eq!((r.flow, r.stream, r.status), (5, 1, 200));
                 assert_eq!(r.content_type.as_deref(), Some("text/event-stream"));
@@ -527,7 +567,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         obs.close(now, &mut out);
         assert_eq!(out.len(), 2, "{out:?}");
-        match &out[1] {
+        match &out[1].payload {
             Payload::HttpResponse(r) => {
                 assert_eq!(r.status, 200);
                 assert_eq!(r.body_bytes, 7);
@@ -551,7 +591,7 @@ mod tests {
             &mut out,
         );
         obs.close(now, &mut out);
-        match &out[1] {
+        match &out[1].payload {
             Payload::HttpResponse(r) => {
                 assert_eq!(r.body_bytes, 5);
                 assert_eq!(r.degraded, None);
@@ -574,7 +614,7 @@ mod tests {
         obs.lost(Direction::ToHost, now, &mut out);
         obs.close(now, &mut out);
         assert_eq!(out.len(), 1, "{out:?}");
-        match &out[0] {
+        match &out[0].payload {
             Payload::HttpRequest(r) => {
                 assert_eq!(r.degraded.as_deref(), Some("lost"));
                 assert_eq!(r.body_bytes, 5);

@@ -995,6 +995,97 @@ pub struct HttpResponse {
     pub degraded: Option<String>,
 }
 
+/// `llm.request`: a request to a model API the gate knows, read from an
+/// inspected flow once its body ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LlmRequest {
+    /// The `flow` and `stream` of the `http.request` it was read from.
+    pub flow: u64,
+    pub stream: u32,
+    /// `anthropic`, `openai_chat` or `openai_responses`.
+    pub provider: String,
+    pub model: Option<String>,
+    /// The request asked for a streamed response.
+    pub streaming: bool,
+    /// How many messages (or input items) the request carried.
+    pub messages: u32,
+    /// `b3:` and blake3 of the system prompt (or instructions), if any.
+    pub system_b3: Option<String>,
+    /// The tools offered, by name, at most 64.
+    pub tools: Vec<String>,
+    pub max_tokens: Option<u64>,
+    /// Decoded body bytes, and their hash, as the `http.request` has them.
+    pub body_bytes: u64,
+    pub body_b3: Option<String>,
+    /// Why the body could not be read: `body_truncated`, `request_json`,
+    /// or what degraded the `http.request`.
+    pub degraded: Option<String>,
+}
+
+/// `llm.response`: the model's reply to an `llm.request`, once it ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LlmResponse {
+    pub flow: u64,
+    pub stream: u32,
+    pub provider: String,
+    pub model: Option<String>,
+    /// The provider's stop or finish reason, or status.
+    pub stop_reason: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    /// The assistant's text, by size and blake3 (`b3:`), never inline.
+    pub text_bytes: u64,
+    pub text_b3: Option<String>,
+    /// How many tool calls the reply made (each a `tool.open`).
+    pub tool_uses: u32,
+    /// From the request's first byte to the reply's last.
+    pub dur_ms: u64,
+    /// Why the reply could not be read whole: `stream_error`,
+    /// `stream_unfinished`, `block_unfinished`, `call_unfinished`,
+    /// `event_json`, `response_json`, `body_truncated`, `flow_closed`.
+    pub degraded: Option<String>,
+}
+
+/// `tool.open`: the model asked for a tool to run. Opens the span the
+/// record's envelope names (`trace_id` the session, `span_id` the tool use
+/// id); the `tool.close` with the same id closes it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolOpen {
+    pub flow: u64,
+    pub stream: u32,
+    /// The provider's id for the call (`toolu_...`, `call_...`).
+    pub tool_use_id: String,
+    pub tool_name: String,
+    /// `b3:` and blake3 of the arguments' JSON.
+    pub args_b3: Option<String>,
+    /// The arguments in at most 512 bytes, scrubbed.
+    pub args_summary: String,
+    /// The arguments, when their JSON is at most 8 KiB; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+}
+
+/// `tool.close`: the agent sent the tool's result back to the model, in
+/// its next request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolClose {
+    pub flow: u64,
+    pub stream: u32,
+    pub tool_use_id: String,
+    /// `ok`, or `error` when the agent said so.
+    pub status: String,
+    /// The result's text, by size and blake3 (`b3:`).
+    pub result_bytes: u64,
+    pub result_b3: Option<String>,
+    /// The result in at most 512 bytes, scrubbed.
+    pub result_summary: String,
+}
+
 /// `finding`: the reconciler's conclusion from records of both rings, with
 /// the records it read as evidence. Never sampled; a score of 70 or more
 /// is written through to disk at once.

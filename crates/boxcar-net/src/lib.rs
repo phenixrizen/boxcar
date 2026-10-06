@@ -32,6 +32,8 @@
 //!   legs, and the observer that takes the plaintext.
 //! - [`http`]: the observer's parsers: HTTP/1.1, HTTP/2, bodies, event
 //!   streams and WebSocket, read passively.
+//! - [`model`]: the model APIs the observer knows, whose requests, replies
+//!   and tool calls become `llm.*` and `tool.*` records.
 //! - [`audit`]: the `net.*` records.
 //! - [`config`]: the addressing, the DNS upstreams, and the relays' bounds.
 //! - [`device`]: the virtio-net device in front of the stack, and the net
@@ -50,6 +52,7 @@ pub mod gate;
 pub mod http;
 pub mod http_host;
 pub mod icmp;
+pub mod model;
 pub mod policy;
 pub mod sni;
 pub mod stack;

@@ -1066,6 +1066,188 @@
         }
       }
     },
+    "LlmRequest": {
+      "description": "`llm.request`: a request to a model API the gate knows, read from an inspected flow once its body ended.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "flow",
+        "messages",
+        "provider",
+        "stream",
+        "streaming",
+        "tools"
+      ],
+      "properties": {
+        "body_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "description": "Decoded body bytes, and their hash, as the `http.request` has them.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "degraded": {
+          "description": "Why the body could not be read: `body_truncated`, `request_json`, or what degraded the `http.request`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow": {
+          "description": "The `flow` and `stream` of the `http.request` it was read from.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "messages": {
+          "description": "How many messages (or input items) the request carried.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "`anthropic`, `openai_chat` or `openai_responses`.",
+          "type": "string"
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "streaming": {
+          "description": "The request asked for a streamed response.",
+          "type": "boolean"
+        },
+        "system_b3": {
+          "description": "`b3:` and blake3 of the system prompt (or instructions), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "description": "The tools offered, by name, at most 64.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "LlmResponse": {
+      "description": "`llm.response`: the model's reply to an `llm.request`, once it ended.",
+      "type": "object",
+      "required": [
+        "dur_ms",
+        "flow",
+        "provider",
+        "stream",
+        "text_bytes",
+        "tool_uses"
+      ],
+      "properties": {
+        "cache_read_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "degraded": {
+          "description": "Why the reply could not be read whole: `stream_error`, `stream_unfinished`, `block_unfinished`, `call_unfinished`, `event_json`, `response_json`, `body_truncated`, `flow_closed`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dur_ms": {
+          "description": "From the request's first byte to the reply's last.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "provider": {
+          "type": "string"
+        },
+        "stop_reason": {
+          "description": "The provider's stop or finish reason, or status.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "text_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text_bytes": {
+          "description": "The assistant's text, by size and blake3 (`b3:`), never inline.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tool_uses": {
+          "description": "How many tool calls the reply made (each a `tool.open`).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "NetClose": {
       "description": "`net.close`: a flow ended.",
       "type": "object",
@@ -2291,6 +2473,78 @@
               "type": "string",
               "enum": [
                 "http.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.close"
               ]
             }
           }
@@ -3696,6 +3950,78 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/LlmRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/Finding"
             },
             "type": {
@@ -3924,6 +4250,97 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        }
+      }
+    },
+    "ToolClose": {
+      "description": "`tool.close`: the agent sent the tool's result back to the model, in its next request.",
+      "type": "object",
+      "required": [
+        "flow",
+        "result_bytes",
+        "result_summary",
+        "status",
+        "stream",
+        "tool_use_id"
+      ],
+      "properties": {
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "result_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result_bytes": {
+          "description": "The result's text, by size and blake3 (`b3:`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "result_summary": {
+          "description": "The result in at most 512 bytes, scrubbed.",
+          "type": "string"
+        },
+        "status": {
+          "description": "`ok`, or `error` when the agent said so.",
+          "type": "string"
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool_use_id": {
+          "type": "string"
+        }
+      }
+    },
+    "ToolOpen": {
+      "description": "`tool.open`: the model asked for a tool to run. Opens the span the record's envelope names (`trace_id` the session, `span_id` the tool use id); the `tool.close` with the same id closes it.",
+      "type": "object",
+      "required": [
+        "args_summary",
+        "flow",
+        "stream",
+        "tool_name",
+        "tool_use_id"
+      ],
+      "properties": {
+        "args": {
+          "description": "The arguments, when their JSON is at most 8 KiB; omitted otherwise."
+        },
+        "args_b3": {
+          "description": "`b3:` and blake3 of the arguments' JSON.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "args_summary": {
+          "description": "The arguments in at most 512 bytes, scrubbed.",
+          "type": "string"
+        },
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "description": "The provider's id for the call (`toolu_...`, `call_...`).",
+          "type": "string"
         }
       }
     },

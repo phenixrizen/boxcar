@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
-use boxcar_proto::{NetClose, NetDrop, Payload, Ring};
+use boxcar_proto::{NetClose, NetDrop, Payload, Ring, SpanRef};
 
 use crate::tcp::FlowId;
 
@@ -36,6 +36,24 @@ pub(crate) fn record(sink: &AuditSink, payload: Payload) {
         }
     });
     match emit(sink, payload) {
+        Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
+        Err(error @ EmitError::Checkpoint) => {
+            boxcar_virtio::limited!(error, "net: audit record refused: {error}");
+        }
+    }
+}
+
+/// [`record`], for a record that belongs to a span (the gate's `tool.*`).
+pub(crate) fn record_in_span(sink: &AuditSink, payload: Payload, span: Option<SpanRef>) {
+    #[cfg(test)]
+    tests::RECORDED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&payload);
+        }
+    });
+    let mut s = submission(payload);
+    s.span = span;
+    match sink.emit(s) {
         Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
         Err(error @ EmitError::Checkpoint) => {
             boxcar_virtio::limited!(error, "net: audit record refused: {error}");
