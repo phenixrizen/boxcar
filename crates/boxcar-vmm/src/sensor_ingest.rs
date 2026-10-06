@@ -325,6 +325,7 @@ mod tests {
                 btf_ok: true,
                 session_cgroup_id: 4242,
                 pid: 77,
+                threads: Vec::new(),
                 reason: None,
             }),
         }

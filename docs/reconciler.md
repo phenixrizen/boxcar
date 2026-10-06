@@ -45,8 +45,11 @@ tool use id as the span id. In between, the reconciler attributes
 processes and ring 0 effects to the span:
 
 - **The agent.** The session's root process (`session.start.pid`) is the
-  agent, and so is a span's executor once a later milestone names one
-  from the sensor's TLS writes. The agent itself is in no span.
+  agent, and so is a span's executor: the process whose `proc.tls_io`
+  write, within 500 ms of the gate's `http.request` and sized like its
+  body (within a tenth plus 1 KiB, as one write or as the process's
+  writes of the window summed), carried the model request the span came
+  from. The agent itself is in no span.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`) whose
@@ -88,7 +91,7 @@ inside each.
 | `indicator_removal` | `indicator_removal` | `fs.unlink`, `fs.rename` (the source) or `fs.setattr` to size 0 of a shell history (`.*_history`), a file under `/var/log/`, `/etc/ld.so.preload`, or a file under `/root/.ssh/` | 90 |
 | `off_book_channel` | `memfd_create` | `proc.memfd` | 75 |
 | `off_book_channel` | `shm_open` | `proc.file_open` of a path under `/dev/shm/` (sampled: one open in 64 is seen) | 75 |
-| `network_anomaly` | `connect_without_dns` | `net.connect` to an address that no `net.dns` answer named in the last 60 s and that the stack had no name for (the gateway excepted) | 60 |
+| `network_anomaly` | `connect_without_dns` | `net.connect` to an address that no `net.dns` answer named in the last 60 s and that the stack had no name for (the gateway excepted); judged once the sensor's `proc.tcp_connect` has named the process, or 500 ms after the connect, whichever comes first, since the two come in either order | 60 |
 | `network_anomaly` | `sni_mismatch` | `net.tls` whose server name was answered with addresses that do not include the flow's destination | 65 |
 | `network_anomaly` | `dns_rate` | more than 50 `net.dns` queries within 10 s; then quiet for 10 s | 70 |
 | `network_anomaly` | `dns_entropy` | 20 or more queries within 10 s whose first labels carry over 3.5 bits of entropy on average; then quiet for 10 s | 70 |

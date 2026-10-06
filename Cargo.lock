@@ -386,6 +386,8 @@ dependencies = [
  "boxcar-proto",
  "boxcar-sensor-common",
  "libc",
+ "object",
+ "tempfile",
  "thiserror",
 ]
 

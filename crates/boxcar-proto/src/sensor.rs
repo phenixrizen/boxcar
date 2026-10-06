@@ -112,6 +112,13 @@ impl SensorFrame {
             Payload::ProcConnectAttempt(attempt) => {
                 within("proto", attempt.proto.len(), MAX_NAME)?;
             }
+            Payload::ProcTlsIo(io) => within("dir", io.dir.len(), MAX_NAME)?,
+            Payload::ProcTlsAttach(attach) => {
+                within("path", attach.path.len(), MAX_PATH)?;
+                if let Some(error) = &attach.error {
+                    within("error", error.len(), MAX_SUMMARY)?;
+                }
+            }
             Payload::ProcSensorStatus(status) => {
                 within("kernel_release", status.kernel_release.len(), MAX_NAME)?;
                 if status.programs.len() > MAX_PROGRAMS {
@@ -366,6 +373,8 @@ mod tests {
             "proc.lsm_deny",
             "proc.heartbeat",
             "proc.sensor_status",
+            "proc.tls_io",
+            "proc.tls_attach",
         ] {
             assert!(is_sensor_kind(kind), "{kind}");
         }

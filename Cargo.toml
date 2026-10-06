@@ -64,6 +64,9 @@ tempfile = "3" # dev only
 # builds them from boxcar-sensor's build.rs, aya-obj parses the built object
 # on the host for the eBPF lane's checks.
 aya = "0.14"
+# The sensor reads a program's ELF symbols for the TLS probes; the same
+# crate aya resolves symbols with.
+object = { version = "0.39", default-features = false, features = ["elf", "read_core", "std"] }
 aya-obj = "0.3"
 aya-build = "0.2"
 

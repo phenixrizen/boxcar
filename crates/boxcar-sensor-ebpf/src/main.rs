@@ -3,7 +3,9 @@
 
 //! The guest sensor's eBPF programs: process lineage (`exec`, `fork`,
 //! `exit`), connections (`socket_connect`, `tcp_connect`), anonymous files
-//! (`memfd_create`), sampled opens (`file_open`), and the self-protection
+//! (`memfd_create`), sampled opens (`file_open`), TLS writes and reads of
+//! runtimes that export OpenSSL's functions (`tls`, attached by the
+//! userspace sensor to each file that has them), and the self-protection
 //! (`bpf`, `task_kill`). Every event is a struct of `boxcar-sensor-common`
 //! in the `EVENTS` ring buffer; every program but the guards reports only
 //! for tasks in the session's cgroup (`SESSION_CGROUP`, set by the loader).
@@ -25,6 +27,7 @@ mod fork;
 mod guards;
 mod memfd;
 mod tcp;
+mod tls;
 #[rustfmt::skip]
 mod vmlinux;
 

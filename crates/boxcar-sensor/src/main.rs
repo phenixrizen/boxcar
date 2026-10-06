@@ -7,7 +7,9 @@
 //! as their filter, attaches them, says what it attached
 //! (`proc.sensor_status`), and then streams their events as `proc.*` frames
 //! with a heartbeat every second. One thread, on `poll(2)`: the ring
-//! buffer's descriptor, or the time to the next heartbeat.
+//! buffer's descriptor, the TLS resolver's pipe, or the time to the next
+//! heartbeat or the next look at a process's maps for the TLS probes
+//! ([`tls`]).
 //!
 //! Whatever fails to load is reported, not fatal: a sensor with no programs
 //! at all still connects and heartbeats, so its silence always means
@@ -27,18 +29,22 @@ mod load;
 mod object;
 mod probe;
 mod status;
+mod tls;
 mod vsock;
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use boxcar_proto::sensor::{encode, SensorFrame};
+use boxcar_proto::Payload;
 
 use crate::heartbeat::Heartbeat;
 use crate::status::Facts;
+use crate::tls::Attacher;
 
 /// The cgroup init puts the session in; its inode is its id.
 const SESSION_CGROUP: &str = "/sys/fs/cgroup/session";
@@ -160,11 +166,15 @@ fn run(args: &[String]) -> Result<(), SensorError> {
         }
     };
     let pid = std::process::id();
+    // The TLS resolver's thread is one of the sensor's own, named in the
+    // status so that its reads of the shares are known to be the sensor's.
+    let mut attacher = Attacher::new();
     let facts = Facts {
         btf_ok: std::path::Path::new(BTF_PATH).exists(),
         kernel_release: kernel_release(),
         session_cgroup_id: cgroup,
         pid,
+        threads: attacher.threads(),
     };
     let loaded = load::load(cgroup, u64::from(pid));
     // Attached, or as attached as it gets: init may start the session.
@@ -187,17 +197,27 @@ fn run(args: &[String]) -> Result<(), SensorError> {
     }
 
     let load::Loaded {
-        ebpf: _ebpf,
+        ebpf,
         events,
         drops,
         ..
     } = loaded;
+    // Kept, and kept mutable: dropping it detaches the programs, and the
+    // TLS probes attach to files as the session runs them.
+    let mut ebpf = ebpf;
     let mut events = events;
-    let mut poll = [libc::pollfd {
-        fd: events.as_ref().map_or(-1, |ring| ring.as_raw_fd()),
-        events: libc::POLLIN,
-        revents: 0,
-    }];
+    let mut poll = [
+        libc::pollfd {
+            fd: events.as_ref().map_or(-1, |ring| ring.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: attacher.wake_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
     loop {
         let now = Instant::now();
         if heartbeat.due(now) {
@@ -205,11 +225,22 @@ fn run(args: &[String]) -> Result<(), SensorError> {
             write_frame(&mut out, &frame)?;
             heartbeat.sent();
         }
-        let wait = heartbeat.wait(Instant::now());
+        if attacher.next_due().is_some_and(|due| due <= now) {
+            for frame in attacher.sweep(now, monotonic_ns()) {
+                write_frame(&mut out, &frame)?;
+                heartbeat.sent();
+            }
+        }
+        let now = Instant::now();
+        let mut wait = heartbeat.wait(now);
+        if let Some(due) = attacher.next_due() {
+            wait = wait.min(due.saturating_duration_since(now));
+        }
         let timeout = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
         poll[0].revents = 0;
-        // SAFETY: poll reads and writes the one pollfd given, for the count given.
-        let ready = unsafe { libc::poll(poll.as_mut_ptr(), 1, timeout) };
+        poll[1].revents = 0;
+        // SAFETY: poll reads and writes the two pollfds given, for the count given.
+        let ready = unsafe { libc::poll(poll.as_mut_ptr(), 2, timeout) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -217,7 +248,17 @@ fn run(args: &[String]) -> Result<(), SensorError> {
             }
             return Err(SensorError::Write(error));
         }
-        if ready == 0 || poll[0].revents & libc::POLLIN == 0 {
+        if ready == 0 {
+            continue;
+        }
+        if poll[1].revents & libc::POLLIN != 0 {
+            // A file's symbols are in: attach, and say how it went.
+            for frame in attacher.resolved(ebpf.as_mut(), monotonic_ns()) {
+                write_frame(&mut out, &frame)?;
+                heartbeat.sent();
+            }
+        }
+        if poll[0].revents & libc::POLLIN == 0 {
             continue;
         }
         let Some(ring) = events.as_mut() else {
@@ -229,9 +270,39 @@ fn run(args: &[String]) -> Result<(), SensorError> {
                     write_frame(&mut out, &frame)?;
                     heartbeat.events_emitted += 1;
                     heartbeat.sent();
+                    for frame in tls_follow_up(&mut attacher, &frame) {
+                        write_frame(&mut out, &frame)?;
+                        heartbeat.sent();
+                    }
                 }
                 Err(error) => eprintln!("boxcar-sensor: dropped an event: {error}"),
             }
         }
+    }
+}
+
+/// What a process record means for the TLS probes: an exec names a file
+/// to try and a process whose maps to look at, a fork a process to look
+/// at, an exit one to forget. The frames to send now, if any; a file's
+/// outcome comes once the resolver has read it.
+fn tls_follow_up(attacher: &mut Attacher, frame: &SensorFrame) -> Vec<SensorFrame> {
+    let now = Instant::now();
+    match &frame.payload {
+        Payload::ProcExec(exec) => {
+            attacher.saw(exec.tgid, now);
+            attacher
+                .consider(Path::new(&exec.filename), monotonic_ns())
+                .into_iter()
+                .collect()
+        }
+        Payload::ProcFork(fork) if !fork.thread => {
+            attacher.saw(fork.child_pid, now);
+            Vec::new()
+        }
+        Payload::ProcExit(exit) if exit.group_dead => {
+            attacher.gone(exit.tgid);
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
 }

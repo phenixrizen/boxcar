@@ -310,7 +310,7 @@ fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
     assert_eq!(status.data["btf_ok"], true, "{status:?}");
     assert_eq!(
         status.data["programs"].as_array().unwrap().len(),
-        9,
+        15,
         "{status:?}"
     );
     assert!(status.data["pid"].as_u64().unwrap() > 1, "{status:?}");

@@ -1,4 +1,4 @@
-{"ts_guest_ns":1000000000,"type":"proc.sensor_status","data":{"phase":"degraded","programs":[{"name":"sched_process_exec","attached":true},{"name":"file_open","attached":false,"error":"the hook is not sleepable here"}],"kernel_release":"6.18.54","btf_ok":true,"session_cgroup_id":4242,"pid":77}}
+{"ts_guest_ns":1000000000,"type":"proc.sensor_status","data":{"phase":"degraded","programs":[{"name":"sched_process_exec","attached":true},{"name":"file_open","attached":false,"error":"the hook is not sleepable here"}],"kernel_release":"6.18.54","btf_ok":true,"session_cgroup_id":4242,"pid":77,"threads":[78]}}
 {"ts_guest_ns":1500000000,"subject":{"pid":200,"uid":1000,"gid":1000},"type":"proc.fork","data":{"parent_tid":200,"parent_tgid":200,"child_pid":212,"child_start_ns":1499990000,"uid":1000,"gid":1000,"thread":false}}
 {"ts_guest_ns":1500100000,"subject":{"pid":212,"uid":1000,"gid":1000},"type":"proc.exec","data":{"tid":212,"tgid":212,"ppid":200,"uid":1000,"gid":1000,"filename":"/usr/bin/curl","argv":["curl","-sS","https://example.com/"],"argv_truncated":false,"start_ns":1499990000,"cgroup_id":4242}}
 {"ts_guest_ns":1500200000,"subject":{"pid":212,"uid":1000,"gid":1000},"type":"proc.connect_attempt","data":{"tid":212,"tgid":212,"family":2,"proto":"tcp","dst":"93.184.215.14","dst_port":443}}
@@ -8,3 +8,5 @@
 {"ts_guest_ns":1700000000,"subject":{"pid":212,"uid":1000,"gid":1000},"type":"proc.lsm_deny","data":{"tid":212,"tgid":212,"hook":"bpf","detail":5}}
 {"ts_guest_ns":1800000000,"subject":{"pid":212,"uid":1000,"gid":1000},"type":"proc.exit","data":{"tid":212,"tgid":212,"exit_code":256,"group_dead":true,"start_ns":1499990000}}
 {"ts_guest_ns":2000000000,"type":"proc.heartbeat","data":{"uptime_ns":1000000000,"events_emitted":8,"ringbuf_drops":0,"frames_sent":10}}
+{"ts_guest_ns":2000000000,"type":"proc.tls_attach","data":{"path":"/lib/libssl.so.3","ok":true}}
+{"ts_guest_ns":2100000000,"subject":{"pid":212,"uid":1000,"gid":1000},"type":"proc.tls_io","data":{"tid":212,"tgid":212,"dir":"write","bytes":517}}

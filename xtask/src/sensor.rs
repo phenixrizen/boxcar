@@ -186,6 +186,8 @@ fn section_kind(section: &ProgramSection) -> &'static str {
         ProgramSection::Lsm { sleepable: true } => "lsm.s",
         ProgramSection::FEntry { sleepable: false } => "fentry",
         ProgramSection::FEntry { sleepable: true } => "fentry.s",
+        ProgramSection::UProbe { sleepable: false } => "uprobe",
+        ProgramSection::URetProbe { sleepable: false } => "uretprobe",
         _ => "other",
     }
 }
@@ -196,6 +198,8 @@ fn kind_name(kind: ProgramKind) -> &'static str {
         ProgramKind::Lsm => "lsm",
         ProgramKind::SleepableLsm => "lsm.s",
         ProgramKind::FEntry => "fentry",
+        ProgramKind::UProbe => "uprobe",
+        ProgramKind::URetProbe => "uretprobe",
     }
 }
 
@@ -214,6 +218,16 @@ mod tests {
     fn kinds_have_their_section_names() {
         assert_eq!(kind_name(ProgramKind::BtfTracepoint), "btf_tracepoint");
         assert_eq!(kind_name(ProgramKind::SleepableLsm), "lsm.s");
+        assert_eq!(kind_name(ProgramKind::UProbe), "uprobe");
+        assert_eq!(kind_name(ProgramKind::URetProbe), "uretprobe");
+        assert_eq!(
+            section_kind(&ProgramSection::UProbe { sleepable: false }),
+            "uprobe"
+        );
+        assert_eq!(
+            section_kind(&ProgramSection::URetProbe { sleepable: false }),
+            "uretprobe"
+        );
         assert_eq!(
             section_kind(&ProgramSection::Lsm { sleepable: true }),
             "lsm.s"
@@ -247,5 +261,14 @@ mod tests {
         assert_eq!(report.license, LICENSE);
         let names: Vec<&str> = report.programs.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"bpf_guard") && names.contains(&"sched_process_exec"));
+        assert!(report
+            .programs
+            .iter()
+            .any(|(n, k)| n == "ssl_write" && k == "uprobe"));
+        assert!(report
+            .programs
+            .iter()
+            .any(|(n, k)| n == "ssl_read_ex_ret" && k == "uretprobe"));
+        assert!(report.maps.iter().any(|(n, t)| n == "TLS_READS" && *t == 1));
     }
 }

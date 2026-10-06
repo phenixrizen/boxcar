@@ -43,6 +43,8 @@ pub struct Facts {
     pub session_cgroup_id: u64,
     /// The sensor's own process id.
     pub pid: u32,
+    /// Its other threads (the TLS resolver's).
+    pub threads: Vec<u32>,
 }
 
 /// `attached` when every program is, `degraded` otherwise (no program at
@@ -79,6 +81,7 @@ pub fn status_frame(
             btf_ok: facts.btf_ok,
             session_cgroup_id: facts.session_cgroup_id,
             pid: facts.pid,
+            threads: facts.threads.clone(),
             reason: reason.map(|r| cut(&r)),
         }),
     }
@@ -117,6 +120,7 @@ mod tests {
                 kernel_release: "6.18.54".into(),
                 session_cgroup_id: 4242,
                 pid: 77,
+                threads: vec![78],
             },
             None,
             1_000,
@@ -153,6 +157,7 @@ mod tests {
                 kernel_release: "6.18.54".into(),
                 session_cgroup_id: 0,
                 pid: 1,
+                threads: Vec::new(),
             },
             Some("no_programs".into()),
             2,
@@ -176,6 +181,7 @@ mod tests {
                 kernel_release: "6.18.54".into(),
                 session_cgroup_id: 1,
                 pid: 1,
+                threads: Vec::new(),
             },
             None,
             3,

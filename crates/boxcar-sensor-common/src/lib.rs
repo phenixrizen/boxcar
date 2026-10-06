@@ -35,6 +35,11 @@ pub const HOOK_BPF: u32 = 1;
 /// `LsmDeny.hook`: a signal to the sensor was refused.
 pub const HOOK_TASK_KILL: u32 = 2;
 
+/// `TlsIoEvent.dir`: a write (`SSL_write`, `SSL_write_ex`).
+pub const TLS_DIR_WRITE: u32 = 0;
+/// `TlsIoEvent.dir`: a read (`SSL_read`, `SSL_read_ex`).
+pub const TLS_DIR_READ: u32 = 1;
+
 /// Which event struct follows a [`Header`].
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +52,7 @@ pub enum Kind {
     FileOpen = 6,
     Memfd = 7,
     LsmDeny = 8,
+    TlsIo = 9,
 }
 
 impl Kind {
@@ -61,6 +67,7 @@ impl Kind {
             6 => Some(Kind::FileOpen),
             7 => Some(Kind::Memfd),
             8 => Some(Kind::LsmDeny),
+            9 => Some(Kind::TlsIo),
             _ => None,
         }
     }
@@ -77,6 +84,7 @@ impl Kind {
             Kind::FileOpen => size_of::<FileOpen>(),
             Kind::Memfd => size_of::<MemfdEvent>(),
             Kind::LsmDeny => size_of::<LsmDeny>(),
+            Kind::TlsIo => size_of::<TlsIoEvent>(),
         }
     }
 }
@@ -227,6 +235,17 @@ pub struct LsmDeny {
     pub detail: i64,
 }
 
+/// `Kind::TlsIo`: a TLS write or read through a runtime that exports
+/// OpenSSL's functions: `dir` is [`TLS_DIR_WRITE`] or [`TLS_DIR_READ`],
+/// `bytes` the size the call carried. The buffer is never read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TlsIoEvent {
+    pub header: Header,
+    pub dir: u32,
+    pub bytes: u32,
+}
+
 #[cfg(feature = "user")]
 mod pod {
     // SAFETY: every struct is `repr(C)`, `Copy`, and made of integers and
@@ -240,6 +259,7 @@ mod pod {
     unsafe impl aya::Pod for super::FileOpen {}
     unsafe impl aya::Pod for super::MemfdEvent {}
     unsafe impl aya::Pod for super::LsmDeny {}
+    unsafe impl aya::Pod for super::TlsIoEvent {}
 }
 
 #[cfg(test)]
@@ -259,10 +279,12 @@ mod tests {
         assert_eq!(size_of::<FileOpen>(), 40 + 16 + PATH_MAX);
         assert_eq!(size_of::<MemfdEvent>(), 40 + 8 + MEMFD_NAME_MAX);
         assert_eq!(size_of::<LsmDeny>(), 40 + 16);
+        assert_eq!(size_of::<TlsIoEvent>(), 40 + 8);
         // The header is the first field of every event, at offset 0, so the
         // reader can look at the kind before it knows the struct.
         assert_eq!(core::mem::offset_of!(ExecEvent, header), 0);
         assert_eq!(core::mem::offset_of!(LsmDeny, header), 0);
+        assert_eq!(core::mem::offset_of!(TlsIoEvent, header), 0);
         assert_eq!(core::mem::offset_of!(Header, kind), 0);
         #[cfg(feature = "user")]
         {
@@ -276,6 +298,7 @@ mod tests {
             pod::<FileOpen>();
             pod::<MemfdEvent>();
             pod::<LsmDeny>();
+            pod::<TlsIoEvent>();
         }
     }
 
@@ -290,6 +313,7 @@ mod tests {
             Kind::FileOpen,
             Kind::Memfd,
             Kind::LsmDeny,
+            Kind::TlsIo,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(Kind::from_u32(*a as u32), Some(*a));
@@ -301,6 +325,7 @@ mod tests {
         assert_eq!(Kind::from_u32(99), None);
         assert_eq!(Kind::Exec.size(), size_of::<ExecEvent>());
         assert_eq!(Kind::LsmDeny.size(), size_of::<LsmDeny>());
+        assert_eq!(Kind::TlsIo.size(), size_of::<TlsIoEvent>());
     }
 
     #[test]
@@ -312,5 +337,6 @@ mod tests {
         assert_eq!(Hook::TaskKill.name(), "task_kill");
         assert_eq!(AF_INET, 2);
         assert_eq!(AF_INET6, 10);
+        assert_ne!(TLS_DIR_WRITE, TLS_DIR_READ);
     }
 }

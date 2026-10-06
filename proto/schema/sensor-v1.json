@@ -2449,6 +2449,42 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/ProcTlsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_io"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTlsAttach"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_attach"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/HttpRequest"
             },
             "type": {
@@ -2998,6 +3034,15 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "threads": {
+          "description": "The sensor's other threads (the one that reads programs for their TLS symbols): their reads of the shares are the sensor's, not the session's. Absent when it has none.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
         }
       }
     },
@@ -3030,6 +3075,60 @@
           "type": "integer",
           "format": "uint16",
           "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcTlsAttach": {
+      "description": "`proc.tls_attach`: the sensor tried to attach its TLS probes to a file: each program the session ran and each `libssl.so*` a session process mapped, once each; `error` is `limit` once after 64 paths. The sensor's own record: no `subject`.",
+      "type": "object",
+      "required": [
+        "ok",
+        "path"
+      ],
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "ProcTlsIo": {
+      "description": "`proc.tls_io`: a process wrote to or read from a TLS connection through a runtime that exports OpenSSL's `SSL_write` and `SSL_read` (or their `_ex` forms), which the sensor probed: the size and the time, never the bytes. What names the process behind a model request.",
+      "type": "object",
+      "required": [
+        "bytes",
+        "dir",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "bytes": {
+          "description": "The bytes the call carried.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "dir": {
+          "description": "`write` or `read`.",
+          "type": "string"
         },
         "tgid": {
           "type": "integer",
@@ -3920,6 +4019,42 @@
               "type": "string",
               "enum": [
                 "proc.sensor_status"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTlsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_io"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTlsAttach"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_attach"
               ]
             }
           }

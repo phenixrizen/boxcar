@@ -417,3 +417,74 @@ Made while writing the plan, 2026-10-06:
 - **`orphaned_work` needs the exit program** (`sched_process_exit`
   attached): without exits nothing says who still runs. `span.list`
   accepts no parameters at all as the default.
+
+### Task 6
+
+- **The return probes are their own programs**, `ssl_read_ret` and
+  `ssl_read_ex_ret`: an object lists programs by function name, so the
+  entry and return probes of one symbol cannot share one. The table's
+  `hook` holds the symbol for both.
+- **A process's maps are looked at 50 ms after its exec, then once a
+  second while it lives**, not only at the heartbeat: busybox's
+  `ssl_client` runs for a fraction of a second, and a sweep only at the
+  heartbeat found its `libssl.so.3` too late or not at all. A process
+  whose maps cannot be read has ended and is forgotten; an exit record
+  forgets it sooner.
+- **The attach is ok when `SSL_write` and `SSL_read` took**; the `_ex`
+  forms are newer and a runtime may lack them. A file without the symbols
+  (`/bin/busybox`, every shell) gets its `proc.tls_attach{ok:false}` once,
+  as the plan says, and counts against the 64 paths.
+- **The executor's write may come before or after the `http.request`**,
+  within 500 ms either way: ring 1 reaches the log through the vsock
+  stream and the VMM, ring 0 through the observer thread, and neither
+  order is guaranteed. A request's body may also go out in several
+  `SSL_write` calls, so a process whose writes of the window sum to the
+  body's size (within a tenth plus 1 KiB) carries it too. The fixture
+  `a_tls_write_names_the_executor` pins the plan's case, and two more
+  scenarios the other order and the sum.
+- **A late `tool.open` adopts a waiting exec as the only open span only
+  within the 500 ms join window**; by argv it adopts within the full 2 s.
+  The late case covers the observer writing the record a moment after the
+  agent acted, which is milliseconds; a process exec'd a second before
+  the span is more likely the agent's own runtime (a `claude` started
+  from the session shell), which must not be a tool's.
+- **The gated test downloads twice** with 2 s between: the first run
+  loads `libssl.so.3`, whose probes attach on the sweep, and the second
+  run's writes and reads are the ones asserted.
+- **The sensor's own reads are nobody's effect.** Attaching a probe reads
+  the file for its symbol, through virtio-fs, so the session's programs
+  (`/bin/busybox`, `wget`, `ls`...) show up as `fs.open` and `fs.close`
+  by the sensor's pid, which no process the sensor reports owns: the
+  first gated run made 18 `no_process` findings of them. The reconciler
+  now knows the sensor's pid from `proc.sensor_status` and judges none of
+  its effects.
+- **The symbols are resolved on a thread of the sensor's own.** Reading a
+  program for its symbols (aya does it at each attach) took the sensor's
+  one thread off its ring buffer for a few milliseconds per program, and
+  that was enough for a `proc.tcp_connect` to reach the log after its
+  `net.connect` instead of before, which the M3 test
+  `a_download_to_a_blocked_address_is_a_joined_finding` showed as a
+  finding naming "the session" rather than `wget`. The sensor now reads
+  the file and finds the four functions' offsets on a `tls-resolve`
+  thread (the `object` crate, the same aya uses, added to the workspace),
+  which writes a byte to a pipe the event loop polls beside the ring
+  buffer; the loop then attaches by absolute offset, a syscall each. The
+  event path never waits on a file, and a program is read once.
+- **`proc.sensor_status` names the sensor's other threads.** The
+  resolver thread's reads reach ring 0 under its own thread id, which is
+  not the sensor's pid, so the fix above left three `no_process`
+  findings of them. The status record gains `threads` (absent when
+  empty), the sensor fills it with the resolver's id before it sends the
+  status, and the reconciler leaves every effect of those threads alone
+  as it does the pid's.
+- **`connect_without_dns` waits for the sensor's connect.** The rule
+  named the process at the `net.connect` itself, so whether it said
+  `wget` or "the session" depended on which ring's record the writer
+  took first, by a fraction of a millisecond; the M3 test
+  `a_download_to_a_blocked_address_is_a_joined_finding` turned on that
+  race and failed one run in two once the sensor had more to do at an
+  exec. The reconciler now holds a nameless connect until its
+  `proc.tcp_connect` has met it or the 500 ms join window has passed,
+  whichever is first, and judges it then with the process named; the
+  finding's content is the same, and the `policy_denial` fixture's order
+  changed by one line.

@@ -12,11 +12,11 @@ use boxcar_proto::limits::{MAX_ARGV_ELEMS, MAX_PATH};
 use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{
     Payload, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcLsmDeny,
-    ProcMemfd, ProcTcpConnect, Subject,
+    ProcMemfd, ProcTcpConnect, ProcTlsIo, Subject,
 };
 use boxcar_sensor_common::{
     ConnectAttempt, ExecEvent, ExitEvent, FileOpen, ForkEvent, Header, Hook, Kind, LsmDeny,
-    MemfdEvent, TcpConnect, AF_INET, AF_INET6, MEMFD_NAME_MAX,
+    MemfdEvent, TcpConnect, TlsIoEvent, AF_INET, AF_INET6, MEMFD_NAME_MAX, TLS_DIR_WRITE,
 };
 
 /// Why bytes from the ring buffer are not an event.
@@ -76,6 +76,7 @@ pub fn frame_from_event(bytes: &[u8]) -> Result<SensorFrame, EventError> {
             Kind::FileOpen => Payload::ProcFileOpen(file_open(&header, &read::<FileOpen>(bytes))),
             Kind::Memfd => Payload::ProcMemfd(memfd(&header, &read::<MemfdEvent>(bytes))),
             Kind::LsmDeny => Payload::ProcLsmDeny(lsm_deny(&header, &read::<LsmDeny>(bytes))),
+            Kind::TlsIo => Payload::ProcTlsIo(tls_io(&header, &read::<TlsIoEvent>(bytes))),
         }
     };
     Ok(SensorFrame {
@@ -231,6 +232,19 @@ fn lsm_deny(header: &Header, ev: &LsmDeny) -> ProcLsmDeny {
     }
 }
 
+fn tls_io(header: &Header, ev: &TlsIoEvent) -> ProcTlsIo {
+    ProcTlsIo {
+        tid: header.tid,
+        tgid: header.tgid,
+        dir: if ev.dir == TLS_DIR_WRITE {
+            "write".to_owned()
+        } else {
+            "read".to_owned()
+        },
+        bytes: ev.bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::size_of;
@@ -238,8 +252,8 @@ mod tests {
     use boxcar_proto::sensor::{encode, Decoder};
     use boxcar_proto::Payload;
     use boxcar_sensor_common::{
-        ConnectAttempt, ExecEvent, ExitEvent, Header, Kind, LsmDeny, TcpConnect, AF_INET, AF_INET6,
-        HOOK_TASK_KILL,
+        ConnectAttempt, ExecEvent, ExitEvent, Header, Kind, LsmDeny, TcpConnect, TlsIoEvent,
+        AF_INET, AF_INET6, HOOK_TASK_KILL, TLS_DIR_READ,
     };
 
     use super::*;
@@ -433,6 +447,35 @@ mod tests {
             unreachable!()
         };
         assert_eq!((deny.hook.as_str(), deny.detail), ("task_kill", 9));
+    }
+
+    #[test]
+    fn tls_events_carry_their_direction_and_size() {
+        let mut ev = TlsIoEvent {
+            header: header(Kind::TlsIo),
+            dir: TLS_DIR_WRITE,
+            bytes: 4096,
+        };
+        let frame = frame_from_event(bytes(&ev)).unwrap();
+        assert_eq!(frame.subject.map(|s| s.pid), Some(212));
+        let Payload::ProcTlsIo(io) = &frame.payload else {
+            panic!("{:?}", frame.payload);
+        };
+        assert_eq!(
+            (io.tid, io.tgid, io.dir.as_str(), io.bytes),
+            (212, 210, "write", 4096)
+        );
+        let mut decoder = Decoder::new();
+        decoder.feed(&encode(&frame).unwrap());
+        assert_eq!(decoder.next_frame().unwrap(), Some(frame));
+
+        ev.dir = TLS_DIR_READ;
+        ev.bytes = 17;
+        let frame = frame_from_event(bytes(&ev)).unwrap();
+        let Payload::ProcTlsIo(io) = frame.payload else {
+            unreachable!()
+        };
+        assert_eq!((io.dir.as_str(), io.bytes), ("read", 17));
     }
 
     #[test]

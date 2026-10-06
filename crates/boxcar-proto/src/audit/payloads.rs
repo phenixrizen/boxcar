@@ -907,6 +907,11 @@ pub struct ProcSensorStatus {
     /// The sensor's own process id in the guest, which the guards protect.
     #[serde(default)]
     pub pid: u32,
+    /// The sensor's other threads (the one that reads programs for their
+    /// TLS symbols): their reads of the shares are the sensor's, not the
+    /// session's. Absent when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<u32>,
     /// Why the sensor is degraded, when a single reason covers it (such as
     /// `no_programs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -932,6 +937,34 @@ pub struct ProgramStatus {
     pub name: String,
     pub attached: bool,
     /// Why it is not attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `proc.tls_io`: a process wrote to or read from a TLS connection
+/// through a runtime that exports OpenSSL's `SSL_write` and `SSL_read`
+/// (or their `_ex` forms), which the sensor probed: the size and the
+/// time, never the bytes. What names the process behind a model request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcTlsIo {
+    pub tid: u32,
+    pub tgid: u32,
+    /// `write` or `read`.
+    pub dir: String,
+    /// The bytes the call carried.
+    pub bytes: u32,
+}
+
+/// `proc.tls_attach`: the sensor tried to attach its TLS probes to a
+/// file: each program the session ran and each `libssl.so*` a session
+/// process mapped, once each; `error` is `limit` once after 64 paths.
+/// The sensor's own record: no `subject`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcTlsAttach {
+    pub path: String,
+    pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

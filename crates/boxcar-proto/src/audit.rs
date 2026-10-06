@@ -47,8 +47,9 @@ pub use payloads::{
     HttpResponse, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop,
     NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit,
     ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
-    ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef,
-    SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SensorPhase, SessionExit,
+    SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop,
+    VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -478,6 +479,10 @@ pub enum Payload {
     ProcHeartbeat(ProcHeartbeat),
     #[serde(rename = "proc.sensor_status")]
     ProcSensorStatus(ProcSensorStatus),
+    #[serde(rename = "proc.tls_io")]
+    ProcTlsIo(ProcTlsIo),
+    #[serde(rename = "proc.tls_attach")]
+    ProcTlsAttach(ProcTlsAttach),
     #[serde(rename = "http.request")]
     HttpRequest(HttpRequest),
     #[serde(rename = "http.response")]
@@ -548,6 +553,8 @@ impl Payload {
             Payload::ProcLsmDeny(_) => "proc.lsm_deny",
             Payload::ProcHeartbeat(_) => "proc.heartbeat",
             Payload::ProcSensorStatus(_) => "proc.sensor_status",
+            Payload::ProcTlsIo(_) => "proc.tls_io",
+            Payload::ProcTlsAttach(_) => "proc.tls_attach",
             Payload::HttpRequest(_) => "http.request",
             Payload::HttpResponse(_) => "http.response",
             Payload::LlmRequest(_) => "llm.request",
@@ -608,7 +615,9 @@ impl Payload {
             | Payload::ProcFileOpen(_)
             | Payload::ProcLsmDeny(_)
             | Payload::ProcHeartbeat(_)
-            | Payload::ProcSensorStatus(_) => Source::Sensor,
+            | Payload::ProcSensorStatus(_)
+            | Payload::ProcTlsIo(_)
+            | Payload::ProcTlsAttach(_) => Source::Sensor,
             Payload::HttpRequest(_)
             | Payload::HttpResponse(_)
             | Payload::LlmRequest(_)
@@ -650,7 +659,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 55] = [
+    const KINDS: [&str; 57] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -698,6 +707,8 @@ mod tests {
         "proc.lsm_deny",
         "proc.heartbeat",
         "proc.sensor_status",
+        "proc.tls_io",
+        "proc.tls_attach",
         "http.request",
         "http.response",
         "llm.request",
@@ -1475,6 +1486,7 @@ mod tests {
                     btf_ok: true,
                     session_cgroup_id: 4242,
                     pid: 77,
+                    threads: vec![78],
                     reason: None,
                 }),
                 json!({
@@ -1487,7 +1499,25 @@ mod tests {
                     "btf_ok": true,
                     "session_cgroup_id": 4242,
                     "pid": 77,
+                    "threads": [78],
                 }),
+            ),
+            (
+                Payload::ProcTlsIo(ProcTlsIo {
+                    tid: 213,
+                    tgid: 212,
+                    dir: "write".into(),
+                    bytes: 4096,
+                }),
+                json!({"tid": 213, "tgid": 212, "dir": "write", "bytes": 4096}),
+            ),
+            (
+                Payload::ProcTlsAttach(ProcTlsAttach {
+                    path: "/bin/busybox".into(),
+                    ok: false,
+                    error: Some("SSL_write: symbol not found".into()),
+                }),
+                json!({"path": "/bin/busybox", "ok": false, "error": "SSL_write: symbol not found"}),
             ),
             (
                 Payload::HttpRequest(HttpRequest {
@@ -1710,6 +1740,14 @@ mod tests {
     /// does not mark skip-if-none travel as explicit nulls.
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
+            (
+                Payload::ProcTlsAttach(ProcTlsAttach {
+                    path: "/usr/bin/node".into(),
+                    ok: true,
+                    error: None,
+                }),
+                json!({"path": "/usr/bin/node", "ok": true}),
+            ),
             (
                 Payload::SpanEffects(SpanEffects {
                     span_id: "call_x".into(),

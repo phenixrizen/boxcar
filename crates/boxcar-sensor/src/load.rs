@@ -5,10 +5,11 @@
 //! kernel's BTF, the two globals, then each program in the table's order,
 //! the guards last. What did not attach is reported, not fatal: a sensor
 //! with fewer programs still heartbeats, and the reconciler knows which
-//! rules to skip.
+//! rules to skip. The TLS probes are only loaded here: `tls` attaches them
+//! to each file found to export their symbols.
 
 use aya::maps::{MapData, PerCpuArray, RingBuf};
-use aya::programs::{BtfTracePoint, FEntry, Lsm};
+use aya::programs::{BtfTracePoint, FEntry, Lsm, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
 use boxcar_sensor_common::programs::{ProgramKind, GLOBALS, PROGRAMS};
 
@@ -121,6 +122,14 @@ fn attach(
                 .map_err(|e| describe("not an fentry program", &e))?;
             program.load(hook, btf).map_err(|e| describe("load", &e))?;
             program.attach().map_err(|e| describe("attach", &e))?;
+        }
+        ProgramKind::UProbe | ProgramKind::URetProbe => {
+            // Loaded now; attached by `tls` to each file that exports
+            // `hook`, as the session runs them.
+            let program: &mut UProbe = program
+                .try_into()
+                .map_err(|e| describe("not a uprobe program", &e))?;
+            program.load().map_err(|e| describe("load", &e))?;
         }
     }
     Ok(())

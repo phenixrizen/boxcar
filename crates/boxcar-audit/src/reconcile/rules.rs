@@ -12,7 +12,7 @@ use boxcar_proto::{Evidence, Finding, FindingCategory, Payload, Record, Verdict}
 use super::dns;
 use super::paths::indicator;
 use super::spans::{EffectKind, Spans};
-use super::state::{Flow, PendingEffect, ProcKey, SensorConnect, State};
+use super::state::{Flow, PendingConnect, PendingEffect, ProcKey, SensorConnect, State};
 use super::{
     ReconcileConfig, ATTACH_DEADLINE_NS, JOIN_WINDOW_NS, LOW_CONFIDENCE_PENALTY, SILENCE_NS,
 };
@@ -205,6 +205,8 @@ pub fn observe(
         }
         Payload::ProcSensorStatus(status) => {
             state.sensor.status = Some((ts, record.seq));
+            state.sensor.pid = Some(status.pid);
+            state.sensor.threads = status.threads.iter().copied().collect();
             state.sensor.attached = status
                 .programs
                 .iter()
@@ -264,7 +266,17 @@ pub fn observe(
                 .finish(state),
             );
         }
-        Payload::ProcFileOpen(_) | Payload::ProcConnectAttempt(_) => {}
+        Payload::ProcTlsIo(io) => {
+            if io.dir == "write" {
+                spans.tls_write(state, ts, io.tgid, u64::from(io.bytes));
+            }
+        }
+        Payload::ProcFileOpen(_) | Payload::ProcConnectAttempt(_) | Payload::ProcTlsAttach(_) => {}
+
+        // Ring 0: the gate's requests, for the executor of a span.
+        Payload::HttpRequest(request) => {
+            spans.http_request(state, ts, request.flow, request.stream, request.body_bytes);
+        }
 
         // Ring 0: the session and the clocks.
         Payload::SessionStart(start) => {
@@ -327,22 +339,14 @@ pub fn observe(
                     .names_for(IpAddr::V4(*connect.dst.ip()), ts)
                     .is_empty()
             {
-                let who = describe_flow(state, connect.flow);
-                out.push(
-                    Draft::new(
-                        FindingCategory::NetworkAnomaly,
-                        60,
-                        "connect_without_dns",
-                        format!(
-                            "{who} connected to {} ({}), an address no DNS answer named in the \
-                             last minute",
-                            connect.dst, connect.proto
-                        ),
-                    )
-                    .evidence(flow_evidence(state, connect.flow, record.seq))
-                    .low_confidence(state.low_confidence(ts, state.sensor.heartbeat.is_some()))
-                    .finish(state),
-                );
+                // Judged once the sensor's connect has named the process,
+                // or when the join window has passed: the two come in
+                // either order.
+                state.pending_connects.push_back(PendingConnect {
+                    flow: connect.flow,
+                    seq: record.seq,
+                    ts,
+                });
             }
         }
         Payload::NetTls(tls) => {
@@ -513,6 +517,7 @@ pub fn observe(
         }
         _ => {}
     }
+    out.extend(judge_connects(state, ts));
     out.extend(expire(state, cfg, ts));
     out.extend(silence(state, cfg, ts));
     out.extend(spans.tick(state, ts));
@@ -526,9 +531,48 @@ pub fn on_tick(
     cfg: &ReconcileConfig,
     now: u64,
 ) -> Vec<Finding> {
-    let mut out = expire(state, cfg, now);
+    let mut out = judge_connects(state, now);
+    out.extend(expire(state, cfg, now));
     out.extend(silence(state, cfg, now));
     out.extend(spans.tick(state, now));
+    out
+}
+
+/// `connect_without_dns` for the connects whose process the sensor has
+/// named, or whose wait for it is over.
+fn judge_connects(state: &mut State, now: u64) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut kept = std::collections::VecDeque::new();
+    while let Some(pending) = state.pending_connects.pop_front() {
+        let joined = state
+            .flows
+            .get(&pending.flow)
+            .is_some_and(|flow| flow.proc_key.is_some());
+        if !joined && now.saturating_sub(pending.ts) < JOIN_WINDOW_NS {
+            kept.push_back(pending);
+            continue;
+        }
+        let Some(flow) = state.flows.get(&pending.flow) else {
+            continue;
+        };
+        let (dst, proto) = (flow.dst, flow.proto.clone());
+        let who = describe_flow(state, pending.flow);
+        out.push(
+            Draft::new(
+                FindingCategory::NetworkAnomaly,
+                60,
+                "connect_without_dns",
+                format!(
+                    "{who} connected to {dst} ({proto}), an address no DNS answer named in the \
+                     last minute"
+                ),
+            )
+            .evidence(flow_evidence(state, pending.flow, pending.seq))
+            .low_confidence(state.low_confidence(now, state.sensor.heartbeat.is_some()))
+            .finish(state),
+        );
+    }
+    state.pending_connects = kept;
     out
 }
 
@@ -566,6 +610,11 @@ fn effect(state: &mut State, cfg: &ReconcileConfig, record: &Record, what: &str)
     };
     if !cfg.sensor_expected || !state.sensor.lineage_ok() {
         // Nothing to join with, by design or for want of the programs.
+        return Vec::new();
+    }
+    if state.sensor.is_own(subject.pid) {
+        // The sensor's own reads (the programs it looks for TLS symbols
+        // in): outside the session's cgroup by design, and no one's work.
         return Vec::new();
     }
     if state.attribute(subject.pid, record.ts_host_ns).is_none() {

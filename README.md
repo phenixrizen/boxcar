@@ -180,6 +180,11 @@ the session's cgroup:
   (the 4-tuple once the port is chosen), which is what ties a connection to
   a process;
 - `proc.memfd` (anonymous memory files) and a sample of `proc.file_open`;
+- `proc.tls_io`: the size and time of each TLS write and read of a
+  runtime that exports OpenSSL's functions (Node, or busybox's
+  `ssl_client` through `libssl`), never the bytes, and `proc.tls_attach`
+  for each file the sensor tried to probe; this is what names the process
+  behind a model request;
 - `proc.lsm_deny`: the sensor's own protection refused something, a
   `bpf()` call or a signal to the sensor;
 - `proc.heartbeat` once a second, and `proc.sensor_status` with what it

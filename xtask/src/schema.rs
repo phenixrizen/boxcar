@@ -30,8 +30,8 @@ use boxcar_proto::guest::{GuestMsg, HostMsg, SessionConfig};
 use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{
     Hash, NetConnect, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
-    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, Ring,
-    SensorPhase, SessionId, Source, Subject, Verdict,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach,
+    ProcTlsIo, ProgramStatus, Ring, SensorPhase, SessionId, Source, Subject, Verdict,
 };
 use schemars::gen::{SchemaGenerator, SchemaSettings};
 use schemars::schema::{RootSchema, Schema, SchemaObject};
@@ -233,6 +233,7 @@ pub fn sensor_lines() -> Result<Vec<u8>> {
                 btf_ok: true,
                 session_cgroup_id: 4242,
                 pid: 77,
+                threads: vec![78],
                 reason: None,
             }),
         ),
@@ -349,6 +350,25 @@ pub fn sensor_lines() -> Result<Vec<u8>> {
                 events_emitted: 8,
                 ringbuf_drops: 0,
                 frames_sent: 10,
+            }),
+        ),
+        frame(
+            2_000_000_000,
+            None,
+            Payload::ProcTlsAttach(ProcTlsAttach {
+                path: "/lib/libssl.so.3".to_owned(),
+                ok: true,
+                error: None,
+            }),
+        ),
+        frame(
+            2_100_000_000,
+            subject,
+            Payload::ProcTlsIo(ProcTlsIo {
+                tid: 212,
+                tgid: 212,
+                dir: "write".to_owned(),
+                bytes: 517,
             }),
         ),
     ];
@@ -786,6 +806,8 @@ mod tests {
                 "proc.memfd",
                 "proc.sensor_status",
                 "proc.tcp_connect",
+                "proc.tls_attach",
+                "proc.tls_io",
             ]
         );
         assert_eq!(sensor_lines().unwrap(), sensor_lines().unwrap());

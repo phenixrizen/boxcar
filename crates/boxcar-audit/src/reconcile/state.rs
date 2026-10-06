@@ -78,6 +78,15 @@ pub struct PendingEffect {
     pub what: String,
 }
 
+/// A `net.connect` to an address no DNS answer named, waiting for the
+/// sensor's connect that names its process before it is judged.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingConnect {
+    pub flow: u64,
+    pub seq: u64,
+    pub ts: u64,
+}
+
 /// A flow ring 0 relays, from its `net.connect`.
 #[derive(Clone, Debug)]
 pub struct Flow {
@@ -118,11 +127,21 @@ pub struct Sensor {
     pub silence_open: bool,
     /// The never-attached finding was made.
     pub never_attached_reported: bool,
+    /// The sensor's own process and its other threads, from
+    /// `proc.sensor_status`: their reads of the programs the session runs
+    /// (to find the TLS symbols) are the sensor's own, not the session's.
+    pub pid: Option<u32>,
+    pub threads: HashSet<u32>,
 }
 
 impl Sensor {
     pub fn is_attached(&self, program: &str) -> bool {
         self.attached.contains(program)
+    }
+
+    /// Whether `tid` is one of the sensor's own threads.
+    pub fn is_own(&self, tid: u32) -> bool {
+        self.pid == Some(tid) || self.threads.contains(&tid)
     }
 
     /// Whether every program the exec/fork/exit joins need is attached.
@@ -143,6 +162,9 @@ pub struct State {
     /// Each thread's memberships, oldest first.
     threads: HashMap<u32, Vec<Membership>>,
     pub pending: VecDeque<PendingEffect>,
+    /// Connects without a name, waiting for their process (at most the
+    /// join window).
+    pub pending_connects: VecDeque<PendingConnect>,
     pub flows: HashMap<u64, Flow>,
     pub sensor_connects: VecDeque<SensorConnect>,
     pub sensor: Sensor,

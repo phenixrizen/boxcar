@@ -1,4 +1,4 @@
 {"category":"policy_denial","score":40,"rule":"policy_denial","summary":"the DNS query for blocked.example was denied","evidence":[{"seq":4,"ring":0}],"low_confidence":false}
 {"category":"policy_denial","score":40,"rule":"policy_denial","summary":"the connection to 198.51.100.7:443 was denied","evidence":[{"seq":5,"ring":0}],"low_confidence":false}
-{"category":"network_anomaly","score":60,"rule":"connect_without_dns","summary":"the session connected to 198.51.100.7:443 (tcp), an address no DNS answer named in the last minute","evidence":[{"seq":5,"ring":0}],"low_confidence":false}
 {"category":"policy_denial","score":40,"rule":"policy_denial","summary":"a vsock connection to port 5000 was refused","evidence":[{"seq":6,"ring":0}],"low_confidence":false}
+{"category":"network_anomaly","score":60,"rule":"connect_without_dns","summary":"the session connected to 198.51.100.7:443 (tcp), an address no DNS answer named in the last minute","evidence":[{"seq":5,"ring":0}],"low_confidence":false}

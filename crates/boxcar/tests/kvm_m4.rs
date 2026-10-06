@@ -239,3 +239,97 @@ fn an_inspected_connection_to_an_untrusted_host_fails_closed() {
     }
     drop(upstream);
 }
+
+/// Ring 1 sees the TLS of a runtime that exports OpenSSL's functions:
+/// busybox's `ssl_client` loads `libssl.so.3`, which the sensor finds in
+/// its maps and attaches its probes to, so the next download's writes and
+/// reads are reported with their sizes. With the destination inspected,
+/// the gate's `http.request` and a write of its size lie within 500 ms:
+/// what names the process behind a request.
+#[test]
+fn a_tls_download_is_seen_by_both_rings() {
+    let Some(guest) = networked_guest_or_skip("a_tls_download_is_seen_by_both_rings") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &["--allow", "example.com:443", "--inspect", "example.com:443"],
+        &[
+            "/bin/sh",
+            "-c",
+            "wget -q -O /dev/null https://example.com/; sleep 2; \
+             wget -q -O /dev/null https://example.com/; sleep 1",
+        ],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    let records = run.records();
+    let attached = of_kind(&records, "proc.tls_attach");
+    let libssl = attached
+        .iter()
+        .find(|r| {
+            r.data["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("libssl.so.3"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no proc.tls_attach for libssl.so.3 among {attached:?}\n{}",
+                run.describe()
+            )
+        });
+    assert_eq!(libssl.data["ok"], true, "{libssl:?}");
+    assert!(libssl.subject.is_none(), "{libssl:?}");
+    // The shell itself was tried (its exec's filename, as exec'd) and has
+    // no such symbol.
+    assert!(
+        attached
+            .iter()
+            .any(|r| r.data["path"] == "/bin/sh" && r.data["ok"] == false),
+        "{attached:?}"
+    );
+    let clients: Vec<_> = of_kind(&records, "proc.exec")
+        .into_iter()
+        .filter(|r| r.data["argv"][0] == "ssl_client")
+        .collect();
+    assert!(clients.len() >= 2, "{clients:?}\n{}", run.describe());
+    let second = clients[clients.len() - 1];
+    let tgid = second.data["tgid"].as_u64().unwrap();
+    let io: Vec<_> = of_kind(&records, "proc.tls_io")
+        .into_iter()
+        .filter(|r| r.data["tgid"] == tgid)
+        .collect();
+    let writes: Vec<_> = io.iter().filter(|r| r.data["dir"] == "write").collect();
+    let reads: Vec<_> = io.iter().filter(|r| r.data["dir"] == "read").collect();
+    assert!(
+        !writes.is_empty() && !reads.is_empty(),
+        "writes {writes:?}, reads {reads:?}\n{}",
+        run.describe()
+    );
+    for record in &io {
+        assert!(record.data["bytes"].as_u64().unwrap() > 0, "{record:?}");
+        assert_eq!(record.ring, boxcar_proto::Ring::Guest, "{record:?}");
+        assert_eq!(
+            record.subject.map(|s| s.pid as u64),
+            Some(tgid),
+            "{record:?}"
+        );
+    }
+    // The second download's request, and the write that carried it.
+    let requests = of_kind(&records, "http.request");
+    let request = requests
+        .last()
+        .unwrap_or_else(|| panic!("no http.request\n{}", run.describe()));
+    assert_eq!(request.data["method"], "GET", "{request:?}");
+    let body = request.data["body_bytes"].as_u64().unwrap();
+    let carried = writes.iter().any(|w| {
+        w.ts_host_ns.abs_diff(request.ts_host_ns) <= 500 * 1_000_000
+            && w.data["bytes"].as_u64().unwrap().abs_diff(body) <= body / 10 + 1024
+    });
+    assert!(
+        carried,
+        "no tls_io write within 500 ms and 1 KiB of {request:?}: {writes:?}\n{}",
+        run.describe()
+    );
+}

@@ -21,6 +21,11 @@
 //!   touches; one that joins nothing waits for its process to join.
 //! - A `net.connect` joins the span of the process its `proc.tcp_connect`
 //!   named, once the two have met.
+//! - The executor of a span is the process whose `proc.tls_io` write,
+//!   within [`EXECUTOR_WINDOW_NS`] of the gate's `http.request` and sized
+//!   like its body (within a tenth plus 1 KiB, as one write or as the
+//!   window's sum for the process), carried the model request the span
+//!   came from; the session root otherwise.
 //!
 //! At close the span's membership is written as `span.effects`, and the
 //! rules judge it: `intent_effect_mismatch` (`argv` at the join,
@@ -38,7 +43,7 @@ use serde_json::Value;
 
 use super::rules::Draft;
 use super::state::{ProcKey, State};
-use super::PENDING_NS;
+use super::{JOIN_WINDOW_NS, PENDING_NS};
 
 /// The most processes a span lists.
 pub const MAX_SPAN_PROCS: usize = 1024;
@@ -52,6 +57,13 @@ const MAX_SPANS_KEPT: usize = 4096;
 const MAX_RECENT: usize = 4096;
 /// How many parents are followed when looking for the agent.
 const MAX_ANCESTRY: usize = 64;
+/// How far apart a TLS write and the `http.request` it carried may be.
+pub const EXECUTOR_WINDOW_NS: u64 = 500 * 1_000_000;
+/// The slack a write's size has against the body's: a tenth, plus this.
+const EXECUTOR_SLACK_BYTES: u64 = 1024;
+/// The most requests whose executor is remembered, and the most writes
+/// and requests kept waiting for each other.
+const MAX_EXECUTORS: usize = 256;
 /// The tools that run a shell command the agent declares.
 const SHELL_TOOLS: [&str; 5] = ["Bash", "bash", "shell", "exec_command", "local_shell"];
 /// The tools that declare a file they write.
@@ -300,6 +312,23 @@ struct RecentEffect {
     kind: EffectKind,
 }
 
+/// A TLS write ring 1 reported, waiting for the request it carried.
+#[derive(Clone, Copy, Debug)]
+struct TlsWrite {
+    ts: u64,
+    tgid: u32,
+    bytes: u64,
+}
+
+/// An `http.request`, waiting for the write that carried it.
+#[derive(Clone, Copy, Debug)]
+struct Request {
+    ts: u64,
+    flow: u64,
+    stream: u32,
+    body_bytes: u64,
+}
+
 /// The spans of a session and what waits to join them.
 pub struct Spans {
     spans: HashMap<String, Span>,
@@ -316,6 +345,12 @@ pub struct Spans {
     index: Option<SpanIndex>,
     /// The session's root process, from `session.start`.
     session_pid: Option<u32>,
+    tls_writes: VecDeque<TlsWrite>,
+    requests: VecDeque<Request>,
+    /// The process behind each request, by the request's flow and stream,
+    /// and the order they came in.
+    executors: HashMap<(u64, u32), ProcKey>,
+    executor_order: VecDeque<(u64, u32)>,
 }
 
 impl Spans {
@@ -330,6 +365,98 @@ impl Spans {
             records: Vec::new(),
             index,
             session_pid: None,
+            tls_writes: VecDeque::new(),
+            requests: VecDeque::new(),
+            executors: HashMap::new(),
+            executor_order: VecDeque::new(),
+        }
+    }
+
+    /// A `proc.tls_io` write: a request of the window it fits, alone or
+    /// with the process's other writes of the window, gets its executor;
+    /// the write is kept for a request still to come.
+    pub fn tls_write(&mut self, state: &State, ts: u64, tgid: u32, bytes: u64) {
+        self.tls_writes.push_back(TlsWrite { ts, tgid, bytes });
+        while self.tls_writes.len() > MAX_EXECUTORS
+            || self
+                .tls_writes
+                .front()
+                .is_some_and(|w| ts.saturating_sub(w.ts) > 2 * EXECUTOR_WINDOW_NS)
+        {
+            self.tls_writes.pop_front();
+        }
+        let named: Vec<(Request, u32)> = self
+            .requests
+            .iter()
+            .filter(|r| !self.executors.contains_key(&(r.flow, r.stream)))
+            .filter_map(|r| self.carrier(r).map(|tgid| (*r, tgid)))
+            .collect();
+        for (request, tgid) in named {
+            self.name_executor(state, request.flow, request.stream, tgid, request.ts);
+        }
+    }
+
+    /// An `http.request`: the write that carried it names its executor,
+    /// one write of its size or a process's writes of the window summed;
+    /// else it waits for the write.
+    pub fn http_request(&mut self, state: &State, ts: u64, flow: u64, stream: u32, body: u64) {
+        let request = Request {
+            ts,
+            flow,
+            stream,
+            body_bytes: body,
+        };
+        if let Some(tgid) = self.carrier(&request) {
+            self.name_executor(state, flow, stream, tgid, ts);
+        }
+        self.requests.push_back(request);
+        while self.requests.len() > MAX_EXECUTORS
+            || self
+                .requests
+                .front()
+                .is_some_and(|r| ts.saturating_sub(r.ts) > 2 * EXECUTOR_WINDOW_NS)
+        {
+            self.requests.pop_front();
+        }
+    }
+
+    /// The process whose writes carried `request`: one write of the
+    /// window sized like the body, else a process whose writes of the
+    /// window sum to it.
+    fn carrier(&self, request: &Request) -> Option<u32> {
+        let (ts, body) = (request.ts, request.body_bytes);
+        let one = self
+            .tls_writes
+            .iter()
+            .rev()
+            .find(|w| within(w.ts, ts) && sized(w.bytes, body))
+            .map(|w| w.tgid);
+        one.or_else(|| {
+            let mut sums: Vec<(u32, u64)> = Vec::new();
+            for write in self.tls_writes.iter().filter(|w| within(w.ts, ts)) {
+                match sums.iter_mut().find(|(tgid, _)| *tgid == write.tgid) {
+                    Some((_, sum)) => *sum += write.bytes,
+                    None => sums.push((write.tgid, write.bytes)),
+                }
+            }
+            sums.into_iter()
+                .find(|(_, sum)| sized(*sum, body))
+                .map(|(tgid, _)| tgid)
+        })
+    }
+
+    /// The process `tgid` made the request on (`flow`, `stream`).
+    fn name_executor(&mut self, state: &State, flow: u64, stream: u32, tgid: u32, ts: u64) {
+        let Some(key) = state.attribute(tgid, ts) else {
+            return;
+        };
+        if self.executors.insert((flow, stream), key).is_none() {
+            self.executor_order.push_back((flow, stream));
+        }
+        while self.executor_order.len() > MAX_EXECUTORS {
+            if let Some(oldest) = self.executor_order.pop_front() {
+                self.executors.remove(&oldest);
+            }
         }
     }
 
@@ -364,12 +491,14 @@ impl Spans {
             return Vec::new();
         }
         self.evict();
-        self.spans
-            .insert(id.clone(), Span::new(open, record.seq, record.ts_host_ns));
+        let mut span = Span::new(open, record.seq, record.ts_host_ns);
+        span.executor = self.executors.get(&(open.flow, open.stream)).copied();
+        self.spans.insert(id.clone(), span);
         self.order.push_back(id.clone());
         self.open.push(id.clone());
 
-        // Execs that came first: by argv, or as the only open span.
+        // Execs that came first: by argv, or, within the join window (the
+        // observer wrote the record a moment late), as the only open span.
         let mut findings = Vec::new();
         let waiting: Vec<PendingExec> = self.pending_execs.drain(..).collect();
         for pending in waiting {
@@ -378,6 +507,11 @@ impl Spans {
             };
             let argv = proc.argv.clone();
             match self.choose(state, pending.key, &argv) {
+                Some((_, true))
+                    if record.ts_host_ns.saturating_sub(pending.ts) > JOIN_WINDOW_NS =>
+                {
+                    self.pending_execs.push_back(pending);
+                }
                 Some((span_id, judge)) => {
                     self.join(state, &span_id, pending.key, Some(pending.seq));
                     if judge {
@@ -487,6 +621,10 @@ impl Spans {
         let Some(subject) = record.subject else {
             return;
         };
+        if state.sensor.is_own(subject.pid) {
+            // The sensor's own reads are no tool's work.
+            return;
+        }
         let (seq, ts) = (record.seq, record.ts_host_ns);
         let who = Who::Tid(subject.pid);
         match self.owner(state, who, ts) {
@@ -1158,6 +1296,17 @@ fn carries(command: Option<&str>, whole: &str, declared: &str) -> bool {
         || whole == declared
 }
 
+/// Whether two host times are within the executor window of each other.
+fn within(a: u64, b: u64) -> bool {
+    a.abs_diff(b) <= EXECUTOR_WINDOW_NS
+}
+
+/// Whether a write's size fits a body's: within a tenth of it, plus the
+/// slack for the request's headers and framing.
+fn sized(bytes: u64, body: u64) -> bool {
+    bytes.abs_diff(body) <= body / 10 + EXECUTOR_SLACK_BYTES
+}
+
 /// Whitespace runs as one space, no quotes or backslashes, trimmed: the
 /// form two commands are compared in.
 fn normalize(text: &str) -> String {
@@ -1284,6 +1433,17 @@ mod tests {
             "sh -c curl",
             "ls -la"
         ));
+    }
+
+    #[test]
+    fn a_write_fits_a_body_within_a_tenth_and_the_slack() {
+        assert!(sized(5000, 4800));
+        assert!(sized(100, 0), "a GET: headers only");
+        assert!(sized(110_000, 100_000));
+        assert!(!sized(120_000, 100_000));
+        assert!(!sized(0, 4800));
+        assert!(within(1_000_000_000, 1_400_000_000));
+        assert!(!within(1_000_000_000, 1_600_000_000));
     }
 
     #[test]

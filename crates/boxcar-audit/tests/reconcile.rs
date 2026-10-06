@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 use boxcar_audit::{ManualClock, ReconcileConfig, Reconciler, SpanIndex};
 use boxcar_proto::{
-    Attrib, ClockSync, Finding, FsClose, FsCreate, FsPathOp, Hash, HashStatus, NetConnect, NetDns,
-    NetTls, OpResult, Payload, ProcExec, ProcExit, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd,
-    ProcSensorStatus, ProcTcpConnect, ProgramStatus, Record, Ring, SensorPhase, SessionId,
-    SessionStart, SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStop,
-    VsockConnect,
+    Attrib, ClockSync, Finding, FsClose, FsCreate, FsPathOp, Hash, HashStatus, HttpRequest,
+    NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec, ProcExit, ProcFork, ProcHeartbeat,
+    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsIo, ProgramStatus, Record,
+    Ring, SensorPhase, SessionId, SessionStart, SpanEffects, SpanRef, Subject, ToolClose, ToolOpen,
+    Verdict, VmmStop, VsockConnect,
 };
 use serde_json::{json, Value};
 
@@ -139,6 +139,7 @@ impl Log {
                 btf_ok: true,
                 session_cgroup_id: 4242,
                 pid: 77,
+                threads: vec![78],
                 reason: None,
             }),
         )
@@ -320,6 +321,44 @@ impl Log {
                 open_seq: None,
                 attrib: Attrib::Caller,
                 ts_release_ns: 0,
+            }),
+        )
+    }
+
+    fn tls_io(&mut self, at_ms: u64, pid: u32, dir: &str, bytes: u32) -> Step {
+        self.rec(
+            at_ms,
+            Ring::Guest,
+            Some((pid, 1000, 1000)),
+            Payload::ProcTlsIo(ProcTlsIo {
+                tid: pid,
+                tgid: pid,
+                dir: dir.into(),
+                bytes,
+            }),
+        )
+    }
+
+    fn http_request(&mut self, at_ms: u64, flow: u64, stream: u32, body_bytes: u64) -> Step {
+        self.rec(
+            at_ms,
+            Ring::Host,
+            None,
+            Payload::HttpRequest(HttpRequest {
+                flow,
+                stream,
+                version: "2".into(),
+                method: "POST".into(),
+                authority: Some("api.anthropic.com".into()),
+                path: Some("/v1/messages".into()),
+                content_type: Some("application/json".into()),
+                content_encoding: None,
+                content_length: Some(body_bytes),
+                user_agent: None,
+                body_bytes,
+                body_b3: None,
+                body_truncated: false,
+                degraded: None,
             }),
         )
     }
@@ -780,6 +819,8 @@ fn policy_denial() {
     steps.push(log.dns(1500, "blocked.example", &[], Verdict::Deny));
     steps.push(log.connect(1600, 1, 40002, "198.51.100.7:443", &[], Verdict::Deny));
     steps.push(log.vsock_denied(1700, 5000));
+    // The nameless connect is judged once its join window has passed.
+    steps.push(Step::Tick(2500));
     let findings = run(true, steps);
     assert_eq!(
         findings.len(),
@@ -1255,4 +1296,118 @@ fn a_late_tool_open_takes_the_exec_that_waited() {
     let spans = spans_of(&out);
     assert_eq!(spans[0].procs, [370]);
     assert_eq!(spans[0].effects, [4]);
+}
+
+/// A TLS write sized like the request's body, 100 ms before the gate's
+/// `http.request`, names the process that made the request: the span the
+/// reply opens has it as its executor, and its children join the span.
+#[test]
+fn a_tls_write_names_the_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.tls_io(1900, 200, "write", 5000));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert_eq!(spans[0].executor_tgid, Some(200), "node, not the shell");
+    assert_eq!(spans[0].procs, [300]);
+    assert_eq!(spans[0].effects, [8]);
+    check_all("a_tls_write_names_the_executor", &out);
+}
+
+/// The write may come after the request (ring 1 reaches the log through
+/// the VMM), and several writes of the window add up to the body.
+#[test]
+fn writes_after_the_request_and_in_pieces_name_the_executor_too() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.http_request(2000, 1, 1, 100_000));
+    steps.push(log.tls_io(2050, 200, "write", 60_000));
+    steps.push(log.tls_io(2060, 200, "write", 41_000));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(200), "{out:?}");
+    assert_eq!(spans[0].procs, [300]);
+}
+
+/// A write of another size, or too long before, names nobody: the root
+/// stays the executor.
+#[test]
+fn an_unrelated_tls_write_names_no_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.tls_io(1300, 200, "write", 5000));
+    steps.push(log.tls_io(1950, 200, "write", 300));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(100), "{out:?}");
+    assert_eq!(spans[0].procs, [300], "reached the root through node");
+}
+
+/// The sensor reads the programs the session runs (for the TLS symbols):
+/// those reads are the sensor's own, outside the session, and no finding.
+#[test]
+fn the_sensors_own_reads_are_not_unattributed() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    // The sensor's pid, as `attached` reports it, is 77, and its
+    // resolver thread 78.
+    steps.push(log.tool_open(1400, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(1500, 300, 100, 10, &["sh", "-c", "ls"]));
+    steps.push(log.fs_create(1600, 77, "/bin/busybox"));
+    steps.push(log.fs_close(1610, 78, "/bin/busybox", 0));
+    steps.push(log.fs_create(1700, 999, "/mystery.txt"));
+    steps.push(log.exit(1800, 300, 10));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let findings = findings_of(&out);
+    assert_eq!(findings.len(), 1, "only the unknown thread's: {out:?}");
+    assert_eq!(findings[0].rule, "no_process");
+    assert!(findings[0].summary.contains("thread 999"));
+    let spans = spans_of(&out);
+    assert_eq!(
+        spans[0].effects,
+        [5, 8],
+        "the unknown thread's write joined the only open span as the agent's own; the sensor's \
+         reads joined nothing"
+    );
 }
