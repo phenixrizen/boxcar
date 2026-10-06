@@ -16,9 +16,12 @@ use std::io;
 use std::net::SocketAddrV4;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use boxcar_audit::AuditSink;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
+
+use super::exchange::Observation;
 
 /// The most plaintext bytes one message carries.
 pub const CHUNK_MAX: usize = 64 * 1024;
@@ -228,16 +231,16 @@ pub struct ObserverThread {
 }
 
 impl ObserverThread {
-    /// Starts the thread on `rx`. It ends when every [`Observer`] is gone
-    /// and the channel is drained.
-    pub fn spawn(rx: Receiver<Message>) -> io::Result<ObserverThread> {
+    /// Starts the thread on `rx`, recording into `sink`. It ends when
+    /// every [`Observer`] is gone and the channel is drained.
+    pub fn spawn(rx: Receiver<Message>, sink: AuditSink) -> io::Result<ObserverThread> {
         let (stopped, done) = mpsc::channel::<()>();
         let thread = thread::Builder::new()
             .name("gate-observe".into())
             .spawn(move || {
                 // Dropped when the thread ends, however it ends.
                 let _stopped = stopped;
-                run(rx);
+                run(rx, &sink);
             })?;
         Ok(ObserverThread { done, thread })
     }
@@ -252,27 +255,56 @@ impl ObserverThread {
     }
 }
 
-/// The observer's work: for now, the plaintext bytes of each open flow,
-/// each way; the HTTP observer builds on it.
-fn run(rx: Receiver<Message>) {
-    let mut flows: HashMap<u64, [u64; 2]> = HashMap::new();
+/// The observer's work: each open flow's HTTP exchanges
+/// ([`Observation`]), whose records go into the log with the blocking
+/// emit (a full writer stalls this thread, never the net thread). At the
+/// end, when the senders are gone, what is still open is recorded as it
+/// stands.
+fn run(rx: Receiver<Message>, sink: &AuditSink) {
+    let mut flows: HashMap<u64, Observation> = HashMap::new();
+    let mut out = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Message::Open { flow, .. }) => {
-                flows.insert(flow, [0, 0]);
+            Ok(Message::Open {
+                flow,
+                dst,
+                name,
+                alpn,
+                tls,
+            }) => {
+                flows.insert(
+                    flow,
+                    Observation::new(flow, dst, name, alpn.as_deref(), tls),
+                );
             }
             Ok(Message::Data { flow, dir, bytes }) => {
-                if let Some(counts) = flows.get_mut(&flow) {
-                    counts[dir.index()] = counts[dir.index()].saturating_add(bytes.len() as u64);
+                if let Some(observation) = flows.get_mut(&flow) {
+                    observation.data(dir, &bytes, Instant::now(), &mut out);
                 }
             }
-            Ok(Message::Lost { .. }) => {}
+            Ok(Message::Lost { flow, dir }) => {
+                if let Some(observation) = flows.get_mut(&flow) {
+                    observation.lost(dir, Instant::now(), &mut out);
+                }
+            }
             Ok(Message::Close { flow }) => {
-                flows.remove(&flow);
+                if let Some(mut observation) = flows.remove(&flow) {
+                    observation.close(Instant::now(), &mut out);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        for payload in out.drain(..) {
+            crate::audit::record(sink, payload);
+        }
+    }
+    let now = Instant::now();
+    for (_, mut observation) in flows.drain() {
+        observation.close(now, &mut out);
+    }
+    for payload in out.drain(..) {
+        crate::audit::record(sink, payload);
     }
 }
 
@@ -403,11 +435,19 @@ mod tests {
         assert_eq!(flow.close(&observer, 3), Sent::Closed);
     }
 
-    /// The thread ends once every sender is gone, and is joined.
+    /// The thread ends once every sender is gone, and is joined; what it
+    /// read of a flow is in the log.
     #[test]
     fn the_thread_ends_with_its_senders() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            dir.path().join("data"),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
         let (observer, rx) = Observer::channel();
-        let thread = ObserverThread::spawn(rx).unwrap();
+        let thread = ObserverThread::spawn(rx, sink).unwrap();
         assert_eq!(
             observer.send(Message::Open {
                 flow: 1,
@@ -419,10 +459,30 @@ mod tests {
             Sent::Ok
         );
         let mut flow = Observed::default();
-        flow.data(&observer, 1, Direction::ToHost, b"hello");
+        flow.data(
+            &observer,
+            1,
+            Direction::ToHost,
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+        );
+        flow.data(
+            &observer,
+            1,
+            Direction::ToGuest,
+            b"HTTP/1.1 204 No Content\r\n\r\n",
+        );
         flow.close(&observer, 1);
         drop(observer);
         assert!(thread.join(Duration::from_secs(5)));
+        writer.close().unwrap();
+        let kinds: Vec<String> = boxcar_audit::LogReader::open(&session_dir)
+            .map(|r| r.records().map(|r| r.unwrap().kind).collect())
+            .unwrap_or_default();
+        assert!(
+            kinds.contains(&"http.request".to_owned())
+                && kinds.contains(&"http.response".to_owned()),
+            "{kinds:?}"
+        );
     }
 
     #[test]

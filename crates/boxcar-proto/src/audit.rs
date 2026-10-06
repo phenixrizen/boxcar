@@ -43,11 +43,12 @@ mod payloads;
 pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
-    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, NetClose,
-    NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged,
-    ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
-    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit,
-    SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
+    HttpResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp,
+    OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus,
+    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop,
+    VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -116,7 +117,8 @@ pub enum Source {
     Guest,
     Sensor,
     Reconciler,
-    Gateway,
+    /// The model traffic gate: `http.*`, `llm.*` and `tool.*`.
+    Gate,
     Control,
     /// The guest's session, as its init reports it over the control
     /// channel.
@@ -150,6 +152,9 @@ impl Source {
             Some(Source::Policy)
         } else if kind.starts_with("proc.") {
             Some(Source::Sensor)
+        } else if kind.starts_with("http.") || kind.starts_with("llm.") || kind.starts_with("tool.")
+        {
+            Some(Source::Gate)
         } else if kind == "finding" {
             Some(Source::Reconciler)
         } else {
@@ -473,6 +478,10 @@ pub enum Payload {
     ProcHeartbeat(ProcHeartbeat),
     #[serde(rename = "proc.sensor_status")]
     ProcSensorStatus(ProcSensorStatus),
+    #[serde(rename = "http.request")]
+    HttpRequest(HttpRequest),
+    #[serde(rename = "http.response")]
+    HttpResponse(HttpResponse),
     #[serde(rename = "finding")]
     Finding(Finding),
 }
@@ -529,6 +538,8 @@ impl Payload {
             Payload::ProcLsmDeny(_) => "proc.lsm_deny",
             Payload::ProcHeartbeat(_) => "proc.heartbeat",
             Payload::ProcSensorStatus(_) => "proc.sensor_status",
+            Payload::HttpRequest(_) => "http.request",
+            Payload::HttpResponse(_) => "http.response",
             Payload::Finding(_) => "finding",
         }
     }
@@ -583,6 +594,7 @@ impl Payload {
             | Payload::ProcLsmDeny(_)
             | Payload::ProcHeartbeat(_)
             | Payload::ProcSensorStatus(_) => Source::Sensor,
+            Payload::HttpRequest(_) | Payload::HttpResponse(_) => Source::Gate,
             Payload::Finding(_) => Source::Reconciler,
         }
     }
@@ -618,7 +630,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 48] = [
+    const KINDS: [&str; 50] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -666,6 +678,8 @@ mod tests {
         "proc.lsm_deny",
         "proc.heartbeat",
         "proc.sensor_status",
+        "http.request",
+        "http.response",
         "finding",
     ];
 
@@ -1451,6 +1465,70 @@ mod tests {
                 }),
             ),
             (
+                Payload::HttpRequest(HttpRequest {
+                    flow: 7,
+                    stream: 1,
+                    version: "2".into(),
+                    method: "POST".into(),
+                    authority: Some("api.anthropic.com".into()),
+                    path: Some("/v1/messages".into()),
+                    content_type: Some("application/json".into()),
+                    content_encoding: Some("gzip".into()),
+                    content_length: Some(2048),
+                    user_agent: Some("claude-cli/2.1.290".into()),
+                    body_bytes: 9012,
+                    body_b3: Some(format!("b3:{}", "ab".repeat(32))),
+                    body_truncated: false,
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7,
+                    "stream": 1,
+                    "version": "2",
+                    "method": "POST",
+                    "authority": "api.anthropic.com",
+                    "path": "/v1/messages",
+                    "content_type": "application/json",
+                    "content_encoding": "gzip",
+                    "content_length": 2048,
+                    "user_agent": "claude-cli/2.1.290",
+                    "body_bytes": 9012,
+                    "body_b3": format!("b3:{}", "ab".repeat(32)),
+                    "body_truncated": false,
+                    "degraded": null,
+                }),
+            ),
+            (
+                Payload::HttpResponse(HttpResponse {
+                    flow: 7,
+                    stream: 1,
+                    status: 200,
+                    content_type: Some("text/event-stream".into()),
+                    content_encoding: None,
+                    body_bytes: 4567,
+                    body_b3: Some(format!("b3:{}", "cd".repeat(32))),
+                    body_truncated: false,
+                    sse_events: 42,
+                    ws_messages: 0,
+                    dur_ms: 3210,
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7,
+                    "stream": 1,
+                    "status": 200,
+                    "content_type": "text/event-stream",
+                    "content_encoding": null,
+                    "body_bytes": 4567,
+                    "body_b3": format!("b3:{}", "cd".repeat(32)),
+                    "body_truncated": false,
+                    "sse_events": 42,
+                    "ws_messages": 0,
+                    "dur_ms": 3210,
+                    "degraded": null,
+                }),
+            ),
+            (
                 Payload::Finding(Finding {
                     category: FindingCategory::NetworkAnomaly,
                     score: 60,
@@ -1509,6 +1587,53 @@ mod tests {
     /// does not mark skip-if-none travel as explicit nulls.
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
+            (
+                Payload::HttpRequest(HttpRequest {
+                    flow: 8,
+                    stream: 3,
+                    version: "1.1".into(),
+                    method: "GET".into(),
+                    authority: None,
+                    path: None,
+                    content_type: None,
+                    content_encoding: None,
+                    content_length: None,
+                    user_agent: None,
+                    body_bytes: 0,
+                    body_b3: None,
+                    body_truncated: false,
+                    degraded: Some("lost".into()),
+                }),
+                json!({
+                    "flow": 8, "stream": 3, "version": "1.1", "method": "GET",
+                    "authority": null, "path": null, "content_type": null,
+                    "content_encoding": null, "content_length": null, "user_agent": null,
+                    "body_bytes": 0, "body_b3": null, "body_truncated": false,
+                    "degraded": "lost",
+                }),
+            ),
+            (
+                Payload::HttpResponse(HttpResponse {
+                    flow: 8,
+                    stream: 3,
+                    status: 0,
+                    content_type: None,
+                    content_encoding: None,
+                    body_bytes: 0,
+                    body_b3: None,
+                    body_truncated: true,
+                    sse_events: 0,
+                    ws_messages: 2,
+                    dur_ms: 0,
+                    degraded: Some("flow_closed".into()),
+                }),
+                json!({
+                    "flow": 8, "stream": 3, "status": 0, "content_type": null,
+                    "content_encoding": null, "body_bytes": 0, "body_b3": null,
+                    "body_truncated": true, "sse_events": 0, "ws_messages": 2, "dur_ms": 0,
+                    "degraded": "flow_closed",
+                }),
+            ),
             (
                 Payload::VmmStart(VmmStart {
                     version: "0.1.0".into(),
@@ -1829,6 +1954,11 @@ mod tests {
                 Source::Sensor
             } else if payload.kind() == "finding" {
                 Source::Reconciler
+            } else if payload.kind().starts_with("http.")
+                || payload.kind().starts_with("llm.")
+                || payload.kind().starts_with("tool.")
+            {
+                Source::Gate
             } else {
                 Source::Vmm
             };
@@ -1848,8 +1978,8 @@ mod tests {
         assert_eq!(Source::from_kind("proc.heartbeat"), Some(Source::Sensor));
         assert_eq!(Source::from_kind("finding"), Some(Source::Reconciler));
         for other in [
-            "tool.open",
-            "llm.request",
+            "tools.open",
+            "llms.request",
             "proc",
             "process.exec",
             "syncs",
@@ -1876,7 +2006,7 @@ mod tests {
 
     #[test]
     fn from_record_rejects_unknown_kinds_and_malformed_data() {
-        let unknown = record("tool.open", Source::Gateway, json!({}));
+        let unknown = record("tool.open", Source::Gate, json!({}));
         assert!(Payload::from_record(&unknown).is_err());
         let known_kind_bad_data = record("proc.exec", Source::Sensor, json!({"argv": ["ls"]}));
         assert!(Payload::from_record(&known_kind_bad_data).is_err());
@@ -2252,7 +2382,7 @@ mod tests {
             (Source::Guest, "guest"),
             (Source::Sensor, "sensor"),
             (Source::Reconciler, "reconciler"),
-            (Source::Gateway, "gateway"),
+            (Source::Gate, "gate"),
             (Source::Control, "control"),
             (Source::Session, "session"),
             (Source::Policy, "policy"),

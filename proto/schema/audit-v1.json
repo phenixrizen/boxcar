@@ -886,6 +886,186 @@
         }
       ]
     },
+    "HttpRequest": {
+      "description": "`http.request`: a request an inspected flow carried, once its body ended. Headers that carry a credential never reach the observer's records: their values are dropped at the parser.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "body_truncated",
+        "flow",
+        "method",
+        "stream",
+        "version"
+      ],
+      "properties": {
+        "authority": {
+          "description": "`:authority`, or the `Host` header, lowercase.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_b3": {
+          "description": "`b3:` and blake3 of the decoded body; `null` for an empty one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "description": "Decoded body bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "body_truncated": {
+          "description": "The body passed what the observer keeps (16 MiB): hashed, not read by the model parsers.",
+          "type": "boolean"
+        },
+        "content_encoding": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_length": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "content_type": {
+          "description": "`Content-Type` without its parameters, lowercase.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degraded": {
+          "description": "Why the request could not be read whole, if it could not: `lost`, `incomplete`, `flow_closed`, `content_encoding`, `content_decode`, a parser's reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "description": "The request target, cut at 4096 bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "description": "HTTP/2's stream id, or 1, 2, 3... for HTTP/1.1's requests in order.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "user_agent": {
+          "description": "`User-Agent`, cut at 512 bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "`1.1` or `2`.",
+          "type": "string"
+        }
+      }
+    },
+    "HttpResponse": {
+      "description": "`http.response`: the response to an `http.request`, once it ended; for a WebSocket stream, when it closed.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "body_truncated",
+        "dur_ms",
+        "flow",
+        "sse_events",
+        "status",
+        "stream",
+        "ws_messages"
+      ],
+      "properties": {
+        "body_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "body_truncated": {
+          "type": "boolean"
+        },
+        "content_encoding": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degraded": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dur_ms": {
+          "description": "From the request's first byte to the response's last, as the observer took them.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sse_events": {
+          "description": "Events of a `text/event-stream` body.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "status": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ws_messages": {
+          "description": "Messages of a WebSocket stream, both ways.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
     "NetClose": {
       "description": "`net.close`: a flow ended.",
       "type": "object",
@@ -2087,6 +2267,42 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/HttpRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/Finding"
             },
             "type": {
@@ -2854,8 +3070,14 @@
             "guest",
             "sensor",
             "reconciler",
-            "gateway",
             "control"
+          ]
+        },
+        {
+          "description": "The model traffic gate: `http.*`, `llm.*` and `tool.*`.",
+          "type": "string",
+          "enum": [
+            "gate"
           ]
         },
         {

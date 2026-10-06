@@ -936,6 +936,65 @@ pub struct ProgramStatus {
     pub error: Option<String>,
 }
 
+/// `http.request`: a request an inspected flow carried, once its body
+/// ended. Headers that carry a credential never reach the observer's
+/// records: their values are dropped at the parser.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HttpRequest {
+    /// The `flow` of the flow's `net.connect`.
+    pub flow: u64,
+    /// HTTP/2's stream id, or 1, 2, 3... for HTTP/1.1's requests in order.
+    pub stream: u32,
+    /// `1.1` or `2`.
+    pub version: String,
+    pub method: String,
+    /// `:authority`, or the `Host` header, lowercase.
+    pub authority: Option<String>,
+    /// The request target, cut at 4096 bytes.
+    pub path: Option<String>,
+    /// `Content-Type` without its parameters, lowercase.
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_length: Option<u64>,
+    /// `User-Agent`, cut at 512 bytes.
+    pub user_agent: Option<String>,
+    /// Decoded body bytes.
+    pub body_bytes: u64,
+    /// `b3:` and blake3 of the decoded body; `null` for an empty one.
+    pub body_b3: Option<String>,
+    /// The body passed what the observer keeps (16 MiB): hashed, not
+    /// read by the model parsers.
+    pub body_truncated: bool,
+    /// Why the request could not be read whole, if it could not:
+    /// `lost`, `incomplete`, `flow_closed`, `content_encoding`,
+    /// `content_decode`, a parser's reason.
+    pub degraded: Option<String>,
+}
+
+/// `http.response`: the response to an `http.request`, once it ended; for
+/// a WebSocket stream, when it closed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HttpResponse {
+    pub flow: u64,
+    pub stream: u32,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub body_bytes: u64,
+    pub body_b3: Option<String>,
+    pub body_truncated: bool,
+    /// Events of a `text/event-stream` body.
+    pub sse_events: u64,
+    /// Messages of a WebSocket stream, both ways.
+    pub ws_messages: u64,
+    /// From the request's first byte to the response's last, as the
+    /// observer took them.
+    pub dur_ms: u64,
+    pub degraded: Option<String>,
+}
+
 /// `finding`: the reconciler's conclusion from records of both rings, with
 /// the records it read as evidence. Never sampled; a score of 70 or more
 /// is written through to disk at once.

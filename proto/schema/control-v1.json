@@ -861,8 +861,14 @@
             "guest",
             "sensor",
             "reconciler",
-            "gateway",
             "control"
+          ]
+        },
+        {
+          "description": "The model traffic gate: `http.*`, `llm.*` and `tool.*`.",
+          "type": "string",
+          "enum": [
+            "gate"
           ]
         },
         {

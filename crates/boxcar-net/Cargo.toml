@@ -36,6 +36,14 @@ time = { workspace = true }
 # The CA's PEM and its fingerprint's hex.
 base64 = { workspace = true }
 hex = { workspace = true }
+# The HTTP observer (M4): heads, HPACK, content codings, body hashes, and
+# the model APIs' JSON.
+httparse = { workspace = true }
+fluke-hpack = { workspace = true }
+flate2 = { workspace = true }
+brotli-decompressor = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

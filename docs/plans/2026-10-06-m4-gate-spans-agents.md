@@ -305,3 +305,43 @@ Made while writing the plan, 2026-10-06:
   rather than waiting for a host event that, with nothing left to read,
   never comes. Without it a guest's FIN left the flow open until the VM
   stopped (`net.close{reason:"shutdown"}` instead of `fin`).
+
+### Task 3
+
+- **HPACK and the HTTP/1.1 head parser are crates, not transcriptions.**
+  `fluke-hpack` (MIT, the maintained fork of `hpack`) decodes the header
+  blocks: its static and dynamic tables, Huffman code and size updates
+  are the RFC's, and a hand-transcribed Huffman table of 257 codes could
+  be checked only against the RFC's few examples. `httparse` (MIT or
+  Apache-2.0) parses request and response lines and headers. The frames,
+  streams, bodies, chunked coding, event streams and WebSocket frames are
+  in-tree. The RFC 7541 C.4 sequence is still a test of the whole path.
+- **Credential headers lose their values at the parser.** `Headers::push`
+  keeps the name of a header that carries a credential (by name, or by a
+  `-token`, `-secret` or `-password` suffix) and drops the value, so no
+  accessor can give it: there is no raw map to redact afterwards.
+- **An upgrade request holds the guest's side** until the response says
+  whether the protocol switched: bytes after a `Connection: Upgrade`
+  request are the new protocol's on a `101`, and are not read as a next
+  request.
+- **A response that reads until the connection closes is whole at the
+  close** (`degraded` stays unset); one with a length, or chunked, that
+  the close cut short is `incomplete`.
+- **A WebSocket reader told to drop its context cannot tell** that a
+  sender kept it: the inflater copies from an empty window and yields
+  bytes that are not the message, with no error. The test checks that the
+  message is not the original rather than that inflation fails.
+- **`Source::Gateway` became `Source::Gate` here**, where the first gate
+  records land; nothing had emitted the old value.
+- **The observer records with the blocking emit** on the `gate-observe`
+  thread, which the net thread never waits on; a full writer stalls the
+  observer and the channel fills, which the net thread counts as
+  `net.drop{reason:"observe"}`.
+- **Times in `http.response.dur_ms` are the observer's**: when it took the
+  bytes, which is when they moved unless it fell behind.
+- **The gated suite runs alone.** With a build running beside it,
+  `kvm_m3`'s `a_download_to_a_blocked_address_is_a_joined_finding` saw its
+  finding marked low in confidence (a sync round trip over 2 ms, or a
+  lagging subscription, under load) and failed on the score; alone it
+  passes. The verification runs of this plan keep the machine to the
+  gated suite while it runs.

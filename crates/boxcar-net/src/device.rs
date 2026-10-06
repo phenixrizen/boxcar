@@ -253,7 +253,7 @@ impl VirtioNet {
         let (observer, observer_thread) = match &inspect {
             Some(_) => {
                 let (observer, rx) = Observer::channel();
-                let thread = ObserverThread::spawn(rx)
+                let thread = ObserverThread::spawn(rx, sink.clone())
                     .map_err(|error| ConfigError::Observer(error.to_string()))?;
                 (Some(observer), Some(thread))
             }

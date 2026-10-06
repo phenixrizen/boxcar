@@ -28,7 +28,10 @@
 //! - [`stack`]: the queues, smoltcp's interface (the far end of the
 //!   relayed connections), and the counted drops.
 //! - [`gate`]: the model traffic gate, for the destinations the policy
-//!   marks `inspect`: the session's CA and the leaves it signs.
+//!   marks `inspect`: the session's CA and the leaves it signs, the TLS
+//!   legs, and the observer that takes the plaintext.
+//! - [`http`]: the observer's parsers: HTTP/1.1, HTTP/2, bodies, event
+//!   streams and WebSocket, read passively.
 //! - [`audit`]: the `net.*` records.
 //! - [`config`]: the addressing, the DNS upstreams, and the relays' bounds.
 //! - [`device`]: the virtio-net device in front of the stack, and the net
@@ -44,6 +47,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod frame;
 pub mod gate;
+pub mod http;
 pub mod http_host;
 pub mod icmp;
 pub mod policy;

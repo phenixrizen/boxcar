@@ -18,7 +18,7 @@ reported from inside the guest by its sensor (`proc.*`).
 | `session_id` | string | A lowercase hyphenated UUIDv7, the session's. |
 | `seq` | u64 | The record's position in the session, from 1 with no gaps; the single writer assigns it. |
 | `ring` | 0 or 1 | 0: observed on the host, where the guest cannot alter it. 1: reported from inside the guest. |
-| `src` | string | Who made the record: `vmm`, `fs`, `net`, `vsock`, `control`, `session`, `policy`, `sensor` (ring 1), `reconciler` (and, later, `pty`, `guest`, `gateway`). |
+| `src` | string | Who made the record: `vmm`, `fs`, `net`, `vsock`, `control`, `session`, `policy`, `sensor` (ring 1), `reconciler`, `gate` (the model traffic gate's observer) (and, later, `pty`, `guest`). |
 | `type` | string | The dotted event type, below. New types are additive; a reader ignores types it does not know. |
 | `ts_host_ns` | u64 | Host `CLOCK_REALTIME`, nanoseconds since the epoch, when the writer took the event. The one timestamp that joins events across rings. |
 | `ts_mono_ns` | u64 | Host `CLOCK_MONOTONIC` at the same moment. |
@@ -198,6 +198,23 @@ The sensor's stream is framed `[u32 LE len][json]`, each frame the record's
 `type` and `data` with `ts_guest_ns` and `subject` beside them, at most 64
 KiB; `proto/schema/sensor-v1.json` and `proto/testdata/sensor-v1.jsonl`
 describe it. A frame that is not a sensor's ends the stream.
+
+## `http.*` (host, src `gate`)
+
+The observer's reading of an inspected flow's plaintext (`--inspect`):
+every HTTP/1.1 and HTTP/2 exchange, as the bytes moved. The observer
+takes a copy of the plaintext off the net thread; bodies are
+content-decoded (`gzip`, `deflate`, `br`), hashed whole, and kept for the
+model parsers up to 16 MiB. A header that carries a credential
+(`authorization`, `x-api-key`, `cookie`, names ending in `-token` or
+`-secret`, among others) has its value dropped at the parser: nothing
+downstream can see it. `stream` is HTTP/2's stream id, or 1, 2, 3... for
+HTTP/1.1's requests in order on the flow.
+
+| Type | Fields | When |
+|---|---|---|
+| `http.request` | `flow`, `stream`, `version` (`1.1` or `2`), `method`, `authority`, `path` (cut at 4096 bytes), `content_type`, `content_encoding`, `content_length`, `user_agent` (cut at 512), `body_bytes` (decoded), `body_b3`, `body_truncated`, `degraded` | A request's body ended (or could not: `degraded` says why: `lost` (the observer's channel had no room), `incomplete`, `flow_closed`, `content_encoding` (a coding the observer does not decode: the raw body is hashed), `content_decode`, or a parser's reason). |
+| `http.response` | `flow`, `stream`, `status`, `content_type`, `content_encoding`, `body_bytes`, `body_b3`, `body_truncated`, `sse_events` (events of a `text/event-stream` body), `ws_messages` (messages of a WebSocket stream, both ways), `dur_ms` (the request's first byte to the response's last, as the observer took them), `degraded` | A response ended; for a WebSocket stream, when it closed. |
 
 ## `finding` (host, src `reconciler`)
 
