@@ -29,7 +29,7 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
   events between responses.
 
 ```text
-<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","findings"]}
+<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings"]}
 -> {"v":1,"id":1,"op":"status"}
 <- {"v":1,"id":1,"ok":true,"result":{"state":"running",...}}
 -> {"v":1,"id":2,"op":"stop","mode":"graceful"}
@@ -43,7 +43,8 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
 **Hello** (the server's first line): `v` 1, `event` `"hello"`, `protocol`
 `"boxcar.control"`, `versions` `[1]`, `server` `"boxcar/<version>"`,
 `session_id`, and `capabilities`: the op families served beyond `status`
-and `stop`, today `["pty","audit","policy.net","findings"]`.
+and `stop`, today `["pty","audit","policy.net","policy.inspect","findings"]`
+(`policy.inspect`: the network policy carries `inspect` lines).
 
 **Request**: `{"v":1,"id":N,"op":"<op>", ...}`. `id` is an unsigned
 64-bit integer the client chooses; every other field is a parameter of the
@@ -193,7 +194,8 @@ or has failed), `internal` (the log cannot be read).
 No parameters. The result is the policy in force:
 
 ```json
-{"net":{"default":"deny","allow":["example.com:443","*.github.io"],"deny":["10.0.0.0/8"]},
+{"net":{"default":"deny","allow":["example.com:443","*.github.io"],"deny":["10.0.0.0/8"],
+        "inspect":["api.anthropic.com:443"]},
  "vsock":{"allow_ports":[5000]},
  "version":1}
 ```
@@ -201,7 +203,10 @@ No parameters. The result is the policy in force:
 `net.default` is `allow` or `deny`; `net.allow` and `net.deny` are the
 rules' targets as written, each list in order, in the form `boxcar run
 --allow` takes: `name[:port]`, `*.name[:port]`, `address[:port]` or
-`address/prefix[:port]`. `vsock.allow_ports` are the host ports a guest
+`address/prefix[:port]`. `net.inspect` lists the `inspect` lines (`boxcar
+run --inspect`) the same way: destinations whose TLS the gate ends and
+whose traffic it observes once an allow rule admitted the connection; they
+decide no verdict, and a server from before them leaves the list out. `vsock.allow_ports` are the host ports a guest
 vsock connection may reach besides the VMM's own (1024 to 1026). `version`
 is 1 for the policy the VM started with, one more for each update. A VM
 without a network card or a vsock device reports that part empty.

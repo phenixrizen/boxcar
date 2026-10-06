@@ -216,7 +216,7 @@ pub struct Hello {
     pub server: String,
     pub session_id: String,
     /// The op families the server serves beyond `status` and `stop`, such
-    /// as `pty`, `audit` and `policy.net`.
+    /// as `pty`, `audit`, `policy.net` and `policy.inspect`.
     pub capabilities: Vec<String>,
 }
 
@@ -641,7 +641,8 @@ pub const MAX_POLICY_RULE_LEN: usize = 512;
 pub const MAX_VSOCK_ALLOW_PORTS: usize = 1024;
 
 /// The network policy as `policy.get` reports it and `policy.update` takes
-/// it: `{"default":"deny","allow":["example.com:443"],"deny":["10.0.0.0/8"]}`.
+/// it: `{"default":"deny","allow":["example.com:443"],"deny":["10.0.0.0/8"],
+/// "inspect":["api.example.com:443"]}`.
 /// Each rule is a target as `boxcar run --allow` takes it: `name[:port]`,
 /// `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The
 /// policy in force puts every deny before every allow, in the order given,
@@ -661,6 +662,12 @@ pub struct NetPolicy {
     /// The deny rules, as targets, in order.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// The inspect lines, as targets, in order: destinations whose TLS the
+    /// gate ends and whose traffic it observes, once an allow rule admitted
+    /// the connection. They decide no verdict. Absent in older servers'
+    /// views.
+    #[serde(default)]
+    pub inspect: Vec<String>,
 }
 
 impl NetPolicy {
@@ -669,11 +676,15 @@ impl NetPolicy {
     /// [`MAX_POLICY_RULE_LEN`] bytes and one line. What a rule says is for
     /// the server to parse (`bad_request` names the rule it refuses).
     pub fn check(&self) -> Result<(), String> {
-        let rules = self.allow.len() + self.deny.len();
+        let rules = self.allow.len() + self.deny.len() + self.inspect.len();
         if rules > MAX_POLICY_RULES {
             return Err(format!("{rules} rules: at most {MAX_POLICY_RULES}"));
         }
-        for (list, rules) in [("allow", &self.allow), ("deny", &self.deny)] {
+        for (list, rules) in [
+            ("allow", &self.allow),
+            ("deny", &self.deny),
+            ("inspect", &self.inspect),
+        ] {
             for (at, rule) in rules.iter().enumerate() {
                 if rule.is_empty() || rule.len() > MAX_POLICY_RULE_LEN {
                     return Err(format!(
@@ -1276,6 +1287,7 @@ mod tests {
                 default: Verdict::Deny,
                 allow: vec!["example.com:443".into(), "*.github.io".into()],
                 deny: vec!["10.0.0.0/8".into()],
+                inspect: vec!["example.com:443".into()],
             },
             vsock: VsockPolicy {
                 allow_ports: vec![5000],
@@ -1283,7 +1295,7 @@ mod tests {
             version: 3,
         };
         let wire = json!({
-            "net": {"default": "deny", "allow": ["example.com:443", "*.github.io"], "deny": ["10.0.0.0/8"]},
+            "net": {"default": "deny", "allow": ["example.com:443", "*.github.io"], "deny": ["10.0.0.0/8"], "inspect": ["example.com:443"]},
             "vsock": {"allow_ports": [5000]},
             "version": 3,
         });
@@ -1295,6 +1307,10 @@ mod tests {
         assert_eq!(bare.version, 0);
         assert_eq!(bare.net.default, Verdict::Allow);
         assert!(bare.net.allow.is_empty() && bare.net.deny.is_empty());
+        assert!(
+            bare.net.inspect.is_empty(),
+            "an older server's view has no inspect"
+        );
         assert!(bare.vsock.allow_ports.is_empty());
         for bad in [
             json!({"net": {"default": "maybe"}, "vsock": {}}),
@@ -1319,7 +1335,7 @@ mod tests {
         assert!(net_only.vsock.is_none());
         assert_eq!(
             serde_json::to_value(&net_only).unwrap(),
-            json!({"net": {"default": "deny", "allow": ["a.test"], "deny": []}})
+            json!({"net": {"default": "deny", "allow": ["a.test"], "deny": [], "inspect": []}})
         );
         let vsock_only: PolicyUpdateParams =
             serde_json::from_value(json!({"vsock": {"allow_ports": [1027, 5000]}})).unwrap();
@@ -1335,7 +1351,26 @@ mod tests {
             default: Verdict::Deny,
             allow,
             deny,
+            inspect: Vec::new(),
         };
+        // Inspect lines count toward the limit and are checked like the rest.
+        let inspect = |inspect: Vec<String>| NetPolicy {
+            default: Verdict::Deny,
+            allow: vec!["a".into(); MAX_POLICY_RULES],
+            deny: Vec::new(),
+            inspect,
+        };
+        assert_eq!(inspect(Vec::new()).check(), Ok(()));
+        assert!(inspect(vec!["b".into()]).check().is_err());
+        let bad = NetPolicy {
+            default: Verdict::Deny,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            inspect: vec!["a.test".into(), "b.test # no".into()],
+        }
+        .check()
+        .unwrap_err();
+        assert!(bad.starts_with("net.inspect[1]"), "{bad}");
         assert_eq!(
             net(
                 vec!["a".into(); MAX_POLICY_RULES / 2],

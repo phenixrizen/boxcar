@@ -185,37 +185,46 @@ pub fn net_view(policy: &Policy) -> NetPolicy {
         default: policy.default,
         allow: Vec::new(),
         deny: Vec::new(),
+        inspect: Vec::new(),
+    };
+    // The text is `<verb> <target>`, as the parser wrote it.
+    let target = |text: &str| {
+        text.split_once(' ')
+            .map_or(text, |(_, target)| target)
+            .to_owned()
     };
     for rule in &policy.rules {
-        // The text is `<verb> <target>`, as the parser wrote it.
-        let target = rule
-            .text
-            .split_once(' ')
-            .map_or(rule.text.as_str(), |(_, target)| target);
         match rule.verdict {
-            Verdict::Allow => view.allow.push(target.to_owned()),
-            Verdict::Deny => view.deny.push(target.to_owned()),
+            Verdict::Allow => view.allow.push(target(&rule.text)),
+            Verdict::Deny => view.deny.push(target(&rule.text)),
         }
     }
+    view.inspect
+        .extend(policy.inspect.iter().map(|line| target(&line.text)));
     view
 }
 
-/// The policy `view` describes: the denies, then the allows, each in
-/// order, and the default. A target that does not parse names itself.
+/// The policy `view` describes: the denies, then the allows, then the
+/// inspect lines, each in order, and the default. A target that does not
+/// parse names itself.
 pub fn net_policy(view: &NetPolicy) -> Result<Policy, UpdateError> {
     let mut lines = vec![format!("default {}", verb(view.default))];
     lines.extend(view.deny.iter().map(|rule| format!("deny {rule}")));
     lines.extend(view.allow.iter().map(|rule| format!("allow {rule}")));
+    lines.extend(view.inspect.iter().map(|rule| format!("inspect {rule}")));
     Policy::parse(&lines).map_err(|error| {
         // Line 1 is the default, which cannot fail; the denies follow it,
-        // then the allows.
+        // then the allows, then the inspect lines.
         let index = error.line.saturating_sub(2);
         let (list, at, rule) = if index < view.deny.len() {
             ("deny", index, view.deny[index].as_str())
-        } else {
+        } else if index < view.deny.len() + view.allow.len() {
             let at = index - view.deny.len();
-            let rule = view.allow.get(at).map_or("", String::as_str);
-            ("allow", at, rule)
+            ("allow", at, view.allow[at].as_str())
+        } else {
+            let at = index - view.deny.len() - view.allow.len();
+            let rule = view.inspect.get(at).map_or("", String::as_str);
+            ("inspect", at, rule)
         };
         UpdateError::Rule {
             list,
@@ -248,7 +257,33 @@ mod tests {
             default,
             allow: allow.iter().map(|s| (*s).to_owned()).collect(),
             deny: deny.iter().map(|s| (*s).to_owned()).collect(),
+            inspect: Vec::new(),
         }
+    }
+
+    /// Inspect lines go to their own list and come back as inspect lines,
+    /// after the rules; a bad one is named with its list.
+    #[test]
+    fn inspect_lines_round_trip_through_the_view() {
+        let policy = Policy::parse(&[
+            "inspect api.example.com:443",
+            "allow api.example.com",
+            "inspect 127.0.0.1:8443",
+        ])
+        .unwrap();
+        let view = net_view(&policy);
+        assert_eq!(view.allow, ["api.example.com"]);
+        assert_eq!(view.inspect, ["api.example.com:443", "127.0.0.1:8443"]);
+        let made = net_policy(&view).unwrap();
+        assert_eq!(made.inspect, policy.inspect);
+        assert_eq!(made.rules.len(), 1);
+        let mut bad = view.clone();
+        bad.inspect.push("exa_mple.com".into());
+        let error = net_policy(&bad).unwrap_err();
+        let UpdateError::Rule { list, at, rule, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!((*list, *at, rule.as_str()), ("inspect", 2, "exa_mple.com"));
     }
 
     fn at(ip: [u8; 4], port: u16) -> SocketAddrV4 {

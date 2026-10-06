@@ -1,5 +1,5 @@
 {"ready":true,"control":"/run/user/1000/boxcar/017f22e2-79b0-7cc3-98c4-dc0c0c07398f/control.sock","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f"}
-{"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","capabilities":["pty","audit","policy.net","findings"]}
+{"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","capabilities":["pty","audit","policy.net","policy.inspect","findings"]}
 {"v":1,"id":1,"op":"status"}
 {"v":1,"id":1,"ok":true,"result":{"audit":{"failed":false,"next_seq":8},"devices":["fs:root","fs:workspace","net","vsock"],"guest":{"exit":null,"init_ready":true,"session_pid":212},"mem_mib":512,"pid":4242,"sensor":{"heartbeats":61,"last_heartbeat_ns":1700000000000000000,"state":"attached"},"session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","state":"running","uptime_ms":61500,"vcpus":2}}
 {"v":1,"id":2,"op":"pty.attach","mode":"rw","replay_bytes":65536,"session":"main"}
@@ -14,8 +14,8 @@
 {"v":1,"event":"audit","sub":1,"rec":{"v":1,"session_id":"017f22e2-79b0-7cc3-98c4-dc0c0c07398f","seq":7,"ring":0,"src":"net","type":"net.connect","ts_host_ns":1700000000000000000,"ts_mono_ns":5001000000,"subject":{"pid":212,"uid":1000,"gid":1000},"data":{"dst":"93.184.215.14:443","flow":3,"names":["example.com"],"proto":"tcp","rule":"allow example.com","src":"10.0.2.15:40000","verdict":"allow"},"prev":"b3:1111111111111111111111111111111111111111111111111111111111111111","hash":"b3:2222222222222222222222222222222222222222222222222222222222222222"}}
 {"v":1,"event":"audit.lagged","sub":1,"resume_seq":16385}
 {"v":1,"id":6,"op":"policy.get"}
-{"v":1,"id":6,"ok":true,"result":{"net":{"allow":["example.com","*.github.io:443"],"default":"deny","deny":["10.0.0.0/8"]},"version":1,"vsock":{"allow_ports":[5000]}}}
-{"v":1,"id":7,"op":"policy.update","net":{"allow":["example.com","*.github.io:443","api.github.com:443"],"default":"deny","deny":["10.0.0.0/8"]}}
+{"v":1,"id":6,"ok":true,"result":{"net":{"allow":["example.com","*.github.io:443"],"default":"deny","deny":["10.0.0.0/8"],"inspect":["api.anthropic.com:443"]},"version":1,"vsock":{"allow_ports":[5000]}}}
+{"v":1,"id":7,"op":"policy.update","net":{"allow":["example.com","*.github.io:443","api.github.com:443"],"default":"deny","deny":["10.0.0.0/8"],"inspect":["api.anthropic.com:443"]}}
 {"v":1,"id":7,"ok":true,"result":{"policy_version":2}}
 {"v":1,"id":8,"ok":false,"error":{"code":"bad_request","message":"stop parameters: unknown variant `now`"}}
 {"v":1,"id":9,"ok":false,"error":{"code":"unsupported_version","message":"v must be 1"}}

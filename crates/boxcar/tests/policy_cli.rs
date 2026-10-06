@@ -33,6 +33,7 @@ fn starting_policy() -> PolicyView {
             default: Verdict::Deny,
             allow: strings(&["a.test", "*.github.io:443"]),
             deny: strings(&["b.test", "c.test"]),
+            inspect: strings(&["a.test:443"]),
         },
         vsock: VsockPolicy {
             allow_ports: vec![5000, 6000],
@@ -66,7 +67,7 @@ fn fake_server(
         let hello = Hello::new(
             "boxcar/fake",
             SESSION,
-            strings(&["pty", "audit", "policy.net", "findings"]),
+            strings(&["pty", "audit", "policy.net", "policy.inspect", "findings"]),
         );
         stream.write_all(&to_line(&hello).unwrap()).unwrap();
         let reader = BufReader::new(stream.try_clone().unwrap());
@@ -162,6 +163,7 @@ fn policy_show_prints_the_policy_as_a_table_or_json() {
          allow    *.github.io:443\n\
          deny     b.test\n\
          deny     c.test\n\
+         inspect  a.test:443\n\
          vsock    5000, 6000\n"
     );
     assert_eq!(ops(&server.join().unwrap()), ["policy.get"]);
@@ -187,6 +189,7 @@ fn policy_show_of_an_empty_policy() {
             default: Verdict::Allow,
             allow: Vec::new(),
             deny: Vec::new(),
+            inspect: Vec::new(),
         },
         vsock: VsockPolicy::default(),
         version: 7,
@@ -200,6 +203,7 @@ fn policy_show_of_an_empty_policy() {
          default  allow\n\
          allow    (none)\n\
          deny     (none)\n\
+         inspect  (none)\n\
          vsock    (none)\n"
     );
     server.join().unwrap();
@@ -224,6 +228,7 @@ fn policy_allow_appends_the_rule_and_drops_its_deny() {
             default: Verdict::Deny,
             allow: strings(&["a.test", "*.github.io:443", "b.test"]),
             deny: strings(&["c.test"]),
+            inspect: strings(&["a.test:443"]),
         }
     );
 }
@@ -243,6 +248,7 @@ fn policy_deny_appends_the_rule_and_drops_its_allow() {
             default: Verdict::Deny,
             allow: strings(&["a.test"]),
             deny: strings(&["b.test", "c.test", "*.github.io:443"]),
+            inspect: strings(&["a.test:443"]),
         }
     );
 }

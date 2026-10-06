@@ -61,7 +61,7 @@ Common pieces:
 
 | Type | Fields | When |
 |---|---|---|
-| `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none) | The VM was built and is about to run. |
+| `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none), `inspect_ca_sha256` (omitted when the policy has no `inspect` rule) | The VM was built and is about to run. `inspect_ca_sha256` is the SHA-256, lowercase hex, of the DER certificate of the session CA the guest was told to trust for the gate's certificates (`--inspect`). |
 | `vmm.stop` | `reason`, `exit_code` (or null), `console_dropped_bytes`, `stdin_dropped_bytes` | The VM stopped; the last record of a run (a closing checkpoint follows). `reason`: `guest_reset`, `guest_shutdown`, `signal`, `console_escape`, `stop_requested`, `vcpu_error`, `audit_failed`, `vmm_error`. The byte counts are console output the host never wrote out and console input it dropped (0 for a run without them). |
 | `checkpoint` | `records_since`, `dropped`, `root_hash` | The writer's summary of the records since the previous checkpoint: every 1024 records or 2 s, at a segment seal, and at close. `root_hash` is blake3 over the raw hashes of those records; `dropped` counts droppable events (`fs.read`, `net.drop`) the full channel dropped. |
 

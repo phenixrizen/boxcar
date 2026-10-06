@@ -13,6 +13,7 @@
 //! deny 203.0.113.0/24       # a network
 //! allow 192.168.0.0/16      # lifts the built-in denial of exactly this range
 //! allow 198.51.100.7:22     # a bare address is a /32
+//! inspect api.example.com   # end its TLS in the gate and observe the traffic
 //! ```
 //!
 //! [`Policy::egress`] decides a connection:
@@ -51,6 +52,13 @@
 //! leaves the flow denied, the rule text is `builtin:udp-needs-cidr`
 //! ([`BUILTIN_UDP_NEEDS_CIDR`]). Allow UDP by address with a network rule
 //! (`allow 192.0.2.53:53`, `allow 198.51.100.0/24:123`).
+//!
+//! An `inspect` line decides no verdict. A connection an `allow` rule
+//! admitted whose gate name (or, for a network rule, whose destination)
+//! matches one is inspected ([`Policy::inspects`]): the relay ends its TLS
+//! itself, with a certificate from the session's CA, connects to the real
+//! host with its own TLS, relays the plaintext unchanged and observes it.
+//! A plain HTTP connection matching one is observed as it is.
 //!
 //! The stack shares one policy through an `Arc<arc_swap::ArcSwap<Policy>>`
 //! and loads it for every decision, so a swapped policy decides the next
@@ -205,6 +213,15 @@ pub enum Target {
     Cidr { net: Ipv4Net, port: Option<u16> },
 }
 
+/// One `inspect` line: a destination whose connections, once an `allow`
+/// rule admitted them, the gate ends the TLS of and observes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inspect {
+    pub target: Target,
+    /// The line as written, without its comment: what records name it by.
+    pub text: String,
+}
+
 /// A policy file's rules and default.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -212,6 +229,9 @@ pub struct Policy {
     pub default: Verdict,
     /// In file order: the first that matches decides.
     pub rules: Vec<Rule>,
+    /// The `inspect` lines, in file order: the first that matches names
+    /// the connection as inspected. They decide no verdict.
+    pub inspect: Vec<Inspect>,
 }
 
 /// No rules, and deny: a policy file with nothing in it.
@@ -220,6 +240,7 @@ impl Default for Policy {
         Policy {
             default: Verdict::Deny,
             rules: Vec::new(),
+            inspect: Vec::new(),
         }
     }
 }
@@ -235,7 +256,7 @@ pub struct PolicyError {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyErrorKind {
-    #[error("{0:?} is not a rule; a rule starts with allow, deny or default")]
+    #[error("{0:?} is not a rule; a rule starts with allow, deny, inspect or default")]
     UnknownWord(String),
     #[error("default is given twice")]
     DuplicateDefault,
@@ -261,17 +282,19 @@ impl Policy {
         Policy {
             default: Verdict::Allow,
             rules: Vec::new(),
+            inspect: Vec::new(),
         }
     }
 
     /// Parses a policy file's lines: `default allow|deny` at most once
-    /// (deny when absent), and `allow|deny <target>`, where the target is
-    /// `name[:port]`, `*.name[:port]`, `address[:port]` or
-    /// `address/prefix[:port]`. Names are lowercased and lose a trailing
-    /// dot. `#` starts a comment.
+    /// (deny when absent), `allow|deny <target>` and `inspect <target>`,
+    /// where the target is `name[:port]`, `*.name[:port]`,
+    /// `address[:port]` or `address/prefix[:port]`. Names are lowercased
+    /// and lose a trailing dot. `#` starts a comment.
     pub fn parse<S: AsRef<str>>(lines: &[S]) -> Result<Policy, PolicyError> {
         let mut default = None;
         let mut rules = Vec::new();
+        let mut inspect = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             let at = |kind| PolicyError {
                 line: index + 1,
@@ -307,12 +330,36 @@ impl Policy {
                         text: format!("{verb} {target}"),
                     });
                 }
+                ["inspect", rest @ ..] => {
+                    let [target] = rest else {
+                        return Err(at(PolicyErrorKind::Target("inspect")));
+                    };
+                    inspect.push(Inspect {
+                        target: parse_target(target).map_err(at)?,
+                        text: format!("inspect {target}"),
+                    });
+                }
                 [word, ..] => return Err(at(PolicyErrorKind::UnknownWord((*word).to_owned()))),
             }
         }
         Ok(Policy {
             default: default.unwrap_or(Verdict::Deny),
             rules,
+            inspect,
+        })
+    }
+
+    /// The `inspect` line, if any, that names a connection to `dst` whose
+    /// first bytes showed `name` (its TLS server name or HTTP `Host`): the
+    /// first domain line matching the name on the port, or the first
+    /// network line holding the address on the port. Decides no verdict:
+    /// an `allow` rule admits the connection first, or nothing does.
+    pub fn inspects(&self, name: Option<&str>, dst: SocketAddrV4) -> Option<&Inspect> {
+        self.inspect.iter().find(|line| match &line.target {
+            Target::Domain { pattern, port } => {
+                on_port(*port, dst.port()) && name.is_some_and(|name| name_matches(pattern, name))
+            }
+            Target::Cidr { net, port } => on_port(*port, dst.port()) && net.contains(*dst.ip()),
         })
     }
 
@@ -1013,6 +1060,109 @@ mod tests {
         assert_eq!(parse(&["default deny"]).default, Verdict::Deny);
     }
 
+    /// `inspect` lines take the targets `allow` and `deny` take, keep
+    /// their text, and go in their own list, in order.
+    #[test]
+    fn inspect_lines_parse_like_allow_and_deny() {
+        let p = parse(&[
+            "allow api.example.com:443",
+            "inspect   API.Example.COM.:443  # the model host",
+            "inspect *.openai.example",
+            "inspect 127.0.0.1:8443",
+            "deny 10.0.0.0/8",
+        ]);
+        assert_eq!(p.rules.len(), 2);
+        assert_eq!(
+            p.inspect,
+            [
+                Inspect {
+                    target: Target::Domain {
+                        pattern: "api.example.com".into(),
+                        port: Some(443),
+                    },
+                    text: "inspect API.Example.COM.:443".into(),
+                },
+                Inspect {
+                    target: Target::Domain {
+                        pattern: "*.openai.example".into(),
+                        port: None,
+                    },
+                    text: "inspect *.openai.example".into(),
+                },
+                Inspect {
+                    target: Target::Cidr {
+                        net: "127.0.0.1/32".parse().unwrap(),
+                        port: Some(8443),
+                    },
+                    text: "inspect 127.0.0.1:8443".into(),
+                },
+            ]
+        );
+        assert!(parse(&["allow a.test"]).inspect.is_empty());
+    }
+
+    /// An `inspect` line is not an `allow`: it opens nothing, resolves
+    /// nothing and passes nothing at the gate.
+    #[test]
+    fn inspect_does_not_decide_a_verdict() {
+        let p = parse(&["inspect api.example.com", "inspect 192.0.2.0/24"]);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 443);
+        let names = ["api.example.com".to_owned()];
+        assert_eq!(p.egress(dst, &names), (Verdict::Deny, None));
+        assert_eq!(p.egress_udp(dst, &names), (Verdict::Deny, None));
+        assert_eq!(p.dns("api.example.com"), Verdict::Deny);
+        assert_eq!(p.gate_allows("api.example.com", 443), (Verdict::Deny, None));
+        // Allowed, and inspected: two different lines.
+        let p = parse(&["allow api.example.com", "inspect api.example.com"]);
+        assert_eq!(
+            p.gate_allows("api.example.com", 443),
+            (Verdict::Allow, Some("allow api.example.com".into()))
+        );
+        assert!(p.inspects(Some("api.example.com"), dst).is_some());
+    }
+
+    /// A domain line matches the name the gate saw, on its port if it has
+    /// one; a network line matches the destination, with or without a
+    /// name; the first that matches is the one named.
+    #[test]
+    fn inspects_matches_the_gate_name_or_the_destination() {
+        let p = parse(&[
+            "inspect api.example.com:443",
+            "inspect *.model.example",
+            "inspect 127.0.0.1:8443",
+        ]);
+        let at = |ip: [u8; 4], port: u16| SocketAddrV4::new(Ipv4Addr::from(ip), port);
+        let text = |line: Option<&Inspect>| line.map(|l| l.text.clone());
+        assert_eq!(
+            text(p.inspects(Some("API.example.com."), at([203, 0, 113, 5], 443))),
+            Some("inspect api.example.com:443".to_owned())
+        );
+        // Not on the line's port.
+        assert_eq!(
+            text(p.inspects(Some("api.example.com"), at([203, 0, 113, 5], 8443))),
+            None
+        );
+        assert_eq!(
+            text(p.inspects(Some("chat.model.example"), at([203, 0, 113, 5], 80))),
+            Some("inspect *.model.example".to_owned())
+        );
+        assert_eq!(
+            text(p.inspects(Some("model.example"), at([203, 0, 113, 5], 80))),
+            None
+        );
+        // A network line needs no name.
+        assert_eq!(
+            text(p.inspects(None, at([127, 0, 0, 1], 8443))),
+            Some("inspect 127.0.0.1:8443".to_owned())
+        );
+        assert_eq!(text(p.inspects(None, at([127, 0, 0, 1], 443))), None);
+        assert_eq!(text(p.inspects(None, at([203, 0, 113, 5], 443))), None);
+        assert_eq!(
+            text(Policy::default().inspects(Some("a.test"), at([1, 2, 3, 4], 443))),
+            None
+        );
+    }
+
     #[test]
     fn a_bad_line_is_refused_with_its_number() {
         use PolicyErrorKind as K;
@@ -1036,6 +1186,9 @@ mod tests {
             (vec!["default deny now"], 1, K::Default),
             (vec!["allow"], 1, K::Target("allow")),
             (vec!["deny a.com b.com"], 1, K::Target("deny")),
+            (vec!["inspect"], 1, K::Target("inspect")),
+            (vec!["inspect a.com b.com"], 1, K::Target("inspect")),
+            (vec!["inspect example.com:x"], 1, K::Port("x".into())),
             (vec!["allow example.com:0"], 1, K::Port("0".into())),
             (vec!["allow example.com:65536"], 1, K::Port("65536".into())),
             (vec!["allow example.com:http"], 1, K::Port("http".into())),

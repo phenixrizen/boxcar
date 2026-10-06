@@ -102,6 +102,7 @@ fn golden_records() -> Vec<Record> {
             vcpus: 2,
             mem_mib: 512,
             shares: Vec::new(),
+            inspect_ca_sha256: None,
         }),
         None,
         None,

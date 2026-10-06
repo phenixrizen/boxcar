@@ -21,7 +21,7 @@ use boxcar_audit::{
     AuditSink, ReconcileConfig, Reconciler, SystemClock, WriterConfig, WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
-use boxcar_net::{NetConfig, Policy};
+use boxcar_net::{NetConfig, Policy, SessionCa};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
@@ -117,6 +117,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let audit_dir = check_audit_dir(&audit_dir, &named)?;
 
     let session_id = SessionId::new();
+    // A session that inspects has a CA, whose key stays in this process.
+    let inspect_ca = session_ca(&policy, &session_id)?;
     let user = invoking_user();
     // clap requires --rootfs unless --no-fs.
     let has_shares = rootfs.is_some();
@@ -128,13 +130,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let devices = DeviceSet::new(share_count, net, vsock);
     check_cmdline_size(args.debug_boot, &cmdline_extra, &devices)?;
     // In vsock mode the command travels in the control channel's config.
-    let session = session_config(
+    let mut session = session_config(
         &args.command,
         user,
         &session_id,
         has_shares,
         terminal_size(stdin_terminal_size()),
     );
+    // The guest is told to trust the CA: the certificate, never the key.
+    session.ca_pem = inspect_ca.as_ref().map(|ca| ca.pem().to_owned());
     if mode == GuestMode::Vsock {
         session.validate()?;
     }
@@ -227,6 +231,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             state_dir: state_dir.clone(),
             session_id: session_id.clone(),
         }),
+        inspect_ca,
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -453,7 +458,18 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Policy, String>> {
         None => None,
     };
     let file = file.as_ref().map(|(path, text)| (*path, text.as_str()));
-    Ok(build_policy(file, &args.deny, &args.allow))
+    Ok(build_policy(file, &args.deny, &args.allow, &args.inspect))
+}
+
+/// The session's CA when `policy` has an `inspect` line: made now, for
+/// `session_id`. None when nothing is inspected: no CA, nothing for the
+/// guest to trust.
+fn session_ca(policy: &Policy, session_id: &SessionId) -> anyhow::Result<Option<Arc<SessionCa>>> {
+    if policy.inspect.is_empty() {
+        return Ok(None);
+    }
+    let ca = SessionCa::generate(session_id.as_str()).context("cannot make the session's CA")?;
+    Ok(Some(Arc::new(ca)))
 }
 
 /// Where a line of the policy came from.
@@ -465,13 +481,15 @@ enum Source<'a> {
 /// The policy the guest's network gets: the lines of the policy file
 /// (`file`, its path and its text) first, then a `deny` line for each of
 /// `deny`, then an `allow` line for each of `allow`, in order; the first
-/// rule that matches decides. Deny by default, unless the file gives a
-/// `default`. A rule that does not parse is refused with where it came
-/// from: `--policy-file PATH line N: ...` or `--allow "RULE": ...`.
+/// rule that matches decides; then an `inspect` line for each of
+/// `inspect`, which decide no verdict. Deny by default, unless the file
+/// gives a `default`. A rule that does not parse is refused with where it
+/// came from: `--policy-file PATH line N: ...` or `--allow "RULE": ...`.
 fn build_policy(
     file: Option<(&Path, &str)>,
     deny: &[String],
     allow: &[String],
+    inspect: &[String],
 ) -> Result<Policy, String> {
     let mut lines: Vec<(String, Source<'_>)> = Vec::new();
     if let Some((path, text)) = file {
@@ -483,7 +501,11 @@ fn build_policy(
             lines.push((line.to_owned(), source));
         }
     }
-    for (verb, flag, rules) in [("deny", "--deny", deny), ("allow", "--allow", allow)] {
+    for (verb, flag, rules) in [
+        ("deny", "--deny", deny),
+        ("allow", "--allow", allow),
+        ("inspect", "--inspect", inspect),
+    ] {
         for rule in rules {
             lines.push((format!("{verb} {rule}"), Source::Flag { flag, rule }));
         }
@@ -502,10 +524,11 @@ fn build_policy(
 }
 
 /// Whether any of the flags that set the network's policy or its DNS was
-/// given: `--allow`, `--deny`, `--policy-file`, `--dns`.
+/// given: `--allow`, `--deny`, `--inspect`, `--policy-file`, `--dns`.
 fn policy_flags_given(args: &RunArgs) -> bool {
     !args.allow.is_empty()
         || !args.deny.is_empty()
+        || !args.inspect.is_empty()
         || args.policy_file.is_some()
         || !args.dns.is_empty()
 }
@@ -1254,11 +1277,62 @@ mod tests {
         assert!(size(&cmdline) > 2048);
     }
 
+    use boxcar_net::Verdict;
+
+    /// The flags' policy with no `--inspect`: what the tests below built
+    /// before inspect lines existed.
+    fn build_policy(
+        file: Option<(&Path, &str)>,
+        deny: &[String],
+        allow: &[String],
+    ) -> Result<Policy, String> {
+        super::build_policy(file, deny, allow, &[])
+    }
+
+    /// `--inspect` lines come last, in order, in their own list, and a
+    /// session with one gets a CA whose certificate the guest is told to
+    /// trust.
+    #[test]
+    fn inspect_rules_reach_the_policy_and_make_a_ca() {
+        let file = "allow api.example.com:443\ninspect api.example.com:443\n";
+        let policy = super::build_policy(
+            Some((Path::new("p"), file)),
+            &[],
+            &strings(&["example.com"]),
+            &strings(&["127.0.0.1:8443", "*.model.example"]),
+        )
+        .unwrap();
+        let texts: Vec<&str> = policy.inspect.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "inspect api.example.com:443",
+                "inspect 127.0.0.1:8443",
+                "inspect *.model.example",
+            ]
+        );
+        assert_eq!(policy.rules.len(), 2);
+        let error = super::build_policy(None, &[], &[], &strings(&["exa_mple.com"])).unwrap_err();
+        assert!(error.starts_with("--inspect \"exa_mple.com\": "), "{error}");
+
+        let id: SessionId = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f".parse().unwrap();
+        let ca = session_ca(&policy, &id).unwrap().expect("a CA");
+        assert!(ca.pem().starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(!ca.pem().contains("PRIVATE KEY"));
+        assert_eq!(ca.fingerprint_sha256().len(), 64);
+    }
+
+    #[test]
+    fn no_inspect_means_no_ca() {
+        let id: SessionId = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f".parse().unwrap();
+        let policy = build_policy(None, &[], &strings(&["example.com"])).unwrap();
+        assert!(policy.inspect.is_empty());
+        assert!(session_ca(&policy, &id).unwrap().is_none());
+    }
+
     /// The policy is the file's lines, then each `--deny`, then each
     /// `--allow`, in the order given; deny by default unless the file says
     /// otherwise.
-    use boxcar_net::Verdict;
-
     #[test]
     fn the_policy_is_the_file_then_the_denies_then_the_allows() {
         let file = "# the team's rules\nallow api.example.com:443\n\ndeny *.ads.example\n";
@@ -1303,7 +1377,7 @@ mod tests {
         assert_eq!(
             error,
             "--policy-file /etc/team.policy line 3: \"frobnicate\" is not a rule; a rule \
-             starts with allow, deny or default"
+             starts with allow, deny, inspect or default"
         );
         let error = build_policy(
             Some((Path::new("p"), "allow a.example\n")),

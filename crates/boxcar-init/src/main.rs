@@ -45,6 +45,7 @@ mod sensor;
 mod session;
 mod shutdown;
 mod sysctl;
+mod trust;
 mod vsock;
 
 use std::collections::BTreeMap;
@@ -210,6 +211,19 @@ fn run_configured(
     ctl::check_config(config)?;
     sethostname(&config.hostname).step(&format!("sethostname {}", config.hostname))?;
     sysctl::apply_config(&config.sysctls);
+    if let Some(ca_pem) = &config.ca_pem {
+        // The session can run without it: its inspected connections then
+        // fail inside the guest, which is what the gate's records show.
+        match trust::install(ca_pem) {
+            Ok(installed) if !installed.bound => warn(&format!(
+                "trust: the root filesystem has no {}; the session CA is in {} only",
+                trust::STORE,
+                trust::DIR
+            )),
+            Ok(_) => {}
+            Err(failed) => warn(&format!("trust: {failed}")),
+        }
+    }
 
     // Everything the child needs, before the fork.
     let env = pty::session_env(config);

@@ -4,7 +4,10 @@
 # Zlib: foldhash, hashbrown's hasher, reached through aya and object (M3, the
 # guest sensor and the eBPF lane); permissive, with no notice requirement
 # beyond the source.
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "0BSD", "Zlib"]
+# ISC: ring (`Apache-2.0 AND ISC`), rustls-webpki and untrusted, reached
+# through rustls and rcgen (M4, the model traffic gate); permissive, a notice
+# requirement like MIT's.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "0BSD", "Zlib", "ISC"]
 
 [bans]
 multiple-versions = "deny"
@@ -19,6 +22,7 @@ skip = [
     { crate = "nix:^0.24", reason = "fuse-backend-rs 0.14.0 requires nix 0.24; boxcar-init (guest only) uses nix 0.31 and the two never link into one binary" },
     { crate = "syn:^2", reason = "tracing-attributes 0.1.31 still uses syn 2 while serde_derive, thiserror-impl and clap_derive use syn 3; proc macros, build time only" },
     { crate = "windows-sys:^0.48", reason = "mio 0.8 (via fuse-backend-rs 0.14.0) requires windows-sys 0.48; Windows is not a target, so it never builds" },
+    { crate = "getrandom:^0.2", reason = "ring 0.17 (rustls, rcgen: the model traffic gate) requires getrandom 0.2; uuid 1 uses getrandom 0.4" },
 ]
 # The same for a whole subtree: the crate, and the windows-targets set under it.
 skip-tree = [

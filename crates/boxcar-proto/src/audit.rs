@@ -723,6 +723,7 @@ mod tests {
                             host_root: "/tmp/ws".into(),
                         },
                     ],
+                    inspect_ca_sha256: Some("ab".repeat(32)),
                 }),
                 json!({
                     "version": "0.1.0",
@@ -735,6 +736,7 @@ mod tests {
                         {"tag": "root", "host_root": "/k/rootfs"},
                         {"tag": "workspace", "host_root": "/tmp/ws"},
                     ],
+                    "inspect_ca_sha256": "ab".repeat(32),
                 }),
             ),
             (
@@ -1491,6 +1493,7 @@ mod tests {
                     vcpus: 1,
                     mem_mib: 128,
                     shares: Vec::new(),
+                    inspect_ca_sha256: None,
                 }),
                 json!({
                     "version": "0.1.0",

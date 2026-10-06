@@ -33,7 +33,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
-use boxcar_net::{NetConfig, Policy};
+use boxcar_net::{NetConfig, Policy, SessionCa};
 use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
@@ -220,6 +220,11 @@ pub struct VmConfig {
     pub session: SessionConfig,
     /// The control socket, if any: see [`ControlConfig`].
     pub control: Option<ControlConfig>,
+    /// The session's CA, when its policy has an `inspect` rule: the gate
+    /// signs its leaf certificates with it, `vmm.start` records its
+    /// fingerprint, and `session.ca_pem` (set by `boxcar run`) carries its
+    /// certificate to the guest. Its key never leaves this process.
+    pub inspect_ca: Option<Arc<SessionCa>>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -264,6 +269,7 @@ impl VmConfig {
             sensor: true,
             session: SessionConfig::for_user(shell, uid, gid),
             control: None,
+            inspect_ca: None,
         }
     }
 }
@@ -557,6 +563,10 @@ impl Vmm {
             vcpus: u32::from(cfg.vcpus),
             mem_mib: cfg.mem_mib,
             shares: share_refs(&cfg.fs_shares),
+            inspect_ca_sha256: cfg
+                .inspect_ca
+                .as_ref()
+                .map(|ca| ca.fingerprint_sha256().to_owned()),
         };
         tracing::debug!("vmm.start: {start:?}");
         cfg.audit.emit(Submission {

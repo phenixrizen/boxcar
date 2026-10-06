@@ -200,3 +200,31 @@ Made while writing the plan, 2026-10-06:
 - **Ring 1 TLS events carry sizes and times, never bytes**: the sensor cannot know which bytes are a credential, and the gate already has the plaintext in ring 0. Their use is to name the process behind a request.
 - **Dump mode covers the network only**; `--audit-level verbose` is already the filesystem's dump. Nothing in the dump is chained; it is a debugging aid.
 - **The agents' guest is Debian** because the native Claude Code build needs glibc; Alpine stays the stock guest and the one the KVM-free parts of the suite assume. The agent tests need credentials from the host environment and skip without them; CI never has them.
+
+### Task 1
+
+- `inspect` lines live in their own list (`Policy.inspect: Vec<Inspect>`,
+  `NetPolicy.inspect`) rather than as a third `RuleKind` on `Rule`: no
+  decision path can mistake one for a rule, and the verdict code is
+  untouched. `Policy::inspects` is the one reader.
+- rcgen is used without its `pem` feature, which would bring `base64 0.23`
+  beside the workspace's `0.22`; the PEM block is written in `gate/ca.rs`.
+  `time` (for the validity dates rcgen takes) and `ring` (for the SHA-256
+  fingerprint) are direct dependencies at the versions rustls uses.
+  `getrandom 0.2` (ring) is skipped in `deny.toml` beside uuid's `0.4`.
+- rcgen's `Ia5String` takes any ASCII as a DNS SAN, so a leaf's name is
+  checked as a DNS name (`rustls_pki_types::DnsName`) first; a server name
+  that is not one is refused, never signed.
+- `SessionConfig::validate` checks `ca_pem` on both sides of the guest
+  channel: ASCII, at most 8 KiB, a `CERTIFICATE` block, nothing that says
+  `PRIVATE KEY`. The field is omitted from the line when unset, so the
+  guest protocol's golden lines are unchanged.
+- The `policy.inspect` capability lands here, where the protocol starts
+  carrying inspect lines; `spans` waits for Task 5.
+- Init makes no directory in the root share: a rootfs without
+  `/etc/ssl/certs` gets the CA on `/run` and the variables only, and the
+  console says so. Alpine's bundle ends in a blank line; the bundle keeps
+  the store's text as it is and appends the CA after it.
+- The gated test is in `boot_session` (the VMM's `VmConfig`), beside the
+  session tests, with the CA made by the test; `boxcar run --inspect` is
+  covered by unit tests here and by the M4 gated suite from Task 2 on.

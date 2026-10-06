@@ -9,7 +9,8 @@
 //! [`Ops::dispatch`]: the VMM's serves `pty.attach`, `pty.watch` and
 //! `pty.resize` (the hello's capability `pty`), `audit.subscribe` (the
 //! capability `audit`), and `policy.get` and `policy.update` (the
-//! capability `policy.net`).
+//! capabilities `policy.net`, and `policy.inspect` for the `inspect`
+//! lines they carry).
 //!
 //! ## `pty.attach`
 //!
@@ -349,6 +350,7 @@ impl Ops for VmmOps {
             "pty".to_owned(),
             "audit".to_owned(),
             "policy.net".to_owned(),
+            "policy.inspect".to_owned(),
             "findings".to_owned(),
         ]
     }
@@ -519,7 +521,7 @@ mod tests {
         assert_eq!(ops.status(), handle.status());
         assert_eq!(
             ops.capabilities(),
-            ["pty", "audit", "policy.net", "findings"]
+            ["pty", "audit", "policy.net", "policy.inspect", "findings"]
         );
 
         let mut conn = ConnCtx::new(1, 0);
@@ -644,7 +646,7 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net", "findings"])
+            json!(["pty", "audit", "policy.net", "policy.inspect", "findings"])
         );
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
         assert_eq!(response["result"]["raw"], true, "{response}");
@@ -970,7 +972,7 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net", "findings"])
+            json!(["pty", "audit", "policy.net", "policy.inspect", "findings"])
         );
 
         // The response comes first, though the log has records to send.
@@ -1222,13 +1224,13 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net", "findings"])
+            json!(["pty", "audit", "policy.net", "policy.inspect", "findings"])
         );
         let before = wire.request("policy.get", Value::Null);
         assert_eq!(
             before["result"],
             json!({
-                "net": {"default": "deny", "allow": [], "deny": []},
+                "net": {"default": "deny", "allow": [], "deny": [], "inspect": []},
                 "vsock": {"allow_ports": []},
                 "version": 1,
             }),
@@ -1256,7 +1258,7 @@ mod tests {
         assert_eq!(
             after["result"],
             json!({
-                "net": {"default": "deny", "allow": ["api.github.com:443"], "deny": ["evil.example"]},
+                "net": {"default": "deny", "allow": ["api.github.com:443"], "deny": ["evil.example"], "inspect": []},
                 "vsock": {"allow_ports": [5000]},
                 "version": 2,
             }),

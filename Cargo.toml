@@ -67,6 +67,17 @@ aya = "0.14"
 aya-obj = "0.3"
 aya-build = "0.2"
 
+# The model traffic gate (M4): rustls on the `ring` provider for both TLS
+# legs, rcgen for the session CA and its leaves, ring's digest for the CA's
+# fingerprint. `aws-lc-sys` stays banned (deny.toml); ring builds C and
+# assembly through `cc` on the host only, as blake3 does.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17"
+# Certificate validity (rcgen takes `time` types); the PEM is written here.
+time = { version = "0.3", default-features = false, features = ["std"] }
+
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-raw"] }
 socket2 = { version = "0.5", features = ["all"] }
 arc-swap = "1"

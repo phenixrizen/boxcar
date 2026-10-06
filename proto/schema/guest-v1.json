@@ -174,6 +174,13 @@
                 "type": "string"
               }
             },
+            "ca_pem": {
+              "description": "The session CA's certificate as PEM, when the session's policy has an `inspect` rule: init writes it to `/run/boxcar/ca.pem`, puts it in the guest's trust store and names it in the session's environment. The certificate only, never a key; at most [`MAX_CA_PEM`] bytes. Absent (and omitted) otherwise.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cols": {
               "type": "integer",
               "format": "uint16",
@@ -373,6 +380,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "ca_pem": {
+          "description": "The session CA's certificate as PEM, when the session's policy has an `inspect` rule: init writes it to `/run/boxcar/ca.pem`, puts it in the guest's trust store and names it in the session's environment. The certificate only, never a key; at most [`MAX_CA_PEM`] bytes. Absent (and omitted) otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "cols": {
           "type": "integer",

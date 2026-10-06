@@ -63,12 +63,15 @@ pub enum Kind {
     Missing,
 }
 
-/// The two lookups [`follow`] makes, of absolute guest paths.
+/// The lookups [`follow`] makes, of absolute guest paths, and the read
+/// the trust store needs (`crate::trust`).
 pub trait Lookup {
     /// What is at `path`, as `lstat(2)` sees it.
     fn kind(&self, path: &Path) -> io::Result<Kind>;
     /// The target of the link at `path`, as written.
     fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
+    /// The whole of the file at `path`, as text.
+    fn read_to_string(&self, path: &Path) -> io::Result<String>;
 }
 
 /// The guest's filesystem, as the directory `root` holds it: `/` for init;
@@ -104,6 +107,10 @@ impl Lookup for Rooted<'_> {
 
     fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
         fs::read_link(self.host(path))
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        fs::read_to_string(self.host(path))
     }
 }
 
@@ -200,7 +207,7 @@ pub enum Step {
     /// Write `text` as the whole of the file `path`, with `mode`.
     Write {
         path: PathBuf,
-        text: &'static str,
+        text: String,
         mode: u32,
     },
     /// Create `path` empty, with `mode`, unless something is there.
@@ -220,7 +227,7 @@ pub fn plan(lookup: &impl Lookup) -> Result<Vec<Step>, String> {
         },
         Step::Write {
             path: FILE.into(),
-            text: TEXT,
+            text: TEXT.to_owned(),
             mode: 0o644,
         },
     ];
@@ -260,7 +267,8 @@ pub fn set_up() -> Result<(), Failed> {
     steps.iter().try_for_each(run)
 }
 
-fn run(step: &Step) -> Result<(), Failed> {
+/// Runs one step; `crate::trust` runs its steps the same way.
+pub(crate) fn run(step: &Step) -> Result<(), Failed> {
     match step {
         Step::Mkdir { path, mode } => make_dir(path, *mode),
         Step::Write { path, text, mode } => {
@@ -387,7 +395,7 @@ mod tests {
             mkdir("/run/boxcar"),
             Step::Write {
                 path: FILE.into(),
-                text: "nameserver 10.0.2.2\n",
+                text: "nameserver 10.0.2.2\n".to_owned(),
                 mode: 0o644,
             },
         ]

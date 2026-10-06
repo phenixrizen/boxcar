@@ -24,6 +24,15 @@ socket2 = { workspace = true }
 libc = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }
+# The gate (M4): the session CA and its leaves, and the TLS legs.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+time = { workspace = true }
+# The CA's PEM and its fingerprint's hex.
+base64 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

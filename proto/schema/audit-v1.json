@@ -2897,6 +2897,13 @@
             }
           ]
         },
+        "inspect_ca_sha256": {
+          "description": "SHA-256 of the session CA's certificate (DER), lowercase hex, when the session's policy has an `inspect` rule: the authority the guest was told to trust for the gate's certificates. Omitted when the session has none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "kernel": {
           "$ref": "#/definitions/ArtifactRef"
         },

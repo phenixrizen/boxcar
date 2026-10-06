@@ -88,6 +88,12 @@ pub struct VmmStart {
     /// and read as none when absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<ShareRef>,
+    /// SHA-256 of the session CA's certificate (DER), lowercase hex, when
+    /// the session's policy has an `inspect` rule: the authority the guest
+    /// was told to trust for the gate's certificates. Omitted when the
+    /// session has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect_ca_sha256: Option<String>,
 }
 
 /// `vmm.stop`: the VM stopped.

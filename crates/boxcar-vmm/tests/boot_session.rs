@@ -44,11 +44,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{verify_session, LogReader, WriterConfig};
 use boxcar_fs::{CachePolicyKind, FsShareConfig};
+use boxcar_net::SessionCa;
 use boxcar_proto::guest::HostMsg;
 use boxcar_proto::{Record, SessionId};
 use boxcar_vmm::guest_ctl::SessionConfig;
@@ -190,6 +192,15 @@ impl Beside {
 /// writing to `session.out` and the control socket in `state/`; `during` runs beside
 /// the VM. A watchdog stops a VM that does not end within [`LIMIT`].
 fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Run> {
+    run_with(argv, None, during)
+}
+
+/// [`run`], with the session CA the guest is told to trust, when given.
+fn run_with(
+    argv: &[&str],
+    ca: Option<Arc<SessionCa>>,
+    during: impl FnOnce(Beside) + Send + 'static,
+) -> Option<Run> {
     let (kernel, initramfs, rootfs) = guest_or_skip(TEST)?;
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -202,6 +213,8 @@ fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Ru
     // SAFETY: getuid and getgid take no arguments and cannot fail.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let argv: Vec<String> = argv.iter().map(|&a| a.to_owned()).collect();
+    let mut session = SessionConfig::for_user(argv, uid, gid);
+    session.ca_pem = ca.as_ref().map(|ca| ca.pem().to_owned());
     let cfg = VmConfig {
         cmdline_extra: vec!["boxcar.mode=vsock".into()],
         console: ConsoleOut::File(dir.path().join("console.log")),
@@ -212,11 +225,12 @@ fn run(argv: &[&str], during: impl FnOnce(Beside) + Send + 'static) -> Option<Ru
             share("workspace", workspace, "/workspace", CachePolicyKind::Auto),
         ],
         vsock: Some(VsockConfig::new(state.join("vsock.sock"))),
-        session: SessionConfig::for_user(argv, uid, gid),
+        session,
         control: Some(ControlConfig {
             state_dir: state.clone(),
             session_id: SessionId::new(),
         }),
+        inspect_ca: ca,
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -476,6 +490,106 @@ fn a_resize_reaches_the_session() {
     let out = run.text("session.out");
     let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
     assert_eq!(lines, ["24 80", "READY", "40 120"], "{}", run.describe());
+}
+
+/// With a session CA, the guest has the certificate, and only that, on
+/// its `/run` tmpfs; its trust store ends with it; the session's
+/// environment names both files; and `vmm.start` carries the CA's
+/// fingerprint. The key never travels.
+#[test]
+fn the_guest_trusts_the_session_ca() {
+    let ca = Arc::new(SessionCa::generate("boot-session-test").unwrap());
+    // The markers are not dashes: a PEM line starts with those.
+    let script = "echo ===CA; cat /run/boxcar/ca.pem; echo ===STORE; \
+                  tail -c 1200 /etc/ssl/certs/ca-certificates.crt; echo; echo ===ENV; \
+                  env | grep -E '^(SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|CURL_CA_BUNDLE|\
+                  REQUESTS_CA_BUNDLE|GIT_SSL_CAINFO)=' | sort; echo ===LS; \
+                  cd /run/boxcar && for f in *; do echo \"$f\"; done";
+    let Some(run) = run_with(&["/bin/sh", "-c", script], Some(ca.clone()), |_| {}) else {
+        return;
+    };
+    assert_eq!(exit_code_for(&run.exit), 0, "{}", run.describe());
+    let out = run.text("session.out");
+    let section = |name: &str| -> Vec<String> {
+        let marker = format!("==={name}");
+        out.lines()
+            .map(str::trim_end)
+            .skip_while(|line| *line != marker)
+            .skip(1)
+            .take_while(|line| !line.starts_with("==="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let pem: Vec<&str> = ca.pem().lines().collect();
+    assert_eq!(
+        section("CA"),
+        pem,
+        "{}\n--- session.out:\n{out}\n--- console.log:\n{}",
+        run.describe(),
+        run.text("console.log")
+    );
+    // `tail` then `echo` leave a blank line after the store's own newline.
+    let mut store = section("STORE");
+    while store.last().is_some_and(String::is_empty) {
+        store.pop();
+    }
+    assert!(
+        store.len() > pem.len() && store[store.len() - pem.len()..] == pem,
+        "the store does not end with the CA: {store:?}"
+    );
+    assert_eq!(
+        section("ENV"),
+        [
+            "CURL_CA_BUNDLE=/run/boxcar/ca-bundle.pem",
+            "GIT_SSL_CAINFO=/run/boxcar/ca-bundle.pem",
+            "NODE_EXTRA_CA_CERTS=/run/boxcar/ca.pem",
+            "REQUESTS_CA_BUNDLE=/run/boxcar/ca-bundle.pem",
+            "SSL_CERT_FILE=/run/boxcar/ca-bundle.pem",
+        ],
+        "{}",
+        run.describe()
+    );
+    assert_eq!(
+        section("LS"),
+        ["ca-bundle.pem", "ca.pem"],
+        "{}",
+        run.describe()
+    );
+    assert!(
+        !run.text("console.log").contains("trust:"),
+        "{}",
+        run.describe()
+    );
+    let records = run.records();
+    let start = of_kind(&records, "vmm.start");
+    assert_eq!(
+        start[0].data["inspect_ca_sha256"],
+        serde_json::json!(ca.fingerprint_sha256()),
+        "{:?}",
+        start[0]
+    );
+}
+
+/// Without a CA the guest gets no trust files and no variables, and
+/// `vmm.start` carries no fingerprint.
+#[test]
+fn without_a_ca_the_guest_has_no_trust_files() {
+    let script = "if [ -e /run/boxcar ]; then echo HAVE; else echo NONE; fi; \
+                  env | grep -c -E '^(SSL_CERT_FILE|NODE_EXTRA_CA_CERTS)='; true";
+    let Some(run) = run(&["/bin/sh", "-c", script], |_| {}) else {
+        return;
+    };
+    assert_eq!(exit_code_for(&run.exit), 0, "{}", run.describe());
+    let out = run.text("session.out");
+    let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+    assert_eq!(lines, ["NONE", "0"], "{}", run.describe());
+    let records = run.records();
+    let start = of_kind(&records, "vmm.start");
+    assert!(
+        start[0].data.get("inspect_ca_sha256").is_none(),
+        "{:?}",
+        start[0]
+    );
 }
 
 /// `signal` through the control channel: `SIGINT` to the session's process

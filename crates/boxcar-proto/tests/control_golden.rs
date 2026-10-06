@@ -103,7 +103,7 @@ fn every_golden_line_parses_as_what_it_is_and_everything_appears() {
                     assert_eq!(hello.versions, [1]);
                     assert_eq!(
                         hello.capabilities,
-                        ["pty", "audit", "policy.net", "findings"]
+                        ["pty", "audit", "policy.net", "policy.inspect", "findings"]
                     );
                 }
                 "state" => {

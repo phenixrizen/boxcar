@@ -448,10 +448,20 @@ pub struct RunArgs {
     #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
     pub deny: Vec<String>,
     /// Read policy rules from PATH, one a line: `allow RULE`, `deny RULE`,
-    /// and at most one `default allow` or `default deny` (deny if none
-    /// says); `#` starts a comment. Its rules come first.
+    /// `inspect RULE`, and at most one `default allow` or `default deny`
+    /// (deny if none says); `#` starts a comment. Its rules come first.
     #[arg(long, value_name = "PATH", conflicts_with = "no_net")]
     pub policy_file: Option<PathBuf>,
+    /// Watch the guest's traffic to RULE, written as for `--allow` (which
+    /// must still admit it): a connection whose name, or address for a
+    /// CIDR rule, matches ends its TLS in boxcar, which connects to the
+    /// real host itself, hands the guest a certificate from this session's
+    /// CA (init puts the CA in the guest's trust store), relays the
+    /// plaintext unchanged and records the HTTP exchanges and the model
+    /// API calls it knows. The agent keeps its own credential; nothing is
+    /// injected. Repeatable.
+    #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
+    pub inspect: Vec<String>,
     /// Where the guest's DNS queries are forwarded: an address, on port 53
     /// unless given as `ip:port`. Repeatable, in order of preference.
     /// Default: the nameservers in the host's /etc/resolv.conf.
@@ -625,6 +635,7 @@ mod tests {
         for flag in [
             ["--allow", "a.example"],
             ["--deny", "a.example"],
+            ["--inspect", "a.example"],
             ["--policy-file", "p"],
             ["--dns", "9.9.9.9"],
         ] {

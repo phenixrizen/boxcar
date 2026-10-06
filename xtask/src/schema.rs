@@ -412,7 +412,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
         out.extend(message.line()?);
         Ok(())
     };
-    let capabilities = ["pty", "audit", "policy.net", "findings"]
+    let capabilities = ["pty", "audit", "policy.net", "policy.inspect", "findings"]
         .map(str::to_owned)
         .to_vec();
     line(&Ready {
@@ -515,6 +515,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
                 .map(str::to_owned)
                 .to_vec(),
             deny: vec!["10.0.0.0/8".to_owned()],
+            inspect: vec!["api.anthropic.com:443".to_owned()],
         },
         vsock: VsockPolicy {
             allow_ports: vec![5000],
@@ -532,6 +533,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
                     .map(str::to_owned)
                     .to_vec(),
                 deny: vec!["10.0.0.0/8".to_owned()],
+                inspect: vec!["api.anthropic.com:443".to_owned()],
             }),
             vsock: None,
         })?,

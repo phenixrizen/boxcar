@@ -298,7 +298,7 @@
       ],
       "properties": {
         "capabilities": {
-          "description": "The op families the server serves beyond `status` and `stop`, such as `pty`, `audit` and `policy.net`.",
+          "description": "The op families the server serves beyond `status` and `stop`, such as `pty`, `audit`, `policy.net` and `policy.inspect`.",
           "type": "array",
           "items": {
             "type": "string"
@@ -336,7 +336,7 @@
       }
     },
     "NetPolicy": {
-      "description": "The network policy as `policy.get` reports it and `policy.update` takes it: `{\"default\":\"deny\",\"allow\":[\"example.com:443\"],\"deny\":[\"10.0.0.0/8\"]}`. Each rule is a target as `boxcar run --allow` takes it: `name[:port]`, `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The policy in force puts every deny before every allow, in the order given, as `boxcar run` orders `--deny` and `--allow`: the first rule that matches decides, so a deny wins over an allow of the same target. A policy file whose allows and denies are interleaved reads back from `policy.get` in this shape, which is the same policy only when no allow before a deny matches what the deny does.",
+      "description": "The network policy as `policy.get` reports it and `policy.update` takes it: `{\"default\":\"deny\",\"allow\":[\"example.com:443\"],\"deny\":[\"10.0.0.0/8\"], \"inspect\":[\"api.example.com:443\"]}`. Each rule is a target as `boxcar run --allow` takes it: `name[:port]`, `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The policy in force puts every deny before every allow, in the order given, as `boxcar run` orders `--deny` and `--allow`: the first rule that matches decides, so a deny wins over an allow of the same target. A policy file whose allows and denies are interleaved reads back from `policy.get` in this shape, which is the same policy only when no allow before a deny matches what the deny does.",
       "type": "object",
       "required": [
         "default"
@@ -356,6 +356,14 @@
         },
         "deny": {
           "description": "The deny rules, as targets, in order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inspect": {
+          "description": "The inspect lines, as targets, in order: destinations whose TLS the gate ends and whose traffic it observes, once an allow rule admitted the connection. They decide no verdict. Absent in older servers' views.",
           "default": [],
           "type": "array",
           "items": {
