@@ -185,6 +185,12 @@ pub struct Span {
     settled: bool,
     /// The `argv` rule fired: once a span.
     argv_fired: bool,
+    /// A shell the span took by ancestry alone whose command does not
+    /// carry the declared one: (the shell, its exec's seq, its host time,
+    /// its command). Judged at the close.
+    mismatch: Option<(ProcKey, u64, u64, String)>,
+    /// An exec that carries the declared command joined the span.
+    carried: bool,
     /// Its `span.effects` was written.
     recorded: bool,
 }
@@ -219,6 +225,8 @@ impl Span {
             worst_score: 0,
             settled: false,
             argv_fired: false,
+            mismatch: None,
+            carried: false,
             recorded: false,
         }
     }
@@ -233,6 +241,19 @@ impl Span {
 
     fn is_write_tool(&self) -> bool {
         WRITE_TOOLS.contains(&self.tool_name.as_str())
+    }
+
+    /// An exec joined the span: notes whether it ran the declared command.
+    fn note_exec(&mut self, argv: &[String]) {
+        if let Some(declared) = self.declared.as_deref() {
+            if carries(
+                shell_command(argv).as_deref(),
+                &normalize(&argv.join(" ")),
+                declared,
+            ) {
+                self.carried = true;
+            }
+        }
     }
 
     fn has_member(&self, key: ProcKey) -> bool {
@@ -568,7 +589,7 @@ impl Spans {
         span.closed = Some((record.seq, record.ts_host_ns));
         span.status = Some(close.status.clone());
         self.open.retain(|open| open != id);
-        let mut findings = Vec::new();
+        let mut findings = self.argv_at_close(state, id);
         if close.status == "ok" {
             findings.extend(self.hidden_net(state, id, record));
         }
@@ -591,6 +612,7 @@ impl Spans {
         if let Some(id) = self.by_proc.get(&key).cloned() {
             // A member that exec'd again (a shell running its command).
             if let Some(span) = self.spans.get_mut(&id) {
+                span.note_exec(&exec.argv);
                 span.push_effect(Effect {
                     seq,
                     kind: EffectKind::Exec,
@@ -835,6 +857,11 @@ impl Spans {
                 return;
             }
             span.members.push(Member { key, exec_seq });
+            if exec_seq.is_some() {
+                if let Some(proc) = state.proc(key) {
+                    span.note_exec(&proc.argv);
+                }
+            }
             if let Some(seq) = exec_seq {
                 span.push_effect(Effect {
                     seq,
@@ -988,38 +1015,59 @@ impl Spans {
 
     // --- the rules
 
-    /// `intent_effect_mismatch` / `argv`: a shell tool's span took a shell
-    /// by ancestry alone, and the command the shell was given does not
-    /// carry the declared one.
+    /// Notes a shell the span took by ancestry alone whose command does
+    /// not carry the declared one; [`Spans::argv_at_close`] judges it.
     fn judge_argv(
         &mut self,
-        state: &State,
+        _state: &State,
         id: &str,
         key: ProcKey,
         exec_seq: u64,
         ts: u64,
         argv: &[String],
     ) -> Vec<Finding> {
-        let Some(span) = self.spans.get(id) else {
+        let Some(span) = self.spans.get_mut(id) else {
             return Vec::new();
         };
         let Some(declared) = span.declared.clone() else {
             return Vec::new();
         };
-        if !span.is_shell_tool() || span.argv_fired {
+        if !span.is_shell_tool() || span.mismatch.is_some() {
             return Vec::new();
         }
         let Some(command) = shell_command(argv) else {
             return Vec::new();
         };
         if carries(Some(&command), &normalize(&argv.join(" ")), &declared) {
+            span.carried = true;
             return Vec::new();
         }
+        span.mismatch = Some((key, exec_seq, ts, command));
+        Vec::new()
+    }
+
+    /// `intent_effect_mismatch` / `argv`, at the close: a shell tool's span
+    /// took a shell by ancestry alone whose command does not carry the
+    /// declared one, and no exec in the span ever carried it (a runtime's
+    /// helper shell before the command, as Claude Code under Node runs
+    /// `bash -c env`, is no mismatch).
+    fn argv_at_close(&mut self, state: &State, id: &str) -> Vec<Finding> {
+        let Some(span) = self.spans.get(id) else {
+            return Vec::new();
+        };
+        if span.carried || span.argv_fired {
+            return Vec::new();
+        }
+        let (Some((key, exec_seq, ts, command)), Some(declared)) =
+            (span.mismatch.clone(), span.declared.clone())
+        else {
+            return Vec::new();
+        };
         let opened_seq = span.opened.0;
         let tool = span.tool_name.clone();
         let summary = format!(
             "the {tool} tool call {id} declared \"{}\", but the shell it ran (pid {}) was given \
-             \"{}\"",
+             \"{}\", and nothing in the call ran the declared command",
             quote(&declared),
             key.tgid,
             quote(&command)

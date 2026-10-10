@@ -227,7 +227,7 @@ inspected above.) Afterwards `boxcar
 spans` lists the tool calls, and the log holds, for the Bash call, the
 exec of the shell with that command and the close of the file it wrote,
 in one chain. The gated tests `claude_code_native_runs_a_bash_tool_inside`,
-`claude_code_under_node_runs_a_bash_tool_inside` and
+`claude_code_from_npm_runs_a_bash_tool_inside` and
 `codex_runs_a_shell_tool_inside` do exactly this, and skip without the
 Debian guest or a credential.
 

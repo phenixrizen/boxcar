@@ -1410,3 +1410,27 @@ fn the_sensors_own_reads_are_not_unattributed() {
         "neither the sensor's reads nor the unknown thread's write joined a shell tool's span"
     );
 }
+
+/// A runtime's helper shell before the command (Claude Code under Node
+/// runs `bash -c env` first) is no argv mismatch once the declared
+/// command ran in the same call.
+#[test]
+fn a_helper_shell_before_the_command_is_no_mismatch() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let command = "echo boxcar-m4 > marker.txt";
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": command})));
+    steps.push(log.exec(2100, 330, 100, 10, &["bash", "-c", "env"]));
+    steps.push(log.exit(2150, 330, 10));
+    steps.push(log.exec(2200, 331, 100, 11, &["bash", "-c", command]));
+    steps.push(log.exit(2300, 331, 11));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    assert_eq!(spans_of(&out)[0].procs, [330, 331]);
+}

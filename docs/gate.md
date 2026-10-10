@@ -142,7 +142,7 @@ look at it. Filesystem traffic has its own dump: `--audit-level verbose`.
 
 ## Running an agent inside
 
-Claude Code (the native build, or the npm build under Node) and Codex run
+Claude Code (installed natively or from npm, which since 2.1 installs the same native build) and Codex run
 inside on their own account logins: the agent presents its token to the
 provider as it would anywhere, over a connection the gate inspects, and
 boxcar records what was asked and what was answered without ever holding

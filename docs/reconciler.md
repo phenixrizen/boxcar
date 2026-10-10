@@ -101,7 +101,7 @@ inside each.
 | `network_anomaly` | `dns_entropy` | 20 or more queries within 10 s whose first labels carry over 3.5 bits of entropy on average; then quiet for 10 s | 70 |
 | `privilege_probe` | `lsm_deny` | any `proc.lsm_deny`: a `bpf()` call, or a signal to the sensor, refused | 80 |
 | `policy_denial` | `policy_denial` | `net.dns`, `net.connect`, `net.tls`, `net.udp` or `vsock.connect` with `verdict: "deny"`, or `fs.denied` | 40 |
-| `intent_effect_mismatch` | `argv` | a shell tool's span took a shell by ancestry alone (it was the only open span), and the command the shell was given does not carry the declared one; once a span | 70 |
+| `intent_effect_mismatch` | `argv` | a shell tool's span took a shell by ancestry alone (it was the only open span) whose command does not carry the declared one, and no exec in the span carried the declared command by its close (a runtime's helper shell before the command is no mismatch); once a span | 70 |
 | `intent_effect_mismatch` | `phantom_write` | a write tool's call said `ok`, and a second after its close no `fs.create`, `fs.close` with bytes written, `fs.rename` or `fs.unlink` among its effects touched a declared path (`file_path`, `notebook_path`, `path`, `filename`, or the files an `apply_patch` names) | 65 |
 | `intent_effect_mismatch` | `hidden_net` | a span's process made an allowed `net.connect` whose names and address appear nowhere in the call's arguments, and the call said `ok`; judged at the close | 55 |
 | `orphaned_work` | `orphaned_work` | a span's process is still running a second after the span closed, while the sensor reports exits; once a span | 50 |

@@ -782,13 +782,43 @@ fn debian_guest_or_skip(test: &str) -> Option<kvm_harness::Guest> {
     })
 }
 
-/// The Claude Code token from the host's environment, or `None` after
-/// saying why the test skips. Its value is passed on and never printed.
+/// The Claude Code token, or `None` after saying why the test skips: the
+/// host's `CLAUDE_CODE_OAUTH_TOKEN`, else the access token of the host's
+/// own Claude Code login (`~/.claude/.credentials.json`) while it has at
+/// least ten minutes left. Only the access token goes to the guest, never
+/// the refresh token, so nothing in the guest can rotate the host's login.
+/// Its value is passed on and never printed.
 fn claude_token_or_skip(test: &str) -> Option<String> {
-    match std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-        Ok(token) if !token.is_empty() => Some(token),
-        _ => {
-            eprintln!("skipping {test}: CLAUDE_CODE_OAUTH_TOKEN is not set (claude setup-token)");
+    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    let login = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".claude/.credentials.json"))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let oauth = login.as_ref().map(|login| &login["claudeAiOauth"]);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match oauth.and_then(|o| Some((o["accessToken"].as_str()?, o["expiresAt"].as_u64()?))) {
+        Some((token, expires)) if expires > now_ms + 10 * 60 * 1000 && !token.is_empty() => {
+            Some(token.to_owned())
+        }
+        Some(_) => {
+            eprintln!(
+                "skipping {test}: the local Claude Code login expires within 10 minutes; run \
+                 claude once to refresh it, or set CLAUDE_CODE_OAUTH_TOKEN"
+            );
+            None
+        }
+        None => {
+            eprintln!(
+                "skipping {test}: neither CLAUDE_CODE_OAUTH_TOKEN nor a local Claude Code login \
+                 (claude setup-token)"
+            );
             None
         }
     }
@@ -946,14 +976,16 @@ fn claude_code_native_runs_a_bash_tool_inside() {
     check_agent_run(&run, "anthropic", &scratch, &token);
 }
 
-/// Claude Code under Node runs a Bash tool inside; Node exports OpenSSL's
-/// functions, so ring 1 sees its TLS too.
+/// Claude Code from npm runs a Bash tool inside. Since 2.1 the npm package
+/// installs the same native build (`bin/claude.exe`), not a Node script,
+/// so this is the npm installation path rather than a second runtime;
+/// Node's own TLS is `node_tls_is_seen_by_both_rings`.
 #[test]
-fn claude_code_under_node_runs_a_bash_tool_inside() {
-    let Some(guest) = debian_guest_or_skip("claude_code_under_node_runs_a_bash_tool_inside") else {
+fn claude_code_from_npm_runs_a_bash_tool_inside() {
+    let Some(guest) = debian_guest_or_skip("claude_code_from_npm_runs_a_bash_tool_inside") else {
         return;
     };
-    let Some(token) = claude_token_or_skip("claude_code_under_node_runs_a_bash_tool_inside") else {
+    let Some(token) = claude_token_or_skip("claude_code_from_npm_runs_a_bash_tool_inside") else {
         return;
     };
     let scratch = Scratch::new();
@@ -985,31 +1017,68 @@ fn claude_code_under_node_runs_a_bash_tool_inside() {
     .finish();
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     check_agent_run(&run, "anthropic", &scratch, &token);
+}
+
+/// Node exports OpenSSL's functions, so ring 1 sees a Node program's TLS:
+/// in the Debian guest, `node` fetches an inspected page twice; the
+/// sensor attaches to the `node` binary, reports its writes and reads, and
+/// the gate's `http.request` of the second fetch has a write of its size
+/// within 500 ms.
+#[test]
+fn node_tls_is_seen_by_both_rings() {
+    let Some(guest) = debian_guest_or_skip("node_tls_is_seen_by_both_rings") else {
+        return;
+    };
+    if let Err(reason) = kvm_harness::example_com_reachable() {
+        eprintln!("skipping node_tls_is_seen_by_both_rings: {reason}");
+        return;
+    }
+    let scratch = Scratch::new();
+    let script = "const https = require('https'); \
+        const get = () => new Promise((ok, fail) => https.get('https://example.com/', \
+          (res) => { res.resume(); res.on('end', ok); }).on('error', fail)); \
+        get().then(() => new Promise((ok) => setTimeout(ok, 2000))).then(get) \
+          .then(() => console.log('FETCHED'), (e) => { console.log('FAILED', e.message); process.exit(1); });";
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &["--allow", "example.com:443", "--inspect", "example.com:443"],
+        &["/usr/local/bin/node", "-e", script],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(run.stdout.contains("FETCHED"), "{}", run.describe());
     let records = run.records();
-    let node = of_kind(&records, "proc.tls_attach")
+    let attach = of_kind(&records, "proc.tls_attach")
         .into_iter()
-        .find(|r| {
-            r.data["path"]
-                .as_str()
-                .is_some_and(|p| p.ends_with("/node"))
-        })
+        .find(|r| r.data["path"] == "/usr/local/bin/node")
         .unwrap_or_else(|| panic!("no proc.tls_attach for node\n{}", run.describe()));
-    assert_eq!(node.data["ok"], true, "{node:?}");
-    let node_tgids: Vec<u64> = of_kind(&records, "proc.exec")
+    assert_eq!(attach.data["ok"], true, "{attach:?}");
+    let node: Vec<u64> = of_kind(&records, "proc.exec")
         .into_iter()
-        .filter(|r| {
-            r.data["filename"]
-                .as_str()
-                .is_some_and(|p| p.ends_with("/node"))
-        })
+        .filter(|r| r.data["filename"] == "/usr/local/bin/node")
         .map(|r| r.data["tgid"].as_u64().unwrap())
         .collect();
+    let io: Vec<_> = of_kind(&records, "proc.tls_io")
+        .into_iter()
+        .filter(|r| node.contains(&r.data["tgid"].as_u64().unwrap()))
+        .collect();
+    let writes: Vec<_> = io.iter().filter(|r| r.data["dir"] == "write").collect();
     assert!(
-        of_kind(&records, "proc.tls_io")
-            .into_iter()
-            .any(|r| node_tgids.contains(&r.data["tgid"].as_u64().unwrap())),
-        "no proc.tls_io from node {node_tgids:?}\n{}",
+        !writes.is_empty() && io.iter().any(|r| r.data["dir"] == "read"),
+        "no TLS writes and reads from node {node:?}: {io:?}\n{}",
         run.describe()
+    );
+    let request = of_kind(&records, "http.request")
+        .into_iter()
+        .last()
+        .unwrap_or_else(|| panic!("no http.request\n{}", run.describe()));
+    let body = request.data["body_bytes"].as_u64().unwrap();
+    assert!(
+        writes.iter().any(
+            |w| w.ts_host_ns.abs_diff(request.ts_host_ns) <= 500 * 1_000_000
+                && w.data["bytes"].as_u64().unwrap().abs_diff(body) <= body / 10 + 1024
+        ),
+        "no node write within 500 ms and 1 KiB of {request:?}: {writes:?}"
     );
 }
 

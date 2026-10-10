@@ -560,3 +560,24 @@ Made while writing the plan, 2026-10-06:
   holds; so an effect by a process in no span joins the only open write
   tool span, or the write tool span whose path it touches, and nothing
   else.
+- **The `argv` rule is judged at the close.** Claude Code (its npm installation, in the run that showed it) runs
+  a helper shell (`bash -c env`, a snapshot of the shell's environment)
+  inside a Bash call before the declared command, and the rule fired on
+  it at the join. It now notes the mismatched shell and fires at the
+  close only if no exec in the span ever carried the declared command.
+  The Claude Code agent tests ran locally (2026-10-10) on the access
+  token of the machine's own Claude Code login, which the tests read
+  when `CLAUDE_CODE_OAUTH_TOKEN` is unset and the login has ten minutes
+  left; the refresh token never goes to the guest, so nothing there can
+  rotate the host's login.
+- **Claude Code's npm package no longer runs under Node.** Since 2.1 it
+  installs the native build (`bin/claude.exe`, a Bun ELF), so the plan's
+  "Claude Code under Node" test cannot see Node's TLS: there is no Node.
+  It became `claude_code_from_npm_runs_a_bash_tool_inside` (the npm
+  installation of the same agent), and Node's own TLS is pinned by
+  `node_tls_is_seen_by_both_rings`, a `node -e` fetch in the Debian guest
+  whose writes and reads ring 1 reports through the `node` binary's
+  exported OpenSSL functions.
+- **`device::tests::a_corrupt_tx_ring_asks_for_a_reset` (M2) timed out
+  once** under the full workspace's parallel load and passes alone (three
+  of three); recorded, not changed.
