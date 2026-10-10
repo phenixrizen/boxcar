@@ -351,6 +351,9 @@ impl H2 {
         let Some(pending) = side.pending.take() else {
             return;
         };
+        if !block_shape_ok(&pending.block) {
+            return self.degrade(dir, Some(pending.stream), "hpack", out);
+        }
         let decoded = match side.decoder.decode(&pending.block) {
             Ok(fields) => fields,
             Err(_) => return self.degrade(dir, Some(pending.stream), "hpack", out),
@@ -480,6 +483,63 @@ fn unpad(payload: &[u8], padded: bool) -> Option<&[u8]> {
     let pad = usize::from(*payload.first()?);
     let body = &payload[1..];
     body.get(..body.len().checked_sub(pad)?)
+}
+
+/// Whether a header block's representations are whole: every integer and
+/// string ends inside the block. Only lengths are read, never the tables,
+/// so this is cheap; it runs before the decoder, which does not tolerate a
+/// table size update cut short at the end of a block.
+fn block_shape_ok(block: &[u8]) -> bool {
+    let mut at = 0;
+    while at < block.len() {
+        let first = block[at];
+        let rest = &block[at..];
+        let used = if first & 0x80 != 0 {
+            hpack_integer(rest, 7)
+        } else if first & 0xe0 == 0x20 {
+            hpack_integer(rest, 5)
+        } else {
+            let prefix = if first & 0x40 != 0 { 6 } else { 4 };
+            hpack_integer(rest, prefix).and_then(|(index, mut used)| {
+                if index == 0 {
+                    used += hpack_string(&rest[used..])?;
+                }
+                used += hpack_string(&rest[used..])?;
+                Some((index, used))
+            })
+        };
+        match used {
+            Some((_, n)) if n > 0 => at += n,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// An HPACK integer with a `prefix`-bit prefix at the start of `buf`: its
+/// value and the bytes it takes, or `None` if it runs past the end or past
+/// five bytes.
+fn hpack_integer(buf: &[u8], prefix: u32) -> Option<(usize, usize)> {
+    let mask = (1usize << prefix) - 1;
+    let mut value = usize::from(*buf.first()?) & mask;
+    if value < mask {
+        return Some((value, 1));
+    }
+    for (i, &b) in buf.iter().enumerate().skip(1).take(4) {
+        value = value.checked_add(usize::from(b & 0x7f) << (7 * (i - 1)))?;
+        if b & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// The bytes an HPACK string literal at the start of `buf` takes, if it
+/// ends inside `buf`.
+fn hpack_string(buf: &[u8]) -> Option<usize> {
+    let (len, used) = hpack_integer(buf, 7)?;
+    let end = used.checked_add(len)?;
+    (end <= buf.len()).then_some(end)
 }
 
 #[cfg(test)]
@@ -826,6 +886,43 @@ mod tests {
             }),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn block_shapes() {
+        assert!(block_shape_ok(&[0x82, 0x84]));
+        assert!(block_shape_ok(&[0x20, 0x82]));
+        assert!(block_shape_ok(&[0x3f, 0xe1, 0x1f, 0x82]));
+        assert!(!block_shape_ok(&[0x3f]));
+        assert!(!block_shape_ok(&[0x82, 0x3f, 0x80]));
+        assert!(!block_shape_ok(&[0x40, 0x03, b'a']));
+        assert!(!block_shape_ok(&[0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]));
+    }
+
+    #[test]
+    fn a_short_size_update_degrades_the_stream() {
+        let mut c2s = PREFACE.to_vec();
+        c2s.extend(frame(SETTINGS, 0, 0, &[]));
+        c2s.extend(frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x3f]));
+        let events = run(&c2s, &[], 4096);
+        assert!(
+            events.contains(&Event::Degraded {
+                stream: Some(1),
+                reason: "hpack"
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn random_header_blocks_never_panic() {
+        use proptest::prelude::*;
+        proptest!(|(block in proptest::collection::vec(any::<u8>(), 0..64))| {
+            let mut c2s = PREFACE.to_vec();
+            c2s.extend(frame(SETTINGS, 0, 0, &[]));
+            c2s.extend(frame(HEADERS, END_HEADERS | END_STREAM, 1, &block));
+            let _ = run(&c2s, &[], 4096);
+        });
     }
 
     #[test]

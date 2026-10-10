@@ -490,11 +490,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
     pub inspect: Vec<String>,
     /// Write a debugging dump of the guest's network to DIR, made 0700:
-    /// `frames.pcap` with every frame either way, and for inspected flows
-    /// each decoded exchange (`http/`), credentials' values left out and
-    /// secret-looking body fields scrubbed. Not part of the audit log:
-    /// nothing in it is hashed or chained. DIR may be neither a share nor
-    /// inside one, nor hold one.
+    /// `frames.pcap` with every frame either way cut to its headers, and
+    /// for inspected flows each decoded exchange (`http/`), credentials'
+    /// values left out and secret-looking fields scrubbed. Not part of the
+    /// audit log: nothing in it is hashed or chained. DIR must be new or
+    /// empty, and may be neither a share nor inside one, nor hold one.
     #[arg(long, value_name = "DIR", conflicts_with = "no_net")]
     pub dump: Option<PathBuf>,
     /// Set NAME to VALUE in the session's environment, after the defaults

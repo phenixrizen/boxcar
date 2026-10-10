@@ -1277,6 +1277,36 @@ fn span_effects_at_stop() {
     check_all("span_effects_at_stop", &out);
 }
 
+/// Past the open-span limit the oldest open span is written as it stands,
+/// truncated, and a close that comes for it later changes nothing.
+#[test]
+fn open_spans_are_bounded() {
+    use boxcar_audit::reconcile::spans::MAX_OPEN_SPANS;
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let extra = 44;
+    for n in 0..MAX_OPEN_SPANS + extra {
+        let at = 2000 + n as u64;
+        steps.push(log.tool_open(
+            at,
+            &format!("toolu_{n:04}"),
+            "Read",
+            json!({"file_path": "/x"}),
+        ));
+    }
+    steps.push(log.tool_close(3000, "toolu_0000", "ok"));
+    let (out, index) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), extra, "{}", spans.len());
+    for (n, span) in spans.iter().enumerate() {
+        assert_eq!(span.span_id, format!("toolu_{n:04}"));
+        assert_eq!(span.closed_seq, None);
+        assert!(span.truncated);
+    }
+    assert!(index.list(false).len() <= boxcar_proto::control::MAX_SPAN_LIST);
+}
+
 /// An exec that came before its `tool.open` (the gate's observer wrote
 /// the record a moment late) joins the span when it opens.
 #[test]
@@ -1363,6 +1393,67 @@ fn an_unrelated_tls_write_names_no_executor() {
     steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
     steps.push(log.tls_io(1300, 200, "write", 5000));
     steps.push(log.tls_io(1950, 200, "write", 300));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(100), "{out:?}");
+    assert_eq!(spans[0].procs, [300], "reached the root through node");
+}
+
+/// The process that opened the request's flow is its executor, whatever
+/// other process wrote a TLS record of the request's size in the window.
+#[test]
+fn the_flows_opener_is_the_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+    steps.push(log.tcp_connect(1350, 200, 41000, "203.0.113.5:443"));
+    steps.push(log.connect(
+        1360,
+        1,
+        41000,
+        "203.0.113.5:443",
+        &["api.example"],
+        Verdict::Allow,
+    ));
+    steps.push(log.tls_io(1990, 400, "write", 4800));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000, 7000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(200), "{out:?}");
+    assert_eq!(spans[0].procs, [300]);
+}
+
+/// Two processes whose writes fit the request name no executor: the
+/// session root stands in.
+#[test]
+fn two_fitting_writers_name_no_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.tls_io(1900, 200, "write", 5000));
+    steps.push(log.tls_io(1950, 400, "write", 4900));
     steps.push(log.http_request(2000, 1, 1, 4800));
     steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
     steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));

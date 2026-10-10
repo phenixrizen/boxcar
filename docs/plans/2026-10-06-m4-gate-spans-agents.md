@@ -581,3 +581,26 @@ Made while writing the plan, 2026-10-06:
 - **`device::tests::a_corrupt_tx_ring_asks_for_a_reset` (M2) timed out
   once** under the full workspace's parallel load and passes alone (three
   of three); recorded, not changed.
+- **Hardening after the review of the branch.** Free text is scrubbed
+  before it is recorded (`redact::scrub_text`, `scrub_deep`,
+  `scrub_target`): tool arguments inline and in summaries, tool-result
+  summaries, request paths' query values, user agents and the dump's
+  heads. The reconciler compares a declared command with an exec's argv
+  after scrubbing both the same way. `frames.pcap` keeps frames' headers
+  only (ARP, DNS and DHCP whole), and `--dump DIR` must be new or empty,
+  its files created where nothing was and never through a link. The
+  observer bounds what it holds: a stream that degrades is recorded at
+  once and let go, 512 open exchanges a flow, 64 MiB of decoded body, 8192
+  flows, consumed SSE events dropped; the channel keeps its last 1024
+  places for `Open` and `Close`. Header blocks are checked for shape
+  before HPACK decoding. The reconciler holds at most 256 open spans (the
+  oldest written `truncated` and set aside) and names a request's
+  executor from the process that opened its flow, falling back to a TLS
+  write only when one process fits. The gate relays the plaintext of a
+  guest's last record before its FIN's `close_notify`, and the net
+  device's close drains and joins the observer before `vmm.stop`.
+- **`control::server::tests::shutdown_does_not_wait_on_a_client_that_does_not_read`
+  (M3) failed under load** (a 500 ms bound) twice in full runs and once
+  in four runs of the crate's tests while other sessions loaded the
+  machine (load average 23 on 64 cores); it passes alone; recorded, not
+  changed.

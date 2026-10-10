@@ -45,11 +45,20 @@ tool use id as the span id. In between, the reconciler attributes
 processes and ring 0 effects to the span:
 
 - **The agent.** The session's root process (`session.start.pid`) is the
-  agent, and so is a span's executor: the process whose `proc.tls_io`
-  write, within 500 ms of the gate's `http.request` and sized like its
-  body (within a tenth plus 1 KiB, as one write or as the process's
-  writes of the window summed), carried the model request the span came
-  from. The agent itself is in no span.
+  agent, and so is a span's executor: the process that opened the flow
+  the model request the span came from went over (its `proc.tcp_connect`
+  joined the flow's `net.connect`). Without that join, the process whose
+  `proc.tls_io` write, within 500 ms of the gate's `http.request` and
+  sized like its body (within a tenth plus 1 KiB, as one write or as the
+  process's writes of the window summed), carried the request is the
+  executor, when it is the only process that fits; two that fit name
+  none, and the root stands in. The agent itself is in no span.
+- **Bounds.** At most 256 spans are open at once: past that the oldest
+  open span gets its `span.effects` as it stands (`closed_seq` null,
+  `truncated`) and takes nothing more, nor its `tool.close`. A shell
+  command and an exec's argv are compared after both are scrubbed as the
+  gate scrubs a tool's arguments, so a secret in a command, redacted in
+  `tool.open`, still matches.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)

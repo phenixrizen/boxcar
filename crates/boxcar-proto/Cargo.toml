@@ -22,3 +22,6 @@ base64 = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

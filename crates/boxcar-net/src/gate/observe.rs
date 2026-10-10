@@ -10,6 +10,13 @@
 //! for that flow and direction is a [`Message::Lost`], so the observer
 //! knows the stream it holds has a hole from there on and marks it
 //! degraded. Nothing on the net thread blocks on this channel, ever.
+//!
+//! The last [`CONTROL_RESERVE`] places are kept for `Open` and `Close`, so
+//! plaintext filling the channel never costs a flow its beginning or its
+//! end. A flow whose `Open` still finds no room is not observed: its
+//! plaintext is counted dropped from then on. A `Close` that finds no room
+//! leaves its flow with the observer, which holds at most
+//! [`MAX_OBSERVED`] and records the oldest as it stands to make room.
 
 use std::collections::HashMap;
 use std::io;
@@ -27,8 +34,14 @@ use super::exchange::Observation;
 
 /// The most plaintext bytes one message carries.
 pub const CHUNK_MAX: usize = 64 * 1024;
-/// How many messages the channel holds before chunks are dropped.
+/// How many messages the channel holds.
 pub const CHANNEL_CAP: usize = 4096;
+/// The places at the channel's end only `Open` and `Close` may take.
+pub const CONTROL_RESERVE: usize = 1024;
+/// The most flows the observer holds open; past it the oldest is recorded
+/// as it stands and let go. Above the TCP flow cap, so only flows whose
+/// `Close` was lost are ever let go this way.
+pub const MAX_OBSERVED: usize = 8192;
 
 /// Which way plaintext moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -98,6 +111,8 @@ impl Message {
 #[derive(Clone, Debug)]
 pub struct Observer {
     tx: Sender<Message>,
+    /// How many messages may wait before plaintext is refused.
+    data_limit: usize,
 }
 
 /// What a send came to.
@@ -122,11 +137,17 @@ impl Observer {
     /// [`channel`](Self::channel) with a capacity of its own (tests).
     pub fn with_capacity(cap: usize) -> (Observer, Receiver<Message>) {
         let (tx, rx) = crossbeam_channel::bounded(cap);
-        (Observer { tx }, rx)
+        let data_limit = cap.saturating_sub(CONTROL_RESERVE.min(cap / 4));
+        (Observer { tx, data_limit }, rx)
     }
 
-    /// Queues `msg` without waiting.
+    /// Queues `msg` without waiting: plaintext (`Data`, `Lost`) only below
+    /// the control reserve, `Open` and `Close` while there is any room.
     pub fn send(&self, msg: Message) -> Sent {
+        let control = matches!(msg, Message::Open { .. } | Message::Close { .. });
+        if !control && self.tx.len() >= self.data_limit {
+            return Sent::Dropped;
+        }
         match self.tx.try_send(msg) {
             Ok(()) => Sent::Ok,
             Err(TrySendError::Full(_)) => Sent::Dropped,
@@ -151,8 +172,11 @@ pub struct Observed {
     pub sent: [u64; 2],
     /// Plaintext bytes dropped, each way.
     pub dropped: [u64; 2],
-    /// The observer is gone: nothing more is sent.
+    /// The observer is gone: nothing more is sent, and what would have
+    /// been is counted dropped.
     closed: bool,
+    /// The flow's `Open` found no room: its plaintext is all dropped.
+    refused: bool,
 }
 
 impl Observed {
@@ -161,10 +185,16 @@ impl Observed {
     /// (the caller counts them); the dropped bytes are the tail. Never
     /// waits.
     pub fn data(&mut self, observer: &Observer, flow: u64, dir: Direction, bytes: &[u8]) -> u64 {
-        if self.closed || bytes.is_empty() {
+        if bytes.is_empty() {
             return 0;
         }
         let i = dir.index();
+        // Unannounced, or the observer gone (its receiver lives as long as
+        // a sender does, so only a thread that died drops it): counted.
+        if self.refused || self.closed {
+            self.dropped[i] = self.dropped[i].saturating_add(bytes.len() as u64);
+            return bytes.len() as u64;
+        }
         if self.lost[i] {
             match observer.send(Message::Lost { flow, dir }) {
                 Sent::Ok => self.lost[i] = false,
@@ -174,7 +204,8 @@ impl Observed {
                 }
                 Sent::Closed => {
                     self.closed = true;
-                    return 0;
+                    self.dropped[i] = self.dropped[i].saturating_add(bytes.len() as u64);
+                    return bytes.len() as u64;
                 }
             }
         }
@@ -196,11 +227,7 @@ impl Observed {
                 }
             }
         }
-        let dropped = if self.closed {
-            0
-        } else {
-            (bytes.len() - sent) as u64
-        };
+        let dropped = (bytes.len() - sent) as u64;
         self.sent[i] = self.sent[i].saturating_add(sent as u64);
         self.dropped[i] = self.dropped[i].saturating_add(dropped);
         dropped
@@ -211,8 +238,25 @@ impl Observed {
         self.lost[dir.index()]
     }
 
+    /// Announces the flow (`msg` is its `Open`). Whether the observer will
+    /// hear of it: if not, its plaintext is counted dropped from here.
+    pub fn open(&mut self, observer: &Observer, msg: Message) -> bool {
+        match observer.send(msg) {
+            Sent::Ok => true,
+            Sent::Dropped => {
+                self.refused = true;
+                false
+            }
+            Sent::Closed => {
+                self.closed = true;
+                false
+            }
+        }
+    }
+
     /// Tells the observer the flow is over. A `Close` that cannot be
-    /// queued is dropped: the observer ends the flow at the VM's stop.
+    /// queued is dropped: the observer ends the flow at the VM's stop, or
+    /// sooner past [`MAX_OBSERVED`].
     pub fn close(&mut self, observer: &Observer, flow: u64) -> Sent {
         if self.closed {
             return Sent::Closed;
@@ -279,6 +323,13 @@ fn run(rx: Receiver<Message>, sink: &AuditSink, trace_id: &str, dump: Option<&Du
                 alpn,
                 tls,
             }) => {
+                if flows.len() >= MAX_OBSERVED {
+                    if let Some(oldest) = flows.keys().min().copied() {
+                        if let Some(mut observation) = flows.remove(&oldest) {
+                            observation.close(Instant::now(), &mut out);
+                        }
+                    }
+                }
                 flows.insert(
                     flow,
                     Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id)
@@ -324,6 +375,52 @@ mod tests {
 
     fn dst() -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 443)
+    }
+
+    fn open_msg(flow: u64) -> Message {
+        Message::Open {
+            flow,
+            dst: dst(),
+            name: None,
+            alpn: None,
+            tls: true,
+        }
+    }
+
+    /// Plaintext stops at the control reserve; `Open` and `Close` still
+    /// go in it.
+    #[test]
+    fn opens_and_closes_keep_room_that_plaintext_cannot_take() {
+        let (observer, rx) = Observer::with_capacity(16);
+        let mut observed = Observed::default();
+        assert!(observed.open(&observer, open_msg(1)));
+        let mut queued = 1;
+        while observed.data(&observer, 1, Direction::ToHost, b"x") == 0 {
+            queued += 1;
+        }
+        assert_eq!(
+            queued,
+            16 - 4,
+            "the reserve is a quarter of a small channel"
+        );
+        let mut other = Observed::default();
+        assert!(other.open(&observer, open_msg(2)));
+        assert_eq!(observed.close(&observer, 1), Sent::Ok);
+        drop(rx);
+    }
+
+    /// A flow whose `Open` found no room is not observed: its plaintext is
+    /// counted dropped, all of it.
+    #[test]
+    fn a_refused_open_drops_the_flows_plaintext() {
+        let (observer, _rx) = Observer::with_capacity(4);
+        for flow in 0..4 {
+            assert_eq!(observer.send(open_msg(flow)), Sent::Ok);
+        }
+        let mut observed = Observed::default();
+        assert!(!observed.open(&observer, open_msg(9)));
+        assert_eq!(observed.data(&observer, 9, Direction::ToGuest, b"abc"), 3);
+        assert_eq!(observed.dropped, [0, 3]);
     }
 
     /// Chunks go in order and in pieces of at most `CHUNK_MAX`.
@@ -431,15 +528,18 @@ mod tests {
         assert!(flow.lost(Direction::ToGuest));
     }
 
-    /// An observer that is gone stops everything quietly.
+    /// An observer that is gone takes nothing, and what it did not take
+    /// is counted dropped: its receiver outlives every sender unless its
+    /// thread died.
     #[test]
-    fn a_gone_observer_takes_nothing_and_drops_nothing() {
+    fn a_gone_observer_takes_nothing_and_its_bytes_are_counted() {
         let (observer, rx) = Observer::channel();
         drop(rx);
         let mut flow = Observed::default();
-        assert_eq!(flow.data(&observer, 3, Direction::ToHost, b"x"), 0);
+        assert_eq!(flow.data(&observer, 3, Direction::ToHost, b"x"), 1);
+        assert_eq!(flow.data(&observer, 3, Direction::ToGuest, b"yz"), 2);
         assert_eq!(flow.sent, [0, 0]);
-        assert_eq!(flow.dropped, [0, 0]);
+        assert_eq!(flow.dropped, [1, 2]);
         assert_eq!(flow.close(&observer, 3), Sent::Closed);
     }
 

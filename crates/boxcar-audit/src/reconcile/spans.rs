@@ -40,6 +40,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_proto::control::{SpanEntry, MAX_SPAN_LIST};
+use boxcar_proto::redact::scrub_text;
 use boxcar_proto::{Finding, FindingCategory, ProcExec, Record, SpanEffects, ToolClose, ToolOpen};
 use serde_json::Value;
 
@@ -53,8 +54,13 @@ pub const MAX_SPAN_PROCS: usize = 1024;
 pub const MAX_SPAN_EFFECTS: usize = 4096;
 /// How long after a span's close its effects and processes are judged.
 pub const SETTLE_NS: u64 = 1_000_000_000;
-/// The most spans kept in memory; beyond it the oldest settled span goes.
+/// The most spans kept in memory; beyond it the oldest settled span goes
+/// (the oldest closed one, if none has settled).
 const MAX_SPANS_KEPT: usize = 4096;
+/// The most spans open at once; beyond it the oldest open span is set
+/// aside: its `span.effects` written as it stands, `truncated`, and
+/// nothing more joins it.
+pub const MAX_OPEN_SPANS: usize = 256;
 /// The most effects waiting for their process to join a span.
 const MAX_RECENT: usize = 4096;
 /// How many parents are followed when looking for the agent.
@@ -193,6 +199,8 @@ pub struct Span {
     carried: bool,
     /// Its `span.effects` was written.
     recorded: bool,
+    /// Set aside open, past [`MAX_OPEN_SPANS`].
+    abandoned: bool,
 }
 
 impl Span {
@@ -228,11 +236,12 @@ impl Span {
             mismatch: None,
             carried: false,
             recorded: false,
+            abandoned: false,
         }
     }
 
     pub fn is_open(&self) -> bool {
-        self.closed.is_none()
+        self.closed.is_none() && !self.abandoned
     }
 
     fn is_shell_tool(&self) -> bool {
@@ -246,11 +255,7 @@ impl Span {
     /// An exec joined the span: notes whether it ran the declared command.
     fn note_exec(&mut self, argv: &[String]) {
         if let Some(declared) = self.declared.as_deref() {
-            if carries(
-                shell_command(argv).as_deref(),
-                &normalize(&argv.join(" ")),
-                declared,
-            ) {
+            if carries(shell_command(argv).as_deref(), &whole_argv(argv), declared) {
                 self.carried = true;
             }
         }
@@ -385,6 +390,10 @@ pub struct Spans {
     /// and the order they came in.
     executors: HashMap<(u64, u32), ProcKey>,
     executor_order: VecDeque<(u64, u32)>,
+    /// The process that opened each flow, from the sensor's connect, and
+    /// the order they came in.
+    flow_owners: HashMap<u64, ProcKey>,
+    flow_order: VecDeque<u64>,
 }
 
 impl Spans {
@@ -403,6 +412,8 @@ impl Spans {
             requests: VecDeque::new(),
             executors: HashMap::new(),
             executor_order: VecDeque::new(),
+            flow_owners: HashMap::new(),
+            flow_order: VecDeque::new(),
         }
     }
 
@@ -430,10 +441,15 @@ impl Spans {
         }
     }
 
-    /// An `http.request`: the write that carried it names its executor,
-    /// one write of its size or a process's writes of the window summed;
+    /// An `http.request`: the process that opened its flow is its
+    /// executor. Without that, the write that carried it names one (one
+    /// write of its size or a process's writes of the window summed),
     /// else it waits for the write.
     pub fn http_request(&mut self, state: &State, ts: u64, flow: u64, stream: u32, body: u64) {
+        if let Some(owner) = self.flow_owners.get(&flow).copied() {
+            self.name_executor(state, flow, stream, owner.tgid, ts);
+            return;
+        }
         let request = Request {
             ts,
             flow,
@@ -454,29 +470,32 @@ impl Spans {
         }
     }
 
-    /// The process whose writes carried `request`: one write of the
-    /// window sized like the body, else a process whose writes of the
-    /// window sum to it.
+    /// The process whose writes carried `request`: the one process with
+    /// a write of the window sized like the body, else the one process
+    /// whose writes of the window sum to it. Two processes that fit name
+    /// nobody: a size and a time are evidence, not proof.
     fn carrier(&self, request: &Request) -> Option<u32> {
         let (ts, body) = (request.ts, request.body_bytes);
-        let one = self
+        let mut one = self
             .tls_writes
             .iter()
-            .rev()
-            .find(|w| within(w.ts, ts) && sized(w.bytes, body))
+            .filter(|w| within(w.ts, ts) && sized(w.bytes, body))
             .map(|w| w.tgid);
-        one.or_else(|| {
-            let mut sums: Vec<(u32, u64)> = Vec::new();
-            for write in self.tls_writes.iter().filter(|w| within(w.ts, ts)) {
-                match sums.iter_mut().find(|(tgid, _)| *tgid == write.tgid) {
-                    Some((_, sum)) => *sum += write.bytes,
-                    None => sums.push((write.tgid, write.bytes)),
-                }
+        if let Some(first) = one.next() {
+            return one.all(|tgid| tgid == first).then_some(first);
+        }
+        let mut sums: Vec<(u32, u64)> = Vec::new();
+        for write in self.tls_writes.iter().filter(|w| within(w.ts, ts)) {
+            match sums.iter_mut().find(|(tgid, _)| *tgid == write.tgid) {
+                Some((_, sum)) => *sum += write.bytes,
+                None => sums.push((write.tgid, write.bytes)),
             }
-            sums.into_iter()
-                .find(|(_, sum)| sized(*sum, body))
-                .map(|(tgid, _)| tgid)
-        })
+        }
+        let mut fits = sums.into_iter().filter(|(_, sum)| sized(*sum, body));
+        match (fits.next(), fits.next()) {
+            (Some((tgid, _)), None) => Some(tgid),
+            _ => None,
+        }
     }
 
     /// The process `tgid` made the request on (`flow`, `stream`).
@@ -525,6 +544,10 @@ impl Spans {
             return Vec::new();
         }
         self.evict();
+        while self.open.len() >= MAX_OPEN_SPANS {
+            let oldest = self.open.remove(0);
+            self.abandon(&oldest);
+        }
         let mut span = Span::new(open, record.seq, record.ts_host_ns);
         span.executor = self.executors.get(&(open.flow, open.stream)).copied();
         self.spans.insert(id.clone(), span);
@@ -583,7 +606,7 @@ impl Spans {
         let Some(span) = self.spans.get_mut(id) else {
             return Vec::new();
         };
-        if span.closed.is_some() {
+        if span.closed.is_some() || span.abandoned {
             return Vec::new();
         }
         span.closed = Some((record.seq, record.ts_host_ns));
@@ -677,8 +700,17 @@ impl Spans {
         }
     }
 
-    /// A flow's `net.connect` met the `proc.tcp_connect` of `key`.
+    /// A flow's `net.connect` met the `proc.tcp_connect` of `key`: `key`
+    /// opened it, and the flow is an effect of its span.
     pub fn flow(&mut self, state: &State, flow: u64, seq: u64, ts: u64, key: ProcKey) {
+        if self.flow_owners.insert(flow, key).is_none() {
+            self.flow_order.push_back(flow);
+        }
+        while self.flow_order.len() > MAX_EXECUTORS {
+            if let Some(oldest) = self.flow_order.pop_front() {
+                self.flow_owners.remove(&oldest);
+            }
+        }
         let kind = EffectKind::Net { flow };
         match self.by_proc.get(&key).cloned() {
             Some(id) => {
@@ -757,7 +789,7 @@ impl Spans {
             return None;
         }
         let command = shell_command(argv);
-        let whole = normalize(&argv.join(" "));
+        let whole = whole_argv(argv);
         let by_argv = self.open.iter().find(|id| {
             self.spans.get(*id).is_some_and(|span| {
                 span.declared
@@ -977,10 +1009,17 @@ impl Spans {
         if self.spans.len() < MAX_SPANS_KEPT {
             return;
         }
-        let victim = self.order.iter().position(|id| {
+        let settled = self.order.iter().position(|id| {
             self.spans
                 .get(id)
                 .is_some_and(|span| !span.is_open() && span.settled && span.recorded)
+        });
+        // None settled: the oldest that is not open goes all the same,
+        // its record written first. Open spans are bounded on their own.
+        let victim = settled.or_else(|| {
+            self.order
+                .iter()
+                .position(|id| self.spans.get(id).is_some_and(|span| !span.is_open()))
         });
         let Some(index) = victim else {
             return;
@@ -988,11 +1027,25 @@ impl Spans {
         let Some(id) = self.order.remove(index) else {
             return;
         };
+        self.write_record(&id);
         if let Some(span) = self.spans.remove(&id) {
             for member in &span.members {
                 self.by_proc.remove(&member.key);
             }
         }
+    }
+
+    /// Sets an open span aside: its record is written as it stands,
+    /// `truncated`, and it takes nothing more.
+    fn abandon(&mut self, id: &str) {
+        let Some(span) = self.spans.get_mut(id) else {
+            return;
+        };
+        span.abandoned = true;
+        span.settled = true;
+        span.truncated = true;
+        self.write_record(id);
+        self.index_update(id);
     }
 
     fn write_record(&mut self, id: &str) {
@@ -1038,7 +1091,7 @@ impl Spans {
         let Some(command) = shell_command(argv) else {
             return Vec::new();
         };
-        if carries(Some(&command), &normalize(&argv.join(" ")), &declared) {
+        if carries(Some(&command), &whole_argv(argv), &declared) {
             span.carried = true;
             return Vec::new();
         }
@@ -1399,8 +1452,15 @@ fn shell_command(argv: &[String]) -> Option<String> {
         .iter()
         .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))?;
     let command = argv.get(at + 2)?;
-    let command = normalize(command);
+    let command = normalize(&scrub_text(command));
     (!command.is_empty()).then_some(command)
+}
+
+/// An exec's whole argv, scrubbed as a tool's arguments are and
+/// normalized, to compare with a declared command.
+fn whole_argv(argv: &[String]) -> String {
+    let parts: Vec<String> = argv.iter().map(|arg| scrub_text(arg)).collect();
+    normalize(&parts.join(" "))
 }
 
 /// Whether an exec carries the declared command: its shell command is the
@@ -1570,6 +1630,27 @@ mod tests {
             "sh -c curl",
             "ls -la"
         ));
+    }
+
+    #[test]
+    fn a_declared_command_scrubbed_of_a_key_still_carries() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+        let command = "curl -H 'X-Api-Key: k1' https://example.com/";
+        let mut args = json!({"command": command});
+        boxcar_proto::redact::scrub_deep(&mut args);
+        let declared = declared_command("Bash", &args).unwrap();
+        assert!(!declared.contains("k1"));
+        let exec = argv(&["bash", "-c", command]);
+        assert!(carries(
+            shell_command(&exec).as_deref(),
+            &whole_argv(&exec),
+            &declared
+        ));
+        let direct = argv(&["curl", "-H", "X-Api-Key: k1", "https://example.com/"]);
+        let mut parts = json!({"command": ["curl", "-H", "X-Api-Key: k1", "https://example.com/"]});
+        boxcar_proto::redact::scrub_deep(&mut parts);
+        let declared = declared_command("shell", &parts).unwrap();
+        assert!(carries(None, &whole_argv(&direct), &declared));
     }
 
     #[test]

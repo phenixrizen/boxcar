@@ -892,14 +892,14 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
                         flow.observe_plain = true;
                         flow.inspect_rule = Some(start.rule);
                         if let Some(observer) = env.observer {
-                            flow.observe_open = true;
-                            observer.send(Message::Open {
+                            let open = Message::Open {
                                 flow: flow.id.0,
                                 dst: flow.dst,
                                 name: start.name,
                                 alpn: None,
                                 tls: false,
-                            });
+                            };
+                            flow.observe_open = flow.observed.open(observer, open);
                         }
                         flow.state = FlowState::Relaying;
                         release_held(flow);
@@ -1356,14 +1356,14 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
                 ),
             );
             if let Some(observer) = env.observer {
-                flow.observe_open = true;
-                observer.send(Message::Open {
+                let open = Message::Open {
                     flow: flow.id.0,
                     dst: flow.dst,
                     name,
                     alpn: negotiated.alpn,
                     tls: true,
-                });
+                };
+                flow.observe_open = flow.observed.open(observer, open);
             }
         }
         _ => {}

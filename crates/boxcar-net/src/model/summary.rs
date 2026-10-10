@@ -13,11 +13,11 @@ pub fn b3(bytes: &[u8]) -> Option<String> {
     (!bytes.is_empty()).then(|| format!("b3:{}", blake3::hash(bytes).to_hex()))
 }
 
-/// `value` as compact JSON, scrubbed of what looks like a credential and
-/// cut to [`SUMMARY_LIMIT`].
+/// `value` as compact JSON, scrubbed of what looks like a credential (by
+/// key and in its strings) and cut to [`SUMMARY_LIMIT`].
 pub fn summarize(value: &Value) -> String {
     let mut value = value.clone();
-    boxcar_proto::redact::scrub(&mut value);
+    boxcar_proto::redact::scrub_deep(&mut value);
     let json = match value {
         Value::String(text) => text,
         other => other.to_string(),
@@ -25,14 +25,15 @@ pub fn summarize(value: &Value) -> String {
     cut(&json, SUMMARY_LIMIT)
 }
 
-/// `text` with credential-looking tokens replaced, through the protocol
-/// crate's scrub.
+/// `text` with what looks like a credential replaced: as JSON, by key and
+/// in its strings, when it parses as JSON; as free text otherwise.
 pub fn scrubbed(text: &str) -> String {
-    let mut value = Value::String(text.to_owned());
-    boxcar_proto::redact::scrub(&mut value);
-    match value {
-        Value::String(text) => text,
-        other => other.to_string(),
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut value @ (Value::Object(_) | Value::Array(_))) => {
+            boxcar_proto::redact::scrub_deep(&mut value);
+            value.to_string()
+        }
+        _ => boxcar_proto::redact::scrub_text(text),
     }
 }
 
@@ -60,6 +61,15 @@ mod tests {
         assert!(summary.len() <= SUMMARY_LIMIT);
         assert!(summary.ends_with('…'));
         assert_eq!(summarize(&serde_json::json!("plain")), "plain");
+        assert_eq!(
+            summarize(&serde_json::json!({"command": "curl -H 'X-Api-Key: k1' u"})),
+            r#"{"command":"curl -H 'X-Api-Key: [redacted]' u"}"#
+        );
+        assert_eq!(scrubbed("out: token=abc"), "out: token=[redacted]");
+        assert_eq!(
+            scrubbed(r#"{"refresh_token":"r","n":1}"#),
+            r#"{"n":1,"refresh_token":"[redacted]"}"#
+        );
         assert_eq!(b3(b""), None);
         assert_eq!(
             b3(b"x").unwrap(),

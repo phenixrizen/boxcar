@@ -71,8 +71,6 @@ struct Tracked {
     stream: Option<Stream>,
     /// The response is a stream (events), not one document.
     sse: bool,
-    /// How far the exchange's events were read.
-    events_read: usize,
     /// Over WebSocket: the responses are the events until completion.
     ws: bool,
     degraded: Option<&'static str>,
@@ -112,7 +110,6 @@ impl Tracker {
                     requested: false,
                     stream: None,
                     sse: false,
-                    events_read: 0,
                     ws: false,
                     degraded: None,
                 },
@@ -188,14 +185,14 @@ impl Tracker {
             return;
         }
         tracked.sse = headers.content_type().as_deref() == Some("text/event-stream");
-        tracked.events_read = 0;
         if tracked.sse {
             tracked.stream = Some(Stream::new(tracked.provider));
         }
     }
 
-    /// More of a response came: the events it completed, each tool call
-    /// that is whole a `tool.open`.
+    /// More of a response came: the events it completed (the exchange's
+    /// events, which it drops after this), each tool call that is whole a
+    /// `tool.open`.
     pub fn response_body(&mut self, stream: u32, exchange: &Exchange, out: &mut Vec<Emit>) {
         let Some(tracked) = self.streams.get_mut(&stream) else {
             return;
@@ -204,10 +201,9 @@ impl Tracker {
             return;
         };
         let mut opens = Vec::new();
-        for event in &exchange.sse_events[tracked.events_read.min(exchange.sse_events.len())..] {
+        for event in &exchange.sse_events {
             opens.extend(parser.event(event));
         }
-        tracked.events_read = exchange.sse_events.len();
         for open in opens {
             out.push(self.open_record(stream, open));
         }
@@ -370,20 +366,27 @@ impl Tracker {
         let mut open: Vec<u32> = self.streams.keys().copied().collect();
         open.sort_unstable();
         for stream in open {
-            let Some(tracked) = self.streams.remove(&stream) else {
-                continue;
-            };
-            let Some(parser) = tracked.stream else {
-                continue;
-            };
-            let (mut info, opens) = parser.finish();
-            info.degraded
-                .get_or_insert(tracked.degraded.unwrap_or("flow_closed"));
-            for open in opens {
-                out.push(self.open_record(stream, open));
-            }
-            out.push(self.response_record(stream, tracked.provider, info, tracked.started, now));
+            self.end(stream, now, out);
         }
+    }
+
+    /// `stream` is observed no further (the flow ended, or the stream was
+    /// reset or could not be read): a response under way is recorded as it
+    /// stands, and the stream is forgotten.
+    pub fn end(&mut self, stream: u32, now: Instant, out: &mut Vec<Emit>) {
+        let Some(tracked) = self.streams.remove(&stream) else {
+            return;
+        };
+        let Some(parser) = tracked.stream else {
+            return;
+        };
+        let (mut info, opens) = parser.finish();
+        info.degraded
+            .get_or_insert(tracked.degraded.unwrap_or("flow_closed"));
+        for open in opens {
+            out.push(self.open_record(stream, open));
+        }
+        out.push(self.response_record(stream, tracked.provider, info, tracked.started, now));
     }
 
     fn span(&self, tool_use_id: &str) -> SpanRef {

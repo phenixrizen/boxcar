@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::time::Instant;
 
+use boxcar_proto::redact::{scrub_target, scrub_text};
 use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
 
 use super::Direction;
@@ -52,6 +53,9 @@ impl Emit {
 pub const PATH_CUT: usize = 4096;
 /// The most bytes of a user agent kept in a record.
 pub const USER_AGENT_CUT: usize = 512;
+/// The most exchanges a flow keeps open at once: past it, the oldest is
+/// recorded as it stands (`degraded: "too_many_exchanges"`) and let go.
+pub const MAX_EXCHANGES: usize = 512;
 
 /// A request's head, as the record will say it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,12 +92,10 @@ pub struct Exchange {
     request_head_text: Option<String>,
     response_head_text: Option<String>,
     sse: Option<SseParser>,
-    /// The event stream's events, as they complete: the model parsers
-    /// take them.
+    /// The event stream's events completed since the model parsers last
+    /// took them: dropped once they have.
     pub sse_events: Vec<SseEvent>,
     sse_count: u64,
-    /// The WebSocket messages of an upgraded stream, as they complete.
-    pub ws_messages: Vec<(Direction, bool, Vec<u8>)>,
     ws_count: u64,
     upgraded: bool,
     response_recorded: bool,
@@ -117,7 +119,6 @@ impl Exchange {
             sse: None,
             sse_events: Vec::new(),
             sse_count: 0,
-            ws_messages: Vec::new(),
             ws_count: 0,
             upgraded: false,
             response_recorded: false,
@@ -269,6 +270,14 @@ impl Observation {
                     version,
                     headers,
                 } => {
+                    if !self.exchanges.contains_key(&stream)
+                        && self.exchanges.len() >= MAX_EXCHANGES
+                    {
+                        // The oldest open exchange makes room.
+                        if let Some(&oldest) = self.exchanges.keys().min() {
+                            self.degrade_and_end(oldest, "too_many_exchanges", now, out);
+                        }
+                    }
                     let exchange = self
                         .exchanges
                         .entry(stream)
@@ -279,7 +288,7 @@ impl Observation {
                     if self.dump.is_some() {
                         let start = format!(
                             "{method} {} HTTP/{}",
-                            path.as_deref().unwrap_or("*"),
+                            path.as_deref().map_or_else(|| "*".to_owned(), scrub_target),
                             version.as_str()
                         );
                         exchange.request_head_text =
@@ -356,6 +365,7 @@ impl Observation {
                             exchange.sse_count += (exchange.sse_events.len() - before) as u64;
                         }
                         self.model.response_body(stream, exchange, out);
+                        exchange.sse_events.clear();
                     }
                 }
                 Event::ResponseEnd { stream } => {
@@ -375,6 +385,7 @@ impl Observation {
                             out.push(Emit::plain(self.response_record(&mut exchange, now)));
                         }
                         self.model.response_end(stream, &exchange, now, out);
+                        exchange.sse_events.clear();
                         if !exchange.done() {
                             self.exchanges.insert(stream, exchange);
                         }
@@ -406,7 +417,6 @@ impl Observation {
                         exchange.last_response_at = now;
                         exchange.ws_count += 1;
                         self.model.ws_message(stream, dir, text, &payload, now, out);
-                        exchange.ws_messages.push((dir, text, payload));
                     }
                 }
                 Event::WsClosed { stream } => {
@@ -423,8 +433,8 @@ impl Observation {
                         Some(stream) => vec![stream],
                         None => self.exchanges.keys().copied().collect(),
                     };
-                    for stream in streams {
-                        if let Some(exchange) = self.exchanges.get_mut(&stream) {
+                    for stream in &streams {
+                        if let Some(exchange) = self.exchanges.get_mut(stream) {
                             if !exchange.request_recorded {
                                 exchange.request_degraded.get_or_insert(reason);
                             }
@@ -432,11 +442,47 @@ impl Observation {
                                 exchange.response_degraded.get_or_insert(reason);
                             }
                         }
-                        self.model.degraded(stream, reason);
+                        self.model.degraded(*stream, reason);
+                    }
+                    // One stream is observed no further: what it had is
+                    // recorded now and its state let go, so streams that
+                    // end this way do not pile up until the flow closes.
+                    if let Some(stream) = stream {
+                        self.end_stream(stream, now, out);
                     }
                 }
             }
         }
+    }
+
+    /// Marks `stream` degraded for `reason`, then ends it.
+    fn degrade_and_end(
+        &mut self,
+        stream: u32,
+        reason: &'static str,
+        now: Instant,
+        out: &mut Vec<Emit>,
+    ) {
+        if let Some(exchange) = self.exchanges.get_mut(&stream) {
+            exchange.request_degraded.get_or_insert(reason);
+            exchange.response_degraded.get_or_insert(reason);
+        }
+        self.model.degraded(stream, reason);
+        self.end_stream(stream, now, out);
+    }
+
+    /// Records what `stream` has not recorded yet, degraded, and forgets
+    /// it.
+    fn end_stream(&mut self, stream: u32, now: Instant, out: &mut Vec<Emit>) {
+        if let Some(mut exchange) = self.exchanges.remove(&stream) {
+            if exchange.request.is_some() && !exchange.request_recorded {
+                out.push(Emit::plain(self.request_record(&mut exchange)));
+            }
+            if exchange.response.is_some() && !exchange.response_recorded {
+                out.push(Emit::plain(self.response_record(&mut exchange, now)));
+            }
+        }
+        self.model.end(stream, now, out);
     }
 
     fn request_record(&self, exchange: &mut Exchange) -> Payload {
@@ -526,14 +572,14 @@ fn request_head(
     RequestHead {
         method,
         authority,
-        path: path.map(|p| cut(&p, PATH_CUT)),
+        path: path.map(|p| cut(&scrub_target(&p), PATH_CUT)),
         version,
         content_type: headers.content_type(),
         content_encoding: headers.content_encoding(),
         content_length: headers.content_length(),
         user_agent: headers
             .get_str("user-agent")
-            .map(|ua| cut(ua, USER_AGENT_CUT)),
+            .map(|ua| cut(&scrub_text(ua), USER_AGENT_CUT)),
     }
 }
 
@@ -565,6 +611,71 @@ mod tests {
             true,
             "trace-test",
         )
+    }
+
+    /// An HTTP/2 frame of `kind` with `flags` on `stream`.
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend_from_slice(&[kind, flags]);
+        f.extend_from_slice(&stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    #[test]
+    fn reset_streams_are_recorded_and_let_go() {
+        let mut obs = observation(Some("h2"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        let mut encoder = fluke_hpack::Encoder::new();
+        let mut c2s = crate::http::h2::PREFACE.to_vec();
+        c2s.extend(h2_frame(4, 0, 0, &[]));
+        obs.data(Direction::ToHost, &c2s, now, &mut out);
+        for n in 0..2000u32 {
+            let stream = 2 * n + 1;
+            let block = encoder.encode([
+                (&b":method"[..], &b"POST"[..]),
+                (b":path", b"/v1/messages"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example"),
+            ]);
+            let mut bytes = h2_frame(1, 0x4, stream, &block);
+            bytes.extend(h2_frame(0, 0, stream, b"{\"model\":"));
+            bytes.extend(h2_frame(3, 0, stream, &8u32.to_be_bytes()));
+            obs.data(Direction::ToHost, &bytes, now, &mut out);
+            assert!(obs.exchanges().len() <= 1, "{n}: {}", obs.exchanges().len());
+        }
+        let degraded = out
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload, Payload::HttpRequest(r) if r.degraded.as_deref() == Some("rst_stream"))
+            })
+            .count();
+        assert_eq!(degraded, 2000);
+    }
+
+    #[test]
+    fn open_exchanges_are_bounded() {
+        let mut obs = observation(Some("http/1.1"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        for n in 0..(MAX_EXCHANGES as u32 + 10) {
+            obs.handle(
+                vec![Event::RequestHead {
+                    stream: n + 1,
+                    method: "GET".into(),
+                    authority: None,
+                    path: Some("/".into()),
+                    version: Version::Http1,
+                    headers: Headers::new(),
+                }],
+                now,
+                &mut out,
+            );
+        }
+        assert_eq!(obs.exchanges().len(), MAX_EXCHANGES);
+        assert!(out.iter().any(|e| matches!(&e.payload,
+            Payload::HttpRequest(r) if r.degraded.as_deref() == Some("too_many_exchanges") && r.stream == 1)));
     }
 
     #[test]

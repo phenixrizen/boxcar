@@ -6,7 +6,9 @@
 //!
 //! - `frames.pcap`: every frame the guest sent and every frame the stack
 //!   gave it, as pcap 2.4 (little endian, microsecond timestamps,
-//!   Ethernet). The net thread copies each frame into a bounded channel
+//!   Ethernet), cut after the frame's headers ([`headers_len`]): a TCP
+//!   payload is not written, plain HTTP's credentials included; each
+//!   record keeps the frame's original length. The net thread copies each frame into a bounded channel
 //!   with `try_send`; the `dump` thread writes them. A frame the channel
 //!   had no room for is dropped and counted (`net.drop{reason:"dump"}`):
 //!   the net thread never waits on the dump.
@@ -34,13 +36,15 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use boxcar_proto::redact::scrub_text;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::http::headers::is_credential;
 
 /// How many frames may wait for the `dump` thread.
 pub const FRAME_QUEUE: usize = 4096;
-/// The pcap snapshot length: every frame is kept whole.
+/// The pcap snapshot length: the most of a frame a record could hold
+/// (records hold a frame's headers, [`headers_len`]).
 pub const SNAPLEN: u32 = 65535;
 /// The pcap global header's magic, for microsecond timestamps.
 pub const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
@@ -59,7 +63,9 @@ impl DumpDir {
     /// Makes `dir` (mode 0700) unless it exists, and refuses one that is a
     /// share, is inside one, or holds one. `shares` are the shares' paths,
     /// resolved. The directory itself is resolved through its parent, so a
-    /// link into a share is found.
+    /// link into a share is found. An existing directory must be empty:
+    /// each run's dump is its own, and nothing already in it (a link to
+    /// another file, say) is ever written through.
     pub fn prepare(dir: &Path, shares: &[&Path]) -> io::Result<DumpDir> {
         let resolved = resolve(dir)?;
         for share in shares {
@@ -87,22 +93,25 @@ impl DumpDir {
         match fs::create_dir(&resolved) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if !resolved.is_dir() {
+                if !fs::symlink_metadata(&resolved)?.is_dir() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("dump dir {} is not a directory", resolved.display()),
+                    ));
+                }
+                if fs::read_dir(&resolved)?.next().is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("dump dir {} is not empty", resolved.display()),
                     ));
                 }
             }
             Err(error) => return Err(error),
         }
         fs::set_permissions(&resolved, fs::Permissions::from_mode(0o700))?;
+        // Made here, so it is a directory and not a link to one.
         let http = resolved.join("http");
-        match fs::create_dir(&http) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
+        fs::create_dir(&http)?;
         fs::set_permissions(&http, fs::Permissions::from_mode(0o700))?;
         Ok(DumpDir { path: resolved })
     }
@@ -156,12 +165,13 @@ fn resolve(dir: &Path) -> io::Result<PathBuf> {
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
-/// A file of the dump, created 0600 and truncated.
+/// A new file of the dump, created 0600. Nothing may be there already,
+/// and a link is never followed.
 pub fn create(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(path)
 }
@@ -171,7 +181,10 @@ pub fn create(path: &Path) -> io::Result<File> {
 /// One frame on its way to the `dump` thread.
 struct Frame {
     at: SystemTime,
+    /// The frame's headers ([`headers_len`]).
     bytes: Vec<u8>,
+    /// The whole frame's length.
+    len: usize,
 }
 
 /// The net thread's end of the frame dump. Cheap to clone: every stack of
@@ -199,7 +212,8 @@ impl FrameDump {
     pub fn push(&self, bytes: &[u8]) -> bool {
         let frame = Frame {
             at: SystemTime::now(),
-            bytes: bytes.to_vec(),
+            bytes: bytes[..headers_len(bytes)].to_vec(),
+            len: bytes.len(),
         };
         match self.tx.try_send(frame) {
             Ok(()) => true,
@@ -238,7 +252,10 @@ fn write_frames(rx: Receiver<Frame>, file: File) {
         if failed {
             continue;
         }
-        if out.write_all(&pcap_record(frame.at, &frame.bytes)).is_err() {
+        if out
+            .write_all(&pcap_record(frame.at, &frame.bytes, frame.len))
+            .is_err()
+        {
             failed = true;
         }
     }
@@ -257,9 +274,9 @@ pub fn pcap_header() -> [u8; 24] {
     header
 }
 
-/// One pcap record: its 16-byte header, then the frame, cut at
-/// [`SNAPLEN`].
-pub fn pcap_record(at: SystemTime, frame: &[u8]) -> Vec<u8> {
+/// One pcap record: its 16-byte header, then `frame` (the part of a frame
+/// `len` long that is kept), cut at [`SNAPLEN`].
+pub fn pcap_record(at: SystemTime, frame: &[u8], len: usize) -> Vec<u8> {
     let since = at.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     let secs = u32::try_from(since.as_secs()).unwrap_or(u32::MAX);
     let kept = frame.len().min(SNAPLEN as usize);
@@ -267,9 +284,73 @@ pub fn pcap_record(at: SystemTime, frame: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&secs.to_le_bytes());
     out.extend_from_slice(&since.subsec_micros().to_le_bytes());
     out.extend_from_slice(&(kept as u32).to_le_bytes());
-    out.extend_from_slice(&(frame.len().min(u32::MAX as usize) as u32).to_le_bytes());
+    out.extend_from_slice(&(len.max(kept).min(u32::MAX as usize) as u32).to_le_bytes());
     out.extend_from_slice(&frame[..kept]);
     out
+}
+
+/// The UDP ports whose payload the frame dump keeps: DNS and DHCP, which
+/// the gateway answers itself.
+const KEPT_UDP_PORTS: [u16; 3] = [53, 67, 68];
+
+/// How much of an Ethernet frame the frame dump keeps: the Ethernet,
+/// IPv4 or IPv6, and TCP, UDP or ICMP headers, without the payload after
+/// them. ARP is kept whole, and so is UDP to or from ports 53, 67 and 68
+/// (DNS and DHCP).
+/// A frame too short for what its headers say is kept to its Ethernet
+/// header.
+pub fn headers_len(frame: &[u8]) -> usize {
+    const ETH: usize = 14;
+    let ether_short = frame.len().min(ETH);
+    if frame.len() < ETH {
+        return frame.len();
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let (proto, l4) = match ethertype {
+        0x0806 => return frame.len(),
+        0x0800 => {
+            let Some(&vihl) = frame.get(ETH) else {
+                return ether_short;
+            };
+            let ihl = usize::from(vihl & 0x0f) * 4;
+            match frame.get(ETH + 9) {
+                Some(&proto) if ihl >= 20 => (proto, ETH + ihl),
+                _ => return ether_short,
+            }
+        }
+        0x86dd => match frame.get(ETH + 6) {
+            Some(&next) => (next, ETH + 40),
+            None => return ether_short,
+        },
+        _ => return ether_short,
+    };
+    let len = match proto {
+        6 => match frame.get(l4 + 12) {
+            Some(&offset) => l4 + usize::from(offset >> 4) * 4,
+            None => return ether_short,
+        },
+        17 => {
+            let ports = frame.get(l4..l4 + 4).map(|p| {
+                [
+                    u16::from_be_bytes([p[0], p[1]]),
+                    u16::from_be_bytes([p[2], p[3]]),
+                ]
+            });
+            match ports {
+                Some(ports) if ports.iter().any(|p| KEPT_UDP_PORTS.contains(p)) => {
+                    return frame.len()
+                }
+                _ => l4 + 8,
+            }
+        }
+        1 | 58 => l4 + 8,
+        _ => l4,
+    };
+    if len > frame.len() {
+        ether_short
+    } else {
+        len
+    }
 }
 
 // --- the exchanges
@@ -310,6 +391,7 @@ pub fn append_ws(
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(dir.ws_file(flow, stream))?;
     writeln!(
@@ -377,7 +459,7 @@ fn form_secret(name: &str) -> bool {
 /// The head text of a request or response as the dump writes it: the
 /// start line, then each header as `name: value`, each line ending in
 /// CRLF. `headers` are the observer's, which never hold a credential's
-/// value.
+/// value; each value is also scrubbed as free text.
 pub fn head_text<'a>(
     start_line: &str,
     headers: impl Iterator<Item = (&'a str, &'a [u8])>,
@@ -388,7 +470,7 @@ pub fn head_text<'a>(
     for (name, value) in headers {
         text.push_str(name);
         text.push_str(": ");
-        text.push_str(&String::from_utf8_lossy(value));
+        text.push_str(&scrub_text(&String::from_utf8_lossy(value)));
         text.push_str("\r\n");
     }
     text
@@ -417,7 +499,7 @@ mod tests {
 
         let at = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
         let frame = [0xab; 60];
-        let record = pcap_record(at, &frame);
+        let record = pcap_record(at, &frame, frame.len());
         assert_eq!(record.len(), 16 + 60);
         assert_eq!(u32_at(&record, 0), 1_700_000_000);
         assert_eq!(u32_at(&record, 4), 123_456, "microseconds");
@@ -427,10 +509,64 @@ mod tests {
 
         // Over the snapshot length the record is cut and says so.
         let long = vec![1u8; SNAPLEN as usize + 10];
-        let record = pcap_record(at, &long);
+        let record = pcap_record(at, &long, long.len());
         assert_eq!(u32_at(&record, 8), SNAPLEN);
         assert_eq!(u32_at(&record, 12), SNAPLEN + 10);
         assert_eq!(record.len(), 16 + SNAPLEN as usize);
+
+        // A frame cut to its headers keeps its original length.
+        let record = pcap_record(at, &frame[..54], 1514);
+        assert_eq!(u32_at(&record, 8), 54);
+        assert_eq!(u32_at(&record, 12), 1514);
+    }
+
+    /// An Ethernet frame holding IPv4 with `proto`, then `l4` and `payload`.
+    fn ipv4(proto: u8, l4: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; 12];
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[9] = proto;
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(l4);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn frames_are_kept_to_their_headers() {
+        let mut tcp = [0u8; 20];
+        tcp[12] = 5 << 4;
+        let payload = b"GET / HTTP/1.1\r\nAuthorization: x\r\n\r\n";
+        let frame = ipv4(6, &tcp, payload);
+        assert_eq!(headers_len(&frame), 54);
+
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        assert_eq!(headers_len(&ipv4(17, &udp, b"quic")), 42);
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+        let dns = ipv4(17, &udp, b"query");
+        assert_eq!(headers_len(&dns), dns.len());
+
+        let mut arp = vec![0u8; 12];
+        arp.extend_from_slice(&0x0806u16.to_be_bytes());
+        arp.extend_from_slice(&[0u8; 28]);
+        assert_eq!(headers_len(&arp), arp.len());
+
+        // A TCP header longer than the frame: only Ethernet is kept.
+        let mut bad = [0u8; 20];
+        bad[12] = 15 << 4;
+        assert_eq!(headers_len(&ipv4(6, &bad, b"")), 14);
+        assert_eq!(headers_len(&[1, 2, 3]), 3);
+    }
+
+    #[test]
+    fn random_frames_never_panic() {
+        use proptest::prelude::*;
+        proptest!(|(frame in proptest::collection::vec(any::<u8>(), 0..128))| {
+            prop_assert!(headers_len(&frame) <= frame.len());
+        });
     }
 
     #[test]
@@ -454,8 +590,10 @@ mod tests {
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
         let second = 24 + 16 + 14;
-        assert_eq!(u32_at(&bytes, second + 8), 20);
-        assert_eq!(bytes.len(), second + 16 + 20);
+        // An unknown ethertype: the Ethernet header is kept, the rest not.
+        assert_eq!(u32_at(&bytes, second + 8), 14);
+        assert_eq!(u32_at(&bytes, second + 12), 20);
+        assert_eq!(bytes.len(), second + 16 + 14);
         let mode = fs::metadata(dir.frames()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
@@ -492,11 +630,27 @@ mod tests {
         let beside = DumpDir::prepare(&tmp.path().join("dump"), &[&share]).unwrap();
         assert!(beside.path().is_dir());
         assert!(beside.path().join("http").is_dir());
-        // Again: an existing directory is fine.
-        DumpDir::prepare(&tmp.path().join("dump"), &[&share]).unwrap();
+        // Again: the directory now holds the first run's dump, so no.
+        assert!(DumpDir::prepare(&tmp.path().join("dump"), &[&share]).is_err());
+        // An existing empty directory is fine.
+        fs::create_dir(tmp.path().join("empty")).unwrap();
+        DumpDir::prepare(&tmp.path().join("empty"), &[&share]).unwrap();
         // A file in the way is not.
         fs::write(tmp.path().join("file"), b"x").unwrap();
         assert!(DumpDir::prepare(&tmp.path().join("file"), &[]).is_err());
+    }
+
+    #[test]
+    fn dump_files_never_write_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[]).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::write(&elsewhere, b"keep").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.exchange_file(1, 1, true)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.ws_file(1, 1)).unwrap();
+        assert!(write_exchange(&dir, 1, 1, true, "GET / HTTP/1.1\r\n", None, b"").is_err());
+        assert!(append_ws(&dir, 1, 1, "c2s", true, b"{}").is_err());
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"keep");
     }
 
     #[test]

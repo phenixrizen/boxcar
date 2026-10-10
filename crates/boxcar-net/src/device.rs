@@ -441,8 +441,13 @@ impl VirtioDevice for VirtioNet {
     }
 }
 
-impl Drop for VirtioNet {
-    fn drop(&mut self) {
+impl VirtioNet {
+    /// The device's end, before the log's: the net thread stops (and
+    /// records the end of every flow), then the observer takes what is
+    /// queued, records what is still open and is joined, then the dump.
+    /// So every record they make is in the log before `vmm.stop`. Waits
+    /// at most [`JOIN_LIMIT`] on each; a second call does nothing.
+    pub fn shutdown(&mut self) {
         // No thread may outlive the device: the net thread first, then the
         // observer, which ends once the last sender (the stacks') is gone.
         self.reset();
@@ -467,6 +472,12 @@ impl Drop for VirtioNet {
                 );
             }
         }
+    }
+}
+
+impl Drop for VirtioNet {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -2155,5 +2166,56 @@ mod tests {
                 (2, "10.0.2.15:40001".to_owned())
             ]
         );
+    }
+
+    /// The device's shutdown waits for the observer: what it still held is
+    /// in the log before anything written after the shutdown returns.
+    #[test]
+    fn shutdown_records_what_the_observer_held_first() {
+        use crate::gate::{Direction as PlainDir, Message};
+        let session = Session::new();
+        let inspect = crate::gate::tls::tests::config(&[]);
+        let mut net = VirtioNet::with_inspect(
+            session.config(),
+            session.sink.clone(),
+            Session::policy(),
+            Some(inspect),
+        )
+        .unwrap();
+        let observer = net.observer.clone().unwrap();
+        let dst = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 80);
+        observer.send(Message::Open {
+            flow: 7,
+            dst,
+            name: Some("api.example".into()),
+            alpn: None,
+            tls: false,
+        });
+        for _ in 0..200 {
+            observer.send(Message::Data {
+                flow: 7,
+                dir: PlainDir::ToHost,
+                bytes: b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx".to_vec(),
+            });
+        }
+        drop(observer);
+        net.shutdown();
+        crate::audit::record(
+            &session.sink,
+            boxcar_proto::Payload::NetDrop(boxcar_proto::NetDrop {
+                reason: "marker".into(),
+                count: 1,
+            }),
+        );
+        let records = session.records();
+        let marker = records.iter().position(|r| r.kind == "net.drop").unwrap();
+        let requests: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == "http.request")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(requests.len(), 200, "{}", requests.len());
+        assert!(requests.iter().all(|&i| i < marker));
     }
 }

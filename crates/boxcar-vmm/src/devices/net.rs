@@ -102,16 +102,16 @@ impl NetDevice {
         self.policy_wake.as_ref()
     }
 
-    /// Resets the device through its transport, as a driver's status-0
-    /// write would: an activated device stops its net thread, which
-    /// records the end of every flow, and joins it. Called once the vCPUs
-    /// have stopped, and before the audit writer is closed.
+    /// Ends the device for good: its net thread stops, which records the
+    /// end of every flow, then the gate's observer records what it still
+    /// holds and is joined, and the dump's thread too
+    /// (`VirtioNet::shutdown`). Called once the vCPUs have stopped, and
+    /// before `vmm.stop`, so the observer's last records come before it.
     pub fn close(&self) {
         if let Some(device) = &self.device {
-            device
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .reset();
+            let mut transport = device.lock().unwrap_or_else(PoisonError::into_inner);
+            transport.reset();
+            transport.device_mut().shutdown();
         }
     }
 }

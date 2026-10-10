@@ -121,13 +121,18 @@ says why.
 
 - `frames.pcap`: every frame the guest sent and every frame it was given,
   as a pcap 2.4 file (Ethernet, microsecond timestamps), after bitvessel's
-  `DebugNet`. Open it with Wireshark or `tcpdump -r`. A frame the dump's
+  `DebugNet`. Open it with Wireshark or `tcpdump -r`. Each frame is cut
+  after its Ethernet, IP and TCP, UDP or ICMP headers, keeping its
+  original length: a TCP payload (plain HTTP's included) is never written.
+  ARP, DNS and DHCP are kept whole. A frame the dump's
   queue had no room for is dropped and counted (`net.drop{reason:"dump"}`);
   the net thread never waits on the dump.
 - `http/<flow>-<stream>.req` and `.resp`: each decoded exchange of an
   inspected flow, by its `net.connect` flow id and stream: the start line,
   the headers as the observer keeps them (a credential's value is already
-  gone), a blank line, the decoded body. A JSON body has its secret-looking
+  gone, and the rest are scrubbed as free text), with the query values
+  scrubbed as `http.request.path`'s are, a blank line, the decoded body. A
+  JSON body has its secret-looking
   fields scrubbed as the audit log's summaries are, and a form body (the
   shape of an OAuth token exchange) its credential fields' values replaced.
   The raw plaintext is not written: it would hold what the records never
@@ -135,8 +140,9 @@ says why.
   well: its messages one after another, each with its direction and size
   and, for a text message, the text scrubbed the same way.
 
-DIR is made mode 0700 and every file 0600; it may be neither a share nor
-inside one, nor hold one. The dump is an aid, not part of the audit log:
+DIR is made mode 0700 and every file 0600. It must be new or empty, so a
+run's dump is its own: each file is created where nothing was, never
+through a link. It may be neither a share nor inside one, nor hold one. The dump is an aid, not part of the audit log:
 nothing in it is hashed or chained, and `boxcar audit verify` does not
 look at it. Filesystem traffic has its own dump: `--audit-level verbose`.
 

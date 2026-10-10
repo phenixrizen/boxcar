@@ -140,12 +140,14 @@ impl Text {
 /// A tool call's arguments, as a `tool.open` carries them.
 pub fn tool_open(id: &str, name: &str, args: &Value) -> ToolOpen {
     let json = serde_json::to_string(args).unwrap_or_default();
+    let mut inline = args.clone();
+    boxcar_proto::redact::scrub_deep(&mut inline);
     ToolOpen {
         tool_use_id: id.to_owned(),
         tool_name: name.to_owned(),
         args_b3: b3(json.as_bytes()),
         args_summary: summarize(args),
-        args: (json.len() <= ARGS_INLINE).then(|| args.clone()),
+        args: (json.len() <= ARGS_INLINE).then_some(inline),
     }
 }
 
@@ -157,7 +159,7 @@ pub fn tool_open_text(id: &str, name: &str, arguments: &str) -> ToolOpen {
             tool_use_id: id.to_owned(),
             tool_name: name.to_owned(),
             args_b3: b3(arguments.as_bytes()),
-            args_summary: summary::cut(arguments, SUMMARY_LIMIT),
+            args_summary: summary::cut(&summary::scrubbed(arguments), SUMMARY_LIMIT),
             args: None,
         },
     }

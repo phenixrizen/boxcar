@@ -12,6 +12,43 @@ use std::io::Write;
 /// The most decoded bytes kept for the parsers.
 pub const BODY_KEEP: usize = 16 * 1024 * 1024;
 
+/// The most bytes one body may decode to: past it the decoder stops
+/// (`degraded: "decode_budget"`) and the rest is hashed raw, so a body that
+/// expands without end costs neither memory nor time without end.
+pub const DECODE_BUDGET: usize = 4 * BODY_KEEP;
+
+/// A decoder's output: refuses a write past what is left of the budget,
+/// which fails the decoder before it allocates more.
+struct Capped {
+    buf: Vec<u8>,
+    left: usize,
+}
+
+impl Capped {
+    fn new() -> Capped {
+        Capped {
+            buf: Vec::new(),
+            left: DECODE_BUDGET,
+        }
+    }
+}
+
+impl Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.left {
+            self.left = 0;
+            return Err(std::io::Error::other("decode_budget"));
+        }
+        self.left -= data.len();
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A `Content-Encoding` the observer decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coding {
@@ -38,9 +75,9 @@ impl Coding {
 
 enum Inner {
     Identity,
-    Gzip(flate2::write::GzDecoder<Vec<u8>>),
-    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
-    Brotli(Box<brotli_decompressor::DecompressorWriter<Vec<u8>>>),
+    Gzip(flate2::write::GzDecoder<Capped>),
+    Deflate(flate2::write::ZlibDecoder<Capped>),
+    Brotli(Box<brotli_decompressor::DecompressorWriter<Capped>>),
 }
 
 /// Decodes one body's content coding as its bytes come.
@@ -53,10 +90,10 @@ impl ContentDecoder {
     pub fn new(coding: Coding) -> ContentDecoder {
         let inner = match coding {
             Coding::Identity => Inner::Identity,
-            Coding::Gzip => Inner::Gzip(flate2::write::GzDecoder::new(Vec::new())),
-            Coding::Deflate => Inner::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
+            Coding::Gzip => Inner::Gzip(flate2::write::GzDecoder::new(Capped::new())),
+            Coding::Deflate => Inner::Deflate(flate2::write::ZlibDecoder::new(Capped::new())),
             Coding::Brotli => Inner::Brotli(Box::new(
-                brotli_decompressor::DecompressorWriter::new(Vec::new(), 64 * 1024),
+                brotli_decompressor::DecompressorWriter::new(Capped::new(), 64 * 1024),
             )),
         };
         ContentDecoder {
@@ -73,14 +110,17 @@ impl ContentDecoder {
         }
         let result = match &mut self.inner {
             Inner::Identity => return Ok(raw.to_vec()),
-            Inner::Gzip(d) => d.write_all(raw).map(|_| std::mem::take(d.get_mut())),
-            Inner::Deflate(d) => d.write_all(raw).map(|_| std::mem::take(d.get_mut())),
-            Inner::Brotli(d) => d.write_all(raw).map(|_| std::mem::take(d.get_mut())),
+            Inner::Gzip(d) => d
+                .write_all(raw)
+                .map(|_| std::mem::take(&mut d.get_mut().buf)),
+            Inner::Deflate(d) => d
+                .write_all(raw)
+                .map(|_| std::mem::take(&mut d.get_mut().buf)),
+            Inner::Brotli(d) => d
+                .write_all(raw)
+                .map(|_| std::mem::take(&mut d.get_mut().buf)),
         };
-        result.map_err(|_| {
-            self.failed = true;
-            "content_decode"
-        })
+        result.map_err(|_| self.fail())
     }
 
     /// What the decoder still held at the body's end.
@@ -90,14 +130,29 @@ impl ContentDecoder {
         }
         let result = match &mut self.inner {
             Inner::Identity => return Ok(Vec::new()),
-            Inner::Gzip(d) => d.try_finish().map(|_| std::mem::take(d.get_mut())),
-            Inner::Deflate(d) => d.try_finish().map(|_| std::mem::take(d.get_mut())),
-            Inner::Brotli(d) => d.flush().map(|_| std::mem::take(d.get_mut())),
+            Inner::Gzip(d) => d.try_finish().map(|_| std::mem::take(&mut d.get_mut().buf)),
+            Inner::Deflate(d) => d.try_finish().map(|_| std::mem::take(&mut d.get_mut().buf)),
+            Inner::Brotli(d) => d.flush().map(|_| std::mem::take(&mut d.get_mut().buf)),
         };
-        result.map_err(|_| {
-            self.failed = true;
+        result.map_err(|_| self.fail())
+    }
+
+    /// The decoder failed: why, its budget spent or the stream bad. What
+    /// it had decoded is let go.
+    fn fail(&mut self) -> &'static str {
+        self.failed = true;
+        let capped = match &mut self.inner {
+            Inner::Identity => return "content_decode",
+            Inner::Gzip(d) => d.get_mut(),
+            Inner::Deflate(d) => d.get_mut(),
+            Inner::Brotli(d) => d.get_mut(),
+        };
+        capped.buf = Vec::new();
+        if capped.left == 0 {
+            "decode_budget"
+        } else {
             "content_decode"
-        })
+        }
     }
 }
 
@@ -236,6 +291,23 @@ mod tests {
         // gives for "" and on a known fixture below.
         let _ = bytes;
         vec![0x3b]
+    }
+
+    #[test]
+    fn a_body_decodes_to_its_budget_and_no_further() {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0u8; 1024 * 1024];
+        for _ in 0..(DECODE_BUDGET / zeros.len() + 8) {
+            e.write_all(&zeros).unwrap();
+        }
+        let raw = e.finish().unwrap();
+        let mut sink = BodySink::new(Some("gzip"));
+        let decoded = sink.push(&raw);
+        assert!(decoded.len() <= raw.len(), "{}", decoded.len());
+        sink.finish();
+        let summary = sink.summary();
+        assert_eq!(summary.degraded, Some("decode_budget"));
+        assert!(summary.bytes <= raw.len() as u64);
     }
 
     #[test]

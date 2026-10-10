@@ -697,7 +697,8 @@ fn the_dump_holds_the_frames_and_the_decoded_exchange() {
     assert_eq!(u16::from_le_bytes([pcap[4], pcap[5]]), 2);
     assert_eq!(u16::from_le_bytes([pcap[6], pcap[7]]), 4);
     assert_eq!(u32_at(&pcap, 20), 1, "Ethernet");
-    // Every record's lengths add up, and one is the flow's SYN to the stub.
+    // Every record's lengths add up, no TCP record holds payload, and one
+    // is the flow's SYN to the stub.
     let mut at = 24;
     let mut frames = 0;
     let mut syn = false;
@@ -714,6 +715,8 @@ fn the_dump_holds_the_frames_and_the_decoded_exchange() {
             if dst_port == stub.addr.port() && flags & 0x12 == 0x02 {
                 syn = true;
             }
+            // A TCP segment is kept to its headers, without its payload.
+            assert_eq!(included, 14 + ihl + usize::from(tcp[12] >> 4) * 4);
         }
         frames += 1;
         at += 16 + included;

@@ -188,8 +188,11 @@ pub struct Inspect {
     /// A `close_notify` has been sent each way.
     host_notified: bool,
     guest_notified: bool,
-    /// The guest's stream ended: its `close_notify`, or its FIN.
+    /// The guest's plaintext ended: its `close_notify`, or its FIN once
+    /// every byte before it was read.
     guest_done: bool,
+    /// The guest's FIN was taken: no more TLS bytes come.
+    guest_fin: bool,
     /// rustls holds as much decrypted plaintext from that leg as it will
     /// (it refuses more TLS bytes with an `Other` error): no more is taken
     /// from that side until the relay has read some.
@@ -272,6 +275,7 @@ impl Inspect {
             host_notified: false,
             guest_notified: false,
             guest_done: false,
+            guest_fin: false,
             host_plain_full: false,
             guest_plain_full: false,
             to_host_bytes: 0,
@@ -472,7 +476,7 @@ impl Inspect {
     pub fn guest_eof(&mut self) {
         match self.phase {
             Phase::Upstream | Phase::Guest => self.fail("guest_rejected"),
-            Phase::Relaying => self.guest_done = true,
+            Phase::Relaying => self.guest_fin = true,
             Phase::Failed(_) => {}
         }
     }
@@ -581,7 +585,12 @@ impl Inspect {
                         self.to_host_bytes = self.to_host_bytes.saturating_add(n as u64);
                         self.to_host = Pending { bytes: buf, at: 0 };
                     }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    // Nothing more to read: with the FIN taken, nothing
+                    // more ever will be.
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        self.guest_done = self.guest_fin;
+                        break;
+                    }
                     Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
                         self.guest_done = true;
                         break;
@@ -1070,5 +1079,45 @@ pub(crate) mod tests {
         }
         assert_eq!(up.thread.join().unwrap(), b"bye");
         assert_eq!(inspect.to_host_bytes, 3);
+    }
+
+    /// The guest's last record and its FIN taken in the same round: the
+    /// record's plaintext still reaches the host before the close.
+    #[test]
+    fn the_last_record_before_a_guest_fin_reaches_the_host() {
+        let up = upstream(&[], 4, Vec::new());
+        let cfg = config(std::slice::from_ref(&up.cert));
+        let mut guest = make_guest(trust(cfg.ca()), &[]);
+        let hello = hello_of(&mut guest);
+        let mut inspect =
+            Inspect::new(&cfg, Some(NAME.into()), Ipv4Addr::LOCALHOST, &[], &hello).unwrap();
+        let mut host = connect(up.addr);
+        let mut plain = Vec::new();
+        let started = Instant::now();
+        while drive(&mut inspect, &mut guest, &mut host, &mut plain) != Phase::Relaying {
+            assert!(started.elapsed() < DEADLINE);
+            thread::sleep(Duration::from_millis(1));
+        }
+        guest.writer().write_all(b"last").unwrap();
+        let mut tls = Vec::new();
+        while guest.wants_write() {
+            guest.write_tls(&mut tls).unwrap();
+        }
+        let mut at = 0;
+        while at < tls.len() {
+            at += inspect.guest_in(&tls[at..]).unwrap();
+        }
+        inspect.guest_eof();
+        while !inspect.host_notified() {
+            drive(&mut inspect, &mut guest, &mut host, &mut plain);
+            assert!(started.elapsed() < DEADLINE);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // What the last step queued goes out.
+        for _ in 0..3 {
+            drive(&mut inspect, &mut guest, &mut host, &mut plain);
+        }
+        assert_eq!(up.thread.join().unwrap(), b"last");
+        assert_eq!(inspect.to_host_bytes, 4);
     }
 }
