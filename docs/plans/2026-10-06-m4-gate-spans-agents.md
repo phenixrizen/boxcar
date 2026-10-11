@@ -695,3 +695,11 @@ Made while writing the plan, 2026-10-06:
   the span and the process's later execs, the command among them, were
   dropped as a member's. They now join as the span's effects (Codex
   passed five of five after).
+- **An exchange is charged whole; a URL ends only at a space, quote or
+  bracket.** An exchange now charges its own size (its two body sinks'
+  fixed parts included) with its heads, so the budget bounds how many are
+  open across every flow; open exchanges are boxed, and a flow's map
+  gives its room back once mostly empty. The URL pass finds a URL's
+  scheme by characters, not bytes, and runs a URL to the next space,
+  quote, `<` or `>`: a `,` or `;` may sit in a path, and one the text puts
+  after a URL is taken in, over-matching at worst.

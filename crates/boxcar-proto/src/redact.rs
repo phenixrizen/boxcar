@@ -250,9 +250,11 @@ fn plain(text: &str) -> String {
     words(&text)
 }
 
-/// Each URL in `text` (`scheme://...`, to the next space, quote, `<`,
-/// `>`, `,` or `;`) scrubbed as a request target ([`scrub_target`]): its
-/// query values kept only when short, plain and under an ordinary name.
+/// Each URL in `text` (`scheme://...`, to the next space, quote, `<` or
+/// `>`) scrubbed as a request target ([`scrub_target`]): its query values
+/// kept only when short, plain and under an ordinary name. A `,` or `;`
+/// does not end a URL (a path may hold either); one the text put after it
+/// is taken in, over-matching at worst.
 /// A redirect's `code`, a signed URL's `sig`, are found wherever the URL
 /// sits (a `Refresh` header, a `Link`, a command's argument).
 fn urls(text: &str) -> String {
@@ -260,10 +262,12 @@ fn urls(text: &str) -> String {
     let mut rest = text;
     while let Some(at) = rest.find("://") {
         let scheme_start = rest[..at]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |p| p + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(p, c)| p + c.len_utf8());
         let end = rest[at + 3..]
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ',' | ';'))
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
             .map_or(rest.len(), |p| at + 3 + p);
         out.push_str(&rest[..scheme_start]);
         if scheme_start == at {
@@ -651,6 +655,15 @@ mod tests {
                 "see https://example.com/docs now",
             ),
             ("not a url: ://nothing", "not a url: ://nothing"),
+            // A `;` or `,` in a path or a query does not end the URL.
+            (
+                "https://client.example/cb;v=1?code=example-code",
+                "https://client.example/cb;v=1?code=[redacted]",
+            ),
+            (
+                "go to https://x.example/p,q?n=1,2&sig=s, then",
+                "go to https://x.example/p,q?n=1,2&sig=[redacted] then",
+            ),
         ];
         for (text, want) in cases {
             assert_eq!(scrub_text(text), want, "{text}");
@@ -658,6 +671,24 @@ mod tests {
         // Nested schemes end, however many.
         let nested = "a://".repeat(10_000);
         let _ = scrub_text(&nested);
+    }
+
+    #[test]
+    fn urls_next_to_wide_characters_are_scrubbed() {
+        let cases = [
+            (
+                "éhttps://x.test/?code=abc",
+                "éhttps://x.test/?code=[redacted]",
+            ),
+            ("日本://x.test/?code=abc", "日本://x.test/?code=abc"),
+            (
+                "→https://例え.jp/a?sig=z ok",
+                "→https://例え.jp/a?sig=[redacted] ok",
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text}");
+        }
     }
 
     #[test]

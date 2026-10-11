@@ -140,7 +140,8 @@ impl Exchange {
         self
     }
 
-    /// The bytes its heads hold: the request's fields, and the dump's
+    /// The bytes it holds outside its bodies: the exchange itself (its
+    /// sinks' fixed parts included), the request's fields, and the dump's
     /// copies of both heads while they wait to be written.
     fn meta_bytes(&self) -> usize {
         let text = |t: &Option<String>| t.as_ref().map_or(0, String::capacity);
@@ -156,7 +157,11 @@ impl Exchange {
             .response
             .as_ref()
             .map_or(0, |r| text(&r.content_type) + text(&r.content_encoding));
-        request + response + text(&self.request_head_text) + text(&self.response_head_text)
+        size_of::<Exchange>()
+            + request
+            + response
+            + text(&self.request_head_text)
+            + text(&self.response_head_text)
     }
 
     /// Whether both sides have been recorded (or will never be).
@@ -172,7 +177,8 @@ pub struct Observation {
     pub name: Option<String>,
     pub tls: bool,
     conn: Connection,
-    exchanges: HashMap<u32, Exchange>,
+    /// Boxed, so the room the map keeps is a pointer an entry.
+    exchanges: HashMap<u32, Box<Exchange>>,
     model: Tracker,
     /// Where each decoded exchange is written, when the session dumps.
     dump: Option<DumpDir>,
@@ -287,7 +293,7 @@ impl Observation {
     }
 
     /// The exchanges under way, by stream.
-    pub fn exchanges(&mut self) -> &mut HashMap<u32, Exchange> {
+    pub fn exchanges(&mut self) -> &mut HashMap<u32, Box<Exchange>> {
         &mut self.exchanges
     }
 
@@ -351,10 +357,9 @@ impl Observation {
                         }
                     }
                     let retained = self.retained.clone();
-                    let exchange = self
-                        .exchanges
-                        .entry(stream)
-                        .or_insert_with(|| Exchange::new(stream, now).with_retained(&retained));
+                    let exchange = self.exchanges.entry(stream).or_insert_with(|| {
+                        Box::new(Exchange::new(stream, now).with_retained(&retained))
+                    });
                     exchange.request_started = now;
                     exchange.request_body = Some(
                         BodySink::new(headers.content_encoding().as_deref())
@@ -412,13 +417,13 @@ impl Observation {
                     headers,
                 } => {
                     let retained = self.retained.clone();
-                    let exchange = self
-                        .exchanges
-                        .entry(stream)
-                        .or_insert_with(|| Exchange::new(stream, now).with_retained(&retained));
+                    let exchange = self.exchanges.entry(stream).or_insert_with(|| {
+                        Box::new(Exchange::new(stream, now).with_retained(&retained))
+                    });
                     exchange.last_response_at = now;
                     // An interim response is followed by the final one.
                     if (100..200).contains(&status) && status != 101 {
+                        self.charge_meta(stream, now, out);
                         continue;
                     }
                     let content_type = headers.content_type();
@@ -559,6 +564,11 @@ impl Observation {
                     }
                 }
             }
+        }
+        // A map keeps its room when its exchanges go: give it back once
+        // it is mostly empty.
+        if self.exchanges.capacity() > 2 * self.exchanges.len() + 16 {
+            self.exchanges.shrink_to(self.exchanges.len());
         }
     }
 
@@ -787,8 +797,10 @@ mod tests {
     /// not kept, and says so.
     #[test]
     fn request_bodies_draw_on_the_budget_until_recorded() {
-        // Room for two bodies and the heads, not three bodies.
-        let retained = Retained::with_limit(2 * 1024 * 1024 + 4096);
+        // Room for two bodies and three exchanges with their heads, not
+        // three bodies.
+        let exchanges = 3 * size_of::<Exchange>() + 4096;
+        let retained = Retained::with_limit(2 * 1024 * 1024 + exchanges);
         let mut obs = observation(Some("http/1.1")).with_retained(retained.clone());
         let mut out = Vec::new();
         let now = Instant::now();
@@ -822,7 +834,10 @@ mod tests {
         for stream in 1..=3 {
             obs.handle(vec![Event::RequestEnd { stream }], now, &mut out);
         }
-        assert!(retained.held() < 4096, "recorded: the bodies given back");
+        assert!(
+            retained.held() < exchanges,
+            "recorded: the bodies given back"
+        );
         let degraded: Vec<Option<String>> = out
             .iter()
             .filter_map(|e| match &e.payload {
@@ -861,7 +876,8 @@ mod tests {
     /// none left the dump's copies go, then the exchange.
     #[test]
     fn exchange_heads_draw_on_the_budget() {
-        let retained = Retained::with_limit(1024);
+        let limit = 8 * size_of::<Exchange>() + 1024;
+        let retained = Retained::with_limit(limit);
         let mut obs = observation(Some("http/1.1")).with_retained(retained.clone());
         let mut out = Vec::new();
         let now = Instant::now();
@@ -879,10 +895,73 @@ mod tests {
                 &mut out,
             );
         }
-        assert!(retained.held() <= 1024, "{}", retained.held());
-        assert!(obs.exchanges().len() < 40);
+        assert!(retained.held() <= limit, "{}", retained.held());
+        assert!((1..40).contains(&obs.exchanges().len()));
         assert!(out.iter().any(|e| matches!(&e.payload,
             Payload::HttpRequest(r) if r.degraded.as_deref() == Some("observe_budget"))));
+    }
+
+    fn get(stream: u32) -> Event {
+        Event::RequestHead {
+            stream,
+            method: "GET".into(),
+            authority: None,
+            path: Some("/".into()),
+            version: Version::Http1,
+            headers: Headers::new(),
+        }
+    }
+
+    #[test]
+    fn unanswered_exchanges_draw_on_one_budget_across_flows() {
+        let limit = 16 * size_of::<Exchange>();
+        let retained = Retained::with_limit(limit);
+        let mut flows: Vec<Observation> = (0..4)
+            .map(|_| observation(Some("http/1.1")).with_retained(retained.clone()))
+            .collect();
+        let mut out = Vec::new();
+        let now = Instant::now();
+        for obs in &mut flows {
+            for stream in 1..=100u32 {
+                obs.handle(
+                    vec![get(stream), Event::RequestEnd { stream }],
+                    now,
+                    &mut out,
+                );
+            }
+        }
+        assert!(retained.held() <= limit, "{}", retained.held());
+        let open: usize = flows.iter_mut().map(|obs| obs.exchanges().len()).sum();
+        assert!((1..=16).contains(&open), "{open}");
+        assert!(out.iter().any(|e| matches!(&e.payload,
+            Payload::HttpRequest(r) if r.degraded.as_deref() == Some("observe_budget"))));
+    }
+
+    #[test]
+    fn a_flow_gives_back_the_room_of_exchanges_that_went() {
+        let mut obs = observation(Some("http/1.1"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        let streams = 1..=400u32;
+        obs.handle(streams.clone().map(get).collect(), now, &mut out);
+        assert!(obs.exchanges().capacity() >= 400);
+        let mut answers = Vec::new();
+        for stream in streams {
+            answers.push(Event::RequestEnd { stream });
+            answers.push(Event::ResponseHead {
+                stream,
+                status: 204,
+                headers: Headers::new(),
+            });
+            answers.push(Event::ResponseEnd { stream });
+        }
+        obs.handle(answers, now, &mut out);
+        assert!(obs.exchanges().is_empty());
+        assert!(
+            obs.exchanges().capacity() <= 16,
+            "{}",
+            obs.exchanges().capacity()
+        );
     }
 
     #[test]
