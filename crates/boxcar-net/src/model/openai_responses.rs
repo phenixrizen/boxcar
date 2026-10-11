@@ -19,8 +19,8 @@ use serde_json::Value;
 use crate::http::Retained;
 
 use super::{
-    b3, content_text, tool_close, tool_open_text, u64_of, CallBudget, RequestInfo, ResponseInfo,
-    Text, ToolClose, ToolOpen,
+    b3, content_text, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget, RequestInfo,
+    ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -173,6 +173,9 @@ struct Call {
     name: String,
     arguments: String,
     done: bool,
+    /// A piece of the arguments found no room: lost until a whole value
+    /// (a `done` event's) replaces them.
+    lost: bool,
 }
 
 /// A streamed response, event by event; the same for the events of a
@@ -256,6 +259,8 @@ impl Stream {
                     {
                         if self.budget.admit(args.len(), &mut self.degraded) {
                             call.arguments = args.to_owned();
+                        } else {
+                            call.lost = true;
                         }
                     }
                 }
@@ -263,12 +268,16 @@ impl Stream {
             "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    if self.room(index) && self.budget.admit(delta.len(), &mut self.degraded) {
-                        self.calls
-                            .entry(index)
-                            .or_default()
-                            .arguments
-                            .push_str(delta);
+                    if self.room(index) {
+                        let admitted = self.budget.admit(delta.len(), &mut self.degraded);
+                        let call = self.calls.entry(index).or_default();
+                        if call.lost {
+                        } else if admitted {
+                            call.arguments.push_str(delta);
+                        } else {
+                            call.lost = true;
+                            call.arguments = String::new();
+                        }
                     }
                 }
             }
@@ -280,7 +289,10 @@ impl Stream {
                     .and_then(Value::as_str)
                 {
                     if self.room(index) && self.budget.admit(args.len(), &mut self.degraded) {
-                        self.calls.entry(index).or_default().arguments = args.to_owned();
+                        // A whole value: what was lost is whole again.
+                        let call = self.calls.entry(index).or_default();
+                        call.arguments = args.to_owned();
+                        call.lost = false;
                     }
                 }
             }
@@ -305,6 +317,7 @@ impl Stream {
                     }
                     if let Some(args) = text("arguments").or_else(|| text("input")) {
                         call.arguments = args.to_owned();
+                        call.lost = false;
                     }
                     call.done = true;
                     self.info.tool_uses += 1;
@@ -313,7 +326,11 @@ impl Stream {
                     } else {
                         &call.call_id
                     };
-                    opens.push(tool_open_text(id, &call.name, &call.arguments));
+                    opens.push(if call.lost {
+                        tool_open_lost(id, &call.name)
+                    } else {
+                        tool_open_text(id, &call.name, &call.arguments)
+                    });
                 }
             }
             "response.output_text.delta" => {

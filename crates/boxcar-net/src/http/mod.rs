@@ -139,6 +139,16 @@ pub struct Connection {
     inner: Inner,
 }
 
+/// A buffer that holds much less than its allocation shrinks to fit (with
+/// some room): a buffer drained after a large frame or line does not keep
+/// its peak allocation, so what is held is what is charged.
+pub(crate) fn trim(buf: &mut Vec<u8>) {
+    const SLACK: usize = 64 * 1024;
+    if buf.capacity() > SLACK && buf.capacity() > 2 * buf.len() {
+        buf.shrink_to(buf.len().max(SLACK / 4));
+    }
+}
+
 impl Connection {
     /// A connection speaking the protocol `alpn` named (`h2`), else
     /// HTTP/1.1.
@@ -199,6 +209,29 @@ impl Connection {
             }
             Inner::Ws(ws) => ws.lost(dir, out),
             Inner::Broken => {}
+        }
+    }
+
+    /// The bytes the parsers hold for this connection (their buffers'
+    /// allocations), after trimming what they no longer need.
+    pub fn held(&mut self) -> usize {
+        match &mut self.inner {
+            Inner::H1(h1) => h1.held(),
+            Inner::H2(h2) => h2.held(),
+            Inner::Ws(ws) => ws.held(),
+            Inner::Broken => 0,
+        }
+    }
+
+    /// The connection is observed no further (`reason`): its parsers and
+    /// what they held go.
+    pub fn give_up(&mut self, reason: &'static str, out: &mut Vec<Event>) {
+        if !matches!(self.inner, Inner::Broken) {
+            self.inner = Inner::Broken;
+            out.push(Event::Degraded {
+                stream: None,
+                reason,
+            });
         }
     }
 

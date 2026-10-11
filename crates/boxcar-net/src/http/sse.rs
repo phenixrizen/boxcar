@@ -74,8 +74,8 @@ impl SseParser {
             self.buf.drain(..at);
             self.line(&line, out);
         }
-        let held = self.buf.len() + self.current.data.len();
-        if self.buf.len() > MAX_EVENT_BYTES || !self.share.set(held) {
+        super::trim(&mut self.buf);
+        if self.buf.len() > MAX_EVENT_BYTES || !self.share.set(self.held()) {
             // Too long, or no room left: the line goes, to its end, and
             // with no room the event under way goes too.
             if self.buf.len() <= MAX_EVENT_BYTES {
@@ -85,8 +85,17 @@ impl SseParser {
             self.buf = Vec::new();
             self.skipping = true;
             self.overflowed = true;
-            self.share.set(self.current.data.len());
+            self.share.set(self.held());
         }
+    }
+
+    /// The bytes held: the line buffer's allocation and the event under
+    /// way's.
+    fn held(&self) -> usize {
+        self.buf.capacity()
+            + self.current.data.capacity()
+            + self.current.event.as_ref().map_or(0, String::capacity)
+            + self.current.id.as_ref().map_or(0, String::capacity)
     }
 
     /// Whether a line was dropped for running past [`MAX_EVENT_BYTES`].
@@ -236,5 +245,25 @@ mod tests {
         assert!(parser.overflowed());
         parser.feed(b"tail\n\ndata: ok\n\n", &mut out);
         assert_eq!(out.last().map(|e| e.data.as_str()), Some("ok"));
+    }
+
+    /// A long line, once read, leaves neither its allocation nor its
+    /// charge behind.
+    #[test]
+    fn a_drained_line_gives_back_its_room() {
+        let retained = crate::http::Retained::default();
+        let mut parser = SseParser::with_retained(retained.clone());
+        let mut out = Vec::new();
+        let mut line = b":".to_vec();
+        line.extend(std::iter::repeat_n(b'x', 8 * 1024 * 1024));
+        parser.feed(&line, &mut out);
+        assert!(retained.held() >= 8 * 1024 * 1024);
+        parser.feed(b"\n", &mut out);
+        assert!(
+            parser.buf.capacity() <= 64 * 1024,
+            "{}",
+            parser.buf.capacity()
+        );
+        assert!(retained.held() <= 64 * 1024, "{}", retained.held());
     }
 }

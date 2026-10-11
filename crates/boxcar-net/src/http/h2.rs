@@ -358,6 +358,19 @@ impl H2 {
         }
     }
 
+    /// The bytes held (frame buffers and header blocks under way, and
+    /// each side's table at its ceiling), after trimming the buffers.
+    pub fn held(&mut self) -> usize {
+        let mut held = 0;
+        for side in [&mut self.c2s, &mut self.s2c] {
+            super::trim(&mut side.buf);
+            held += side.buf.capacity()
+                + side.pending.as_ref().map_or(0, |p| p.block.capacity())
+                + MAX_TABLE_SIZE;
+        }
+        held
+    }
+
     /// A header block is whole: decode it and report the head or the
     /// trailers it is.
     fn complete(&mut self, dir: Direction, out: &mut Vec<Event>) {

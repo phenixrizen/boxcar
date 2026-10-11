@@ -57,13 +57,16 @@ processes and ring 0 effects to the span:
   when that comes. A provisional executor is reported in `span.effects`
   and is never the agent: ancestry is traced to the root instead, and its
   own work is judged as any process's. The agent itself is in no span.
-- **The close.** A `tool.close` closes a span with a bound executor only
-  when it came over a flow that same process opened: one over a flow
-  another process opened is dropped, and one over a flow whose opener is
-  not known yet waits up to 2 s to learn it, then is dropped if it never
-  does. The span stays open for its own close (or is recorded as it
-  stands at the VM's stop). A span with no bound executor takes any
-  close: there is nothing to hold it to.
+- **The close.** A span's executor is its request's bound executor, or,
+  when that entry is gone, the process the sensor says opened the
+  request's flow (learned at the open or later). A span with a known
+  executor closes only by a `tool.close` that came over a flow that same
+  process opened: one over a flow another process opened is dropped, and
+  one over a flow whose opener is not known yet waits up to 2 s to learn
+  it, then is dropped if it never does. The span stays open for its own
+  close (or is recorded as it stands at the VM's stop). A span whose
+  executor is not known, or a session without the sensor's lineage
+  programs, takes any close: there is nothing to hold it to.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
   `truncated`) and takes nothing more, nor its `tool.close`.
@@ -80,9 +83,11 @@ processes and ring 0 effects to the span:
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)
   whose declared `command` (or `cmd`, a string or an array; for a free-text tool such as Codex's `exec`, the quoted string
   after `cmd:` or `command:` in the arguments' summary) the exec
-  carries, compared exactly: a declared argv is the exec's argv; a
-  declared command line is the shell's `-c` command (spaces at either end
-  aside), or Claude Code's wrapper around exactly it read as a shell reads
+  carries, compared exactly: a declared argv is the exec's argv, the file
+  run being the program it names; a declared command line is the `-c`
+  command of a shell the kernel ran (`proc.exec.filename`, never
+  `argv[0]`, which the caller sets) (spaces at either end aside), or
+  Claude Code's wrapper around exactly it read as a shell reads
   it (its own setup as whole `&&` parts, then `eval '<command>' <
   /dev/null && pwd -P >| <file>`, nothing after), or, run without a
   shell, the exec's argv is its words. The declared command appearing

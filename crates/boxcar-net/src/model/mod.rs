@@ -105,13 +105,29 @@ pub struct ToolOpen {
 /// The most bytes of arguments a `tool.open` carries inline.
 pub const ARGS_INLINE: usize = 8 * 1024;
 /// The most bytes of a tool call's id kept anywhere (records, spans):
-/// past it the id is cut, the same way for its open and its close.
+/// past it the id becomes its first [`ID_PREFIX`] bytes and a hash of all
+/// of it, the same for its open and its close, two ids never one.
 pub const MAX_TOOL_ID: usize = 256;
+/// What a too-long id keeps of itself before its hash.
+pub const ID_PREFIX: usize = 128;
 /// The most bytes of a tool's name kept anywhere.
 pub const MAX_TOOL_NAME: usize = 1024;
 
 /// `text` cut to at most `max` bytes at a character boundary, nothing
 /// added: the same text always cuts the same way.
+/// A tool call's id as it is kept: itself, or past [`MAX_TOOL_ID`] its
+/// first [`ID_PREFIX`] bytes, `~`, and blake3 of the whole id.
+pub fn tool_id(id: &str) -> String {
+    if id.len() <= MAX_TOOL_ID {
+        return id.to_owned();
+    }
+    format!(
+        "{}~b3:{}",
+        capped(id, ID_PREFIX),
+        blake3::hash(id.as_bytes()).to_hex()
+    )
+}
+
 fn capped(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
@@ -221,7 +237,7 @@ pub fn tool_open(id: &str, name: &str, args: &Value) -> ToolOpen {
     let mut inline = args.clone();
     boxcar_proto::redact::scrub_deep(&mut inline);
     ToolOpen {
-        tool_use_id: capped(id, MAX_TOOL_ID),
+        tool_use_id: tool_id(id),
         tool_name: capped(name, MAX_TOOL_NAME),
         args_b3: b3(json.as_bytes()),
         args_summary: summarize(args),
@@ -230,12 +246,26 @@ pub fn tool_open(id: &str, name: &str, args: &Value) -> ToolOpen {
     }
 }
 
+/// A tool call whose arguments were not kept whole (a piece of them found
+/// no room): its id and name only. Arguments with a piece missing are not
+/// the arguments, and what is left of them is not scrubbed reliably.
+pub fn tool_open_lost(id: &str, name: &str) -> ToolOpen {
+    ToolOpen {
+        tool_use_id: tool_id(id),
+        tool_name: capped(name, MAX_TOOL_NAME),
+        args_b3: None,
+        args_summary: "[arguments not kept whole]".to_owned(),
+        args: None,
+        raw: None,
+    }
+}
+
 /// A tool call whose arguments came as JSON text (OpenAI's).
 pub fn tool_open_text(id: &str, name: &str, arguments: &str) -> ToolOpen {
     match serde_json::from_str::<Value>(arguments) {
         Ok(value) => tool_open(id, name, &value),
         Err(_) => ToolOpen {
-            tool_use_id: capped(id, MAX_TOOL_ID),
+            tool_use_id: tool_id(id),
             tool_name: capped(name, MAX_TOOL_NAME),
             args_b3: b3(arguments.as_bytes()),
             args_summary: summary::cut(&summary::scrubbed(arguments), SUMMARY_LIMIT),
@@ -250,7 +280,7 @@ pub fn tool_open_text(id: &str, name: &str, arguments: &str) -> ToolOpen {
 pub fn tool_close(id: &str, content: &Value, is_error: bool) -> ToolClose {
     let text = content_text(content);
     ToolClose {
-        tool_use_id: capped(id, MAX_TOOL_ID),
+        tool_use_id: tool_id(id),
         status: if is_error { "error" } else { "ok" }.to_owned(),
         result_bytes: text.len() as u64,
         result_b3: b3(text.as_bytes()),
@@ -302,9 +332,13 @@ mod tests {
         let name = "n".repeat(MAX_TOOL_NAME * 4);
         let open = tool_open(&id, &name, &serde_json::json!({}));
         let close = tool_close(&id, &serde_json::json!("done"), false);
-        assert_eq!(open.tool_use_id.len(), MAX_TOOL_ID);
+        assert!(open.tool_use_id.len() <= MAX_TOOL_ID);
         assert_eq!(open.tool_name.len(), MAX_TOOL_NAME);
         assert_eq!(open.tool_use_id, close.tool_use_id);
+        // Two long ids that share their start stay two.
+        let other = format!("{}j", "i".repeat(MAX_TOOL_ID * 4 - 1));
+        assert_ne!(tool_id(&id), tool_id(&other));
+        assert_eq!(tool_id("short"), "short");
         assert_eq!(capped("ééé", 3), "é");
     }
 

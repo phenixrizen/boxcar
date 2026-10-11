@@ -646,3 +646,13 @@ Made while writing the plan, 2026-10-06:
   data as its size. Responses `done` events count against the call
   budget, and tool ids (256 bytes) and names (1 KiB) are capped wherever
   they are kept.
+- **Hardening after the fifth review.** The retained-byte budget counts
+  parsers by their allocations: HTTP/1, HTTP/2 and WebSocket buffers and
+  the event-stream parser are charged after each feed (a connection that
+  would pass the budget is observed no further), and buffers shrink once
+  drained. Tool-call arguments that lost a piece for want of room are
+  lost whole: the call carries no arguments. A shell is recognized by the
+  file the kernel ran, never `argv[0]`. A span's executor is recovered
+  from the request flow's opener when its entry was evicted or learned
+  later, and a close is held to it. A tool id over 256 bytes becomes a
+  prefix and the hash of the whole id.

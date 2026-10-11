@@ -68,6 +68,17 @@ pub struct Ws {
 }
 
 impl Ws {
+    /// The bytes held (frame buffers and messages under way), after
+    /// trimming the buffers.
+    pub fn held(&mut self) -> usize {
+        let mut held = 0;
+        for side in [&mut self.c2s, &mut self.s2c] {
+            super::trim(&mut side.buf);
+            held += side.buf.capacity() + side.partial.as_ref().map_or(0, |p| p.payload.capacity());
+        }
+        held
+    }
+
     /// A connection whose handshake agreed `extensions` (each as the
     /// `Sec-WebSocket-Extensions` entry, lowercase): none, or
     /// `permessage-deflate` with its parameters. Anything else cannot be

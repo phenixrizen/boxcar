@@ -19,8 +19,8 @@ use serde_json::Value;
 use crate::http::Retained;
 
 use super::{
-    b3, content_text, tool_close, tool_open, tool_open_text, u64_of, CallBudget, RequestInfo,
-    ResponseInfo, Text, ToolClose, ToolOpen,
+    b3, content_text, tool_close, tool_open, tool_open_lost, tool_open_text, u64_of, CallBudget,
+    RequestInfo, ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -117,6 +117,8 @@ struct Block {
     id: String,
     name: String,
     json: String,
+    /// A piece of the arguments found no room: they are lost for good.
+    lost: bool,
 }
 
 /// A streamed response, event by event.
@@ -193,6 +195,7 @@ impl Stream {
                             id: id.to_owned(),
                             name: name.to_owned(),
                             json: String::new(),
+                            lost: false,
                         },
                     );
                 }
@@ -212,8 +215,13 @@ impl Stream {
                                 .and_then(|d| d.get("partial_json"))
                                 .and_then(Value::as_str)
                             {
-                                if self.budget.admit(part.len(), &mut self.degraded) {
+                                if block.lost {
+                                    // Nothing more: the arguments are gone.
+                                } else if self.budget.admit(part.len(), &mut self.degraded) {
                                     block.json.push_str(part);
+                                } else {
+                                    block.lost = true;
+                                    block.json = String::new();
                                 }
                             }
                         }
@@ -267,6 +275,9 @@ impl Stream {
 /// A `tool_use` block as a span's open: its input as JSON when it is
 /// JSON (an empty input is `{}`), else as text, not inlined.
 fn block_open(block: &Block) -> ToolOpen {
+    if block.lost {
+        return tool_open_lost(&block.id, &block.name);
+    }
     if block.json.trim().is_empty() {
         return tool_open(&block.id, &block.name, &Value::Object(Default::default()));
     }
@@ -473,5 +484,43 @@ mod tests {
         assert!(held <= STREAM_CALL_BYTES, "{held}");
         let (info, _) = stream.finish();
         assert_eq!(info.degraded, Some("stream_budget"));
+    }
+
+    /// Arguments that lost a piece for want of room are lost whole: later
+    /// pieces are not kept, and the call carries no arguments.
+    #[test]
+    fn a_call_that_lost_a_piece_keeps_no_arguments() {
+        use crate::http::{Retained, Share};
+        // Its id and name take 6 bytes; another holder takes 25, leaving 9.
+        let retained = Retained::with_limit(40);
+        let mut other = Share::new(retained.clone());
+        let mut stream = Stream::new().with_retained(retained);
+        stream.event(&sse(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}"#,
+        ));
+        let delta = |part: &str| {
+            serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": part}
+            })
+            .to_string()
+        };
+        assert!(other.grow(25));
+        stream.event(&sse("content_block_delta", &delta("{\"password\":\"")));
+        other.clear();
+        stream.event(&sse("content_block_delta", &delta("demo-pass\"}")));
+        let opens = stream.event(&sse(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ));
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].args, None);
+        assert!(
+            !opens[0].args_summary.contains("demo-pass"),
+            "{}",
+            opens[0].args_summary
+        );
+        assert_eq!(opens[0].raw, None);
     }
 }

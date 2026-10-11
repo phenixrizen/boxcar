@@ -149,6 +149,20 @@ impl H1 {
         }
     }
 
+    /// The bytes held, after trimming the buffers.
+    pub fn held(&mut self) -> usize {
+        super::trim(&mut self.c2s.buf);
+        super::trim(&mut self.s2c.buf);
+        let upgrade = self
+            .upgrade
+            .as_ref()
+            .map_or(0, |u| u.c2s.capacity() + u.s2c.capacity());
+        self.c2s.buf.capacity()
+            + self.s2c.buf.capacity()
+            + upgrade
+            + self.seen.capacity() * std::mem::size_of::<Seen>()
+    }
+
     /// The upgrade a `101` made, once, with the bytes beyond it.
     pub fn take_upgrade(&mut self) -> Option<Upgrade> {
         self.upgrade.take()

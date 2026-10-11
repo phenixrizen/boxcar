@@ -24,7 +24,9 @@ use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
 
 use super::Direction;
 use crate::dump::{self, DumpDir};
-use crate::http::{BodySink, Connection, Event, Headers, Retained, SseEvent, SseParser, Version};
+use crate::http::{
+    BodySink, Connection, Event, Headers, Retained, Share, SseEvent, SseParser, Version,
+};
 use crate::model::Tracker;
 
 /// A record the observer made, with the span it belongs to, if any.
@@ -147,6 +149,8 @@ pub struct Observation {
     dump: Option<DumpDir>,
     /// The observer's retained-byte budget, shared by every flow.
     retained: Retained,
+    /// What the connection's parsers take of it.
+    conn_share: Share,
 }
 
 impl Observation {
@@ -170,6 +174,7 @@ impl Observation {
             model: Tracker::new(flow, trace_id.to_owned()),
             dump: None,
             retained: Retained::default(),
+            conn_share: Share::default(),
         }
     }
 
@@ -177,8 +182,19 @@ impl Observation {
     /// observer's `retained` budget, shared by every flow.
     pub fn with_retained(mut self, retained: Retained) -> Observation {
         self.model = self.model.with_retained(retained.clone());
+        self.conn_share = Share::new(retained.clone());
         self.retained = retained;
         self
+    }
+
+    /// Charges what the connection's parsers hold; when it does not fit,
+    /// the connection is observed no further and lets it all go.
+    fn charge_conn(&mut self, events: &mut Vec<Event>) {
+        let held = self.conn.held();
+        if !self.conn_share.set(held) {
+            self.conn.give_up("observe_budget", events);
+            self.conn_share.clear();
+        }
     }
 
     /// The observation with the dump: each exchange's decoded request and
@@ -251,6 +267,7 @@ impl Observation {
     pub fn data(&mut self, dir: Direction, bytes: &[u8], now: Instant, out: &mut Vec<Emit>) {
         let mut events = Vec::new();
         self.conn.feed(dir, bytes, &mut events);
+        self.charge_conn(&mut events);
         self.handle(events, now, out);
     }
 
@@ -258,6 +275,7 @@ impl Observation {
     pub fn lost(&mut self, dir: Direction, now: Instant, out: &mut Vec<Emit>) {
         let mut events = Vec::new();
         self.conn.lost(dir, &mut events);
+        self.charge_conn(&mut events);
         self.handle(events, now, out);
     }
 
@@ -741,6 +759,30 @@ mod tests {
             })
             .collect();
         assert_eq!(degraded, [None, None, Some("observe_budget".to_owned())]);
+    }
+
+    /// A connection whose parsers would hold more than the observer's
+    /// budget is observed no further, and lets go of what it held.
+    #[test]
+    fn a_connection_past_the_budget_is_given_up() {
+        let retained = Retained::with_limit(1024 * 1024);
+        let mut obs = observation(Some("h2")).with_retained(retained.clone());
+        let mut out = Vec::new();
+        let now = Instant::now();
+        let mut c2s = crate::http::h2::PREFACE.to_vec();
+        c2s.extend(h2_frame(4, 0, 0, &[]));
+        obs.data(Direction::ToHost, &c2s, now, &mut out);
+        // A DATA frame announced at 8 MiB, sent in pieces.
+        let mut head = (8u32 * 1024 * 1024).to_be_bytes()[1..].to_vec();
+        head.extend_from_slice(&[0, 0]);
+        head.extend_from_slice(&1u32.to_be_bytes());
+        obs.data(Direction::ToHost, &head, now, &mut out);
+        let piece = vec![0u8; 256 * 1024];
+        for _ in 0..16 {
+            obs.data(Direction::ToHost, &piece, now, &mut out);
+        }
+        assert!(retained.held() <= 1024 * 1024, "{}", retained.held());
+        assert_eq!(retained.held(), 0, "given up: nothing held");
     }
 
     #[test]

@@ -18,8 +18,8 @@ use serde_json::Value;
 use crate::http::Retained;
 
 use super::{
-    b3, content_text, tool_close, tool_open_text, u64_of, CallBudget, RequestInfo, ResponseInfo,
-    Text, ToolClose, ToolOpen,
+    b3, content_text, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget, RequestInfo,
+    ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -149,6 +149,8 @@ struct Call {
     id: String,
     name: String,
     arguments: String,
+    /// A piece of the call found no room: its arguments are lost for good.
+    lost: bool,
 }
 
 /// A streamed response, chunk by chunk.
@@ -221,25 +223,31 @@ impl Stream {
                         continue;
                     }
                     let entry = self.calls.entry(index).or_default();
-                    if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        if self.budget.admit(id.len(), &mut self.degraded) {
-                            entry.id = id.to_owned();
-                        }
-                    }
                     let function = call.get("function");
-                    if let Some(name) = function.and_then(|f| f.get("name")).and_then(Value::as_str)
-                    {
-                        if self.budget.admit(name.len(), &mut self.degraded) {
-                            entry.name.push_str(name);
-                        }
-                    }
-                    if let Some(part) = function
+                    let id = call.get("id").and_then(Value::as_str);
+                    let name = function.and_then(|f| f.get("name")).and_then(Value::as_str);
+                    let part = function
                         .and_then(|f| f.get("arguments"))
-                        .and_then(Value::as_str)
-                    {
-                        if self.budget.admit(part.len(), &mut self.degraded) {
-                            entry.arguments.push_str(part);
-                        }
+                        .and_then(Value::as_str);
+                    let size = id.map_or(0, str::len)
+                        + name.map_or(0, str::len)
+                        + part.map_or(0, str::len);
+                    if entry.lost {
+                        continue;
+                    }
+                    if !self.budget.admit(size, &mut self.degraded) {
+                        entry.lost = true;
+                        entry.arguments = String::new();
+                        continue;
+                    }
+                    if let Some(id) = id {
+                        entry.id = id.to_owned();
+                    }
+                    if let Some(name) = name {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(part) = part {
+                        entry.arguments.push_str(part);
                     }
                 }
             }
@@ -260,7 +268,11 @@ impl Stream {
         let mut opens = Vec::new();
         for (_, call) in calls {
             self.info.tool_uses += 1;
-            opens.push(tool_open_text(&call.id, &call.name, &call.arguments));
+            opens.push(if call.lost {
+                tool_open_lost(&call.id, &call.name)
+            } else {
+                tool_open_text(&call.id, &call.name, &call.arguments)
+            });
         }
         opens
     }
