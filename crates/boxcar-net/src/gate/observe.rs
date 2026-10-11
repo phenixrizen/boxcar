@@ -29,6 +29,7 @@ use boxcar_audit::{AuditSink, DeclaredArgs};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::dump::DumpDir;
+use crate::http::Retained;
 
 use super::exchange::Observation;
 
@@ -325,6 +326,8 @@ fn run(
     declared: Option<&DeclaredArgs>,
 ) {
     let mut flows: HashMap<u64, Observation> = HashMap::new();
+    // One budget for what every flow keeps.
+    let retained = Retained::default();
     let mut out = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
@@ -346,7 +349,8 @@ fn run(
                     flow,
                     Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id)
                         .with_dump(dump.cloned())
-                        .with_declared(declared.cloned()),
+                        .with_declared(declared.cloned())
+                        .with_retained(retained.clone()),
                 );
             }
             Ok(Message::Data { flow, dir, bytes }) => {

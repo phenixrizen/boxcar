@@ -9,6 +9,8 @@
 //! ending may be `\n`, `\r\n` or `\r`. A stream's last event without a
 //! blank line after it is given at [`SseParser::finish`].
 
+use super::retain::{Retained, Share};
+
 /// One event.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SseEvent {
@@ -26,8 +28,12 @@ pub struct SseParser {
     /// A line ran past [`MAX_EVENT_BYTES`] without ending: its bytes are
     /// dropped until it ends.
     skipping: bool,
-    /// Some line was dropped so.
+    /// Some line was dropped so, or for want of room in the observer's
+    /// budget.
     overflowed: bool,
+    /// What the buffered line and the event under way take of the
+    /// observer's budget.
+    share: Share,
 }
 
 /// The most bytes an event may hold before the rest of it is dropped.
@@ -36,6 +42,15 @@ pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 impl SseParser {
     pub fn new() -> SseParser {
         SseParser::default()
+    }
+
+    /// A parser whose buffered bytes come out of the observer's
+    /// `retained` budget.
+    pub fn with_retained(retained: Retained) -> SseParser {
+        SseParser {
+            share: Share::new(retained),
+            ..SseParser::default()
+        }
     }
 
     /// Takes `bytes`, appending the events they complete to `out`.
@@ -59,10 +74,18 @@ impl SseParser {
             self.buf.drain(..at);
             self.line(&line, out);
         }
-        if self.buf.len() > MAX_EVENT_BYTES {
+        let held = self.buf.len() + self.current.data.len();
+        if self.buf.len() > MAX_EVENT_BYTES || !self.share.set(held) {
+            // Too long, or no room left: the line goes, to its end, and
+            // with no room the event under way goes too.
+            if self.buf.len() <= MAX_EVENT_BYTES {
+                self.current = SseEvent::default();
+                self.has_data = false;
+            }
             self.buf = Vec::new();
             self.skipping = true;
             self.overflowed = true;
+            self.share.set(self.current.data.len());
         }
     }
 
@@ -79,6 +102,7 @@ impl SseParser {
             self.line(&line, out);
         }
         self.dispatch(out);
+        self.share.clear();
     }
 
     fn line(&mut self, line: &[u8], out: &mut Vec<SseEvent>) {

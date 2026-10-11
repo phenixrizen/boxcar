@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::http::Retained;
+
 use super::{
     b3, content_text, tool_close, tool_open_text, u64_of, CallBudget, RequestInfo, ResponseInfo,
     Text, ToolClose, ToolOpen,
@@ -163,6 +165,13 @@ pub struct Stream {
 impl Stream {
     pub fn new() -> Stream {
         Stream::default()
+    }
+
+    /// The stream's tool calls take their bytes from the observer's
+    /// `retained` budget too.
+    pub fn with_retained(mut self, retained: Retained) -> Stream {
+        self.budget = CallBudget::with_retained(retained);
+        self
     }
 
     /// One chunk: the tool calls it completes (at a finish reason, or at

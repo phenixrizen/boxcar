@@ -631,3 +631,18 @@ Made while writing the plan, 2026-10-06:
   dump writes a streamed fragment as its size. A `tool.close` that came
   over a flow another process opened than the span's bound executor
   leaves the span open.
+- **Hardening after the fourth review.** A declared command is kept as
+  sent (a line or an argv) and compared exactly, quotes kept: the shell's
+  `-c` command, Claude Code's `eval` wrapper read by the lexer, or the
+  exec's argv against the line's words. Findings quote the record's
+  scrubbed copy. A bound span's close must come over a flow its executor
+  opened; one whose flow's opener is unknown waits 2 s, then is dropped.
+  The observer holds one retained-byte budget (256 MiB) across every
+  flow, which kept bodies, event-stream buffers and tool calls draw on
+  (`observe_budget`); a request body is let go once recorded, and an
+  event-stream response is hashed without being kept unless dumping. A
+  body cut at 16 MiB keeps nothing after; the dump writes such a body as
+  its size, reads an event stream event by event, and writes non-JSON
+  data as its size. Responses `done` events count against the call
+  budget, and tool ids (256 bytes) and names (1 KiB) are capped wherever
+  they are kept.

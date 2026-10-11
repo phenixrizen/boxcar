@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use boxcar_audit::DeclaredArgs;
+
+use crate::http::Retained;
 use boxcar_proto::{
     LlmRequest, LlmResponse, Payload, SpanRef, ToolClose as ToolClosePayload,
     ToolOpen as ToolOpenPayload,
@@ -37,11 +39,18 @@ enum Stream {
 }
 
 impl Stream {
-    fn new(provider: Provider) -> Stream {
+    fn new(provider: Provider, retained: &Retained) -> Stream {
+        let retained = retained.clone();
         match provider {
-            Provider::Anthropic => Stream::Anthropic(anthropic::Stream::new()),
-            Provider::OpenAiChat => Stream::Chat(openai_chat::Stream::new()),
-            Provider::OpenAiResponses => Stream::Responses(openai_responses::Stream::new()),
+            Provider::Anthropic => {
+                Stream::Anthropic(anthropic::Stream::new().with_retained(retained))
+            }
+            Provider::OpenAiChat => {
+                Stream::Chat(openai_chat::Stream::new().with_retained(retained))
+            }
+            Provider::OpenAiResponses => {
+                Stream::Responses(openai_responses::Stream::new().with_retained(retained))
+            }
         }
     }
 
@@ -84,6 +93,8 @@ pub struct Tracker {
     streams: HashMap<u32, Tracked>,
     /// Where the calls' arguments as sent go, for the reconciler.
     declared: Option<DeclaredArgs>,
+    /// The observer's retained-byte budget, which streams draw on.
+    retained: Retained,
 }
 
 impl Tracker {
@@ -95,6 +106,7 @@ impl Tracker {
             trace_id,
             streams: HashMap::new(),
             declared: None,
+            retained: Retained::default(),
         }
     }
 
@@ -190,7 +202,7 @@ impl Tracker {
         }
         tracked.sse = headers.content_type().as_deref() == Some("text/event-stream");
         if tracked.sse {
-            tracked.stream = Some(Stream::new(tracked.provider));
+            tracked.stream = Some(Stream::new(tracked.provider, &self.retained));
         }
     }
 
@@ -310,7 +322,7 @@ impl Tracker {
                 }
                 let (info, closes) = openai_responses::request_value(&value);
                 tracked.started = now;
-                tracked.stream = Some(Stream::new(provider));
+                tracked.stream = Some(Stream::new(provider, &self.retained));
                 let flow = self.flow;
                 out.push(Emit::plain(Payload::LlmRequest(LlmRequest {
                     flow,
@@ -405,6 +417,12 @@ impl Tracker {
     /// the record.
     pub fn with_declared(mut self, declared: Option<DeclaredArgs>) -> Tracker {
         self.declared = declared;
+        self
+    }
+
+    /// Streams draw on the observer's `retained` budget.
+    pub fn with_retained(mut self, retained: Retained) -> Tracker {
+        self.retained = retained;
         self
     }
 

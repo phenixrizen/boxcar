@@ -57,31 +57,38 @@ processes and ring 0 effects to the span:
   when that comes. A provisional executor is reported in `span.effects`
   and is never the agent: ancestry is traced to the root instead, and its
   own work is judged as any process's. The agent itself is in no span.
-- **The close.** A `tool.close` closes the span with its id unless it
-  came over a flow opened by another process than the span's bound
-  executor; then the span stays open for its own close.
+- **The close.** A `tool.close` closes a span with a bound executor only
+  when it came over a flow that same process opened: one over a flow
+  another process opened is dropped, and one over a flow whose opener is
+  not known yet waits up to 2 s to learn it, then is dropped if it never
+  does. The span stays open for its own close (or is recorded as it
+  stands at the VM's stop). A span with no bound executor takes any
+  close: there is nothing to hold it to.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
   `truncated`) and takes nothing more, nor its `tool.close`.
 - **What is compared.** The gate hands the reconciler each call's
   arguments as the model sent them, in memory and never recorded (the
   record's copy is scrubbed); declared commands and paths are compared
-  with what ran as sent. A span that has only the record's copy (a log
-  read later) compares the scrubbed forms of both, and where the copy has
-  a redacted part the `argv` rule cannot tell and says nothing.
+  with what ran exactly, quotes kept. A span that has only the record's
+  copy (a log read later) compares that copy when nothing in it was
+  redacted, and where something was the `argv` rule cannot tell and says
+  nothing. Findings quote the record's scrubbed copy, never the
+  arguments as sent.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)
-  whose declared `command` (or `cmd`, a string or an array joined with
-  spaces; for a free-text tool such as Codex's `exec`, the quoted string
+  whose declared `command` (or `cmd`, a string or an array; for a free-text tool such as Codex's `exec`, the quoted string
   after `cmd:` or `command:` in the arguments' summary) the exec
-  carries, which is the shell's `-c` command being the declared one or
-  Claude Code's wrapper around exactly it (its own setup as whole `&&`
-  parts, then `eval '<command>' < /dev/null && pwd -P >| <file>`, nothing
-  after), or the whole argv being the declared one, after whitespace is
-  collapsed and quotes dropped; the declared command appearing elsewhere
-  in the shell's text (a comment, beside other commands, inside a longer
-  `eval`) is not carrying it. Else as the only open span.
+  carries, compared exactly: a declared argv is the exec's argv; a
+  declared command line is the shell's `-c` command (spaces at either end
+  aside), or Claude Code's wrapper around exactly it read as a shell reads
+  it (its own setup as whole `&&` parts, then `eval '<command>' <
+  /dev/null && pwd -P >| <file>`, nothing after), or, run without a
+  shell, the exec's argv is its words. The declared command appearing
+  elsewhere in the shell's text (a comment, beside other commands, inside
+  a longer `eval`) is not carrying it, nor is a command that reads the
+  same once its quotes are dropped. Else as the only open span.
   An exec that joins nothing waits 2 s for a late `tool.open`. A process
   forked or exec'd by a span's process joins that span, and a process
   that exec's again stays in its span.

@@ -39,6 +39,7 @@ use boxcar_proto::redact::scrub_text;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::http::headers::is_credential;
+use crate::http::SseParser;
 
 /// How many frames may wait for the `dump` thread.
 pub const FRAME_QUEUE: usize = 4096;
@@ -365,13 +366,19 @@ pub fn write_exchange(
     request: bool,
     head: &str,
     content_type: Option<&str>,
-    body: &[u8],
+    body: Result<&[u8], u64>,
 ) -> io::Result<()> {
     let mut file = create(&dir.exchange_file(flow, stream, request))?;
     let head = &head.as_bytes()[..head.len().min(EXCHANGE_FILE_LIMIT)];
     file.write_all(head)?;
     file.write_all(b"\r\n")?;
-    file.write_all(&scrubbed_body(content_type, body))?;
+    match body {
+        Ok(body) => file.write_all(&scrubbed_body(content_type, body))?,
+        Err(bytes) => writeln!(
+            file,
+            "[{bytes} bytes not written: the body was not kept whole]"
+        )?,
+    }
     file.flush()
 }
 
@@ -451,8 +458,10 @@ pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
         )
         .into_bytes();
     };
-    if kind == "text/event-stream"
-        || kind == "application/x-ndjson"
+    if kind == "text/event-stream" {
+        return events(body).into_bytes();
+    }
+    if kind == "application/x-ndjson"
         || kind == "application/jsonl"
         || kind == "application/json-seq"
     {
@@ -530,27 +539,50 @@ fn sizes(value: &mut serde_json::Value) {
     }
 }
 
-/// An event stream or JSON lines, line by line: a line (or a `data:`
-/// line's payload) that is JSON scrubbed as JSON, any other as text.
+/// An event stream, event by event as the observer reads it (`data:`
+/// lines joined): each event's data scrubbed as JSON when it is JSON, its
+/// size alone when it is not (`[DONE]` aside), so that one event's JSON
+/// split over several `data:` lines is never read as loose text.
+fn events(body: &[u8]) -> String {
+    let mut parser = SseParser::new();
+    let mut events = Vec::new();
+    parser.feed(body, &mut events);
+    parser.finish(&mut events);
+    let mut out = String::with_capacity(body.len());
+    for event in events {
+        if let Some(name) = &event.event {
+            out.push_str(&format!("event: {}\n", scrub_text(name)));
+        }
+        if let Some(id) = &event.id {
+            out.push_str(&format!("id: {}\n", scrub_text(id)));
+        }
+        if !event.data.is_empty() {
+            let data = match json_text(event.data.as_bytes()) {
+                Some(clean) => clean,
+                None if event.data.trim() == "[DONE]" => "[DONE]".to_owned(),
+                None => format!("[{} bytes]", event.data.len()),
+            };
+            out.push_str(&format!("data: {data}\n"));
+        }
+        out.push('\n');
+    }
+    if parser.overflowed() {
+        out.push_str("[a line past the event limit was not written]\n");
+    }
+    out
+}
+
+/// JSON lines, line by line: a line that is JSON scrubbed as JSON, any
+/// other written as its size.
 fn lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        let (body, end) = (content, &line[content.len()..]);
-        let (field, payload) = match body.strip_prefix("data:") {
-            Some(payload) => ("data:", payload),
-            None => ("", body),
-        };
-        let lead = &payload[..payload.len() - payload.trim_start().len()];
-        match json_text(payload.trim().as_bytes()) {
-            Some(clean) if !payload.trim().is_empty() => {
-                out.push_str(field);
-                out.push_str(lead);
-                out.push_str(&clean);
-            }
-            _ => {
-                out.push_str(field);
-                out.push_str(&scrub_text(payload));
+        let end = &line[content.len()..];
+        if !content.trim().is_empty() {
+            match json_text(content.trim().as_bytes()) {
+                Some(clean) => out.push_str(&clean),
+                None => out.push_str(&format!("[{} bytes]", content.len())),
             }
         }
         out.push_str(end);
@@ -756,7 +788,7 @@ mod tests {
         fs::write(&elsewhere, b"keep").unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.exchange_file(1, 1, true)).unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.ws_file(1, 1)).unwrap();
-        assert!(write_exchange(&dir, 1, 1, true, "GET / HTTP/1.1\r\n", None, b"").is_err());
+        assert!(write_exchange(&dir, 1, 1, true, "GET / HTTP/1.1\r\n", None, Ok(b"")).is_err());
         assert!(append_ws(&dir, 1, 1, "c2s", true, b"{}").is_err());
         assert_eq!(fs::read(&elsewhere).unwrap(), b"keep");
     }
@@ -780,7 +812,7 @@ mod tests {
             true,
             &head,
             Some("application/json"),
-            b"{\"model\":\"m\",\"api_key\":\"sk-123\"}",
+            Ok(b"{\"model\":\"m\",\"api_key\":\"sk-123\"}"),
         )
         .unwrap();
         let text = fs::read_to_string(dir.exchange_file(7, 1, true)).unwrap();
@@ -861,10 +893,20 @@ mod tests {
         let sse = b"event: ping\ndata: {\"type\":\"ping\"}\r\n\nevent: delta\ndata: {\"partial_json\":\"{\\\"command\\\": \\\"x --token=abc\\\"}\"}\n\n";
         let out = String::from_utf8(scrubbed_body(Some("text/event-stream"), sse)).unwrap();
         assert!(
-            out.starts_with("event: ping\ndata: {\"type\":\"ping\"}\r\n\nevent: delta\n"),
+            out.starts_with("event: ping\ndata: {\"type\":\"ping\"}\n\nevent: delta\n"),
             "{out}"
         );
         assert!(!out.contains("abc"), "{out}");
+        // One event's JSON over several `data:` lines is read whole.
+        let split = "event: e\ndata: {\"type\":\"response.function_call_arguments.delta\",\ndata: \"delta\":\"demo-pass\"}\n\ndata: not json demo-pass\n\ndata: [DONE]\n\n";
+        let out =
+            String::from_utf8(scrubbed_body(Some("text/event-stream"), split.as_bytes())).unwrap();
+        assert!(!out.contains("demo-pass"), "{out}");
+        assert!(out.contains("data: [DONE]\n"), "{out}");
+        assert!(out.contains("data: [18 bytes]\n"), "{out}");
+        let lines = b"{\"a\":1}\nnot json demo-pass\n";
+        let out = String::from_utf8(scrubbed_body(Some("application/x-ndjson"), lines)).unwrap();
+        assert_eq!(out, "{\"a\":1}\n[18 bytes]\n");
         assert_eq!(scrubbed_body(None, b"raw"), b"raw");
         assert_eq!(
             scrubbed_body(Some("text/plain"), b"key=sk-ant-0123456789"),

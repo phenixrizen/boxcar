@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::http::Retained;
+
 use super::{
     b3, content_text, tool_close, tool_open_text, u64_of, CallBudget, RequestInfo, ResponseInfo,
     Text, ToolClose, ToolOpen,
@@ -190,6 +192,13 @@ impl Stream {
         Stream::default()
     }
 
+    /// The stream's tool calls take their bytes from the observer's
+    /// `retained` budget too.
+    pub fn with_retained(mut self, retained: Retained) -> Stream {
+        self.budget = CallBudget::with_retained(retained);
+        self
+    }
+
     /// One event from the stream: the calls it completes.
     pub fn event(&mut self, event: &SseEvent) -> Vec<ToolOpen> {
         let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
@@ -278,21 +287,24 @@ impl Stream {
             "response.output_item.done" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 let item = data.get("item");
-                if is_call(item) {
+                let text = |key: &str| item.and_then(|i| i.get(key)).and_then(Value::as_str);
+                let added = text("call_id").map_or(0, str::len)
+                    + text("name").map_or(0, str::len)
+                    + text("arguments")
+                        .or_else(|| text("input"))
+                        .map_or(0, str::len);
+                // What the done event adds is charged like any other: a call
+                // that does not fit is not made.
+                if is_call(item) && self.budget.admit(added, &mut self.degraded) {
                     let mut call = self.calls.remove(&index).unwrap_or_default();
-                    if let Some(id) = item.and_then(|i| i.get("call_id")).and_then(Value::as_str) {
+                    if let Some(id) = text("call_id") {
                         call.call_id = id.to_owned();
                     }
-                    if let Some(name) = item.and_then(|i| i.get("name")).and_then(Value::as_str) {
+                    if let Some(name) = text("name") {
                         call.name = name.to_owned();
                     }
-                    if let Some(args) = item
-                        .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
-                        .and_then(Value::as_str)
-                    {
-                        if self.budget.admit(args.len(), &mut self.degraded) {
-                            call.arguments = args.to_owned();
-                        }
+                    if let Some(args) = text("arguments").or_else(|| text("input")) {
+                        call.arguments = args.to_owned();
                     }
                     call.done = true;
                     self.info.tool_uses += 1;
@@ -516,5 +528,25 @@ mod tests {
         assert_eq!(opens.len(), 1);
         let (info, _) = stream.finish();
         assert_eq!(info.degraded, Some("stream_unfinished"));
+    }
+
+    /// A done event's metadata counts against the reply's budget: done
+    /// events with large names and nothing else stop making calls.
+    #[test]
+    fn done_events_count_against_the_budget() {
+        use crate::model::STREAM_CALL_BYTES;
+        let mut stream = Stream::new();
+        let name = "n".repeat(1024 * 1024);
+        let mut made = 0;
+        for index in 0..(STREAM_CALL_BYTES / name.len() + 8) {
+            let event = serde_json::json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": {"type": "function_call", "call_id": format!("c{index}"), "name": name, "arguments": ""}
+            });
+            made += stream.value(&event).len();
+        }
+        assert!(made <= STREAM_CALL_BYTES / name.len(), "{made}");
+        let (info, _) = stream.finish();
+        assert_eq!(info.degraded, Some("stream_budget"));
     }
 }

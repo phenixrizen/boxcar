@@ -1450,6 +1450,52 @@ fn a_close_from_another_process_leaves_the_span_open() {
     assert_eq!(spans[0].executor_tgid, Some(200));
 }
 
+/// A close over a flow whose opener is not known yet waits to learn it:
+/// the agent's own is applied then, another process's dropped.
+#[test]
+fn a_close_waits_to_learn_who_sent_it() {
+    for (sender, applied) in [(200u32, true), (400, false)] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+        steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+        steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+        steps.push(log.tcp_connect(1350, 200, 41000, "203.0.113.5:443"));
+        steps.push(log.connect(
+            1360,
+            1,
+            41000,
+            "203.0.113.5:443",
+            &["api.example"],
+            Verdict::Allow,
+        ));
+        steps.push(log.http_request(2000, 1, 1, 4800));
+        steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+        steps.push(log.exec(2200, 300, 200, 10, &["bash", "-c", "ls"]));
+        steps.push(log.exit(2300, 300, 10));
+        // The close comes before the sensor says who opened flow 2.
+        steps.push(log.connect(
+            2400,
+            2,
+            42000,
+            "203.0.113.5:443",
+            &["api.example"],
+            Verdict::Allow,
+        ));
+        steps.push(log.tool_close_on(2450, "toolu_01", "ok", 2));
+        steps.push(log.tcp_connect(2500, sender, 42000, "203.0.113.5:443"));
+        for at in [3000, 4000, 5000, 7000] {
+            steps.push(log.heartbeat(at));
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        let spans = spans_of(&out);
+        let closed = spans.iter().any(|s| s.closed_seq.is_some());
+        assert_eq!(closed, applied, "sender {sender}: {out:?}");
+    }
+}
+
 /// The declared command written in a comment, or beside another, is not
 /// the command run.
 #[test]

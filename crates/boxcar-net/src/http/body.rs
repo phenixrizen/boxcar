@@ -9,6 +9,8 @@
 
 use std::io::Write;
 
+use super::retain::{Retained, Share};
+
 /// The most decoded bytes kept for the parsers.
 pub const BODY_KEEP: usize = 16 * 1024 * 1024;
 
@@ -175,6 +177,10 @@ pub struct BodySummary {
 pub struct BodySink {
     decoder: Option<ContentDecoder>,
     kept: Vec<u8>,
+    /// What the kept bytes take of the observer's budget.
+    share: Share,
+    /// Whether the decoded bytes are kept at all, or only hashed.
+    keep: bool,
     hasher: blake3::Hasher,
     bytes: u64,
     truncated: bool,
@@ -191,6 +197,8 @@ impl BodySink {
         BodySink {
             decoder,
             kept: Vec::new(),
+            share: Share::default(),
+            keep: true,
             hasher: blake3::Hasher::new(),
             bytes: 0,
             truncated: false,
@@ -232,22 +240,64 @@ impl BodySink {
         rest
     }
 
+    /// Keeps the body's bytes within the observer's `retained` budget.
+    pub fn with_retained(mut self, retained: Retained) -> BodySink {
+        self.share = Share::new(retained);
+        self
+    }
+
+    /// Hashes the body without keeping it: no parser and no dump reads it.
+    pub fn hash_only(mut self) -> BodySink {
+        self.keep = false;
+        self
+    }
+
+    /// Lets the kept bytes go once nothing reads them any more (the
+    /// summary stays).
+    pub fn release(&mut self) {
+        self.kept = Vec::new();
+        self.keep = false;
+        self.share.clear();
+    }
+
+    /// Whether the kept bytes are the whole body.
+    pub fn whole(&self) -> bool {
+        self.keep && !self.truncated
+    }
+
     fn take(&mut self, decoded: &[u8]) {
         if decoded.is_empty() {
             return;
         }
         self.hasher.update(decoded);
         self.bytes = self.bytes.saturating_add(decoded.len() as u64);
-        if self.kept.len() + decoded.len() <= BODY_KEEP {
-            self.kept.extend_from_slice(decoded);
+        // Once cut, nothing more is kept: the tail of a body is no body.
+        if !self.keep || self.truncated {
+            return;
+        }
+        if self.kept.len() + decoded.len() > BODY_KEEP {
+            self.cut(None);
+        } else if !self.share.grow(decoded.len()) {
+            self.cut(Some("observe_budget"));
         } else {
-            self.truncated = true;
-            self.kept.clear();
+            self.kept.extend_from_slice(decoded);
+        }
+    }
+
+    /// The body is too long to keep (or there is no room for it): what was
+    /// kept goes, and no more is.
+    fn cut(&mut self, reason: Option<&'static str>) {
+        self.truncated = true;
+        self.kept = Vec::new();
+        self.share.clear();
+        if let Some(reason) = reason {
+            self.degraded.get_or_insert(reason);
         }
     }
 
     /// The decoded bytes kept for the parsers: all of them, or none once
-    /// the body passed the limit.
+    /// the body passed the limit, found no room in the observer's budget,
+    /// or was let go.
     pub fn kept(&self) -> &[u8] {
         &self.kept
     }
@@ -387,5 +437,43 @@ mod tests {
         assert_eq!(Coding::parse(Some("br")), Ok(Coding::Brotli));
         assert_eq!(Coding::parse(Some("zstd")), Err("content_encoding"));
         assert_eq!(Coding::parse(Some("gzip, br")), Err("content_encoding"));
+    }
+
+    /// Past the limit a body is cut for good: later bytes are hashed, never
+    /// kept again.
+    #[test]
+    fn a_cut_body_keeps_nothing_after() {
+        let mut sink = BodySink::new(None);
+        sink.push(&vec![b'a'; BODY_KEEP]);
+        sink.push(b"over");
+        assert!(sink.kept().is_empty());
+        let tail = b"\"password\": \"tail\"";
+        sink.push(tail);
+        assert!(sink.kept().is_empty(), "nothing kept after the cut");
+        let summary = sink.summary();
+        assert!(summary.truncated);
+        assert_eq!(summary.bytes, (BODY_KEEP + 4 + tail.len()) as u64);
+    }
+
+    /// Kept bytes come out of the observer's budget and go back to it.
+    #[test]
+    fn kept_bytes_draw_on_the_budget() {
+        let retained = Retained::with_limit(10);
+        let mut a = BodySink::new(None).with_retained(retained.clone());
+        a.push(b"0123456");
+        assert_eq!(retained.held(), 7);
+        let mut b = BodySink::new(None).with_retained(retained.clone());
+        b.push(b"01234");
+        assert!(b.kept().is_empty());
+        assert_eq!(b.summary().degraded, Some("observe_budget"));
+        a.release();
+        assert_eq!(retained.held(), 0);
+        let mut c = BodySink::new(None)
+            .with_retained(retained.clone())
+            .hash_only();
+        c.push(b"0123456789abc");
+        assert!(c.kept().is_empty() && !c.summary().truncated);
+        assert_eq!(retained.held(), 0);
+        drop((b, c));
     }
 }

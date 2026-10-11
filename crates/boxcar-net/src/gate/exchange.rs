@@ -24,7 +24,7 @@ use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
 
 use super::Direction;
 use crate::dump::{self, DumpDir};
-use crate::http::{BodySink, Connection, Event, Headers, SseEvent, SseParser, Version};
+use crate::http::{BodySink, Connection, Event, Headers, Retained, SseEvent, SseParser, Version};
 use crate::model::Tracker;
 
 /// A record the observer made, with the span it belongs to, if any.
@@ -145,6 +145,8 @@ pub struct Observation {
     model: Tracker,
     /// Where each decoded exchange is written, when the session dumps.
     dump: Option<DumpDir>,
+    /// The observer's retained-byte budget, shared by every flow.
+    retained: Retained,
 }
 
 impl Observation {
@@ -167,7 +169,16 @@ impl Observation {
             exchanges: HashMap::new(),
             model: Tracker::new(flow, trace_id.to_owned()),
             dump: None,
+            retained: Retained::default(),
         }
+    }
+
+    /// Kept bodies, event-stream buffers and tool calls draw on the
+    /// observer's `retained` budget, shared by every flow.
+    pub fn with_retained(mut self, retained: Retained) -> Observation {
+        self.model = self.model.with_retained(retained.clone());
+        self.retained = retained;
+        self
     }
 
     /// The observation with the dump: each exchange's decoded request and
@@ -212,7 +223,13 @@ impl Observation {
         let Some(head) = head else {
             return;
         };
-        let body = body.as_ref().map(BodySink::kept).unwrap_or_default();
+        // A body not kept whole (cut, or no room) is written as its size:
+        // a body's tail is not a body, and scrubbing it is guesswork.
+        let body = match body {
+            Some(sink) if sink.whole() => Ok(sink.kept()),
+            Some(sink) => Err(sink.summary().bytes),
+            None => Ok(&[][..]),
+        };
         let _ = dump::write_exchange(
             dir,
             self.flow,
@@ -291,8 +308,10 @@ impl Observation {
                         .entry(stream)
                         .or_insert_with(|| Exchange::new(stream, now));
                     exchange.request_started = now;
-                    exchange.request_body =
-                        Some(BodySink::new(headers.content_encoding().as_deref()));
+                    exchange.request_body = Some(
+                        BodySink::new(headers.content_encoding().as_deref())
+                            .with_retained(self.retained.clone()),
+                    );
                     if self.dump.is_some() {
                         let start = format!(
                             "{method} {} HTTP/{}",
@@ -326,6 +345,11 @@ impl Observation {
                             out.push(Emit::plain(self.request_record(&mut exchange)));
                         }
                         self.model.request_end(stream, &exchange, out);
+                        // Recorded, parsed and dumped: the body's bytes go,
+                        // its summary stays.
+                        if let Some(sink) = exchange.request_body.as_mut() {
+                            sink.release();
+                        }
                         self.exchanges.insert(stream, exchange);
                     }
                 }
@@ -344,10 +368,17 @@ impl Observation {
                         continue;
                     }
                     let content_type = headers.content_type();
-                    exchange.sse =
-                        (content_type.as_deref() == Some("text/event-stream")).then(SseParser::new);
-                    exchange.response_body =
-                        Some(BodySink::new(headers.content_encoding().as_deref()));
+                    let sse = content_type.as_deref() == Some("text/event-stream");
+                    exchange.sse = sse.then(|| SseParser::with_retained(self.retained.clone()));
+                    let sink = BodySink::new(headers.content_encoding().as_deref())
+                        .with_retained(self.retained.clone());
+                    // An event stream is read as it comes: its body is kept
+                    // only for the dump.
+                    exchange.response_body = Some(if sse && self.dump.is_none() {
+                        sink.hash_only()
+                    } else {
+                        sink
+                    });
                     exchange.response = Some(ResponseHead {
                         status,
                         content_type,
@@ -666,6 +697,52 @@ mod tests {
         assert_eq!(degraded, 2000);
     }
 
+    /// Request bodies count against the observer's budget while they are
+    /// read and give it back once recorded; one with no room is hashed but
+    /// not kept, and says so.
+    #[test]
+    fn request_bodies_draw_on_the_budget_until_recorded() {
+        let retained = Retained::with_limit(2 * 1024 * 1024);
+        let mut obs = observation(Some("http/1.1")).with_retained(retained.clone());
+        let mut out = Vec::new();
+        let now = Instant::now();
+        let body = vec![b'x'; 1024 * 1024];
+        let head = |stream: u32| Event::RequestHead {
+            stream,
+            method: "POST".into(),
+            authority: None,
+            path: Some("/up".into()),
+            version: Version::Http1,
+            headers: Headers::new(),
+        };
+        for stream in 1..=3 {
+            obs.handle(
+                vec![
+                    head(stream),
+                    Event::RequestBody {
+                        stream,
+                        bytes: body.clone(),
+                    },
+                ],
+                now,
+                &mut out,
+            );
+        }
+        assert_eq!(retained.held(), 2 * 1024 * 1024, "the third found no room");
+        for stream in 1..=3 {
+            obs.handle(vec![Event::RequestEnd { stream }], now, &mut out);
+        }
+        assert_eq!(retained.held(), 0, "recorded: given back");
+        let degraded: Vec<Option<String>> = out
+            .iter()
+            .filter_map(|e| match &e.payload {
+                Payload::HttpRequest(r) => Some(r.degraded.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(degraded, [None, None, Some("observe_budget".to_owned())]);
+    }
+
     #[test]
     fn open_exchanges_are_bounded() {
         let mut obs = observation(Some("http/1.1"));
@@ -721,16 +798,16 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let kept = obs
+        // Recorded and parsed: the request's bytes are let go.
+        let sink = obs
             .exchanges()
             .get(&1)
             .unwrap()
             .request_body
             .as_ref()
-            .unwrap()
-            .kept()
-            .to_vec();
-        assert_eq!(kept, b"{\"model\":\"m\"}");
+            .unwrap();
+        assert!(sink.kept().is_empty());
+        assert_eq!(sink.summary().bytes, 13);
         obs.data(
             Direction::ToGuest,
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 44\r\n\r\nevent: message_start\ndata: {}\n\nevent: ping\n\n",

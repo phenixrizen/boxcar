@@ -25,6 +25,8 @@ pub mod summary;
 pub mod track;
 
 use boxcar_audit::Declared;
+
+use crate::http::{Retained, Share};
 use serde_json::Value;
 
 pub use summary::{b3, summarize, SUMMARY_LIMIT};
@@ -102,6 +104,24 @@ pub struct ToolOpen {
 
 /// The most bytes of arguments a `tool.open` carries inline.
 pub const ARGS_INLINE: usize = 8 * 1024;
+/// The most bytes of a tool call's id kept anywhere (records, spans):
+/// past it the id is cut, the same way for its open and its close.
+pub const MAX_TOOL_ID: usize = 256;
+/// The most bytes of a tool's name kept anywhere.
+pub const MAX_TOOL_NAME: usize = 1024;
+
+/// `text` cut to at most `max` bytes at a character boundary, nothing
+/// added: the same text always cuts the same way.
+fn capped(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
 
 /// What a response said, once it ended.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -124,17 +144,32 @@ pub const STREAM_CALL_BYTES: usize = 16 * 1024 * 1024;
 /// The most tool calls a streamed response may have under way at once.
 pub const STREAM_CALLS: usize = 256;
 
-/// What a streamed response's tool calls have gathered so far.
+/// What a streamed response's tool calls have gathered so far, and their
+/// part of the observer's retained bytes.
 #[derive(Default)]
 pub struct CallBudget {
     bytes: usize,
+    share: Share,
 }
 
 impl CallBudget {
-    /// Whether `n` more bytes fit; when not, `degraded` says so.
+    /// A budget whose bytes come out of the observer's `retained` too.
+    pub fn with_retained(retained: Retained) -> CallBudget {
+        CallBudget {
+            bytes: 0,
+            share: Share::new(retained),
+        }
+    }
+
+    /// Whether `n` more bytes fit, in the response's budget and the
+    /// observer's; when not, `degraded` says so.
     pub fn admit(&mut self, n: usize, degraded: &mut Option<&'static str>) -> bool {
         match self.bytes.checked_add(n) {
             Some(total) if total <= STREAM_CALL_BYTES => {
+                if !self.share.grow(n) {
+                    degraded.get_or_insert("observe_budget");
+                    return false;
+                }
                 self.bytes = total;
                 true
             }
@@ -186,8 +221,8 @@ pub fn tool_open(id: &str, name: &str, args: &Value) -> ToolOpen {
     let mut inline = args.clone();
     boxcar_proto::redact::scrub_deep(&mut inline);
     ToolOpen {
-        tool_use_id: id.to_owned(),
-        tool_name: name.to_owned(),
+        tool_use_id: capped(id, MAX_TOOL_ID),
+        tool_name: capped(name, MAX_TOOL_NAME),
         args_b3: b3(json.as_bytes()),
         args_summary: summarize(args),
         args: (json.len() <= ARGS_INLINE).then_some(inline),
@@ -200,8 +235,8 @@ pub fn tool_open_text(id: &str, name: &str, arguments: &str) -> ToolOpen {
     match serde_json::from_str::<Value>(arguments) {
         Ok(value) => tool_open(id, name, &value),
         Err(_) => ToolOpen {
-            tool_use_id: id.to_owned(),
-            tool_name: name.to_owned(),
+            tool_use_id: capped(id, MAX_TOOL_ID),
+            tool_name: capped(name, MAX_TOOL_NAME),
             args_b3: b3(arguments.as_bytes()),
             args_summary: summary::cut(&summary::scrubbed(arguments), SUMMARY_LIMIT),
             args: None,
@@ -215,7 +250,7 @@ pub fn tool_open_text(id: &str, name: &str, arguments: &str) -> ToolOpen {
 pub fn tool_close(id: &str, content: &Value, is_error: bool) -> ToolClose {
     let text = content_text(content);
     ToolClose {
-        tool_use_id: id.to_owned(),
+        tool_use_id: capped(id, MAX_TOOL_ID),
         status: if is_error { "error" } else { "ok" }.to_owned(),
         result_bytes: text.len() as u64,
         result_b3: b3(text.as_bytes()),
@@ -261,6 +296,18 @@ pub fn u64_of(value: Option<&Value>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ids_and_names_are_capped_alike_for_open_and_close() {
+        let id = "i".repeat(MAX_TOOL_ID * 4);
+        let name = "n".repeat(MAX_TOOL_NAME * 4);
+        let open = tool_open(&id, &name, &serde_json::json!({}));
+        let close = tool_close(&id, &serde_json::json!("done"), false);
+        assert_eq!(open.tool_use_id.len(), MAX_TOOL_ID);
+        assert_eq!(open.tool_name.len(), MAX_TOOL_NAME);
+        assert_eq!(open.tool_use_id, close.tool_use_id);
+        assert_eq!(capped("ééé", 3), "é");
+    }
+
     use super::*;
 
     #[test]

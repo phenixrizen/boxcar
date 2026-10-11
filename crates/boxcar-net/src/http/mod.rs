@@ -23,11 +23,13 @@ pub mod body;
 pub mod h1;
 pub mod h2;
 pub mod headers;
+pub mod retain;
 pub mod sse;
 pub mod ws;
 
 pub use body::{BodySink, BodySummary, Coding, ContentDecoder, BODY_KEEP};
 pub use headers::{is_credential, Headers};
+pub use retain::{Retained, Share, RETAINED_LIMIT};
 pub use sse::{SseEvent, SseParser};
 
 use crate::gate::Direction;
