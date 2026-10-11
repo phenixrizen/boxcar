@@ -130,8 +130,9 @@ says why.
 - `http/<flow>-<stream>.req` and `.resp`: each decoded exchange of an
   inspected flow, by its `net.connect` flow id and stream: the start line,
   the headers as the observer keeps them (a credential's value is already
-  gone, and the rest are scrubbed as free text), with the query values
-  scrubbed as `http.request.path`'s are, a blank line, the decoded body
+  gone, and the rest are scrubbed as free text, any URL in them losing its
+  credential query values as `http.request.path` does), with the request
+  target's query values scrubbed the same way, a blank line, the decoded body
   scrubbed by its type: JSON by key and in every string; an event stream
   event by event as the observer reads it (its `data:` lines joined),
   JSON lines line by line, data that is not JSON written as its size, and

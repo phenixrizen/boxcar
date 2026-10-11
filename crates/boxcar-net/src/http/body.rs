@@ -98,6 +98,16 @@ enum Inner {
 pub struct ContentDecoder {
     inner: Inner,
     failed: bool,
+    /// The first byte has been read (Brotli's window size is in it).
+    started: bool,
+}
+
+/// Whether a Brotli stream's first byte asks for the large-window format
+/// (RFC 7932's reserved `WBITS` code, 0b0010001 in its low seven bits),
+/// whose window may reach 1 GiB: the decoder would allocate it, past any
+/// budget. Standard streams' windows are at most 16 MiB.
+fn brotli_large_window(first: u8) -> bool {
+    first & 0x7f == 0x11
 }
 
 impl ContentDecoder {
@@ -113,6 +123,7 @@ impl ContentDecoder {
         ContentDecoder {
             inner,
             failed: false,
+            started: false,
         }
     }
 
@@ -121,6 +132,13 @@ impl ContentDecoder {
     pub fn feed(&mut self, raw: &[u8]) -> Result<Vec<u8>, &'static str> {
         if self.failed {
             return Err("content_decode");
+        }
+        if !self.started && !raw.is_empty() {
+            self.started = true;
+            if matches!(self.inner, Inner::Brotli(_)) && brotli_large_window(raw[0]) {
+                self.failed = true;
+                return Err("decode_budget");
+            }
         }
         let result = match &mut self.inner {
             Inner::Identity => return Ok(raw.to_vec()),
@@ -533,5 +551,19 @@ mod tests {
         assert_eq!(retained.held(), 64 * 1024);
         drop(gz);
         assert_eq!(retained.held(), 0);
+    }
+
+    /// A large-window Brotli stream is refused before the decoder sees it:
+    /// its window could be 1 GiB.
+    #[test]
+    fn a_large_window_brotli_stream_is_refused() {
+        assert!(brotli_large_window(0x11));
+        assert!(brotli_large_window(0x91));
+        assert!(!brotli_large_window(0x0b), "WBITS 22");
+        assert!(!brotli_large_window(0x00), "WBITS 16");
+        assert!(!brotli_large_window(0x21), "WBITS 10");
+        let mut sink = BodySink::new(Some("br"));
+        sink.push(&[0x11, 0x3f, 0x00]);
+        assert_eq!(sink.summary().degraded, Some("decode_budget"));
     }
 }

@@ -501,9 +501,6 @@ fn stub_flags(stub: &Stub, scratch: &Scratch) -> Vec<String> {
     flags.push(stub.addr.to_string());
     flags.push("--dump".to_owned());
     flags.push(scratch.path("dump").to_string_lossy().into_owned());
-    // The stub's agent is a script: each request is its own `wget`.
-    flags.push("--request-helper".to_owned());
-    flags.push("wget".to_owned());
     flags
 }
 
@@ -537,10 +534,11 @@ fn text_under(dir: &Path) -> String {
 /// A session talks to a model on the host, in the Anthropic Messages
 /// API, through the gate: the prompt and its streamed reply become
 /// `llm.request` and `llm.response`, the reply's tool use opens a span
-/// (`tool.open`), the tool result the next request carries closes it
-/// (`tool.close`), the reconciler writes `span.effects`, and `boxcar
-/// spans` lists the span closed. The credential the agent sent appears
-/// nowhere: not in the log, not in the dump.
+/// (`tool.open`), the tool result the next request carries is recorded
+/// (`tool.close`) but, sent by another process than the first request,
+/// leaves the span open, which `boxcar spans` lists and the stop records
+/// (`span.effects`). The credential the agent sent appears nowhere: not
+/// in the log, not in the dump.
 #[test]
 fn a_stub_model_speaks_anthropic_and_the_log_gets_spans() {
     let Some(guest) = guest_or_skip("a_stub_model_speaks_anthropic_and_the_log_gets_spans") else {
@@ -570,19 +568,27 @@ fn a_stub_model_speaks_anthropic_and_the_log_gets_spans() {
         scratch.path("workspace/done").exists()
     });
     let control = running.control();
-    // The span, closed, as the control socket lists it.
+    // The span, as the control socket lists it: still open. This agent is
+    // a script whose requests each come from a `wget` of its own, which
+    // cannot be told from a tool the script runs, so the second `wget`'s
+    // tool result does not close the span; only the process that sent the
+    // span's request (the first `wget`) could have.
     thread::sleep(Duration::from_millis(500));
     let listed = boxcar(&["spans"], &control);
     let spans_out = kvm_harness::text(&listed.stdout);
     assert!(
         spans_out
             .lines()
-            .any(|l| l.starts_with("toolu_9  Bash  closed")),
+            .any(|l| l.starts_with("toolu_9  Bash  open")),
         "boxcar spans said:\n{spans_out}\nstderr:\n{}",
         kvm_harness::text(&listed.stderr)
     );
     let active = boxcar(&["spans", "--active"], &control);
-    assert_eq!(kvm_harness::text(&active.stdout), "", "nothing still open");
+    assert!(
+        kvm_harness::text(&active.stdout).starts_with("toolu_9"),
+        "{}",
+        kvm_harness::text(&active.stdout)
+    );
     let run = running.finish();
     stub.thread.join().unwrap();
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
@@ -617,7 +623,10 @@ fn a_stub_model_speaks_anthropic_and_the_log_gets_spans() {
     let effects = of_kind(&records, "span.effects");
     assert_eq!(effects.len(), 1, "{}", run.describe());
     assert_eq!(effects[0].data["span_id"], "toolu_9");
-    assert_eq!(effects[0].data["closed_seq"], closes[0].seq);
+    assert!(
+        effects[0].data["closed_seq"].is_null(),
+        "written at the stop, open"
+    );
     assert_eq!(effects[0].data["opened_seq"], opens[0].seq);
     // The credential went to the model and nowhere else. This test puts
     // it on wget's command line, which the session's own records

@@ -555,16 +555,6 @@ fn run_with(
     steps: Vec<Step>,
     declared: Option<DeclaredArgs>,
 ) -> (Vec<Out>, SpanIndex) {
-    run_config(sensor_expected, steps, declared, Vec::new())
-}
-
-/// [`run_with`] with the session's request helpers.
-fn run_config(
-    sensor_expected: bool,
-    steps: Vec<Step>,
-    declared: Option<DeclaredArgs>,
-    request_helpers: Vec<String>,
-) -> (Vec<Out>, SpanIndex) {
     let clock = Arc::new(ManualClock::new(T0));
     let index = SpanIndex::new();
     let mut reconciler = Reconciler::new(ReconcileConfig {
@@ -572,7 +562,6 @@ fn run_config(
         clock: clock.clone(),
         spans: Some(index.clone()),
         declared,
-        request_helpers,
     });
     let mut out = Vec::new();
     for step in steps {
@@ -1587,19 +1576,12 @@ fn an_evicted_executor_is_recovered_from_the_flow() {
 }
 
 /// A script agent that sends each request from a helper of its own (its
-/// `wget`s) closes its span from a sibling of the executor: taken when the
-/// session named `wget` a request helper, and only then. A tool the script
-/// started (also its child) cannot close it, nor can a tool's child.
+/// `wget`s) cannot be told from its tools, which are the script's children
+/// too: no sibling of the executor closes its span, the helper's close
+/// included. The span stays open.
 #[test]
-fn a_close_from_a_named_request_helper_is_taken() {
-    let cases = [
-        // (closer, its parent, its program, helpers named, closed)
-        (500u32, 100u32, "wget", true, true),
-        (500, 100, "wget", false, false),
-        (510, 100, "python3", true, false),
-        (600, 300, "wget", true, false),
-    ];
-    for (closer, ppid, program, named, closed) in cases {
+fn a_close_from_the_executors_sibling_is_refused() {
+    for (closer, program) in [(500u32, "wget"), (510, "sh")] {
         let mut log = Log::new();
         let mut steps = Vec::new();
         attached(&mut log, &mut steps);
@@ -1611,8 +1593,7 @@ fn a_close_from_a_named_request_helper_is_taken() {
         steps.push(log.connect(1360, 1, 41000, api, &names, Verdict::Allow));
         steps.push(log.http_request(1400, 1, 1, 4800));
         steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "sleep 1"})));
-        steps.push(log.exec(2150, 300, 100, 10, &["sh", "-c", "sleep 1"]));
-        steps.push(log.exec(2200, closer, ppid, 11, &[program, "-q", "second"]));
+        steps.push(log.exec(2200, closer, 100, 11, &[program, "-q", "second"]));
         steps.push(log.tcp_connect(2250, closer, 42000, api));
         steps.push(log.connect(2260, 2, 42000, api, &names, Verdict::Allow));
         steps.push(log.tool_close_on(2300, "toolu_01", "ok", 2));
@@ -1620,17 +1601,9 @@ fn a_close_from_a_named_request_helper_is_taken() {
             steps.push(log.heartbeat(at));
             steps.push(Step::Tick(at));
         }
-        let helpers = if named {
-            vec!["wget".to_owned()]
-        } else {
-            Vec::new()
-        };
-        let (out, _) = run_config(true, steps, None, helpers);
-        let was_closed = spans_of(&out).iter().any(|s| s.closed_seq.is_some());
-        assert_eq!(
-            was_closed, closed,
-            "closer {closer} ({program}) under {ppid}, named {named}: {out:?}"
-        );
+        let (out, _) = run_all(true, steps);
+        let closed = spans_of(&out).iter().any(|s| s.closed_seq.is_some());
+        assert!(!closed, "closer {closer} ({program}): {out:?}");
     }
 }
 

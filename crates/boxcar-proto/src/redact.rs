@@ -149,12 +149,17 @@ const QUERY_VALUE_KEPT: usize = 16;
 /// and only the values that are short, plain and not under a secret-looking
 /// name. The fragment is dropped.
 pub fn scrub_target(target: &str) -> String {
+    self::target(target)
+}
+
+/// [`scrub_target`]'s work, the path through [`plain`].
+fn target(target: &str) -> String {
     let target = target.split('#').next().unwrap_or("");
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
     };
-    let mut out = scrub_text(path);
+    let mut out = plain(path);
     let Some(query) = query else {
         return out;
     };
@@ -170,7 +175,7 @@ pub fn scrub_target(target: &str) -> String {
         let lower = name.to_ascii_lowercase();
         let secret_name =
             is_secret_key(&lower) || SECRET_PARAMS.contains(&lower.as_str()) || name.contains('%');
-        out.push_str(&scrub_text(name));
+        out.push_str(&plain(name));
         let Some(value) = value else {
             continue;
         };
@@ -235,9 +240,43 @@ const OPAQUE_RUN: usize = 32;
 /// are redacted along with keys. The same text always scrubs the same way,
 /// so two scrubbed texts still compare.
 pub fn scrub_text(text: &str) -> String {
+    plain(&urls(text))
+}
+
+/// [`scrub_text`] without the URL pass: keys, userinfo, tokens.
+fn plain(text: &str) -> String {
     let text = key_values(text);
     let text = userinfo(&text);
     words(&text)
+}
+
+/// Each URL in `text` (`scheme://...`, to the next space, quote, `<`,
+/// `>`, `,` or `;`) scrubbed as a request target ([`scrub_target`]): its
+/// query values kept only when short, plain and under an ordinary name.
+/// A redirect's `code`, a signed URL's `sig`, are found wherever the URL
+/// sits (a `Refresh` header, a `Link`, a command's argument).
+fn urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let scheme_start = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |p| p + 1);
+        let end = rest[at + 3..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ',' | ';'))
+            .map_or(rest.len(), |p| at + 3 + p);
+        out.push_str(&rest[..scheme_start]);
+        if scheme_start == at {
+            // No scheme before `://`: not a URL.
+            out.push_str(&rest[at..at + 3]);
+            rest = &rest[at + 3..];
+            continue;
+        }
+        out.push_str(&target(&rest[scheme_start..end]));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_key_char(c: char) -> bool {
@@ -590,6 +629,35 @@ mod tests {
             scrub_argv(&["--token=abc".to_owned(), "x".to_owned()]),
             ["--token=[redacted]", "x"]
         );
+    }
+
+    #[test]
+    fn urls_in_text_lose_their_credential_query_values() {
+        let cases = [
+            (
+                "0;url=https://client.example/cb?code=a1b2c3d4e5f6a7b8c9d0&state=s",
+                "0;url=https://client.example/cb?code=[redacted]&state=[redacted]",
+            ),
+            (
+                "<https://api.example/items?page=2&sig=abc>; rel=next",
+                "<https://api.example/items?page=2&sig=[redacted]>; rel=next",
+            ),
+            (
+                "curl 'https://x.example/a?key=k1&n=1' -o out",
+                "curl 'https://x.example/a?key=[redacted]&n=1' -o out",
+            ),
+            (
+                "see https://example.com/docs#frag now",
+                "see https://example.com/docs now",
+            ),
+            ("not a url: ://nothing", "not a url: ://nothing"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text}");
+        }
+        // Nested schemes end, however many.
+        let nested = "a://".repeat(10_000);
+        let _ = scrub_text(&nested);
     }
 
     #[test]

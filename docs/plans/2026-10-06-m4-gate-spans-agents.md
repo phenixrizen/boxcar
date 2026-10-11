@@ -673,17 +673,21 @@ Made while writing the plan, 2026-10-06:
   the agent's children, so they still cannot close its spans. Claude Code
   (native and npm) passed there unchanged, sending every request from one
   process.
-- **Request helpers are named, not inferred.** The final review showed
-  that trusting any sibling of the executor also trusts a script agent's
-  tools, which are the script's children too. `boxcar run
-  --request-helper PROGRAM` now names the programs a script agent sends
-  its requests through; a span closes from a sibling only when it runs
-  one of them (by the file the kernel ran). The stub-model test names
-  `wget`. The same review moved two more checks into place: each body
-  decoder takes its worst case from the observer's budget (64 KiB for
-  gzip and deflate, 16 MiB and 64 KiB for Brotli) until its body ends,
-  and the dump scrubs URL-bearing headers (`Location`, `Referer`,
-  `Content-Location`, `Origin`) as request targets.
+- **Only the executor closes a span.** The final review of 48deb50
+  showed that trusting a sibling of the executor also trusts a script
+  agent's tools, which are the script's children too; naming request
+  helper programs (tried in 3329e37 as `--request-helper`) did not help,
+  since a tool can run the same program. A span now closes only from the
+  process that sent its request; an agent that sends its requests from
+  several processes leaves its spans open until the session ends. The
+  stub-model test, such an agent, now checks that. The same review moved
+  two more checks into place: each body decoder takes its worst case from
+  the observer's budget (64 KiB for gzip and deflate, 16 MiB and 64 KiB
+  for Brotli) until its body ends, a Brotli stream asking for a large
+  window (up to 1 GiB) is refused on its first byte, what an exchange
+  keeps of its heads is charged too (the dump's copies dropped once
+  written), and every URL in scrubbed text, a header's or a command's,
+  loses its credential query values as a request target does.
 - **Execs that waited for the open all join.** On the test box the Codex
   test failed four times in six: Codex runs its tool (a setup process
   that exec's bash, then the command) before the observer records the

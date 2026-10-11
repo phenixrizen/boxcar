@@ -61,13 +61,11 @@ processes and ring 0 effects to the span:
   when that entry is gone, the process the sensor says opened the
   request's flow (learned at the open or later). A span with a known
   executor closes only by a `tool.close` that came over a flow that same
-  process opened, or, for a script agent whose requests each come from a
-  helper of its own (its `curl`s), a sibling of it (a child of the same
-  parent, not init) running a program the session named with `boxcar run
-  --request-helper`. A script's tools are its children too, so without
-  that flag no sibling is taken, and with it only those programs are (a
-  tool the script runs directly as one of them could still close a span;
-  agents that send every request themselves need no flag): one over a flow another process opened is dropped, and
+  process opened. An agent whose requests come from several processes (a
+  script whose every request is a `curl` of its own) cannot be told from
+  its own tools, which are the script's children too, so its spans stay
+  open until the session ends, recorded then as they stand. Agents that
+  send every request themselves (Claude Code, Codex) close theirs: one over a flow another process opened is dropped, and
   one over a flow whose opener is not known yet waits up to 2 s to learn
   it, then is dropped if it never does; so does one for a span whose
   request flow is on record but not yet who opened it. The span stays

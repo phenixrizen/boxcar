@@ -91,10 +91,6 @@ pub struct ReconcileConfig {
     /// a declared command or path is compared exactly; without them, with
     /// the record's scrubbed copy.
     pub declared: Option<DeclaredArgs>,
-    /// The programs (file names) a script agent sends its model requests
-    /// through: a span may close from one of them that is a sibling of its
-    /// executor. None by default: only the executor closes its spans.
-    pub request_helpers: Vec<String>,
 }
 
 /// The reconciler's state machine: feed it records and ticks, take the
@@ -108,8 +104,7 @@ pub struct Reconciler {
 
 impl Reconciler {
     pub fn new(cfg: ReconcileConfig) -> Reconciler {
-        let spans = Spans::new(cfg.spans.clone(), cfg.declared.clone())
-            .with_request_helpers(cfg.request_helpers.clone());
+        let spans = Spans::new(cfg.spans.clone(), cfg.declared.clone());
         Reconciler {
             cfg,
             state: State::default(),

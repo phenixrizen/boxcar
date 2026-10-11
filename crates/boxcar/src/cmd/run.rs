@@ -274,7 +274,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             clock: Arc::new(SystemClock),
             spans: Some(spans),
             declared: Some(declared),
-            request_helpers: args.request_helpers.clone(),
         },
     )
     .context("cannot start the reconciler")?;
