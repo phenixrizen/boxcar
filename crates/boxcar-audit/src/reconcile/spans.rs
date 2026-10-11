@@ -567,6 +567,8 @@ pub struct Spans {
     declared: Option<DeclaredArgs>,
     /// `tool.close`s of bound spans whose flow's opener is not known yet.
     pending_closes: VecDeque<PendingClose>,
+    /// The programs a script agent sends its requests through.
+    request_helpers: Vec<String>,
     /// Findings a deferred close made, for the next tick to hand over.
     deferred_findings: Vec<Finding>,
 }
@@ -608,7 +610,28 @@ impl Spans {
             declared,
             pending_closes: VecDeque::new(),
             deferred_findings: Vec::new(),
+            request_helpers: Vec::new(),
         }
+    }
+
+    /// The programs (file names, `curl` or `/usr/bin/curl`) a script agent
+    /// sends its model requests through: a span may close from one of them
+    /// that is a sibling of its executor.
+    pub fn with_request_helpers(mut self, helpers: Vec<String>) -> Spans {
+        self.request_helpers = helpers
+            .iter()
+            .map(|helper| base_name(helper).to_owned())
+            .collect();
+        self
+    }
+
+    /// Whether `key` runs a program the session named a request helper.
+    fn is_request_helper(&self, state: &State, key: ProcKey) -> bool {
+        state.proc(key).is_some_and(|proc| {
+            self.request_helpers
+                .iter()
+                .any(|helper| helper == base_name(&proc.filename))
+        })
     }
 
     /// A `proc.tls_io` write: each request of the window whose flow's
@@ -864,9 +887,9 @@ impl Spans {
 
     /// A `tool.close`: closes the span, judges its connections and writes
     /// its `span.effects`. A span closes only by its executor (the process
-    /// that opened the flow of its model request), or a sibling of it (a
-    /// child of the same parent, not init): the close must come over a flow
-    /// one of them opened. A close by another process is dropped (the span
+    /// that opened the flow of its model request), or, for a script agent,
+    /// a sibling of it running a program the session named a request
+    /// helper: the close must come over a flow one of them opened. A close by another process is dropped (the span
     /// stays open for its own close); one where either opener is not known
     /// yet waits [`CLOSE_WAIT_NS`] to learn them, else is dropped. A span
     /// whose request flow is not on record at all, or a session without
@@ -913,7 +936,9 @@ impl Spans {
             // nothing to hold the close to.
             (None, _) => Verdict::Apply,
             (Some(executor), Some(closer))
-                if executor == *closer || siblings(state, executor, *closer) =>
+                if executor == *closer
+                    || (self.is_request_helper(state, *closer)
+                        && siblings(state, executor, *closer)) =>
             {
                 Verdict::Apply
             }
@@ -1248,7 +1273,20 @@ impl Spans {
     /// `key` joins the span: its exec is an effect, the effects that
     /// waited for it follow, and so do its children that waited.
     fn join(&mut self, state: &State, id: &str, key: ProcKey, exec_seq: Option<u64>) {
-        if self.by_proc.contains_key(&key) {
+        if let Some(member_of) = self.by_proc.get(&key).cloned() {
+            // Already this span's: a later exec of the same process (one
+            // that waited for the span's open with its first, as when the
+            // runtime runs the tool before the gate records the call) is
+            // the span's effect too.
+            if let (true, Some(seq)) = (member_of == id, exec_seq) {
+                if let Some(span) = self.spans.get_mut(id) {
+                    span.push_effect(Effect {
+                        seq,
+                        kind: EffectKind::Exec,
+                    });
+                }
+                self.index_update(id);
+            }
             return;
         }
         {
@@ -1893,10 +1931,10 @@ fn shell_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
 }
 
 /// Whether `a` and `b` are children of the same process, one that is not
-/// init: an agent that sends each model request from a helper process of
-/// its own (a script's `curl`s) closes its spans from a sibling of the
-/// executor. A tool's processes are the agent's children, not its
-/// siblings, and a process re-parented to init has no such sibling.
+/// init: a script agent that sends each model request from a helper of its
+/// own (its `curl`s) closes its spans from a sibling of the executor. A
+/// script's tools are its children too, so only a sibling running a
+/// program the session named a request helper is taken.
 fn siblings(state: &State, a: ProcKey, b: ProcKey) -> bool {
     let (Some(pa), Some(pb)) = (state.proc(a), state.proc(b)) else {
         return false;

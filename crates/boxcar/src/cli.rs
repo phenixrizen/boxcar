@@ -497,6 +497,14 @@ pub struct RunArgs {
     /// empty, and may be neither a share nor inside one, nor hold one.
     #[arg(long, value_name = "DIR", conflicts_with = "no_net")]
     pub dump: Option<PathBuf>,
+    /// A program the agent sends its model requests through, when it is
+    /// a script whose requests each come from a helper of its own (its
+    /// `curl` or `wget`), by the name of the file run. A tool call then may
+    /// close from such a helper beside the one that sent its request.
+    /// Agents that send every request themselves (Claude Code, Codex) need
+    /// none. Repeatable.
+    #[arg(long = "request-helper", value_name = "PROGRAM")]
+    pub request_helpers: Vec<String>,
     /// Set NAME to VALUE in the session's environment, after the defaults
     /// (PATH, HOME, TERM, LANG, BOXCAR_SESSION_ID). Repeatable. For what
     /// an agent inside needs, such as CLAUDE_CODE_OAUTH_TOKEN: the value

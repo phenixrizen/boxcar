@@ -555,6 +555,16 @@ fn run_with(
     steps: Vec<Step>,
     declared: Option<DeclaredArgs>,
 ) -> (Vec<Out>, SpanIndex) {
+    run_config(sensor_expected, steps, declared, Vec::new())
+}
+
+/// [`run_with`] with the session's request helpers.
+fn run_config(
+    sensor_expected: bool,
+    steps: Vec<Step>,
+    declared: Option<DeclaredArgs>,
+    request_helpers: Vec<String>,
+) -> (Vec<Out>, SpanIndex) {
     let clock = Arc::new(ManualClock::new(T0));
     let index = SpanIndex::new();
     let mut reconciler = Reconciler::new(ReconcileConfig {
@@ -562,6 +572,7 @@ fn run_with(
         clock: clock.clone(),
         spans: Some(index.clone()),
         declared,
+        request_helpers,
     });
     let mut out = Vec::new();
     for step in steps {
@@ -1575,12 +1586,20 @@ fn an_evicted_executor_is_recovered_from_the_flow() {
     assert_eq!(spans[0].procs, [300], "the forged close was refused");
 }
 
-/// An agent that sends each request from a helper of its own (a script's
-/// `wget`s) closes its span from a sibling of the executor: taken. A tool's
-/// process (the agent's child) still cannot.
+/// A script agent that sends each request from a helper of its own (its
+/// `wget`s) closes its span from a sibling of the executor: taken when the
+/// session named `wget` a request helper, and only then. A tool the script
+/// started (also its child) cannot close it, nor can a tool's child.
 #[test]
-fn a_close_from_the_executors_sibling_is_taken() {
-    for (closer, ppid, closed) in [(500u32, 100u32, true), (600, 300, false)] {
+fn a_close_from_a_named_request_helper_is_taken() {
+    let cases = [
+        // (closer, its parent, its program, helpers named, closed)
+        (500u32, 100u32, "wget", true, true),
+        (500, 100, "wget", false, false),
+        (510, 100, "python3", true, false),
+        (600, 300, "wget", true, false),
+    ];
+    for (closer, ppid, program, named, closed) in cases {
         let mut log = Log::new();
         let mut steps = Vec::new();
         attached(&mut log, &mut steps);
@@ -1593,7 +1612,7 @@ fn a_close_from_the_executors_sibling_is_taken() {
         steps.push(log.http_request(1400, 1, 1, 4800));
         steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "sleep 1"})));
         steps.push(log.exec(2150, 300, 100, 10, &["sh", "-c", "sleep 1"]));
-        steps.push(log.exec(2200, closer, ppid, 11, &["wget", "-q", "second"]));
+        steps.push(log.exec(2200, closer, ppid, 11, &[program, "-q", "second"]));
         steps.push(log.tcp_connect(2250, closer, 42000, api));
         steps.push(log.connect(2260, 2, 42000, api, &names, Verdict::Allow));
         steps.push(log.tool_close_on(2300, "toolu_01", "ok", 2));
@@ -1601,10 +1620,17 @@ fn a_close_from_the_executors_sibling_is_taken() {
             steps.push(log.heartbeat(at));
             steps.push(Step::Tick(at));
         }
-        let (out, _) = run_all(true, steps);
-        let spans = spans_of(&out);
-        let was_closed = spans.iter().any(|s| s.closed_seq.is_some());
-        assert_eq!(was_closed, closed, "closer {closer} under {ppid}: {out:?}");
+        let helpers = if named {
+            vec!["wget".to_owned()]
+        } else {
+            Vec::new()
+        };
+        let (out, _) = run_config(true, steps, None, helpers);
+        let was_closed = spans_of(&out).iter().any(|s| s.closed_seq.is_some());
+        assert_eq!(
+            was_closed, closed,
+            "closer {closer} ({program}) under {ppid}, named {named}: {out:?}"
+        );
     }
 }
 
@@ -1679,6 +1705,69 @@ fn a_program_named_sh_runs_no_declared_command() {
     let (out, _) = run_all(true, steps);
     let rules: Vec<&str> = findings_of(&out).iter().map(|f| f.rule.as_str()).collect();
     assert!(rules.contains(&"argv"), "{out:?}");
+}
+
+/// A tool run before the gate records its call (Codex outruns the
+/// observer): the process's later execs, which waited with its first, are
+/// the span's effects too, and its command counts as run.
+#[test]
+fn execs_that_waited_for_the_open_all_join() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["codex", "exec", "go"]));
+    steps.push(log.exec_as(
+        2000,
+        594,
+        200,
+        10,
+        "/proc/self/exe",
+        &[
+            "/proc/self/exe",
+            "--codex-run-as-process-setup",
+            "/usr/bin/bash",
+            "-c",
+            "setup",
+        ],
+    ));
+    steps.push(log.exec_as(
+        2010,
+        594,
+        200,
+        10,
+        "/usr/bin/bash",
+        &["/usr/bin/bash", "-c", "setup"],
+    ));
+    steps.push(log.exec_as(
+        2020,
+        594,
+        200,
+        10,
+        "/usr/bin/bash",
+        &["/usr/bin/bash", "-c", "echo boxcar-m4 > marker.txt"],
+    ));
+    steps.push(log.tool_open(
+        2100,
+        "call_1",
+        "exec",
+        json!({"cmd": "echo boxcar-m4 > marker.txt"}),
+    ));
+    steps.push(log.exit(2300, 594, 10));
+    steps.push(log.tool_close(3000, "call_1", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let rules: Vec<&str> = findings_of(&out).iter().map(|f| f.rule.as_str()).collect();
+    assert!(!rules.contains(&"argv"), "{out:?}");
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].procs, [594]);
+    assert_eq!(
+        spans[0].effects.len(),
+        3,
+        "every exec of the process: {out:?}"
+    );
 }
 
 /// The declared command written in a comment, or beside another, is not

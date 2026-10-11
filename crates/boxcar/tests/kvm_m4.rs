@@ -501,6 +501,9 @@ fn stub_flags(stub: &Stub, scratch: &Scratch) -> Vec<String> {
     flags.push(stub.addr.to_string());
     flags.push("--dump".to_owned());
     flags.push(scratch.path("dump").to_string_lossy().into_owned());
+    // The stub's agent is a script: each request is its own `wget`.
+    flags.push("--request-helper".to_owned());
+    flags.push("wget".to_owned());
     flags
 }
 

@@ -61,6 +61,18 @@ pub enum Coding {
 }
 
 impl Coding {
+    /// The most a decoder of this coding holds, as charged against the
+    /// observer's budget when it is made: zlib's window and state for
+    /// gzip and deflate, and for Brotli its largest window (16 MiB) and the
+    /// writer's buffer.
+    pub fn decoder_cost(self) -> usize {
+        match self {
+            Coding::Identity => 0,
+            Coding::Gzip | Coding::Deflate => 64 * 1024,
+            Coding::Brotli => 16 * 1024 * 1024 + 64 * 1024,
+        }
+    }
+
     /// The coding `content_encoding` names; `Err` for one the observer
     /// does not decode (`zstd`, a chain of codings, anything else).
     pub fn parse(content_encoding: Option<&str>) -> Result<Coding, &'static str> {
@@ -179,6 +191,10 @@ pub struct BodySink {
     kept: Vec<u8>,
     /// What the kept bytes take of the observer's budget.
     share: Share,
+    /// What the decoder takes of it, until the body ends.
+    decoder_share: Share,
+    /// The decoder's cost ([`Coding::decoder_cost`]).
+    decoder_cost: usize,
     /// Whether the decoded bytes are kept at all, or only hashed.
     keep: bool,
     hasher: blake3::Hasher,
@@ -190,14 +206,20 @@ pub struct BodySink {
 impl BodySink {
     /// A sink for a body with `content_encoding`.
     pub fn new(content_encoding: Option<&str>) -> BodySink {
-        let (decoder, degraded) = match Coding::parse(content_encoding) {
-            Ok(coding) => (Some(ContentDecoder::new(coding)), None),
-            Err(reason) => (None, Some(reason)),
+        let (decoder, decoder_cost, degraded) = match Coding::parse(content_encoding) {
+            Ok(coding) => (
+                Some(ContentDecoder::new(coding)),
+                coding.decoder_cost(),
+                None,
+            ),
+            Err(reason) => (None, 0, Some(reason)),
         };
         BodySink {
             decoder,
             kept: Vec::new(),
             share: Share::default(),
+            decoder_share: Share::default(),
+            decoder_cost,
             keep: true,
             hasher: blake3::Hasher::new(),
             bytes: 0,
@@ -237,13 +259,28 @@ impl BodySink {
             None => Vec::new(),
         };
         self.take(&rest);
+        self.drop_decoder();
         rest
     }
 
-    /// Keeps the body's bytes within the observer's `retained` budget.
+    /// Keeps the body's bytes, and its decoder, within the observer's
+    /// `retained` budget: a decoder with no room is not made, and the body
+    /// is hashed raw (`observe_budget`).
     pub fn with_retained(mut self, retained: Retained) -> BodySink {
-        self.share = Share::new(retained);
+        self.share = Share::new(retained.clone());
+        self.decoder_share = Share::new(retained);
+        if self.decoder.is_some() && !self.decoder_share.grow(self.decoder_cost) {
+            self.decoder = None;
+            self.degraded.get_or_insert("observe_budget");
+        }
         self
+    }
+
+    /// The body ended or is let go: its decoder, and what it took of the
+    /// budget, go.
+    fn drop_decoder(&mut self) {
+        self.decoder = None;
+        self.decoder_share.clear();
     }
 
     /// Hashes the body without keeping it: no parser and no dump reads it.
@@ -258,6 +295,7 @@ impl BodySink {
         self.kept = Vec::new();
         self.keep = false;
         self.share.clear();
+        self.drop_decoder();
     }
 
     /// Whether the kept bytes are the whole body.
@@ -475,5 +513,25 @@ mod tests {
         assert!(c.kept().is_empty() && !c.summary().truncated);
         assert_eq!(retained.held(), 0);
         drop((b, c));
+    }
+
+    /// A decoder takes its worst case from the budget when made and gives
+    /// it back when the body ends; with no room it is not made.
+    #[test]
+    fn decoders_draw_on_the_budget() {
+        let retained = Retained::with_limit(Coding::Brotli.decoder_cost() + 100 * 1024);
+        let mut br = BodySink::new(Some("br")).with_retained(retained.clone());
+        assert_eq!(retained.held(), Coding::Brotli.decoder_cost());
+        let gz = BodySink::new(Some("gzip")).with_retained(retained.clone());
+        assert_eq!(retained.held(), Coding::Brotli.decoder_cost() + 64 * 1024);
+        let mut late = BodySink::new(Some("br")).with_retained(retained.clone());
+        assert_eq!(late.summary().degraded, Some("observe_budget"));
+        late.push(b"raw");
+        assert_eq!(late.summary().bytes, 3, "hashed raw");
+        drop(late);
+        br.finish();
+        assert_eq!(retained.held(), 64 * 1024);
+        drop(gz);
+        assert_eq!(retained.held(), 0);
     }
 }

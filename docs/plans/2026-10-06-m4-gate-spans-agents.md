@@ -673,3 +673,21 @@ Made while writing the plan, 2026-10-06:
   the agent's children, so they still cannot close its spans. Claude Code
   (native and npm) passed there unchanged, sending every request from one
   process.
+- **Request helpers are named, not inferred.** The final review showed
+  that trusting any sibling of the executor also trusts a script agent's
+  tools, which are the script's children too. `boxcar run
+  --request-helper PROGRAM` now names the programs a script agent sends
+  its requests through; a span closes from a sibling only when it runs
+  one of them (by the file the kernel ran). The stub-model test names
+  `wget`. The same review moved two more checks into place: each body
+  decoder takes its worst case from the observer's budget (64 KiB for
+  gzip and deflate, 16 MiB and 64 KiB for Brotli) until its body ends,
+  and the dump scrubs URL-bearing headers (`Location`, `Referer`,
+  `Content-Location`, `Origin`) as request targets.
+- **Execs that waited for the open all join.** On the test box the Codex
+  test failed four times in six: Codex runs its tool (a setup process
+  that exec's bash, then the command) before the observer records the
+  call, so those execs wait; when the `tool.open` came, the first joined
+  the span and the process's later execs, the command among them, were
+  dropped as a member's. They now join as the span's effects (Codex
+  passed five of five after).

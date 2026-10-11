@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boxcar_proto::redact::scrub_text;
+use boxcar_proto::redact::{scrub_target, scrub_text};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::http::headers::is_credential;
@@ -625,10 +625,15 @@ fn form_secret(name: &str) -> bool {
     FORM_SECRETS.contains(&lower.as_str()) || is_credential(&lower.replace('_', "-"))
 }
 
+/// Headers whose value is a URL, scrubbed as a request target is.
+pub const URL_HEADERS: [&str; 4] = ["location", "content-location", "referer", "origin"];
+
 /// The head text of a request or response as the dump writes it: the
 /// start line, then each header as `name: value`, each line ending in
 /// CRLF. `headers` are the observer's, which never hold a credential's
-/// value; each value is also scrubbed as free text.
+/// value; each value is also scrubbed as free text, and a header that
+/// carries a URL ([`URL_HEADERS`]) as a request target is (its query
+/// values kept only when short, plain and under an ordinary name).
 pub fn head_text<'a>(
     start_line: &str,
     headers: impl Iterator<Item = (&'a str, &'a [u8])>,
@@ -637,9 +642,14 @@ pub fn head_text<'a>(
     text.push_str(start_line);
     text.push_str("\r\n");
     for (name, value) in headers {
+        let value = String::from_utf8_lossy(value);
         text.push_str(name);
         text.push_str(": ");
-        text.push_str(&scrub_text(&String::from_utf8_lossy(value)));
+        if URL_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            text.push_str(&scrub_target(value.trim()));
+        } else {
+            text.push_str(&scrub_text(&value));
+        }
         text.push_str("\r\n");
     }
     text
@@ -876,6 +886,25 @@ mod tests {
         assert!(text.starts_with("c2s text 43\n{"), "{text}");
         assert!(text.contains("\"type\":\"response.create\"") && !text.contains("sk-1"));
         assert!(text.ends_with("\ns2c binary 3\n"), "{text}");
+    }
+
+    /// A URL in a header loses its credential query values as a request
+    /// target does.
+    #[test]
+    fn url_headers_are_scrubbed_as_targets() {
+        let headers = [
+            (
+                "location",
+                &b"https://client.example/cb?code=a1b2c3d4e5f6a7b8c9d0&state=s1"[..],
+            ),
+            ("referer", &b"https://app.example/p?sig=abc&page=2"[..]),
+            ("content-type", &b"text/html"[..]),
+        ];
+        let text = head_text("HTTP/1.1 302", headers.into_iter());
+        assert!(!text.contains("a1b2c3d4e5f6a7b8c9d0"), "{text}");
+        assert!(!text.contains("sig=abc"), "{text}");
+        assert!(text.contains("page=2"), "{text}");
+        assert!(text.contains("content-type: text/html\r\n"), "{text}");
     }
 
     /// A secret split across streamed fragments is in none of them in
