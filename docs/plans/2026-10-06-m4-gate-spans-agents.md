@@ -665,3 +665,11 @@ Made while writing the plan, 2026-10-06:
   like one whose own flow's opener is unknown; the reconciler's state
   keeps at most 16384 flows. A form field's name is decoded before the
   dump decides whether its value is a credential's.
+- **The close rule meets a script agent.** On the KVM run on the test
+  box, the stub-model test (an agent that sends each request from its
+  own `wget`) left its span open: the close came over a flow its second
+  `wget` opened, not the executor's. A close is now also taken from a
+  sibling of the executor (same parent, not init); a tool's processes are
+  the agent's children, so they still cannot close its spans. Claude Code
+  (native and npm) passed there unchanged, sending every request from one
+  process.

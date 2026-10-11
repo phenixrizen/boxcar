@@ -863,15 +863,15 @@ impl Spans {
     }
 
     /// A `tool.close`: closes the span, judges its connections and writes
-    /// its `span.effects`.
-    /// A `tool.close`. A span closes only by its executor (the process
-    /// that opened the flow of its model request): the close must come
-    /// over a flow that process opened. A close by another process is
-    /// dropped (the span stays open for its own close); one where either
-    /// opener is not known yet waits [`CLOSE_WAIT_NS`] to learn them, else
-    /// is dropped. A span whose request flow is not on record at all, or
-    /// a session without the sensor's lineage programs, has nothing to
-    /// hold a close to, and takes any.
+    /// its `span.effects`. A span closes only by its executor (the process
+    /// that opened the flow of its model request), or a sibling of it (a
+    /// child of the same parent, not init): the close must come over a flow
+    /// one of them opened. A close by another process is dropped (the span
+    /// stays open for its own close); one where either opener is not known
+    /// yet waits [`CLOSE_WAIT_NS`] to learn them, else is dropped. A span
+    /// whose request flow is not on record at all, or a session without
+    /// the sensor's lineage programs, has nothing to hold a close to, and
+    /// takes any.
     pub fn close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
         if !state.sensor.lineage_ok() {
             return self.apply_close(state, record, close);
@@ -912,7 +912,11 @@ impl Spans {
             // No such flow on record (a log without the gate's flows):
             // nothing to hold the close to.
             (None, _) => Verdict::Apply,
-            (Some(executor), Some(closer)) if executor == *closer => Verdict::Apply,
+            (Some(executor), Some(closer))
+                if executor == *closer || siblings(state, executor, *closer) =>
+            {
+                Verdict::Apply
+            }
             (Some(_), Some(_)) => Verdict::Drop,
             (Some(_), None) => Verdict::Wait,
         }
@@ -1886,6 +1890,22 @@ fn shell_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
         return None;
     }
     argv.get(at)
+}
+
+/// Whether `a` and `b` are children of the same process, one that is not
+/// init: an agent that sends each model request from a helper process of
+/// its own (a script's `curl`s) closes its spans from a sibling of the
+/// executor. A tool's processes are the agent's children, not its
+/// siblings, and a process re-parented to init has no such sibling.
+fn siblings(state: &State, a: ProcKey, b: ProcKey) -> bool {
+    let (Some(pa), Some(pb)) = (state.proc(a), state.proc(b)) else {
+        return false;
+    };
+    // The same parent pid, and, where the state knows the parent, the same
+    // process (not a reused pid).
+    pa.ppid == pb.ppid
+        && pa.ppid > 1
+        && state.attribute(pa.ppid, pa.first_ts) == state.attribute(pb.ppid, pb.first_ts)
 }
 
 /// The last part of a path.

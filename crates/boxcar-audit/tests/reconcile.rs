@@ -1430,15 +1430,16 @@ fn findings_quote_declared_values_scrubbed() {
     }
 }
 
-/// A `tool.close` sent over a flow another process opened does not close
-/// the span: its own close, over the agent's flow, does.
+/// A `tool.close` sent over a flow another process opened (one the agent
+/// started, as a tool's would be) does not close the span: its own close,
+/// over the agent's flow, does.
 #[test]
 fn a_close_from_another_process_leaves_the_span_open() {
     let mut log = Log::new();
     let mut steps = Vec::new();
     attached(&mut log, &mut steps);
     steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
-    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.exec(1210, 400, 200, 6, &["python3", "other.py"]));
     steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
     steps.push(log.tcp_connect(1350, 200, 41000, "203.0.113.5:443"));
     steps.push(log.connect(
@@ -1488,7 +1489,7 @@ fn a_close_waits_to_learn_who_sent_it() {
         let mut steps = Vec::new();
         attached(&mut log, &mut steps);
         steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
-        steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+        steps.push(log.exec(1210, 400, 200, 6, &["python3", "other.py"]));
         steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
         steps.push(log.tcp_connect(1350, 200, 41000, "203.0.113.5:443"));
         steps.push(log.connect(
@@ -1534,7 +1535,7 @@ fn an_evicted_executor_is_recovered_from_the_flow() {
     let mut steps = Vec::new();
     attached(&mut log, &mut steps);
     steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
-    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.exec(1210, 400, 200, 6, &["python3", "other.py"]));
     steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
     steps.push(log.tcp_connect(1350, 200, 41000, "203.0.113.5:443"));
     steps.push(log.connect(
@@ -1574,6 +1575,39 @@ fn an_evicted_executor_is_recovered_from_the_flow() {
     assert_eq!(spans[0].procs, [300], "the forged close was refused");
 }
 
+/// An agent that sends each request from a helper of its own (a script's
+/// `wget`s) closes its span from a sibling of the executor: taken. A tool's
+/// process (the agent's child) still cannot.
+#[test]
+fn a_close_from_the_executors_sibling_is_taken() {
+    for (closer, ppid, closed) in [(500u32, 100u32, true), (600, 300, false)] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        let api = "203.0.113.5:443";
+        let names = ["api.example"];
+        steps.push(log.exec(1200, 200, 100, 5, &["wget", "-q", "first"]));
+        steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+        steps.push(log.tcp_connect(1350, 200, 41000, api));
+        steps.push(log.connect(1360, 1, 41000, api, &names, Verdict::Allow));
+        steps.push(log.http_request(1400, 1, 1, 4800));
+        steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "sleep 1"})));
+        steps.push(log.exec(2150, 300, 100, 10, &["sh", "-c", "sleep 1"]));
+        steps.push(log.exec(2200, closer, ppid, 11, &["wget", "-q", "second"]));
+        steps.push(log.tcp_connect(2250, closer, 42000, api));
+        steps.push(log.connect(2260, 2, 42000, api, &names, Verdict::Allow));
+        steps.push(log.tool_close_on(2300, "toolu_01", "ok", 2));
+        for at in [3000, 4000, 5000] {
+            steps.push(log.heartbeat(at));
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        let spans = spans_of(&out);
+        let was_closed = spans.iter().any(|s| s.closed_seq.is_some());
+        assert_eq!(was_closed, closed, "closer {closer} under {ppid}: {out:?}");
+    }
+}
+
 /// A close that comes before the sensor says who opened the span's own
 /// request flow waits for it: another process's close is then dropped.
 #[test]
@@ -1584,7 +1618,7 @@ fn a_close_waits_for_the_spans_own_opener() {
     let api = "203.0.113.5:443";
     let names = ["api.example"];
     steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
-    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.exec(1210, 400, 200, 6, &["python3", "other.py"]));
     steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
     steps.push(log.heartbeat(2000));
     // The agent's flow is on record; who opened it, not yet.

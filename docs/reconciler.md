@@ -61,7 +61,10 @@ processes and ring 0 effects to the span:
   when that entry is gone, the process the sensor says opened the
   request's flow (learned at the open or later). A span with a known
   executor closes only by a `tool.close` that came over a flow that same
-  process opened: one over a flow another process opened is dropped, and
+  process opened, or a sibling of it (a child of the same parent, when
+  that parent is not init: an agent that sends each request from a
+  helper of its own, as a script's `curl`s; a tool's processes are the
+  agent's children, not its siblings): one over a flow another process opened is dropped, and
   one over a flow whose opener is not known yet waits up to 2 s to learn
   it, then is dropped if it never does; so does one for a span whose
   request flow is on record but not yet who opened it. The span stays
