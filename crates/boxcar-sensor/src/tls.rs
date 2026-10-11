@@ -493,7 +493,9 @@ mod tests {
         let start = Instant::now();
         let mut attacher = Attacher::new();
         assert_eq!(attacher.next_due(), None);
-        attacher.saw(42, start);
+        // Above any pid_max (at most 2^22): no such process, ever.
+        let gone = u32::MAX - 1;
+        attacher.saw(gone, start);
         assert_eq!(attacher.next_due(), Some(start + FIRST_SWEEP));
         // A process that has gone (no maps to read) is forgotten.
         let frames = attacher.sweep(start + FIRST_SWEEP, 1);

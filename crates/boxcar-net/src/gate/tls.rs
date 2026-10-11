@@ -26,6 +26,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream};
 use std::sync::Arc;
 
+use boxcar_audit::DeclaredArgs;
 use rustls::client::ClientConnection;
 use rustls::crypto::CryptoProvider;
 use rustls::server::{Accepted, Acceptor, ClientHello, ResolvesServerCert, ServerConnection};
@@ -55,11 +56,13 @@ pub enum SetupError {
 }
 
 /// What every inspected flow shares: the session CA, the upstream
-/// client's template (the trust store), and the crypto provider.
+/// client's template (the trust store), the crypto provider, and where the
+/// model calls' arguments go for the reconciler.
 pub struct InspectConfig {
     ca: Arc<SessionCa>,
     client: ClientConfig,
     provider: Arc<CryptoProvider>,
+    declared: Option<DeclaredArgs>,
 }
 
 impl std::fmt::Debug for InspectConfig {
@@ -86,7 +89,19 @@ impl InspectConfig {
             ca,
             client,
             provider,
+            declared: None,
         })
+    }
+
+    /// The model calls' arguments as sent go to `declared`, which the
+    /// reconciler reads: in memory, never recorded.
+    pub fn with_declared(mut self, declared: DeclaredArgs) -> InspectConfig {
+        self.declared = Some(declared);
+        self
+    }
+
+    pub fn declared(&self) -> Option<&DeclaredArgs> {
+        self.declared.as_ref()
     }
 
     /// The host's own trust store, with `extra` added: what the upstream

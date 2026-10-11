@@ -23,6 +23,11 @@ pub struct SseParser {
     buf: Vec<u8>,
     current: SseEvent,
     has_data: bool,
+    /// A line ran past [`MAX_EVENT_BYTES`] without ending: its bytes are
+    /// dropped until it ends.
+    skipping: bool,
+    /// Some line was dropped so.
+    overflowed: bool,
 }
 
 /// The most bytes an event may hold before the rest of it is dropped.
@@ -35,12 +40,35 @@ impl SseParser {
 
     /// Takes `bytes`, appending the events they complete to `out`.
     pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<SseEvent>) {
+        let mut bytes = bytes;
+        if self.skipping {
+            // The rest of the over-long line goes, up to its end.
+            match bytes.iter().position(|&b| b == b'\n' || b == b'\r') {
+                Some(at) => {
+                    self.skipping = false;
+                    // Past the line's end, CRLF as one.
+                    let crlf = bytes[at] == b'\r' && bytes.get(at + 1) == Some(&b'\n');
+                    bytes = &bytes[at + if crlf { 2 } else { 1 }..];
+                }
+                None => return,
+            }
+        }
         self.buf.extend_from_slice(bytes);
         while let Some((line, rest)) = split_line(&self.buf).map(|(l, r)| (l.to_vec(), r.len())) {
             let at = self.buf.len() - rest;
             self.buf.drain(..at);
             self.line(&line, out);
         }
+        if self.buf.len() > MAX_EVENT_BYTES {
+            self.buf = Vec::new();
+            self.skipping = true;
+            self.overflowed = true;
+        }
+    }
+
+    /// Whether a line was dropped for running past [`MAX_EVENT_BYTES`].
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// The event under way, if any: a stream that ended without a blank
@@ -167,5 +195,22 @@ mod tests {
                 id: None,
             }]
         );
+    }
+
+    /// A line that never ends is held only up to the limit; the parser
+    /// reads on after it ends.
+    #[test]
+    fn a_line_past_the_limit_is_dropped_to_its_end() {
+        let mut parser = SseParser::new();
+        let mut out = Vec::new();
+        let chunk = vec![b'x'; 1024 * 1024];
+        parser.feed(b"data: ", &mut out);
+        for _ in 0..(MAX_EVENT_BYTES / chunk.len() + 2) {
+            parser.feed(&chunk, &mut out);
+            assert!(parser.buf.len() <= MAX_EVENT_BYTES + chunk.len());
+        }
+        assert!(parser.overflowed());
+        parser.feed(b"tail\n\ndata: ok\n\n", &mut out);
+        assert_eq!(out.last().map(|e| e.data.as_str()), Some("ok"));
     }
 }

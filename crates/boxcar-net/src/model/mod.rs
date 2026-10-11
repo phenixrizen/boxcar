@@ -24,6 +24,7 @@ pub mod openai_responses;
 pub mod summary;
 pub mod track;
 
+use boxcar_audit::Declared;
 use serde_json::Value;
 
 pub use summary::{b3, summarize, SUMMARY_LIMIT};
@@ -94,6 +95,9 @@ pub struct ToolOpen {
     pub args_summary: String,
     /// The arguments as JSON, when at most [`ARGS_INLINE`] bytes.
     pub args: Option<Value>,
+    /// The arguments as the model sent them, and their size: for the
+    /// reconciler's comparisons only, never recorded.
+    pub raw: Option<(Declared, usize)>,
 }
 
 /// The most bytes of arguments a `tool.open` carries inline.
@@ -111,6 +115,45 @@ pub struct ResponseInfo {
     pub text_b3: Option<String>,
     pub tool_uses: u32,
     pub degraded: Option<&'static str>,
+}
+
+/// The most bytes a streamed response's tool calls may gather (names and
+/// arguments, as they come, whether or not the calls finished): past it
+/// the response is `degraded: "stream_budget"` and no call grows further.
+pub const STREAM_CALL_BYTES: usize = 16 * 1024 * 1024;
+/// The most tool calls a streamed response may have under way at once.
+pub const STREAM_CALLS: usize = 256;
+
+/// What a streamed response's tool calls have gathered so far.
+#[derive(Default)]
+pub struct CallBudget {
+    bytes: usize,
+}
+
+impl CallBudget {
+    /// Whether `n` more bytes fit; when not, `degraded` says so.
+    pub fn admit(&mut self, n: usize, degraded: &mut Option<&'static str>) -> bool {
+        match self.bytes.checked_add(n) {
+            Some(total) if total <= STREAM_CALL_BYTES => {
+                self.bytes = total;
+                true
+            }
+            _ => {
+                degraded.get_or_insert("stream_budget");
+                false
+            }
+        }
+    }
+
+    /// Whether one more call fits beside the `open` ones; when not,
+    /// `degraded` says so.
+    pub fn admit_call(open: usize, degraded: &mut Option<&'static str>) -> bool {
+        if open < STREAM_CALLS {
+            return true;
+        }
+        degraded.get_or_insert("stream_budget");
+        false
+    }
 }
 
 /// The text a response carried, hashed whole as it came.
@@ -148,6 +191,7 @@ pub fn tool_open(id: &str, name: &str, args: &Value) -> ToolOpen {
         args_b3: b3(json.as_bytes()),
         args_summary: summarize(args),
         args: (json.len() <= ARGS_INLINE).then_some(inline),
+        raw: Some((Declared::Json(args.clone()), json.len())),
     }
 }
 
@@ -161,6 +205,7 @@ pub fn tool_open_text(id: &str, name: &str, arguments: &str) -> ToolOpen {
             args_b3: b3(arguments.as_bytes()),
             args_summary: summary::cut(&summary::scrubbed(arguments), SUMMARY_LIMIT),
             args: None,
+            raw: Some((Declared::Text(arguments.to_owned()), arguments.len())),
         },
     }
 }

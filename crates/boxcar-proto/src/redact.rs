@@ -80,9 +80,50 @@ fn texts(v: &mut Value) {
             }
         }
         Value::Object(map) => map.values_mut().for_each(texts),
-        Value::Array(items) => items.iter_mut().for_each(texts),
+        Value::Array(items) => {
+            // An array of strings may be an argv: a secret flag's value is
+            // the next string.
+            let mut flag = false;
+            for item in items.iter_mut() {
+                let next_flag = item.as_str().is_some_and(is_secret_flag);
+                if flag && item.is_string() {
+                    *item = Value::String(REDACTED.to_owned());
+                } else {
+                    texts(item);
+                }
+                flag = next_flag;
+            }
+        }
         _ => {}
     }
+}
+
+/// An argv as a record may keep it: each argument through [`scrub_text`],
+/// and the argument after a secret-looking flag (`--token`, `--password`)
+/// redacted whole. The same argv always scrubs the same way, and a JSON
+/// array of the same strings scrubs as [`scrub_deep`] does it.
+pub fn scrub_argv(argv: &[String]) -> Vec<String> {
+    let mut flag = false;
+    argv.iter()
+        .map(|arg| {
+            let out = if flag {
+                REDACTED.to_owned()
+            } else {
+                scrub_text(arg)
+            };
+            flag = is_secret_flag(arg);
+            out
+        })
+        .collect()
+}
+
+/// `--token`, `-password`: a flag, without a value of its own, whose name
+/// looks like a secret's.
+fn is_secret_flag(arg: &str) -> bool {
+    arg.starts_with('-')
+        && !arg.contains('=')
+        && arg.len() > 1
+        && is_secret_key(arg.trim_start_matches('-'))
 }
 
 /// Query parameter names that carry a credential without a secret stem in
@@ -248,10 +289,7 @@ fn key_values(text: &str) -> String {
                     k += 1;
                 }
                 if let Some(&q) = chars.get(k).filter(|c| matches!(c, '"' | '\'')) {
-                    let end = chars[k + 1..]
-                        .iter()
-                        .position(|&c| c == q)
-                        .map_or(chars.len(), |p| k + 1 + p);
+                    let end = quoted_end(&chars, k + 1, q);
                     replace(&mut out, &chars, i, k + 1, end);
                     i = end;
                     continue;
@@ -269,7 +307,13 @@ fn key_values(text: &str) -> String {
                     },
                 )
             }
-            Some(_) if j > i && (scheme || key.starts_with("--")) => {
+            Some(q @ ('"' | '\'')) if j > i && (scheme || key.starts_with('-')) => {
+                let end = quoted_end(&chars, j + 1, q);
+                replace(&mut out, &chars, i, j + 1, end);
+                i = end;
+                continue;
+            }
+            Some(_) if j > i && (scheme || key.starts_with('-')) => {
                 (j, |c: char| c.is_whitespace() || matches!(c, '"' | '\''))
             }
             _ => continue,
@@ -277,10 +321,7 @@ fn key_values(text: &str) -> String {
         let end = if chars[value_start..].starts_with(&REDACTED_CHARS) {
             value_start
         } else {
-            chars[value_start..]
-                .iter()
-                .position(|&c| ends(c))
-                .map_or(chars.len(), |p| value_start + p)
+            unquoted_end(&chars, value_start, ends)
         };
         if end > value_start {
             replace(&mut out, &chars, i, value_start, end);
@@ -288,6 +329,34 @@ fn key_values(text: &str) -> String {
         }
     }
     out
+}
+
+/// Where a value quoted with `q` from `start` ends: at the first `q` not
+/// escaped by a backslash, or at the end.
+fn quoted_end(chars: &[char], start: usize, q: char) -> usize {
+    let mut k = start;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' => k += 2,
+            c if c == q => return k,
+            _ => k += 1,
+        }
+    }
+    chars.len()
+}
+
+/// Where an unquoted value from `start` ends: at the first character
+/// `ends` takes that a backslash does not escape, or at the end.
+fn unquoted_end(chars: &[char], start: usize, ends: fn(char) -> bool) -> usize {
+    let mut k = start;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' if k + 1 < chars.len() => k += 2,
+            c if ends(c) => return k,
+            _ => k += 1,
+        }
+    }
+    chars.len()
 }
 
 /// Pushes `chars[from..value]` and then the redaction mark in place of
@@ -344,27 +413,46 @@ fn words(text: &str) -> String {
 }
 
 fn push_word(out: &mut String, word: &str) {
-    let prefixed = TOKEN_PREFIXES
-        .iter()
-        .any(|prefix| word.starts_with(prefix) && word.len() >= prefix.len() + PREFIX_TAIL);
-    if prefixed {
+    if prefixed(word) {
         out.push_str(REDACTED);
         return;
     }
-    // Paths and dotted names are split into their parts first, so a long
-    // path is not taken for one opaque run.
+    // A token after `name=` is still a token.
+    for (n, piece) in word.split('=').enumerate() {
+        if n > 0 {
+            out.push('=');
+        }
+        if prefixed(piece) {
+            out.push_str(REDACTED);
+        } else {
+            push_parts(out, piece);
+        }
+    }
+}
+
+/// Whether `word` starts with a known token prefix and has enough after it.
+fn prefixed(word: &str) -> bool {
+    TOKEN_PREFIXES
+        .iter()
+        .any(|prefix| word.starts_with(prefix) && word.len() >= prefix.len() + PREFIX_TAIL)
+}
+
+/// `piece` with each long opaque part redacted. Paths and dotted names are
+/// split into their parts first, so a long path is not taken for one
+/// opaque run.
+fn push_parts(out: &mut String, piece: &str) {
     let mut start = 0;
-    for (at, c) in word
+    for (at, c) in piece
         .char_indices()
-        .chain(std::iter::once((word.len(), '/')))
+        .chain(std::iter::once((piece.len(), '/')))
     {
         if matches!(c, '/' | '.' | '~' | '%') {
-            let part = &word[start..at];
+            let part = &piece[start..at];
             let opaque = part.len() >= OPAQUE_RUN
                 && part.chars().any(|c| c.is_ascii_digit())
                 && part.chars().any(|c| c.is_ascii_alphabetic());
             out.push_str(if opaque { REDACTED } else { part });
-            if at < word.len() {
+            if at < piece.len() {
                 out.push(c);
             }
             start = at + c.len_utf8();
@@ -418,6 +506,22 @@ mod tests {
                 "gh auth --token abc123 login",
                 "gh auth --token [redacted] login",
             ),
+            (
+                "client --password 'demo pass' -v",
+                "client --password '[redacted]' -v",
+            ),
+            (
+                "client --password \"de\\\"mo\" -v",
+                "client --password \"[redacted]\" -v",
+            ),
+            (
+                "client -password demo\\ pass -v",
+                "client -password [redacted] -v",
+            ),
+            (
+                "{\"token\": \"a\\\"b\", \"n\": 1}",
+                "{\"token\": \"[redacted]\", \"n\": 1}",
+            ),
             ("sent Bearer abcdef to it", "sent Bearer [redacted] to it"),
             ("bearer=abcdef", "bearer=[redacted]"),
             (
@@ -429,7 +533,7 @@ mod tests {
             ("jwt eyJhbGciOi.eyJzdWIi.c2ln ok", "jwt [redacted] ok"),
             (
                 "blob Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg== x",
-                "blob [redacted] x",
+                "blob [redacted]== x",
             ),
             (
                 "/home/user/src/project/crates/boxcar/src/main.rs",
@@ -468,6 +572,24 @@ mod tests {
         for (target, want) in cases {
             assert_eq!(scrub_target(target), want, "{target}");
         }
+    }
+
+    #[test]
+    fn an_argv_loses_the_value_after_a_secret_flag() {
+        let argv: Vec<String> = ["client", "--password", "demo-pass", "--user", "me"]
+            .iter()
+            .map(|a| (*a).to_owned())
+            .collect();
+        let want = ["client", "--password", "[redacted]", "--user", "me"];
+        assert_eq!(scrub_argv(&argv), want);
+        let mut v = json!({"command": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"command": want}));
+        // The flag with its value in one argument is the text rule's.
+        assert_eq!(
+            scrub_argv(&["--token=abc".to_owned(), "x".to_owned()]),
+            ["--token=[redacted]", "x"]
+        );
     }
 
     #[test]

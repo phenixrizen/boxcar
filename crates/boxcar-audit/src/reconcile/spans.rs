@@ -40,7 +40,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_proto::control::{SpanEntry, MAX_SPAN_LIST};
-use boxcar_proto::redact::scrub_text;
+use boxcar_proto::redact::{scrub_argv, scrub_text};
 use boxcar_proto::{Finding, FindingCategory, ProcExec, Record, SpanEffects, ToolClose, ToolOpen};
 use serde_json::Value;
 
@@ -87,6 +87,89 @@ const WRITE_TOOLS: [&str; 5] = ["Write", "Edit", "MultiEdit", "NotebookEdit", "a
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ash", "ksh"];
 /// How much of a command a summary quotes.
 const QUOTE_LIMIT: usize = 120;
+
+/// What a redacted value reads as in a record.
+const REDACTED: &str = "[redacted]";
+/// The most tool calls whose arguments [`DeclaredArgs`] keeps.
+pub const MAX_DECLARED: usize = 1024;
+/// The most bytes of arguments [`DeclaredArgs`] keeps, in all.
+pub const MAX_DECLARED_BYTES: usize = 8 * 1024 * 1024;
+/// The largest one call's arguments may be to be kept.
+pub const DECLARED_ARGS_LIMIT: usize = 64 * 1024;
+/// The most flows whose opener is remembered.
+const MAX_FLOW_OWNERS: usize = 4096;
+/// The last part of the command Claude Code's Bash tool runs, before the
+/// file it names: `... && eval '<command>' < /dev/null && pwd -P >| <file>`
+/// (2.1), normalized (quotes dropped).
+const WRAP_LAST_PART: &str = " && pwd -P >| ";
+/// What Claude Code appends to the evaluated command unless the command
+/// reads its own input.
+const WRAP_NO_INPUT: &str = " < /dev/null";
+
+/// A tool call's arguments as the model sent them, before any scrub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Declared {
+    Json(Value),
+    /// Free text (Codex's custom tools), or JSON that did not parse.
+    Text(String),
+}
+
+/// The arguments of tool calls as the model sent them: the gate puts
+/// them, the reconciler takes them when it opens the span, so a shell
+/// tool's declared command and a write tool's paths are compared with
+/// what ran as they were, not as the record keeps them (scrubbed, where
+/// two different secrets read the same). Held in memory only, never
+/// recorded, and bounded: [`MAX_DECLARED`] calls, [`MAX_DECLARED_BYTES`],
+/// the oldest going first. Cheap to clone; one per session.
+#[derive(Clone, Debug, Default)]
+pub struct DeclaredArgs {
+    inner: Arc<Mutex<DeclaredInner>>,
+}
+
+#[derive(Debug, Default)]
+struct DeclaredInner {
+    calls: HashMap<String, (Declared, usize)>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl DeclaredArgs {
+    pub fn new() -> DeclaredArgs {
+        DeclaredArgs::default()
+    }
+
+    /// Keeps the call `id`'s `args`, `len` bytes as sent; arguments over
+    /// [`DECLARED_ARGS_LIMIT`] are not kept.
+    pub fn put(&self, id: &str, args: Declared, len: usize) {
+        if len > DECLARED_ARGS_LIMIT {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, old)) = inner.calls.insert(id.to_owned(), (args, len)) {
+            inner.bytes -= old;
+        } else {
+            inner.order.push_back(id.to_owned());
+        }
+        inner.bytes += len;
+        while inner.order.len() > MAX_DECLARED || inner.bytes > MAX_DECLARED_BYTES {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some((_, old)) = inner.calls.remove(&oldest) {
+                inner.bytes -= old;
+            }
+        }
+    }
+
+    /// The call `id`'s arguments, which are let go.
+    pub fn take(&self, id: &str) -> Option<Declared> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (args, len) = inner.calls.remove(id)?;
+        inner.bytes -= len;
+        inner.order.retain(|kept| kept != id);
+        Some(args)
+    }
+}
 
 /// The spans the control socket lists: kept by the reconciler, read by
 /// `span.list`. Cheap to clone; one per session.
@@ -169,6 +252,11 @@ pub struct Span {
     pub tool_name: String,
     /// The declared shell command, normalized, for a shell tool.
     declared: Option<String>,
+    /// The declared command and paths are the call's arguments as sent
+    /// (from [`DeclaredArgs`]), not the record's scrubbed copy.
+    declared_raw: bool,
+    /// The flow and stream of the model request the span came from.
+    request: (u64, u32),
     /// The declared paths, as (mount, path without its leading slash),
     /// for a write tool.
     paths: Vec<(String, String)>,
@@ -182,9 +270,12 @@ pub struct Span {
     status: Option<String>,
     members: Vec<Member>,
     effects: Vec<Effect>,
-    /// The process behind the model request, when a `proc.tls_io` write
-    /// named one; the session root otherwise.
+    /// The process behind the model request: the one that opened its flow
+    /// (`executor_bound`), or, provisionally, the one whose `proc.tls_io`
+    /// write alone fit it; the session root otherwise.
     pub executor: Option<ProcKey>,
+    /// The executor opened the request's flow: it counts as the agent.
+    executor_bound: bool,
     truncated: bool,
     pub worst_score: u8,
     /// The checks a second after the close ran.
@@ -204,24 +295,46 @@ pub struct Span {
 }
 
 impl Span {
-    fn new(open: &ToolOpen, seq: u64, ts: u64) -> Span {
-        let args = open.args.as_ref();
-        let mut args_text = match args {
-            Some(args) => args.to_string(),
-            None => open.args_summary.clone(),
+    /// A span for `open`, judged by `raw` (the arguments as sent) when the
+    /// gate kept them, else by the record's scrubbed copy.
+    fn new(open: &ToolOpen, raw: Option<Declared>, seq: u64, ts: u64) -> Span {
+        let name = open.tool_name.as_str();
+        let (declared, paths, mut args_text, declared_raw) = match &raw {
+            Some(Declared::Json(args)) => (
+                declared_command(name, args),
+                declared_paths(name, args),
+                args.to_string(),
+                true,
+            ),
+            Some(Declared::Text(text)) => (
+                declared_command_text(name, text),
+                declared_paths_text(name, text),
+                text.clone(),
+                true,
+            ),
+            None => match open.args.as_ref() {
+                Some(args) => (
+                    declared_command(name, args),
+                    declared_paths(name, args),
+                    args.to_string(),
+                    false,
+                ),
+                None => (
+                    declared_command_text(name, &open.args_summary),
+                    declared_paths_text(name, &open.args_summary),
+                    open.args_summary.clone(),
+                    false,
+                ),
+            },
         };
         args_text.make_ascii_lowercase();
         Span {
             id: open.tool_use_id.clone(),
             tool_name: open.tool_name.clone(),
-            declared: match args {
-                Some(args) => declared_command(&open.tool_name, args),
-                None => declared_command_text(&open.tool_name, &open.args_summary),
-            },
-            paths: match args {
-                Some(args) => declared_paths(&open.tool_name, args),
-                None => declared_paths_text(&open.tool_name, &open.args_summary),
-            },
+            declared,
+            declared_raw,
+            request: (open.flow, open.stream),
+            paths,
             args_text,
             opened: (seq, ts),
             closed: None,
@@ -229,6 +342,7 @@ impl Span {
             members: Vec::new(),
             effects: Vec::new(),
             executor: None,
+            executor_bound: false,
             truncated: false,
             worst_score: 0,
             settled: false,
@@ -254,10 +368,32 @@ impl Span {
 
     /// An exec joined the span: notes whether it ran the declared command.
     fn note_exec(&mut self, argv: &[String]) {
-        if let Some(declared) = self.declared.as_deref() {
-            if carries(shell_command(argv).as_deref(), &whole_argv(argv), declared) {
-                self.carried = true;
-            }
+        if self.carried_by(&ExecForms::of(argv)) == Some(true) {
+            self.carried = true;
+        }
+    }
+
+    /// Whether an exec carries the declared command: compared as it ran
+    /// when the span has the call's arguments as sent; else scrubbed as
+    /// the record's copy is. `None` when that cannot tell: no declared
+    /// command, or a copy with a redacted part (two different values read
+    /// the same once redacted, so a match proves nothing).
+    fn carried_by(&self, forms: &ExecForms) -> Option<bool> {
+        let declared = self.declared.as_deref()?;
+        if self.declared_raw {
+            Some(carries(
+                forms.raw.command.as_deref(),
+                &forms.raw.whole,
+                declared,
+            ))
+        } else if declared.contains(REDACTED) {
+            None
+        } else {
+            Some(carries(
+                forms.clean.command.as_deref(),
+                &forms.clean.whole,
+                declared,
+            ))
         }
     }
 
@@ -386,18 +522,20 @@ pub struct Spans {
     session_pid: Option<u32>,
     tls_writes: VecDeque<TlsWrite>,
     requests: VecDeque<Request>,
-    /// The process behind each request, by the request's flow and stream,
-    /// and the order they came in.
-    executors: HashMap<(u64, u32), ProcKey>,
+    /// The process behind each request, by the request's flow and stream
+    /// (and whether it opened the flow), and the order they came in.
+    executors: HashMap<(u64, u32), (ProcKey, bool)>,
     executor_order: VecDeque<(u64, u32)>,
     /// The process that opened each flow, from the sensor's connect, and
     /// the order they came in.
     flow_owners: HashMap<u64, ProcKey>,
     flow_order: VecDeque<u64>,
+    /// The calls' arguments as sent, from the gate.
+    declared: Option<DeclaredArgs>,
 }
 
 impl Spans {
-    pub fn new(index: Option<SpanIndex>) -> Spans {
+    pub fn new(index: Option<SpanIndex>, declared: Option<DeclaredArgs>) -> Spans {
         Spans {
             spans: HashMap::new(),
             order: VecDeque::new(),
@@ -414,12 +552,14 @@ impl Spans {
             executor_order: VecDeque::new(),
             flow_owners: HashMap::new(),
             flow_order: VecDeque::new(),
+            declared,
         }
     }
 
-    /// A `proc.tls_io` write: a request of the window it fits, alone or
-    /// with the process's other writes of the window, gets its executor;
-    /// the write is kept for a request still to come.
+    /// A `proc.tls_io` write: each request of the window whose flow's
+    /// opener is not known is reconsidered: the one process whose writes
+    /// fit it is its executor, provisionally; none, or two, and it has
+    /// none. The write is kept for a request still to come.
     pub fn tls_write(&mut self, state: &State, ts: u64, tgid: u32, bytes: u64) {
         self.tls_writes.push_back(TlsWrite { ts, tgid, bytes });
         while self.tls_writes.len() > MAX_EXECUTORS
@@ -430,24 +570,35 @@ impl Spans {
         {
             self.tls_writes.pop_front();
         }
-        let named: Vec<(Request, u32)> = self
+        let open: Vec<(Request, Option<u32>)> = self
             .requests
             .iter()
-            .filter(|r| !self.executors.contains_key(&(r.flow, r.stream)))
-            .filter_map(|r| self.carrier(r).map(|tgid| (*r, tgid)))
+            .filter(|r| {
+                !self
+                    .executors
+                    .get(&(r.flow, r.stream))
+                    .is_some_and(|(_, bound)| *bound)
+            })
+            .map(|r| (*r, self.carrier(r)))
             .collect();
-        for (request, tgid) in named {
-            self.name_executor(state, request.flow, request.stream, tgid, request.ts);
+        for (request, carrier) in open {
+            match carrier {
+                Some(tgid) => {
+                    self.name_executor(state, request.flow, request.stream, tgid, request.ts, false)
+                }
+                None => self.unname_executor(request.flow, request.stream),
+            }
         }
     }
 
     /// An `http.request`: the process that opened its flow is its
-    /// executor. Without that, the write that carried it names one (one
-    /// write of its size or a process's writes of the window summed),
-    /// else it waits for the write.
+    /// executor. Without that, the write that carried it names one,
+    /// provisionally (one write of its size or a process's writes of the
+    /// window summed, from one process only); the request waits for the
+    /// writes and the flow's opener to come.
     pub fn http_request(&mut self, state: &State, ts: u64, flow: u64, stream: u32, body: u64) {
         if let Some(owner) = self.flow_owners.get(&flow).copied() {
-            self.name_executor(state, flow, stream, owner.tgid, ts);
+            self.name_executor(state, flow, stream, owner.tgid, ts, true);
             return;
         }
         let request = Request {
@@ -457,7 +608,7 @@ impl Spans {
             body_bytes: body,
         };
         if let Some(tgid) = self.carrier(&request) {
-            self.name_executor(state, flow, stream, tgid, ts);
+            self.name_executor(state, flow, stream, tgid, ts, false);
         }
         self.requests.push_back(request);
         while self.requests.len() > MAX_EXECUTORS
@@ -498,17 +649,56 @@ impl Spans {
         }
     }
 
-    /// The process `tgid` made the request on (`flow`, `stream`).
-    fn name_executor(&mut self, state: &State, flow: u64, stream: u32, tgid: u32, ts: u64) {
+    /// The process `tgid` made the request on (`flow`, `stream`): `bound`
+    /// when it opened the flow, provisionally when a TLS write said so. A
+    /// bound executor is never replaced by a provisional one. The open
+    /// spans that came from the request take it.
+    fn name_executor(
+        &mut self,
+        state: &State,
+        flow: u64,
+        stream: u32,
+        tgid: u32,
+        ts: u64,
+        bound: bool,
+    ) {
         let Some(key) = state.attribute(tgid, ts) else {
             return;
         };
-        if self.executors.insert((flow, stream), key).is_none() {
-            self.executor_order.push_back((flow, stream));
+        match self.executors.get(&(flow, stream)) {
+            Some((_, true)) if !bound => return,
+            Some(&named) if named == (key, bound) => return,
+            Some(_) => {}
+            None => self.executor_order.push_back((flow, stream)),
         }
+        self.executors.insert((flow, stream), (key, bound));
         while self.executor_order.len() > MAX_EXECUTORS {
             if let Some(oldest) = self.executor_order.pop_front() {
                 self.executors.remove(&oldest);
+            }
+        }
+        self.set_span_executors((flow, stream), Some((key, bound)));
+    }
+
+    /// A provisional executor no longer stands: the request has none.
+    fn unname_executor(&mut self, flow: u64, stream: u32) {
+        if let Some((_, false)) = self.executors.get(&(flow, stream)) {
+            self.executors.remove(&(flow, stream));
+            self.executor_order.retain(|named| *named != (flow, stream));
+            self.set_span_executors((flow, stream), None);
+        }
+    }
+
+    /// The open spans that came from `request` take `executor`.
+    fn set_span_executors(&mut self, request: (u64, u32), executor: Option<(ProcKey, bool)>) {
+        for id in &self.open {
+            if let Some(span) = self
+                .spans
+                .get_mut(id)
+                .filter(|span| span.request == request)
+            {
+                span.executor = executor.map(|(key, _)| key);
+                span.executor_bound = executor.is_some_and(|(_, bound)| bound);
             }
         }
     }
@@ -548,8 +738,15 @@ impl Spans {
             let oldest = self.open.remove(0);
             self.abandon(&oldest);
         }
-        let mut span = Span::new(open, record.seq, record.ts_host_ns);
-        span.executor = self.executors.get(&(open.flow, open.stream)).copied();
+        let raw = self
+            .declared
+            .as_ref()
+            .and_then(|declared| declared.take(&id));
+        let mut span = Span::new(open, raw, record.seq, record.ts_host_ns);
+        if let Some(&(key, bound)) = self.executors.get(&(open.flow, open.stream)) {
+            span.executor = Some(key);
+            span.executor_bound = bound;
+        }
         self.spans.insert(id.clone(), span);
         self.order.push_back(id.clone());
         self.open.push(id.clone());
@@ -590,7 +787,8 @@ impl Spans {
         let waiting: Vec<RecentEffect> = self.recent.drain(..).collect();
         for effect in waiting {
             let owner = self.owner(state, effect.who, effect.ts);
-            let taken = owner.is_none() && self.take_agent_effect(&effect.kind, effect.seq);
+            let taken = owner.is_none()
+                && self.take_agent_effect(state, effect.who, effect.ts, &effect.kind, effect.seq);
             if !taken {
                 self.recent.push_back(effect);
             }
@@ -693,7 +891,7 @@ impl Spans {
                 // A member of a closed span: its later work is its own.
             }
             None => {
-                if !self.take_agent_effect(&kind, seq) {
+                if !self.take_agent_effect(state, who, ts, &kind, seq) {
                     self.remember(RecentEffect { seq, ts, who, kind });
                 }
             }
@@ -706,10 +904,27 @@ impl Spans {
         if self.flow_owners.insert(flow, key).is_none() {
             self.flow_order.push_back(flow);
         }
-        while self.flow_order.len() > MAX_EXECUTORS {
+        while self.flow_order.len() > MAX_FLOW_OWNERS {
             if let Some(oldest) = self.flow_order.pop_front() {
                 self.flow_owners.remove(&oldest);
             }
+        }
+        // Requests on the flow already seen: their opener is their
+        // executor now, whatever a TLS write said.
+        let streams: Vec<(u32, u64)> = self
+            .executors
+            .keys()
+            .filter(|(f, _)| *f == flow)
+            .map(|&(_, stream)| (stream, ts))
+            .chain(
+                self.requests
+                    .iter()
+                    .filter(|r| r.flow == flow)
+                    .map(|r| (r.stream, r.ts)),
+            )
+            .collect();
+        for (stream, at) in streams {
+            self.name_executor(state, flow, stream, key.tgid, at.max(ts), true);
         }
         let kind = EffectKind::Net { flow };
         match self.by_proc.get(&key).cloned() {
@@ -788,14 +1003,11 @@ impl Spans {
         if self.open.is_empty() {
             return None;
         }
-        let command = shell_command(argv);
-        let whole = whole_argv(argv);
+        let forms = ExecForms::of(argv);
         let by_argv = self.open.iter().find(|id| {
-            self.spans.get(*id).is_some_and(|span| {
-                span.declared
-                    .as_deref()
-                    .is_some_and(|declared| carries(command.as_deref(), &whole, declared))
-            })
+            self.spans
+                .get(*id)
+                .is_some_and(|span| span.carried_by(&forms) == Some(true))
         });
         if let Some(id) = by_argv {
             if self.reaches_agent(state, key, id) {
@@ -815,9 +1027,9 @@ impl Spans {
     fn is_agent(&self, key: ProcKey) -> bool {
         self.session_pid == Some(key.tgid)
             || self.open.iter().any(|id| {
-                self.spans
-                    .get(id)
-                    .is_some_and(|span| span.executor.is_some_and(|e| e.tgid == key.tgid))
+                self.spans.get(id).is_some_and(|span| {
+                    span.executor_bound && span.executor.is_some_and(|e| e.tgid == key.tgid)
+                })
             })
     }
 
@@ -826,9 +1038,12 @@ impl Spans {
     /// no span). With neither known there is nothing to reach: every
     /// process is the agent's.
     fn reaches_agent(&self, state: &State, key: ProcKey, span_id: &str) -> bool {
+        // A provisional executor (a TLS write's) is evidence, never the
+        // agent: only one that opened the request's flow is.
         let target = self
             .spans
             .get(span_id)
+            .filter(|span| span.executor_bound)
             .and_then(|span| span.executor)
             .map(|key| key.tgid)
             .or(self.session_pid);
@@ -954,12 +1169,32 @@ impl Spans {
         self.by_proc.get(&key).cloned()
     }
 
-    /// A filesystem effect by no span's process: the agent's own. It
-    /// joins the only open write tool span, or the write tool span whose
-    /// declared path it touches; a shell tool's work is its process's.
-    fn take_agent_effect(&mut self, kind: &EffectKind, seq: u64) -> bool {
+    /// A filesystem effect by no span's process, made by the agent (the
+    /// session root or a span's bound executor): it joins the only open
+    /// write tool span, or the write tool span whose declared path it
+    /// touches; a shell tool's work is its process's. One by any other
+    /// process joins nothing here. Without the sensor's lineage programs
+    /// no process can be told from another, and any such effect is taken
+    /// for the agent's.
+    fn take_agent_effect(
+        &mut self,
+        state: &State,
+        who: Who,
+        ts: u64,
+        kind: &EffectKind,
+        seq: u64,
+    ) -> bool {
         if !matches!(kind, EffectKind::Fs { .. }) {
             return false;
+        }
+        if state.sensor.lineage_ok() {
+            let key = match who {
+                Who::Tid(tid) => state.attribute(tid, ts),
+                Who::Proc(key) => Some(key),
+            };
+            if !key.is_some_and(|key| self.is_agent(key)) {
+                return false;
+            }
         }
         let writers: Vec<&String> = self
             .open
@@ -1082,20 +1317,19 @@ impl Spans {
         let Some(span) = self.spans.get_mut(id) else {
             return Vec::new();
         };
-        let Some(declared) = span.declared.clone() else {
-            return Vec::new();
-        };
-        if !span.is_shell_tool() || span.mismatch.is_some() {
+        if span.declared.is_none() || !span.is_shell_tool() || span.mismatch.is_some() {
             return Vec::new();
         }
-        let Some(command) = shell_command(argv) else {
+        let forms = ExecForms::of(argv);
+        // The finding quotes the command scrubbed, as a record would.
+        let Some(command) = forms.clean.command.clone() else {
             return Vec::new();
         };
-        if carries(Some(&command), &whole_argv(argv), &declared) {
-            span.carried = true;
-            return Vec::new();
+        match span.carried_by(&forms) {
+            Some(true) => span.carried = true,
+            Some(false) => span.mismatch = Some((key, exec_seq, ts, command)),
+            None => {}
         }
-        span.mismatch = Some((key, exec_seq, ts, command));
         Vec::new()
     }
 
@@ -1439,10 +1673,9 @@ fn mounted(path: &str) -> (String, String) {
     ("workspace".to_owned(), path.to_owned())
 }
 
-/// The command a shell was given with `-c` (or `-lc`, `-ec`...),
-/// normalized; `None` for a program that is no shell, or a shell without
-/// one.
-fn shell_command(argv: &[String]) -> Option<String> {
+/// The command a shell was given with `-c` (or `-lc`, `-ec`...), as
+/// given; `None` for a program that is no shell, or a shell without one.
+fn shell_argument(argv: &[String]) -> Option<&String> {
     let program = argv.first()?;
     let name = program.rsplit('/').next().unwrap_or(program);
     if !SHELLS.contains(&name) {
@@ -1451,24 +1684,80 @@ fn shell_command(argv: &[String]) -> Option<String> {
     let at = argv[1..]
         .iter()
         .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))?;
-    let command = argv.get(at + 2)?;
-    let command = normalize(&scrub_text(command));
+    argv.get(at + 2)
+}
+
+/// The shell's `-c` command scrubbed as a record's arguments are, and
+/// normalized: what a finding quotes.
+fn shell_command(argv: &[String]) -> Option<String> {
+    let command = normalize(&scrub_text(shell_argument(argv)?));
     (!command.is_empty()).then_some(command)
 }
 
 /// An exec's whole argv, scrubbed as a tool's arguments are and
 /// normalized, to compare with a declared command.
 fn whole_argv(argv: &[String]) -> String {
-    let parts: Vec<String> = argv.iter().map(|arg| scrub_text(arg)).collect();
-    normalize(&parts.join(" "))
+    normalize(&scrub_argv(argv).join(" "))
+}
+
+/// An exec's shell command and whole argv, normalized: as it ran, and
+/// scrubbed as a record's arguments are.
+struct ExecForms {
+    raw: Forms,
+    clean: Forms,
+}
+
+struct Forms {
+    command: Option<String>,
+    whole: String,
+}
+
+impl ExecForms {
+    fn of(argv: &[String]) -> ExecForms {
+        let raw_command = shell_argument(argv)
+            .map(|command| normalize(command))
+            .filter(|command| !command.is_empty());
+        ExecForms {
+            raw: Forms {
+                command: raw_command,
+                whole: normalize(&argv.join(" ")),
+            },
+            clean: Forms {
+                command: shell_command(argv),
+                whole: whole_argv(argv),
+            },
+        }
+    }
 }
 
 /// Whether an exec carries the declared command: its shell command is the
-/// declared one or wraps it (`eval '<command>' < /dev/null && ...`, as
-/// Claude Code's Bash tool does), or its whole argv is the declared one.
+/// declared one, or wraps exactly it as Claude Code's Bash tool does
+/// (its own setup, then `eval '<command>' < /dev/null && pwd -P >|
+/// <file>`), or its whole argv is the declared one. The declared command
+/// merely appearing in the shell's text (in a comment, beside other
+/// commands, inside a longer `eval`) is not carrying it.
 fn carries(command: Option<&str>, whole: &str, declared: &str) -> bool {
-    command.is_some_and(|command| command == declared || command.contains(declared))
+    command.is_some_and(|command| command == declared || wraps(command, declared))
         || whole == declared
+}
+
+/// Whether `command` ends as Claude Code's wrapper around exactly
+/// `declared`: a part `eval <declared>` (with ` < /dev/null` unless the
+/// command reads its own input), then `pwd -P >| <file>` and nothing
+/// more. What comes before, as whole `&&` parts, is the runtime's own
+/// setup (sourcing its shell snapshot, exports) and is not judged here.
+fn wraps(command: &str, declared: &str) -> bool {
+    let Some((rest, file)) = command.rsplit_once(WRAP_LAST_PART) else {
+        return false;
+    };
+    if file.is_empty() || file.contains(' ') {
+        return false;
+    }
+    [Some(rest), rest.strip_suffix(WRAP_NO_INPUT)]
+        .into_iter()
+        .flatten()
+        .filter_map(|eval| eval.strip_suffix(declared))
+        .any(|head| head == "eval " || head.ends_with(" && eval "))
 }
 
 /// Whether two host times are within the executor window of each other.
@@ -1630,6 +1919,32 @@ mod tests {
             "sh -c curl",
             "ls -la"
         ));
+        // Claude Code's own setup before the eval is its own.
+        assert!(carries(
+            Some(&normalize(
+                "source /tmp/snapshot.sh 2>/dev/null || true && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
+            )),
+            "",
+            &declared
+        ));
+        // A command that reads its own input gets no `< /dev/null`.
+        let reads = normalize("sort < in.txt");
+        assert!(carries(
+            Some(&normalize("eval 'sort < in.txt' && pwd -P >| /tmp/c")),
+            "",
+            &reads
+        ));
+        // Only the wrapper around exactly the command, nothing more.
+        for other in [
+            "rm -rf / # echo boxcar-m4 > marker.txt",
+            "echo boxcar-m4 > marker.txt; rm -rf /",
+            "eval echo boxcar-m4 > marker.txt; rm -rf / < /dev/null && pwd -P >| /tmp/c",
+            "eval echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c; rm -rf /",
+            "eval rm -rf /; echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c",
+            "xeval echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c",
+        ] {
+            assert!(!carries(Some(other), "", &declared), "{other}");
+        }
     }
 
     #[test]
@@ -1646,6 +1961,12 @@ mod tests {
             &whole_argv(&exec),
             &declared
         ));
+        let flagged = argv(&["client", "--password", "demo-pass"]);
+        let mut parts = json!({"command": ["client", "--password", "demo-pass"]});
+        boxcar_proto::redact::scrub_deep(&mut parts);
+        let declared = declared_command("shell", &parts).unwrap();
+        assert!(!declared.contains("demo-pass"));
+        assert!(carries(None, &whole_argv(&flagged), &declared));
         let direct = argv(&["curl", "-H", "X-Api-Key: k1", "https://example.com/"]);
         let mut parts = json!({"command": ["curl", "-H", "X-Api-Key: k1", "https://example.com/"]});
         boxcar_proto::redact::scrub_deep(&mut parts);

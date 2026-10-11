@@ -273,8 +273,14 @@ impl VirtioNet {
             Some(gate) => {
                 let (observer, rx) = Observer::channel();
                 let trace_id = gate.ca().session_id().to_owned();
-                let thread = ObserverThread::spawn(rx, sink.clone(), trace_id, dump.clone())
-                    .map_err(|error| ConfigError::Observer(error.to_string()))?;
+                let thread = ObserverThread::spawn(
+                    rx,
+                    sink.clone(),
+                    trace_id,
+                    dump.clone(),
+                    gate.declared().cloned(),
+                )
+                .map_err(|error| ConfigError::Observer(error.to_string()))?;
                 (Some(observer), Some(thread))
             }
             None => (None, None),

@@ -131,10 +131,13 @@ says why.
   inspected flow, by its `net.connect` flow id and stream: the start line,
   the headers as the observer keeps them (a credential's value is already
   gone, and the rest are scrubbed as free text), with the query values
-  scrubbed as `http.request.path`'s are, a blank line, the decoded body. A
-  JSON body has its secret-looking
-  fields scrubbed as the audit log's summaries are, and a form body (the
-  shape of an OAuth token exchange) its credential fields' values replaced.
+  scrubbed as `http.request.path`'s are, a blank line, the decoded body
+  scrubbed by its type: JSON by key and in every string; an event stream
+  or JSON lines line by line (a `data:` payload that is JSON as JSON);
+  other text through the free-text scrub; a body that is not text is not
+  written, a line saying how many bytes it was takes its place. A form
+  body (the shape of an OAuth token exchange) has its credential fields'
+  values replaced and the rest scrubbed as text.
   The raw plaintext is not written: it would hold what the records never
   do. An exchange upgraded to WebSocket gets `http/<flow>-<stream>.ws` as
   well: its messages one after another, each with its direction and size

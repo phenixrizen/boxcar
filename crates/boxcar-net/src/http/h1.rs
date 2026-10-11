@@ -25,6 +25,9 @@ use crate::gate::Direction;
 
 /// The most headers one head may carry.
 const MAX_HEADER_COUNT: usize = 128;
+/// The most requests read and not yet answered: past it the guest's side
+/// is observed no further (`pipeline`).
+pub const MAX_PIPELINED: usize = 256;
 
 /// How a message's body is framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +205,12 @@ impl H1 {
         // sends is the new protocol's if the host agrees: it waits for the
         // response.
         if self.c2s.body.is_none() && self.seen.back().is_some_and(|s| s.upgrade) {
+            // A client sends nothing of the new protocol before the switch
+            // (RFC 6455 4.1): what waits for the response is bounded.
+            if self.c2s.buf.len() > MAX_HEADERS_BYTES {
+                let stream = self.seen.back().map(|s| s.stream);
+                self.degrade(Direction::ToHost, stream, "upgrade_wait", out);
+            }
             return;
         }
         if let Some((stream, framing)) = self.c2s.body {
@@ -235,6 +244,9 @@ impl H1 {
             Err(_) => return self.degrade(Direction::ToHost, None, "head_too_large", out),
         };
         self.c2s.buf.drain(..parsed);
+        if self.seen.len() >= MAX_PIPELINED {
+            return self.degrade(Direction::ToHost, None, "pipeline", out);
+        }
         let stream = self.next_stream;
         self.next_stream = self.next_stream.wrapping_add(1).max(1);
         let framing = if headers.chunked() {
@@ -708,5 +720,59 @@ mod tests {
             reason: "incomplete"
         }));
         assert!(!events.contains(&Event::RequestEnd { stream: 1 }));
+    }
+
+    /// What a guest sends after asking to switch protocols, before the
+    /// answer, is held only up to the head limit.
+    #[test]
+    fn bytes_waiting_on_an_upgrade_are_bounded() {
+        let mut h1 = H1::new();
+        let mut out = Vec::new();
+        h1.feed(
+            Direction::ToHost,
+            b"GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            &mut out,
+        );
+        let chunk = vec![b'x'; 16 * 1024];
+        for _ in 0..8 {
+            h1.feed(Direction::ToHost, &chunk, &mut out);
+        }
+        assert!(h1.c2s.buf.len() <= MAX_HEADERS_BYTES + chunk.len());
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                Event::Degraded {
+                    reason: "upgrade_wait",
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+    }
+
+    /// Requests that are never answered are held only up to the limit.
+    #[test]
+    fn unanswered_requests_are_bounded() {
+        let mut h1 = H1::new();
+        let mut out = Vec::new();
+        for _ in 0..MAX_PIPELINED + 5 {
+            h1.feed(
+                Direction::ToHost,
+                b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+                &mut out,
+            );
+        }
+        assert_eq!(h1.seen.len(), MAX_PIPELINED);
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                Event::Degraded {
+                    reason: "pipeline",
+                    ..
+                }
+            )),
+            "{}",
+            out.len()
+        );
     }
 }

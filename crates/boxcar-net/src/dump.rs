@@ -28,7 +28,6 @@
 //! neither a share nor inside one, nor hold one: the audit directory's
 //! rule.
 
-use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -372,8 +371,7 @@ pub fn write_exchange(
     let head = &head.as_bytes()[..head.len().min(EXCHANGE_FILE_LIMIT)];
     file.write_all(head)?;
     file.write_all(b"\r\n")?;
-    let body = scrubbed_body(content_type, body);
-    file.write_all(&body[..body.len().min(EXCHANGE_FILE_LIMIT)])?;
+    file.write_all(&scrubbed_body(content_type, body))?;
     file.flush()
 }
 
@@ -401,8 +399,8 @@ pub fn append_ws(
         payload.len()
     )?;
     if text {
-        let body = scrubbed_body(Some("application/json"), payload);
-        file.write_all(&body[..body.len().min(EXCHANGE_FILE_LIMIT)])?;
+        // A text message: JSON when it parses, text otherwise.
+        file.write_all(&scrubbed_body(None, payload))?;
         file.write_all(b"\n")?;
     }
     file.flush()
@@ -423,31 +421,99 @@ const FORM_SECRETS: [&str; 10] = [
     "code",
 ];
 
-/// `body` as the dump writes it: a JSON body with its secret-looking
-/// fields scrubbed (`redact::scrub`, the audit log's rule), a form body
-/// (`application/x-www-form-urlencoded`, an OAuth token exchange's shape)
-/// with its credential fields' values replaced, anything else as it is.
-pub fn scrubbed_body<'a>(content_type: Option<&str>, body: &'a [u8]) -> Cow<'a, [u8]> {
-    let kind = content_type.unwrap_or("").to_ascii_lowercase();
-    if kind == "application/json" || kind.ends_with("+json") {
-        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) {
-            boxcar_proto::redact::scrub(&mut value);
-            return Cow::Owned(value.to_string().into_bytes());
+/// `body` as the dump writes it, never as it came: scrubbed by its
+/// content type, cut at [`EXCHANGE_FILE_LIMIT`] first.
+///
+/// - JSON: by key and in every string (`redact::scrub_deep`, the audit
+///   log's rule for tool arguments).
+/// - An event stream, or newline-delimited JSON: line by line, each
+///   `data:` payload (or line) that is JSON as JSON, the rest as text.
+/// - A form (`application/x-www-form-urlencoded`, an OAuth token
+///   exchange's shape): a credential field's value replaced, the others
+///   scrubbed as text.
+/// - Other text (`text/*`, XML, JavaScript; or no type, valid UTF-8):
+///   through `redact::scrub_text`.
+/// - Anything else: not written; one line says how many bytes it was.
+pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let body = &body[..body.len().min(EXCHANGE_FILE_LIMIT)];
+    let kind = content_type.unwrap_or("").trim().to_ascii_lowercase();
+    let json_kind = kind == "application/json" || kind.ends_with("+json");
+    if json_kind || kind.is_empty() {
+        if let Some(clean) = json_text(body) {
+            return clean.into_bytes();
         }
-        return Cow::Borrowed(body);
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return format!(
+            "[{} bytes of {} not written]\n",
+            body.len(),
+            if kind.is_empty() { "binary" } else { &kind }
+        )
+        .into_bytes();
+    };
+    if kind == "text/event-stream"
+        || kind == "application/x-ndjson"
+        || kind == "application/jsonl"
+        || kind == "application/json-seq"
+    {
+        return lines(text).into_bytes();
     }
     if kind == "application/x-www-form-urlencoded" {
-        let text = String::from_utf8_lossy(body);
         let fields: Vec<String> = text
             .split('&')
             .map(|field| match field.split_once('=') {
                 Some((name, _)) if form_secret(name) => format!("{name}=[redacted]"),
-                _ => field.to_owned(),
+                Some((name, value)) => format!("{name}={}", scrub_text(value)),
+                None => scrub_text(field),
             })
             .collect();
-        return Cow::Owned(fields.join("&").into_bytes());
+        return fields.join("&").into_bytes();
     }
-    Cow::Borrowed(body)
+    let textual = json_kind
+        || kind.is_empty()
+        || kind.starts_with("text/")
+        || kind.ends_with("+xml")
+        || kind == "application/xml"
+        || kind == "application/javascript";
+    if textual {
+        return scrub_text(text).into_bytes();
+    }
+    format!("[{} bytes of {kind} not written]\n", body.len()).into_bytes()
+}
+
+/// `bytes` as JSON scrubbed by key and in every string, if it is JSON.
+fn json_text(bytes: &[u8]) -> Option<String> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    boxcar_proto::redact::scrub_deep(&mut value);
+    Some(value.to_string())
+}
+
+/// An event stream or JSON lines, line by line: a line (or a `data:`
+/// line's payload) that is JSON scrubbed as JSON, any other as text.
+fn lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let (body, end) = (content, &line[content.len()..]);
+        let (field, payload) = match body.strip_prefix("data:") {
+            Some(payload) => ("data:", payload),
+            None => ("", body),
+        };
+        let lead = &payload[..payload.len() - payload.trim_start().len()];
+        match json_text(payload.trim().as_bytes()) {
+            Some(clean) if !payload.trim().is_empty() => {
+                out.push_str(field);
+                out.push_str(lead);
+                out.push_str(&clean);
+            }
+            _ => {
+                out.push_str(field);
+                out.push_str(&scrub_text(payload));
+            }
+        }
+        out.push_str(end);
+    }
+    out
 }
 
 /// Whether a form field's name names a credential.
@@ -721,13 +787,34 @@ mod tests {
         let out = scrubbed_body("application/json; charset=utf-8".split(';').next(), json);
         assert!(!String::from_utf8_lossy(&out).contains("at-1"));
         assert!(String::from_utf8_lossy(&out).contains("\"ok\":true"));
-        let bad_json = b"{not json";
+        let bad_json = b"{not json, \"token\": \"t-1\"";
+        let out = scrubbed_body(Some("application/json"), bad_json);
         assert_eq!(
-            &*scrubbed_body(Some("application/json"), bad_json),
-            &bad_json[..]
+            String::from_utf8_lossy(&out),
+            "{not json, \"token\": \"[redacted]\""
         );
-        let sse = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
-        assert_eq!(&*scrubbed_body(Some("text/event-stream"), sse), &sse[..]);
-        assert_eq!(&*scrubbed_body(None, b"raw"), &b"raw"[..]);
+        let nested = br#"{"input":{"command":"curl -H 'Authorization: Bearer q1' u"}}"#;
+        let out = String::from_utf8(scrubbed_body(Some("application/json"), nested)).unwrap();
+        assert!(!out.contains("q1"), "{out}");
+        let sse = b"event: ping\ndata: {\"type\":\"ping\"}\r\n\nevent: delta\ndata: {\"partial_json\":\"{\\\"command\\\": \\\"x --token=abc\\\"}\"}\n\n";
+        let out = String::from_utf8(scrubbed_body(Some("text/event-stream"), sse)).unwrap();
+        assert!(
+            out.starts_with("event: ping\ndata: {\"type\":\"ping\"}\r\n\nevent: delta\n"),
+            "{out}"
+        );
+        assert!(!out.contains("abc"), "{out}");
+        assert_eq!(scrubbed_body(None, b"raw"), b"raw");
+        assert_eq!(
+            scrubbed_body(Some("text/plain"), b"key=sk-ant-0123456789"),
+            b"key=[redacted]"
+        );
+        assert_eq!(
+            scrubbed_body(Some("application/octet-stream"), b"x"),
+            b"[1 bytes of application/octet-stream not written]\n"
+        );
+        assert_eq!(
+            scrubbed_body(None, &[0xff, 0xfe]),
+            b"[2 bytes of binary not written]\n"
+        );
     }
 }

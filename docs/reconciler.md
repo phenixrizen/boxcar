@@ -45,37 +45,49 @@ tool use id as the span id. In between, the reconciler attributes
 processes and ring 0 effects to the span:
 
 - **The agent.** The session's root process (`session.start.pid`) is the
-  agent, and so is a span's executor: the process that opened the flow
-  the model request the span came from went over (its `proc.tcp_connect`
-  joined the flow's `net.connect`). Without that join, the process whose
-  `proc.tls_io` write, within 500 ms of the gate's `http.request` and
-  sized like its body (within a tenth plus 1 KiB, as one write or as the
-  process's writes of the window summed), carried the request is the
-  executor, when it is the only process that fits; two that fit name
-  none, and the root stands in. The agent itself is in no span.
+  agent, and so is a span's bound executor: the process that opened the
+  flow the model request the span came from went over (its
+  `proc.tcp_connect` joined the flow's `net.connect`, before or after the
+  request). Until that join, the process whose `proc.tls_io` write,
+  within 500 ms of the gate's `http.request` and sized like its body
+  (within a tenth plus 1 KiB, as one write or as the process's writes of
+  the window summed), carried the request is a provisional executor, when
+  it is the only process that fits; it is reconsidered with every write of
+  the window (two that fit name none) and replaced by the flow's opener
+  when that comes. A provisional executor is reported in `span.effects`
+  and is never the agent: ancestry is traced to the root instead, and its
+  own work is judged as any process's. The agent itself is in no span.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
-  `truncated`) and takes nothing more, nor its `tool.close`. A shell
-  command and an exec's argv are compared after both are scrubbed as the
-  gate scrubs a tool's arguments, so a secret in a command, redacted in
-  `tool.open`, still matches.
+  `truncated`) and takes nothing more, nor its `tool.close`.
+- **What is compared.** The gate hands the reconciler each call's
+  arguments as the model sent them, in memory and never recorded (the
+  record's copy is scrubbed); declared commands and paths are compared
+  with what ran as sent. A span that has only the record's copy (a log
+  read later) compares the scrubbed forms of both, and where the copy has
+  a redacted part the `argv` rule cannot tell and says nothing.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)
   whose declared `command` (or `cmd`, a string or an array joined with
   spaces; for a free-text tool such as Codex's `exec`, the quoted string
   after `cmd:` or `command:` in the arguments' summary) the exec
-  carries, which is the shell's `-c` command being the declared
-  one or containing it (Claude Code wraps it in `eval '...' < /dev/null
-  && pwd -P >| ...`), or the whole argv being the declared one, after
-  whitespace is collapsed and quotes dropped; else as the only open span.
+  carries, which is the shell's `-c` command being the declared one or
+  Claude Code's wrapper around exactly it (its own setup as whole `&&`
+  parts, then `eval '<command>' < /dev/null && pwd -P >| <file>`, nothing
+  after), or the whole argv being the declared one, after whitespace is
+  collapsed and quotes dropped; the declared command appearing elsewhere
+  in the shell's text (a comment, beside other commands, inside a longer
+  `eval`) is not carrying it. Else as the only open span.
   An exec that joins nothing waits 2 s for a late `tool.open`. A process
   forked or exec'd by a span's process joins that span, and a process
   that exec's again stays in its span.
 - **An effect.** `fs.create`, `fs.close`, `fs.rename`, `fs.unlink`,
   `fs.mkdir` and `fs.setattr` join the span of the thread's process, and
   `net.connect` the span of the process its `proc.tcp_connect` named. A
-  filesystem effect by a process in no span is the agent's own work (a
+  filesystem effect by the agent itself (the root or a bound executor;
+  any process in no span when the sensor's lineage programs are not
+  attached, since then none can be told apart) is the agent's own work (a
   `Write` tool writes from the agent): it joins the only open write tool
   span (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `apply_patch`), or
   the write tool span whose declared path it touches; a shell tool's work

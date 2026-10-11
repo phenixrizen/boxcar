@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::{
-    b3, content_text, tool_close, tool_open, tool_open_text, u64_of, RequestInfo, ResponseInfo,
-    Text, ToolClose, ToolOpen,
+    b3, content_text, tool_close, tool_open, tool_open_text, u64_of, CallBudget, RequestInfo,
+    ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -123,6 +123,7 @@ pub struct Stream {
     info: ResponseInfo,
     text: Text,
     blocks: BTreeMap<u64, Block>,
+    budget: CallBudget,
     degraded: Option<&'static str>,
 }
 
@@ -165,7 +166,10 @@ impl Stream {
             "content_block_start" => {
                 let index = u64_of(data.get("index")).unwrap_or(0);
                 let block = data.get("content_block");
-                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
+                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use")
+                    && (self.blocks.contains_key(&index)
+                        || CallBudget::admit_call(self.blocks.len(), &mut self.degraded))
+                {
                     self.blocks.insert(
                         index,
                         Block {
@@ -199,7 +203,9 @@ impl Stream {
                                 .and_then(|d| d.get("partial_json"))
                                 .and_then(Value::as_str)
                             {
-                                block.json.push_str(part);
+                                if self.budget.admit(part.len(), &mut self.degraded) {
+                                    block.json.push_str(part);
+                                }
                             }
                         }
                     }
@@ -411,5 +417,30 @@ mod tests {
         assert_eq!(opens.len(), 1);
         assert_eq!(opens[0].args, None, "the input never became JSON");
         assert_eq!(info.degraded, Some("stream_error"));
+    }
+
+    /// Calls that never finish, and arguments that never stop, are held
+    /// only up to the stream's budget.
+    #[test]
+    fn a_streams_calls_are_bounded() {
+        use crate::model::{STREAM_CALLS, STREAM_CALL_BYTES};
+        let mut stream = Stream::new();
+        for index in 0..STREAM_CALLS + 10 {
+            stream.event(&sse(
+                "content_block_start",
+                &format!(r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"t{index}","name":"Bash","input":{{}}}}}}"#),
+            ));
+        }
+        assert_eq!(stream.blocks.len(), STREAM_CALLS);
+        let part = "x".repeat(1024 * 1024);
+        let delta = format!(
+            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":"{part}"}}}}"#
+        );
+        for _ in 0..(STREAM_CALL_BYTES / part.len() + 4) {
+            stream.event(&sse("content_block_delta", &delta));
+        }
+        assert!(stream.blocks[&0].json.len() <= STREAM_CALL_BYTES);
+        let (info, _) = stream.finish();
+        assert_eq!(info.degraded, Some("stream_budget"));
     }
 }

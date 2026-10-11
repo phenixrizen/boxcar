@@ -18,7 +18,8 @@ use std::{env, fs, io};
 use anyhow::{bail, Context};
 use arc_swap::ArcSwap;
 use boxcar_audit::{
-    AuditSink, ReconcileConfig, Reconciler, SpanIndex, SystemClock, WriterConfig, WriterHandle,
+    AuditSink, DeclaredArgs, ReconcileConfig, Reconciler, SpanIndex, SystemClock, WriterConfig,
+    WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_net::{DumpDir, InspectConfig, NetConfig, Policy, SessionCa};
@@ -124,12 +125,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let session_id = SessionId::new();
     // The tool spans the reconciler keeps and `boxcar spans` lists.
     let spans = SpanIndex::new();
+    // The model calls' arguments as sent: the gate puts them, the
+    // reconciler compares what ran with them. In memory only.
+    let declared = DeclaredArgs::new();
     // A session that inspects has a CA, whose key stays in this process,
     // and a trust store for the real hosts: the host's own.
     let inspect = match session_ca(&policy, &session_id)? {
         Some(ca) => Some(Arc::new(
             InspectConfig::new(ca, InspectConfig::host_roots(&test_upstream_roots()))
-                .context("cannot set up the gate")?,
+                .context("cannot set up the gate")?
+                .with_declared(declared.clone()),
         )),
         None => None,
     };
@@ -268,6 +273,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             sensor_expected: sensor,
             clock: Arc::new(SystemClock),
             spans: Some(spans),
+            declared: Some(declared),
         },
     )
     .context("cannot start the reconciler")?;

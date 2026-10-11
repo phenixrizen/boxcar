@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::{
-    b3, content_text, tool_close, tool_open_text, u64_of, RequestInfo, ResponseInfo, Text,
-    ToolClose, ToolOpen,
+    b3, content_text, tool_close, tool_open_text, u64_of, CallBudget, RequestInfo, ResponseInfo,
+    Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -155,6 +155,7 @@ pub struct Stream {
     info: ResponseInfo,
     text: Text,
     calls: BTreeMap<u64, Call>,
+    budget: CallBudget,
     degraded: Option<&'static str>,
     done: bool,
 }
@@ -205,20 +206,31 @@ impl Stream {
             {
                 for call in calls {
                     let index = u64_of(call.get("index")).unwrap_or(0);
+                    if !self.calls.contains_key(&index)
+                        && !CallBudget::admit_call(self.calls.len(), &mut self.degraded)
+                    {
+                        continue;
+                    }
                     let entry = self.calls.entry(index).or_default();
                     if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        entry.id = id.to_owned();
+                        if self.budget.admit(id.len(), &mut self.degraded) {
+                            entry.id = id.to_owned();
+                        }
                     }
                     let function = call.get("function");
                     if let Some(name) = function.and_then(|f| f.get("name")).and_then(Value::as_str)
                     {
-                        entry.name.push_str(name);
+                        if self.budget.admit(name.len(), &mut self.degraded) {
+                            entry.name.push_str(name);
+                        }
                     }
                     if let Some(part) = function
                         .and_then(|f| f.get("arguments"))
                         .and_then(Value::as_str)
                     {
-                        entry.arguments.push_str(part);
+                        if self.budget.admit(part.len(), &mut self.degraded) {
+                            entry.arguments.push_str(part);
+                        }
                     }
                 }
             }

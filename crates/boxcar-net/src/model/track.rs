@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use boxcar_audit::DeclaredArgs;
 use boxcar_proto::{
     LlmRequest, LlmResponse, Payload, SpanRef, ToolClose as ToolClosePayload,
     ToolOpen as ToolOpenPayload,
@@ -81,6 +82,8 @@ pub struct Tracker {
     flow: u64,
     trace_id: String,
     streams: HashMap<u32, Tracked>,
+    /// Where the calls' arguments as sent go, for the reconciler.
+    declared: Option<DeclaredArgs>,
 }
 
 impl Tracker {
@@ -91,6 +94,7 @@ impl Tracker {
             flow,
             trace_id,
             streams: HashMap::new(),
+            declared: None,
         }
     }
 
@@ -396,7 +400,18 @@ impl Tracker {
         }
     }
 
+    /// Hands the reconciler a call's arguments as sent: put in memory
+    /// before the `tool.open` is recorded, so they are there when it reads
+    /// the record.
+    pub fn with_declared(mut self, declared: Option<DeclaredArgs>) -> Tracker {
+        self.declared = declared;
+        self
+    }
+
     fn open_record(&self, stream: u32, open: ToolOpen) -> Emit {
+        if let (Some(declared), Some((raw, len))) = (&self.declared, open.raw) {
+            declared.put(&open.tool_use_id, raw, len);
+        }
         let span = self.span(&open.tool_use_id);
         Emit::in_span(
             Payload::ToolOpen(ToolOpenPayload {
@@ -498,6 +513,57 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    /// A tool call's arguments go to the reconciler's store as sent, while
+    /// the record keeps them scrubbed.
+    #[test]
+    fn a_calls_arguments_are_kept_as_sent_for_the_reconciler() {
+        let declared = boxcar_audit::DeclaredArgs::new();
+        let mut obs = observation().with_declared(Some(declared.clone()));
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let request =
+            serde_json::json!({"model": "m", "max_tokens": 8, "stream": true, "messages": []});
+        obs.data(
+            Direction::ToHost,
+            &h1_request("/v1/messages", &request.to_string()),
+            t0,
+            &mut out,
+        );
+        let command = "curl -H 'X-Api-Key: k-sent-1' https://example.com/";
+        let input = serde_json::json!({"command": command}).to_string();
+        let delta = serde_json::json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": input}
+        })
+        .to_string();
+        obs.data(
+            Direction::ToGuest,
+            &h1_sse(&[
+                ("message_start", r#"{"type":"message_start","message":{"model":"m"}}"#),
+                ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_k","name":"Bash","input":{}}}"#),
+                ("content_block_delta", &delta),
+                ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+                ("message_stop", r#"{"type":"message_stop"}"#),
+            ]),
+            t0,
+            &mut out,
+        );
+        let open = out
+            .iter()
+            .find_map(|e| match &e.payload {
+                Payload::ToolOpen(open) => Some(open.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!open.args.unwrap().to_string().contains("k-sent-1"));
+        assert_eq!(
+            declared.take("toolu_k"),
+            Some(boxcar_audit::Declared::Json(
+                serde_json::json!({"command": command})
+            ))
+        );
     }
 
     /// An Anthropic turn: the request, its streamed reply with a tool

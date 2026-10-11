@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use boxcar_audit::{ManualClock, ReconcileConfig, Reconciler, SpanIndex};
+use boxcar_audit::{Declared, DeclaredArgs, ManualClock, ReconcileConfig, Reconciler, SpanIndex};
 use boxcar_proto::{
     Attrib, ClockSync, Finding, FsClose, FsCreate, FsPathOp, Hash, HashStatus, HttpRequest,
     NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec, ProcExit, ProcFork, ProcHeartbeat,
@@ -498,12 +498,22 @@ enum Out {
 /// Runs `steps` through a fresh reconciler and returns everything it
 /// produced, in order, with the span index it kept.
 fn run_all(sensor_expected: bool, steps: Vec<Step>) -> (Vec<Out>, SpanIndex) {
+    run_with(sensor_expected, steps, None)
+}
+
+/// [`run_all`] with the calls' arguments as the gate would have kept them.
+fn run_with(
+    sensor_expected: bool,
+    steps: Vec<Step>,
+    declared: Option<DeclaredArgs>,
+) -> (Vec<Out>, SpanIndex) {
     let clock = Arc::new(ManualClock::new(T0));
     let index = SpanIndex::new();
     let mut reconciler = Reconciler::new(ReconcileConfig {
         sensor_expected,
         clock: clock.clone(),
         spans: Some(index.clone()),
+        declared,
     });
     let mut out = Vec::new();
     for step in steps {
@@ -1275,6 +1285,162 @@ fn span_effects_at_stop() {
     assert_eq!(spans[0].effects, [5]);
     assert_eq!(index.list(true).len(), 1, "still open in the index");
     check_all("span_effects_at_stop", &out);
+}
+
+/// A command is compared as the model sent it: two that differ only in
+/// what the record redacts are told apart. With only the record's copy,
+/// which redacted it, the `argv` rule cannot tell and says nothing.
+#[test]
+fn a_redacted_argument_is_compared_as_sent() {
+    let sent = "0123456789abcdef0123456789abcdef01234567";
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    let command = format!("git checkout {sent}");
+    for (ran, kept, mismatch) in [
+        (sent, true, false),
+        (other, true, true),
+        (other, false, false),
+    ] {
+        let declared = DeclaredArgs::new();
+        if kept {
+            declared.put(
+                "toolu_01",
+                Declared::Json(json!({"command": command})),
+                command.len(),
+            );
+        }
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        let mut args = json!({"command": command});
+        boxcar_proto::redact::scrub_deep(&mut args);
+        assert_eq!(args["command"], "git checkout [redacted]");
+        steps.push(log.tool_open(2000, "toolu_01", "Bash", args));
+        let shell = format!("git checkout {ran}");
+        steps.push(log.exec(2100, 330, 100, 10, &["bash", "-c", &shell]));
+        steps.push(log.exit(2500, 330, 10));
+        steps.push(log.tool_close(3000, "toolu_01", "ok"));
+        for at in [4000, 5000] {
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_with(true, steps, Some(declared));
+        let argv = findings_of(&out).iter().any(|f| f.rule == "argv");
+        assert_eq!(argv, mismatch, "{ran} kept {kept}: {out:?}");
+    }
+}
+
+/// The declared command written in a comment, or beside another, is not
+/// the command run.
+#[test]
+fn a_declared_command_in_a_comment_is_not_run() {
+    for shell in [
+        "rm -rf /tmp/x # ls -la",
+        "eval 'ls -la; rm -rf /tmp/x' < /dev/null && pwd -P >| /tmp/c",
+    ] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "ls -la"})));
+        steps.push(log.exec(2100, 330, 100, 10, &["bash", "-c", shell]));
+        steps.push(log.exit(2500, 330, 10));
+        steps.push(log.tool_close(3000, "toolu_01", "ok"));
+        for at in [4000, 5000] {
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        assert!(
+            findings_of(&out).iter().any(|f| f.rule == "argv"),
+            "{shell}: {out:?}"
+        );
+    }
+}
+
+/// A TLS write names an executor only provisionally: the process that
+/// opened the request's flow, once the sensor's connect says so, replaces
+/// it.
+#[test]
+fn a_flows_opener_replaces_a_provisional_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.tls_io(1990, 400, "write", 4800));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.dns(2110, "api.example", &["203.0.113.5"], Verdict::Allow));
+    steps.push(log.tcp_connect(2120, 200, 41000, "203.0.113.5:443"));
+    steps.push(log.connect(
+        2130,
+        1,
+        41000,
+        "203.0.113.5:443",
+        &["api.example"],
+        Verdict::Allow,
+    ));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000, 7000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(200), "{out:?}");
+    assert_eq!(spans[0].procs, [300]);
+}
+
+/// A second process whose write fits the request, after the first was
+/// named, takes the provisional executor away: the root stands in.
+#[test]
+fn a_later_fitting_writer_revokes_a_provisional_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tls_io(2050, 200, "write", 5000));
+    steps.push(log.tls_io(2060, 400, "write", 4900));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(100), "{out:?}");
+}
+
+/// A process in no span that is not the agent writing the declared path
+/// does not make the agent's Write tool call true.
+#[test]
+fn a_write_by_another_process_is_not_the_agents() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 100, 1, 1, &["claude", "-p", "write notes"]));
+    // Started long before any tool call: in no span.
+    steps.push(log.exec(1300, 500, 100, 2, &["sh", "-c", "sleep 30"]));
+    steps.push(log.tool_open(
+        5000,
+        "toolu_01",
+        "Write",
+        json!({"file_path": "/workspace/notes.txt", "content": "hello"}),
+    ));
+    steps.push(log.fs_create(5100, 500, "/notes.txt"));
+    steps.push(log.fs_close(5110, 500, "/notes.txt", 5));
+    steps.push(log.tool_close(5500, "toolu_01", "ok"));
+    for at in [6000, 7000, 8000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let rules: Vec<&str> = findings_of(&out).iter().map(|f| f.rule.as_str()).collect();
+    assert!(rules.contains(&"phantom_write"), "{out:?}");
 }
 
 /// Past the open-span limit the oldest open span is written as it stands,

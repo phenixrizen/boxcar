@@ -33,6 +33,14 @@ pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const MAX_HEADER_BLOCK: usize = 64 * 1024;
 /// The most streams open at once.
 pub const MAX_STREAMS: usize = 256;
+/// The largest dynamic table a decoder keeps, whatever a peer's
+/// `SETTINGS_HEADER_TABLE_SIZE` allows: a size update past it degrades
+/// the stream.
+pub const MAX_TABLE_SIZE: usize = 64 * 1024;
+/// The most bytes a header block may decode to (names and values, 32
+/// bytes more a field, as HPACK counts a table entry), however few bytes it
+/// was encoded in; past it the stream degrades before more is copied.
+pub const MAX_DECODED_BLOCK: usize = 128 * 1024;
 
 const FRAME_HEADER: usize = 9;
 const DATA: u8 = 0;
@@ -72,7 +80,11 @@ impl Dir {
     fn new(preface_needed: bool) -> Dir {
         Dir {
             buf: Vec::new(),
-            decoder: Decoder::new(),
+            decoder: {
+                let mut decoder = Decoder::new();
+                decoder.set_max_allowed_table_size(MAX_TABLE_SIZE);
+                decoder
+            },
             pending: None,
             preface: !preface_needed,
             broken: false,
@@ -268,10 +280,10 @@ impl H2 {
                     end_stream: flags & END_STREAM != 0,
                     promise: false,
                 });
-                if flags & END_HEADERS != 0 {
-                    self.complete(dir, out);
-                } else if fragment.len() > MAX_HEADER_BLOCK {
+                if fragment.len() > MAX_HEADER_BLOCK {
                     self.degrade(dir, Some(stream), "header_block_too_large", out);
+                } else if flags & END_HEADERS != 0 {
+                    self.complete(dir, out);
                 }
             }
             PUSH_PROMISE => {
@@ -292,7 +304,9 @@ impl H2 {
                     end_stream: false,
                     promise: true,
                 });
-                if flags & END_HEADERS != 0 {
+                if rest.len() - 4 > MAX_HEADER_BLOCK {
+                    self.degrade(dir, Some(stream), "header_block_too_large", out);
+                } else if flags & END_HEADERS != 0 {
                     self.complete(dir, out);
                 }
             }
@@ -333,9 +347,9 @@ impl H2 {
                             Direction::ToHost => &mut self.s2c,
                             Direction::ToGuest => &mut self.c2s,
                         };
-                        other
-                            .decoder
-                            .set_max_table_size(usize::try_from(value).unwrap_or(usize::MAX));
+                        let size = usize::try_from(value)
+                            .map_or(MAX_TABLE_SIZE, |v| v.min(MAX_TABLE_SIZE));
+                        other.decoder.set_max_table_size(size);
                     }
                 }
             }
@@ -354,10 +368,25 @@ impl H2 {
         if !block_shape_ok(&pending.block) {
             return self.degrade(dir, Some(pending.stream), "hpack", out);
         }
-        let decoded = match side.decoder.decode(&pending.block) {
-            Ok(fields) => fields,
-            Err(_) => return self.degrade(dir, Some(pending.stream), "hpack", out),
-        };
+        // Decoded fields are copied out only within the budget: a small
+        // block of references to a large table entry decodes to much more.
+        let mut decoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut spent = 0usize;
+        let mut over = false;
+        let result = side.decoder.decode_with_cb(&pending.block, |name, value| {
+            spent = spent.saturating_add(name.len() + value.len() + 32);
+            if spent > MAX_DECODED_BLOCK {
+                over = true;
+            } else if !over {
+                decoded.push((name.into_owned(), value.into_owned()));
+            }
+        });
+        if result.is_err() {
+            return self.degrade(dir, Some(pending.stream), "hpack", out);
+        }
+        if over {
+            return self.degrade(dir, Some(pending.stream), "header_block_too_large", out);
+        }
         if pending.promise {
             return;
         }
@@ -912,6 +941,59 @@ mod tests {
             }),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn a_block_that_decodes_past_the_budget_degrades() {
+        // One literal of 4 KiB indexed into the table, then a block of
+        // one-byte references to it.
+        let mut enc = fluke_hpack::Encoder::new();
+        let big = vec![b'v'; 4000];
+        let first = enc.encode([(&b"x-big"[..], &big[..])]);
+        let mut c2s = PREFACE.to_vec();
+        c2s.extend(frame(SETTINGS, 0, 0, &[]));
+        c2s.extend(frame(HEADERS, END_HEADERS | END_STREAM, 1, &first));
+        // 0xbe is index 62: the newest dynamic entry.
+        c2s.extend(frame(HEADERS, END_HEADERS | END_STREAM, 3, &[0xbe; 64]));
+        let events = run(&c2s, &[], 1 << 20);
+        assert!(
+            events.contains(&Event::Degraded {
+                stream: Some(3),
+                reason: "header_block_too_large"
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_whole_block_past_the_limit_degrades() {
+        let mut c2s = PREFACE.to_vec();
+        c2s.extend(frame(SETTINGS, 0, 0, &[]));
+        c2s.extend(frame(
+            HEADERS,
+            END_HEADERS,
+            1,
+            &vec![0x82; MAX_HEADER_BLOCK + 1],
+        ));
+        let events = run(&c2s, &[], 1 << 20);
+        assert!(
+            events.contains(&Event::Degraded {
+                stream: Some(1),
+                reason: "header_block_too_large"
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_size_past_the_ceiling_is_clamped_not_a_panic() {
+        // Both sides advertise the largest table size there is.
+        let mut settings = Vec::new();
+        settings.extend_from_slice(&SETTINGS_HEADER_TABLE_SIZE.to_be_bytes());
+        settings.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut c2s = PREFACE.to_vec();
+        c2s.extend(frame(SETTINGS, 0, 0, &settings));
+        let _ = run(&c2s, &frame(SETTINGS, 0, 0, &settings), 4096);
     }
 
     #[test]

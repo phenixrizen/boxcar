@@ -53,8 +53,8 @@ use crate::sink::{AuditSink, Priority, Submission};
 use crate::subscribe::{Item, Next};
 use crate::Filter;
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use spans::SpanIndex;
 use spans::Spans;
+pub use spans::{Declared, DeclaredArgs, SpanIndex};
 use state::State;
 
 /// How often the timers are looked at while nothing arrives.
@@ -87,6 +87,10 @@ pub struct ReconcileConfig {
     pub clock: Arc<dyn Clock>,
     /// The index `span.list` reads, kept current when given.
     pub spans: Option<SpanIndex>,
+    /// The tool calls' arguments as sent, which the gate keeps: with them
+    /// a declared command or path is compared exactly; without them, with
+    /// the record's scrubbed copy.
+    pub declared: Option<DeclaredArgs>,
 }
 
 /// The reconciler's state machine: feed it records and ticks, take the
@@ -100,7 +104,7 @@ pub struct Reconciler {
 
 impl Reconciler {
     pub fn new(cfg: ReconcileConfig) -> Reconciler {
-        let spans = Spans::new(cfg.spans.clone());
+        let spans = Spans::new(cfg.spans.clone(), cfg.declared.clone());
         Reconciler {
             cfg,
             state: State::default(),

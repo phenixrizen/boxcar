@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::time::Instant;
 
+use boxcar_audit::DeclaredArgs;
 use boxcar_proto::redact::{scrub_target, scrub_text};
 use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
 
@@ -173,6 +174,13 @@ impl Observation {
     /// response are written to `http/<flow>-<stream>.req` and `.resp`.
     pub fn with_dump(mut self, dump: Option<DumpDir>) -> Observation {
         self.dump = dump;
+        self
+    }
+
+    /// The model calls' arguments as sent go to `declared`, for the
+    /// reconciler.
+    pub fn with_declared(mut self, declared: Option<DeclaredArgs>) -> Observation {
+        self.model = self.model.with_declared(declared);
         self
     }
 
@@ -363,6 +371,10 @@ impl Observation {
                             let before = exchange.sse_events.len();
                             sse.feed(&decoded, &mut exchange.sse_events);
                             exchange.sse_count += (exchange.sse_events.len() - before) as u64;
+                            if sse.overflowed() {
+                                exchange.response_degraded.get_or_insert("sse_line");
+                                self.model.degraded(stream, "sse_line");
+                            }
                         }
                         self.model.response_body(stream, exchange, out);
                         exchange.sse_events.clear();

@@ -604,3 +604,22 @@ Made while writing the plan, 2026-10-06:
   in four runs of the crate's tests while other sessions loaded the
   machine (load average 23 on 64 cores); it passes alone; recorded, not
   changed.
+- **Hardening after the second review.** Scrubbing reads a flag's quoted
+  or escaped value, and an argv (or a JSON array of strings) loses the
+  argument after a secret flag (`redact::scrub_argv`). Dump bodies are
+  scrubbed by their type, and one that is not text is not written. HTTP/2
+  header blocks are checked for size whether or not they end in one frame,
+  decode within 128 KiB, and the decoder's table never passes 64 KiB;
+  HTTP/1 holds at most 64 KiB while an upgrade waits and 256 unanswered
+  requests; an event-stream line is held to 16 MiB, and a streamed reply's
+  tool calls to 16 MiB and 256 at once (`stream_budget`). A flow's close
+  carries the losses not yet told. The gate hands the reconciler each
+  call's arguments as sent, in memory only (`DeclaredArgs`), so declared
+  commands and paths are compared with what ran exactly; from the
+  record's scrubbed copy alone a redacted part means the `argv` rule
+  cannot tell. A shell command carries the declared one only when it is
+  it or Claude Code's `eval` wrapper around exactly it. A TLS write names
+  an executor only provisionally (reconsidered with each write, replaced
+  by the flow's opener), and only the root or a bound executor is the
+  agent, whose filesystem effects outside any span join a write tool's
+  span.

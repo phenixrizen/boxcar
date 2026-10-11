@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::{
-    b3, content_text, tool_close, tool_open_text, u64_of, RequestInfo, ResponseInfo, Text,
-    ToolClose, ToolOpen,
+    b3, content_text, tool_close, tool_open_text, u64_of, CallBudget, RequestInfo, ResponseInfo,
+    Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -180,6 +180,7 @@ pub struct Stream {
     info: ResponseInfo,
     text: Text,
     calls: BTreeMap<u64, Call>,
+    budget: CallBudget,
     degraded: Option<&'static str>,
     completed: bool,
 }
@@ -200,6 +201,12 @@ impl Stream {
         self.value(&data)
     }
 
+    /// Whether the call at `index` is under way, or one more may be.
+    fn room(&mut self, index: u64) -> bool {
+        self.calls.contains_key(&index)
+            || CallBudget::admit_call(self.calls.len(), &mut self.degraded)
+    }
+
     /// One event as a parsed value (a WebSocket message carries one).
     pub fn value(&mut self, data: &Value) -> Vec<ToolOpen> {
         let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
@@ -216,8 +223,8 @@ impl Stream {
             }
             "response.output_item.added" => {
                 let item = data.get("item");
-                if is_call(item) {
-                    let index = u64_of(data.get("output_index")).unwrap_or(0);
+                let index = u64_of(data.get("output_index")).unwrap_or(0);
+                if is_call(item) && self.room(index) {
                     let call = self.calls.entry(index).or_default();
                     call.item_id = item
                         .and_then(|i| i.get("id"))
@@ -238,29 +245,34 @@ impl Stream {
                         .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
                         .and_then(Value::as_str)
                     {
-                        call.arguments = args.to_owned();
+                        if self.budget.admit(args.len(), &mut self.degraded) {
+                            call.arguments = args.to_owned();
+                        }
                     }
                 }
             }
             "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    self.calls
-                        .entry(index)
-                        .or_default()
-                        .arguments
-                        .push_str(delta);
+                    if self.room(index) && self.budget.admit(delta.len(), &mut self.degraded) {
+                        self.calls
+                            .entry(index)
+                            .or_default()
+                            .arguments
+                            .push_str(delta);
+                    }
                 }
             }
             "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
-                let call = self.calls.entry(index).or_default();
                 if let Some(args) = data
                     .get("arguments")
                     .or_else(|| data.get("input"))
                     .and_then(Value::as_str)
                 {
-                    call.arguments = args.to_owned();
+                    if self.room(index) && self.budget.admit(args.len(), &mut self.degraded) {
+                        self.calls.entry(index).or_default().arguments = args.to_owned();
+                    }
                 }
             }
             "response.output_item.done" => {
@@ -278,7 +290,9 @@ impl Stream {
                         .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
                         .and_then(Value::as_str)
                     {
-                        call.arguments = args.to_owned();
+                        if self.budget.admit(args.len(), &mut self.degraded) {
+                            call.arguments = args.to_owned();
+                        }
                     }
                     call.done = true;
                     self.info.tool_uses += 1;
