@@ -133,7 +133,10 @@ says why.
   gone, and the rest are scrubbed as free text), with the query values
   scrubbed as `http.request.path`'s are, a blank line, the decoded body
   scrubbed by its type: JSON by key and in every string; an event stream
-  or JSON lines line by line (a `data:` payload that is JSON as JSON);
+  or JSON lines line by line (a `data:` payload that is JSON as JSON),
+  with a streamed fragment (anything under a `delta`, a `partial_json`)
+  written as its size, since a secret split across fragments is whole in
+  none of them;
   other text through the free-text scrub; a body that is not text is not
   written, a line saying how many bytes it was takes its place. A form
   body (the shape of an OAuth token exchange) has its credential fields'

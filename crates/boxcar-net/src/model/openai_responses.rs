@@ -224,23 +224,23 @@ impl Stream {
             "response.output_item.added" => {
                 let item = data.get("item");
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
-                if is_call(item) && self.room(index) {
+                let text = |key: &str| {
+                    item.and_then(|i| i.get(key))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                };
+                let (item_id, call_id, name) = (text("id"), text("call_id"), text("name"));
+                if is_call(item)
+                    && self.room(index)
+                    && self.budget.admit(
+                        item_id.len() + call_id.len() + name.len(),
+                        &mut self.degraded,
+                    )
+                {
                     let call = self.calls.entry(index).or_default();
-                    call.item_id = item
-                        .and_then(|i| i.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    call.call_id = item
-                        .and_then(|i| i.get("call_id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    call.name = item
-                        .and_then(|i| i.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
+                    call.item_id = item_id.to_owned();
+                    call.call_id = call_id.to_owned();
+                    call.name = name.to_owned();
                     if let Some(args) = item
                         .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
                         .and_then(Value::as_str)

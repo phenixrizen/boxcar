@@ -623,3 +623,11 @@ Made while writing the plan, 2026-10-06:
   by the flow's opener), and only the root or a bound executor is the
   agent, whose filesystem effects outside any span join a write tool's
   span.
+- **Hardening after the third review.** Findings quote a declared
+  command or path scrubbed, though the comparison uses the arguments as
+  sent. Claude Code's wrapper is recognized by reading the shell command
+  as a shell does (quotes, escapes, comments) rather than as quote-free
+  text. A tool call's id and name count against its reply's budget. The
+  dump writes a streamed fragment as its size. A `tool.close` that came
+  over a flow another process opened than the span's bound executor
+  leaves the span open.

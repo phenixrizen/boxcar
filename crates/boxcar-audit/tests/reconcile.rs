@@ -399,6 +399,25 @@ impl Log {
         )
     }
 
+    /// A `tool.close` that came on `flow`.
+    fn tool_close_on(&mut self, at_ms: u64, id: &str, status: &str, flow: u64) -> Step {
+        self.rec_in(
+            at_ms,
+            Ring::Host,
+            None,
+            Payload::ToolClose(ToolClose {
+                flow,
+                stream: 5,
+                tool_use_id: id.into(),
+                status: status.into(),
+                result_bytes: 7,
+                result_b3: None,
+                result_summary: "done".into(),
+            }),
+            Some(id),
+        )
+    }
+
     fn fs_unlink(&mut self, at_ms: u64, tid: u32, path: &str) -> Step {
         self.rec(
             at_ms,
@@ -1326,6 +1345,109 @@ fn a_redacted_argument_is_compared_as_sent() {
         let argv = findings_of(&out).iter().any(|f| f.rule == "argv");
         assert_eq!(argv, mismatch, "{ran} kept {kept}: {out:?}");
     }
+}
+
+/// A finding quotes what the call declared scrubbed, as the record has
+/// it, though the comparison used the arguments as sent.
+#[test]
+fn findings_quote_declared_values_scrubbed() {
+    let declared = DeclaredArgs::new();
+    let command = "client --password demo-pass";
+    declared.put(
+        "toolu_01",
+        Declared::Json(json!({"command": command})),
+        command.len(),
+    );
+    let path = "/workspace/sk-ant-api03-abcdefghijklmnop.txt";
+    declared.put(
+        "toolu_02",
+        Declared::Json(json!({"file_path": path, "content": "x"})),
+        path.len(),
+    );
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let mut args = json!({"command": command});
+    boxcar_proto::redact::scrub_deep(&mut args);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", args));
+    steps.push(log.exec(2100, 330, 100, 10, &["bash", "-c", "true"]));
+    steps.push(log.exit(2500, 330, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    let mut args = json!({"file_path": path, "content": "x"});
+    boxcar_proto::redact::scrub_deep(&mut args);
+    steps.push(log.tool_open(3100, "toolu_02", "Write", args));
+    steps.push(log.tool_close(3200, "toolu_02", "ok"));
+    for at in [4000, 5000, 6000] {
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_with(true, steps, Some(declared));
+    let findings = findings_of(&out);
+    let rules: Vec<&str> = findings.iter().map(|f| f.rule.as_str()).collect();
+    assert!(
+        rules.contains(&"argv") && rules.contains(&"phantom_write"),
+        "{out:?}"
+    );
+    for finding in findings {
+        assert!(
+            !finding.summary.contains("demo-pass"),
+            "{}",
+            finding.summary
+        );
+        assert!(
+            !finding.summary.contains("abcdefghijklmnop"),
+            "{}",
+            finding.summary
+        );
+    }
+}
+
+/// A `tool.close` sent over a flow another process opened does not close
+/// the span: its own close, over the agent's flow, does.
+#[test]
+fn a_close_from_another_process_leaves_the_span_open() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+    steps.push(log.tcp_connect(1350, 200, 41000, "203.0.113.5:443"));
+    steps.push(log.connect(
+        1360,
+        1,
+        41000,
+        "203.0.113.5:443",
+        &["api.example"],
+        Verdict::Allow,
+    ));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "sleep 2"})));
+    steps.push(log.tcp_connect(2150, 400, 42000, "203.0.113.5:443"));
+    steps.push(log.connect(
+        2160,
+        2,
+        42000,
+        "203.0.113.5:443",
+        &["api.example"],
+        Verdict::Allow,
+    ));
+    steps.push(log.tool_close_on(2200, "toolu_01", "error", 2));
+    steps.push(log.exec(2300, 300, 200, 10, &["sh", "-c", "sleep 2"]));
+    steps.push(log.exit(4300, 300, 10));
+    steps.push(log.tool_close(4500, "toolu_01", "ok"));
+    for at in [5000, 6000, 7000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert_eq!(
+        spans[0].procs,
+        [300],
+        "the exec after the forged close joined"
+    );
+    assert_eq!(spans[0].executor_tgid, Some(200));
 }
 
 /// The declared command written in a comment, or beside another, is not

@@ -57,6 +57,9 @@ processes and ring 0 effects to the span:
   when that comes. A provisional executor is reported in `span.effects`
   and is never the agent: ancestry is traced to the root instead, and its
   own work is judged as any process's. The agent itself is in no span.
+- **The close.** A `tool.close` closes the span with its id unless it
+  came over a flow opened by another process than the span's bound
+  executor; then the span stays open for its own close.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
   `truncated`) and takes nothing more, nor its `tool.close`.

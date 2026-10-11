@@ -481,11 +481,53 @@ pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
     format!("[{} bytes of {kind} not written]\n", body.len()).into_bytes()
 }
 
-/// `bytes` as JSON scrubbed by key and in every string, if it is JSON.
+/// `bytes` as JSON scrubbed by key and in every string, its streamed
+/// fragments by their size only ([`without_fragments`]), if it is JSON.
 fn json_text(bytes: &[u8]) -> Option<String> {
     let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    without_fragments(&mut value);
     boxcar_proto::redact::scrub_deep(&mut value);
     Some(value.to_string())
+}
+
+/// A streamed piece of a reply (anything under a `delta`, Anthropic's
+/// `partial_json`) is a fragment: a secret split across fragments is in
+/// none of them whole, where no scrub finds it. The dump writes each
+/// fragment's strings as their size; the whole values, where a reply
+/// gives them (a call's arguments when it is done, the full response),
+/// are written scrubbed.
+fn without_fragments(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "delta" || key == "partial_json" {
+                    sizes(child);
+                } else {
+                    without_fragments(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(without_fragments),
+        _ => {}
+    }
+}
+
+/// Every string in `value` but a `type` replaced by its size.
+fn sizes(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = format!("[{} bytes]", text.len());
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key != "type" {
+                    sizes(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sizes),
+        _ => {}
+    }
 }
 
 /// An event stream or JSON lines, line by line: a line (or a `data:`
@@ -773,6 +815,26 @@ mod tests {
         assert!(text.starts_with("c2s text 43\n{"), "{text}");
         assert!(text.contains("\"type\":\"response.create\"") && !text.contains("sk-1"));
         assert!(text.ends_with("\ns2c binary 3\n"), "{text}");
+    }
+
+    /// A secret split across streamed fragments is in none of them in
+    /// the dump: fragments are written as their size.
+    #[test]
+    fn streamed_fragments_are_written_as_their_size() {
+        let mut sse = String::new();
+        for part in ["{\\\"password\\\": \\\"", "demo-pass", "\\\"}"] {
+            sse.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{part}\"}}}}\n\n"
+            ));
+        }
+        let out =
+            String::from_utf8(scrubbed_body(Some("text/event-stream"), sse.as_bytes())).unwrap();
+        assert!(!out.contains("demo-pass"), "{out}");
+        assert!(out.contains("\"type\":\"input_json_delta\""), "{out}");
+        assert!(out.contains("[9 bytes]"), "{out}");
+        let ws = br#"{"type":"response.function_call_arguments.delta","delta":"demo-pass"}"#;
+        let out = String::from_utf8(scrubbed_body(None, ws)).unwrap();
+        assert!(!out.contains("demo-pass"), "{out}");
     }
 
     #[test]

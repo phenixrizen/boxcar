@@ -98,13 +98,6 @@ pub const MAX_DECLARED_BYTES: usize = 8 * 1024 * 1024;
 pub const DECLARED_ARGS_LIMIT: usize = 64 * 1024;
 /// The most flows whose opener is remembered.
 const MAX_FLOW_OWNERS: usize = 4096;
-/// The last part of the command Claude Code's Bash tool runs, before the
-/// file it names: `... && eval '<command>' < /dev/null && pwd -P >| <file>`
-/// (2.1), normalized (quotes dropped).
-const WRAP_LAST_PART: &str = " && pwd -P >| ";
-/// What Claude Code appends to the evaluated command unless the command
-/// reads its own input.
-const WRAP_NO_INPUT: &str = " < /dev/null";
 
 /// A tool call's arguments as the model sent them, before any scrub.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,7 +375,7 @@ impl Span {
         let declared = self.declared.as_deref()?;
         if self.declared_raw {
             Some(carries(
-                forms.raw.command.as_deref(),
+                forms.raw.text.as_deref(),
                 &forms.raw.whole,
                 declared,
             ))
@@ -390,7 +383,7 @@ impl Span {
             None
         } else {
             Some(carries(
-                forms.clean.command.as_deref(),
+                forms.clean.text.as_deref(),
                 &forms.clean.whole,
                 declared,
             ))
@@ -801,11 +794,20 @@ impl Spans {
     /// its `span.effects`.
     pub fn close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
         let id = close.tool_use_id.as_str();
+        // A close that came over a flow another process opened than the
+        // one the span's model request came from is not the agent's: the
+        // span stays open for its own.
+        let closer = self.flow_owners.get(&close.flow).copied();
         let Some(span) = self.spans.get_mut(id) else {
             return Vec::new();
         };
         if span.closed.is_some() || span.abandoned {
             return Vec::new();
+        }
+        if let (true, Some(executor), Some(closer)) = (span.executor_bound, span.executor, closer) {
+            if closer.tgid != executor.tgid {
+                return Vec::new();
+            }
         }
         span.closed = Some((record.seq, record.ts_host_ns));
         span.status = Some(close.status.clone());
@@ -1322,7 +1324,7 @@ impl Spans {
         }
         let forms = ExecForms::of(argv);
         // The finding quotes the command scrubbed, as a record would.
-        let Some(command) = forms.clean.command.clone() else {
+        let Some(command) = shell_command(argv) else {
             return Vec::new();
         };
         match span.carried_by(&forms) {
@@ -1355,7 +1357,7 @@ impl Spans {
         let summary = format!(
             "the {tool} tool call {id} declared \"{}\", but the shell it ran (pid {}) was given \
              \"{}\", and nothing in the call ran the declared command",
-            quote(&declared),
+            quote(&scrub_text(&declared)),
             key.tgid,
             quote(&command)
         );
@@ -1469,7 +1471,7 @@ impl Spans {
         let paths: Vec<String> = span
             .paths
             .iter()
-            .map(|(mount, path)| format!("{path} on {mount}"))
+            .map(|(mount, path)| format!("{} on {mount}", scrub_text(path)))
             .collect();
         let summary = format!(
             "the {} tool call {id} ended ok, but no file was created, written or renamed at {} \
@@ -1708,22 +1710,21 @@ struct ExecForms {
 }
 
 struct Forms {
-    command: Option<String>,
+    /// The shell's `-c` command as given (or scrubbed), not normalized.
+    text: Option<String>,
     whole: String,
 }
 
 impl ExecForms {
     fn of(argv: &[String]) -> ExecForms {
-        let raw_command = shell_argument(argv)
-            .map(|command| normalize(command))
-            .filter(|command| !command.is_empty());
+        let text = shell_argument(argv);
         ExecForms {
             raw: Forms {
-                command: raw_command,
+                text: text.cloned(),
                 whole: normalize(&argv.join(" ")),
             },
             clean: Forms {
-                command: shell_command(argv),
+                text: text.map(|text| scrub_text(text)),
                 whole: whole_argv(argv),
             },
         }
@@ -1736,28 +1737,146 @@ impl ExecForms {
 /// <file>`), or its whole argv is the declared one. The declared command
 /// merely appearing in the shell's text (in a comment, beside other
 /// commands, inside a longer `eval`) is not carrying it.
-fn carries(command: Option<&str>, whole: &str, declared: &str) -> bool {
-    command.is_some_and(|command| command == declared || wraps(command, declared))
+fn carries(text: Option<&str>, whole: &str, declared: &str) -> bool {
+    text.is_some_and(|text| normalize(text) == declared || wraps(text, declared))
         || whole == declared
 }
 
-/// Whether `command` ends as Claude Code's wrapper around exactly
-/// `declared`: a part `eval <declared>` (with ` < /dev/null` unless the
-/// command reads its own input), then `pwd -P >| <file>` and nothing
-/// more. What comes before, as whole `&&` parts, is the runtime's own
-/// setup (sourcing its shell snapshot, exports) and is not judged here.
-fn wraps(command: &str, declared: &str) -> bool {
-    let Some((rest, file)) = command.rsplit_once(WRAP_LAST_PART) else {
+/// Whether the shell command `text` ends as Claude Code's wrapper around
+/// exactly `declared` (normalized), read as a shell reads it (quotes,
+/// escapes, comments): its last `&&` part `pwd -P >| <file>`, the one
+/// before it `eval <one word>` (and `< /dev/null` unless the command reads
+/// its own input) whose word is the declared command. The parts before
+/// are the runtime's own setup (sourcing its shell snapshot, exports) and
+/// are not judged here, but each must be there: a comment or an open
+/// quote that swallows the rest is no wrapper.
+fn wraps(text: &str, declared: &str) -> bool {
+    let Some(tokens) = lex(text) else {
         return false;
     };
-    if file.is_empty() || file.contains(' ') {
+    let parts: Vec<&[Tok]> = tokens
+        .split(|t| matches!(t, Tok::Op(op) if op == "&&"))
+        .collect();
+    let [setup @ .., eval, last] = parts.as_slice() else {
         return false;
+    };
+    let last_ok = matches!(
+        last,
+        [Tok::Word(pwd), Tok::Word(p), Tok::Op(to), Tok::Word(file)]
+            if pwd == "pwd" && p == "-P" && to == ">|" && !file.is_empty()
+    );
+    let word = match eval {
+        [Tok::Word(e), Tok::Word(word)] if e == "eval" => word,
+        [Tok::Word(e), Tok::Word(word), Tok::Op(from), Tok::Word(null)]
+            if e == "eval" && from == "<" && null == "/dev/null" =>
+        {
+            word
+        }
+        _ => return false,
+    };
+    last_ok && normalize(word) == declared && setup.iter().all(|part| !part.is_empty())
+}
+
+/// A shell token at the top level of a command.
+#[derive(Debug, PartialEq, Eq)]
+enum Tok {
+    /// A word, its quotes and escapes resolved.
+    Word(String),
+    /// An operator (`&&`, `|`, `;`, `>|`, `<`, a newline...).
+    Op(String),
+}
+
+/// The operators of two characters the lexer knows.
+const TWO_CHAR_OPS: [&str; 7] = ["&&", "||", ">|", ">>", "<<", ">&", "<&"];
+
+/// `text` as a shell reads its top level: words (single quotes literal,
+/// double quotes with `\"`, `\\`, `\$` and `` \` `` escapes, a backslash
+/// outside quotes escaping the next character), operators, and comments (a
+/// `#` starting a word, to the line's end) dropped. `None` when a quote is
+/// left open.
+fn lex(text: &str) -> Option<Vec<Tok>> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars().peekable();
+    let flush = |tokens: &mut Vec<Tok>, word: &mut String, in_word: &mut bool| {
+        if *in_word {
+            tokens.push(Tok::Word(std::mem::take(word)));
+            *in_word = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => match chars.next()? {
+                            c @ ('"' | '\\' | '$' | '`') => word.push(c),
+                            '\n' => {}
+                            c => {
+                                word.push('\\');
+                                word.push(c);
+                            }
+                        },
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => match chars.next() {
+                Some('\n') => {}
+                Some(c) => {
+                    in_word = true;
+                    word.push(c);
+                }
+                None => {
+                    in_word = true;
+                    word.push('\\');
+                }
+            },
+            '#' if !in_word => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        tokens.push(Tok::Op("\n".to_owned()));
+                        break;
+                    }
+                }
+            }
+            '\n' => {
+                flush(&mut tokens, &mut word, &mut in_word);
+                tokens.push(Tok::Op("\n".to_owned()));
+            }
+            c if c.is_whitespace() => flush(&mut tokens, &mut word, &mut in_word),
+            '&' | '|' | ';' | '<' | '>' | '(' | ')' => {
+                flush(&mut tokens, &mut word, &mut in_word);
+                let mut op = c.to_string();
+                if let Some(&next) = chars.peek() {
+                    let pair: String = [c, next].iter().collect();
+                    if TWO_CHAR_OPS.contains(&pair.as_str()) {
+                        chars.next();
+                        op = pair;
+                    }
+                }
+                tokens.push(Tok::Op(op));
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
     }
-    [Some(rest), rest.strip_suffix(WRAP_NO_INPUT)]
-        .into_iter()
-        .flatten()
-        .filter_map(|eval| eval.strip_suffix(declared))
-        .any(|head| head == "eval " || head.ends_with(" && eval "))
+    flush(&mut tokens, &mut word, &mut in_word);
+    Some(tokens)
 }
 
 /// Whether two host times are within the executor window of each other.
@@ -1905,10 +2024,8 @@ mod tests {
     #[test]
     fn a_wrapped_command_still_carries_the_declared_one() {
         let declared = normalize("echo boxcar-m4 > marker.txt");
-        let wrapped = normalize(
-            "eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-cwd",
-        );
-        assert!(carries(Some(&wrapped), "", &declared));
+        let wrapped = "eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-cwd";
+        assert!(carries(Some(wrapped), "", &declared));
         assert!(carries(
             None,
             &normalize("bash -lc make test"),
@@ -1921,30 +2038,69 @@ mod tests {
         ));
         // Claude Code's own setup before the eval is its own.
         assert!(carries(
-            Some(&normalize(
-                "source /tmp/snapshot.sh 2>/dev/null || true && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
-            )),
+            Some(
+                "source /tmp/snapshot.sh 2>/dev/null || true && export PATH=\"${PATH:+$PATH:}\"'/x' && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
+            ),
             "",
             &declared
+        ));
+        // Its quoting of a quote, `'"'"'`, reads back as the quote.
+        let quoted = normalize("echo 'it''s'");
+        assert!(carries(
+            Some(r#"eval 'echo '"'"'it'"'"''"'"'s'"'"'' < /dev/null && pwd -P >| /tmp/c"#),
+            "",
+            &quoted
         ));
         // A command that reads its own input gets no `< /dev/null`.
         let reads = normalize("sort < in.txt");
         assert!(carries(
-            Some(&normalize("eval 'sort < in.txt' && pwd -P >| /tmp/c")),
+            Some("eval 'sort < in.txt' && pwd -P >| /tmp/c"),
             "",
             &reads
         ));
-        // Only the wrapper around exactly the command, nothing more.
+        // Only the wrapper around exactly the command, as the shell reads
+        // it: nothing more, nothing in a comment or an open quote.
         for other in [
             "rm -rf / # echo boxcar-m4 > marker.txt",
             "echo boxcar-m4 > marker.txt; rm -rf /",
-            "eval echo boxcar-m4 > marker.txt; rm -rf / < /dev/null && pwd -P >| /tmp/c",
-            "eval echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c; rm -rf /",
-            "eval rm -rf /; echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c",
-            "xeval echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c",
+            "eval 'echo boxcar-m4 > marker.txt; rm -rf /' < /dev/null && pwd -P >| /tmp/c",
+            "eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c; rm -rf /",
+            "eval 'rm -rf /; echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c",
+            "xeval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c",
+            "eval echo boxcar-m4 > marker.txt < /dev/null && pwd -P >| /tmp/c",
+            "printf other # && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c",
+            "printf \"other && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c\"",
+            "printf 'other && eval ' && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c'",
+            " && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c",
         ] {
             assert!(!carries(Some(other), "", &declared), "{other}");
         }
+    }
+
+    #[test]
+    fn the_lexer_reads_quotes_escapes_and_comments() {
+        let word = |w: &str| Tok::Word(w.to_owned());
+        let op = |o: &str| Tok::Op(o.to_owned());
+        assert_eq!(
+            lex(r#"a 'b c' "d\"e" f\ g && h >| i # j && k"#).unwrap(),
+            [
+                word("a"),
+                word("b c"),
+                word("d\"e"),
+                word("f g"),
+                op("&&"),
+                word("h"),
+                op(">|"),
+                word("i")
+            ]
+        );
+        assert_eq!(lex("a#b c").unwrap(), [word("a#b"), word("c")]);
+        assert_eq!(
+            lex("2>/dev/null").unwrap(),
+            [word("2"), op(">"), word("/dev/null")]
+        );
+        assert_eq!(lex("'open"), None);
+        assert_eq!(lex("\"open"), None);
     }
 
     #[test]
@@ -1957,7 +2113,9 @@ mod tests {
         assert!(!declared.contains("k1"));
         let exec = argv(&["bash", "-c", command]);
         assert!(carries(
-            shell_command(&exec).as_deref(),
+            shell_argument(&exec)
+                .map(|text| scrub_text(text))
+                .as_deref(),
             &whole_argv(&exec),
             &declared
         ));

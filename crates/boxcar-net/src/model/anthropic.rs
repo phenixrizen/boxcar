@@ -166,23 +166,23 @@ impl Stream {
             "content_block_start" => {
                 let index = u64_of(data.get("index")).unwrap_or(0);
                 let block = data.get("content_block");
-                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use")
+                let text = |key: &str| {
+                    block
+                        .and_then(|b| b.get(key))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                };
+                let (id, name) = (text("id"), text("name"));
+                if text("type") == "tool_use"
                     && (self.blocks.contains_key(&index)
                         || CallBudget::admit_call(self.blocks.len(), &mut self.degraded))
+                    && self.budget.admit(id.len() + name.len(), &mut self.degraded)
                 {
                     self.blocks.insert(
                         index,
                         Block {
-                            id: block
-                                .and_then(|b| b.get("id"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_owned(),
-                            name: block
-                                .and_then(|b| b.get("name"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_owned(),
+                            id: id.to_owned(),
+                            name: name.to_owned(),
                             json: String::new(),
                         },
                     );
@@ -440,6 +440,28 @@ mod tests {
             stream.event(&sse("content_block_delta", &delta));
         }
         assert!(stream.blocks[&0].json.len() <= STREAM_CALL_BYTES);
+        let (info, _) = stream.finish();
+        assert_eq!(info.degraded, Some("stream_budget"));
+    }
+
+    /// A call's id and name count against the stream's budget too.
+    #[test]
+    fn call_names_count_against_the_budget() {
+        use crate::model::STREAM_CALL_BYTES;
+        let mut stream = Stream::new();
+        let name = "n".repeat(4 * 1024 * 1024);
+        for index in 0..8 {
+            stream.event(&sse(
+                "content_block_start",
+                &format!(r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"t{index}","name":"{name}","input":{{}}}}}}"#),
+            ));
+        }
+        let held: usize = stream
+            .blocks
+            .values()
+            .map(|b| b.name.len() + b.id.len())
+            .sum();
+        assert!(held <= STREAM_CALL_BYTES, "{held}");
         let (info, _) = stream.finish();
         assert_eq!(info.degraded, Some("stream_budget"));
     }
