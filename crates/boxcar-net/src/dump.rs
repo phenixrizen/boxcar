@@ -471,7 +471,9 @@ pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
         let fields: Vec<String> = text
             .split('&')
             .map(|field| match field.split_once('=') {
-                Some((name, _)) if form_secret(name) => format!("{name}=[redacted]"),
+                Some((name, _)) if form_name(name).is_none_or(|name| form_secret(&name)) => {
+                    format!("{name}=[redacted]")
+                }
                 Some((name, value)) => format!("{name}={}", scrub_text(value)),
                 None => scrub_text(field),
             })
@@ -588,6 +590,33 @@ fn lines(text: &str) -> String {
         out.push_str(end);
     }
     out
+}
+
+/// A form field's name decoded as `application/x-www-form-urlencoded`
+/// reads it (`+` a space, `%XX` a byte); `None` when it does not decode,
+/// and its value is then taken for a credential's.
+fn form_name(name: &str) -> Option<String> {
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'+' => {
+                out.push(b' ');
+                at += 1;
+            }
+            b'%' => {
+                let hex = name.get(at + 1..at + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                at += 3;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Whether a form field's name names a credential.
@@ -904,6 +933,13 @@ mod tests {
         assert!(!out.contains("demo-pass"), "{out}");
         assert!(out.contains("data: [DONE]\n"), "{out}");
         assert!(out.contains("data: [18 bytes]\n"), "{out}");
+        // A field name is read decoded: `%70assword` is `password`.
+        let form = b"user=me&%70assword=hunter2&bad%zz=v&q=a+b";
+        let out = scrubbed_body(Some("application/x-www-form-urlencoded"), form);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "user=me&%70assword=[redacted]&bad%zz=[redacted]&q=a+b"
+        );
         let lines = b"{\"a\":1}\nnot json demo-pass\n";
         let out = String::from_utf8(scrubbed_body(Some("application/x-ndjson"), lines)).unwrap();
         assert_eq!(out, "{\"a\":1}\n[18 bytes]\n");

@@ -39,6 +39,14 @@ enum Stream {
 }
 
 impl Stream {
+    fn lose_calls(&mut self) {
+        match self {
+            Stream::Anthropic(stream) => stream.lose_calls(),
+            Stream::Chat(stream) => stream.lose_calls(),
+            Stream::Responses(stream) => stream.lose_calls(),
+        }
+    }
+
     fn new(provider: Provider, retained: &Retained) -> Stream {
         let retained = retained.clone();
         match provider {
@@ -377,6 +385,17 @@ impl Tracker {
         }
     }
 
+    /// `stream`'s reply lost bytes: its calls under way keep no arguments.
+    pub fn lose_calls(&mut self, stream: u32) {
+        if let Some(parser) = self
+            .streams
+            .get_mut(&stream)
+            .and_then(|t| t.stream.as_mut())
+        {
+            parser.lose_calls();
+        }
+    }
+
     /// The flow ended: responses under way are recorded as they stand.
     pub fn close(&mut self, now: Instant, out: &mut Vec<Emit>) {
         let mut open: Vec<u32> = self.streams.keys().copied().collect();
@@ -531,6 +550,65 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    /// A reply whose event stream lost a line keeps no arguments for the
+    /// calls under way across the hole.
+    #[test]
+    fn a_dropped_line_voids_the_calls_under_way() {
+        let mut obs = observation();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let request =
+            serde_json::json!({"model": "m", "max_tokens": 8, "stream": true, "messages": []});
+        obs.data(
+            Direction::ToHost,
+            &h1_request("/v1/messages", &request.to_string()),
+            t0,
+            &mut out,
+        );
+        let delta = |part: &str| {
+            serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": part}
+            })
+            .to_string()
+        };
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let chunk = |text: &str| format!("{:x}\r\n{text}\r\n", text.len());
+        let mut s2c = head.to_owned();
+        s2c += &chunk("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_d\",\"name\":\"Bash\",\"input\":{}}}\n\n");
+        obs.data(Direction::ToGuest, s2c.as_bytes(), t0, &mut out);
+        // A line past the event limit, carrying the key, is dropped.
+        let mut long = format!(
+            "event: content_block_delta\ndata: {}",
+            delta("{\"password\":\"")
+        );
+        long.push_str(&" ".repeat(crate::http::sse::MAX_EVENT_BYTES + 1));
+        obs.data(Direction::ToGuest, chunk(&long).as_bytes(), t0, &mut out);
+        let rest = format!(
+            "\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            delta("demo-pass\"}")
+        );
+        obs.data(
+            Direction::ToGuest,
+            format!("{}0\r\n\r\n", chunk(&rest)).as_bytes(),
+            t0,
+            &mut out,
+        );
+        let open = out
+            .iter()
+            .find_map(|e| match &e.payload {
+                Payload::ToolOpen(open) => Some(open.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(open.args, None);
+        assert!(
+            !open.args_summary.contains("demo-pass"),
+            "{}",
+            open.args_summary
+        );
     }
 
     /// A tool call's arguments go to the reconciler's store as sent, while

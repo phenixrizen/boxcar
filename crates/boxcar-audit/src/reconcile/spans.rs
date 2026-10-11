@@ -864,19 +864,19 @@ impl Spans {
 
     /// A `tool.close`: closes the span, judges its connections and writes
     /// its `span.effects`.
-    /// A `tool.close`. A span whose executor is known (the process that
-    /// opened the flow of its model request) closes only by that process:
-    /// the close must come over a flow it opened. A close by another
-    /// process is dropped (the span stays open for its own close); one
-    /// over a flow whose opener is not known yet waits [`CLOSE_WAIT_NS`]
-    /// to learn it, else is dropped. A span whose executor is not known,
-    /// or a session without the sensor's lineage programs, has nothing to
+    /// A `tool.close`. A span closes only by its executor (the process
+    /// that opened the flow of its model request): the close must come
+    /// over a flow that process opened. A close by another process is
+    /// dropped (the span stays open for its own close); one where either
+    /// opener is not known yet waits [`CLOSE_WAIT_NS`] to learn them, else
+    /// is dropped. A span whose request flow is not on record at all, or
+    /// a session without the sensor's lineage programs, has nothing to
     /// hold a close to, and takes any.
     pub fn close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
         if !state.sensor.lineage_ok() {
             return self.apply_close(state, record, close);
         }
-        match self.close_verdict(close) {
+        match self.close_verdict(state, close) {
             Verdict::Apply => self.apply_close(state, record, close),
             Verdict::Drop => Vec::new(),
             Verdict::Wait => {
@@ -894,7 +894,7 @@ impl Spans {
 
     /// Whether `close` may close its span now: who opened the span's
     /// request flow (its bound executor) against who opened the close's.
-    fn close_verdict(&self, close: &ToolClose) -> Verdict {
+    fn close_verdict(&self, state: &State, close: &ToolClose) -> Verdict {
         let Some(span) = self.spans.get(&close.tool_use_id) else {
             return Verdict::Drop;
         };
@@ -906,7 +906,11 @@ impl Spans {
             _ => self.flow_owners.get(&span.request.0).copied(),
         };
         match (executor, self.flow_owners.get(&close.flow)) {
-            // No executor known: nothing to hold the close to.
+            // The request's flow is known but not yet who opened it: wait
+            // for the sensor to say.
+            (None, _) if state.flows.contains_key(&span.request.0) => Verdict::Wait,
+            // No such flow on record (a log without the gate's flows):
+            // nothing to hold the close to.
             (None, _) => Verdict::Apply,
             (Some(executor), Some(closer)) if executor == *closer => Verdict::Apply,
             (Some(_), Some(_)) => Verdict::Drop,
@@ -1056,7 +1060,7 @@ impl Spans {
         // dropped, or still waiting.
         let waiting: Vec<PendingClose> = self.pending_closes.drain(..).collect();
         for pending in waiting {
-            match self.close_verdict(&pending.close) {
+            match self.close_verdict(state, &pending.close) {
                 Verdict::Apply => {
                     let findings = self.apply_close(state, &pending.record, &pending.close);
                     self.deferred_findings.extend(findings);
@@ -1821,15 +1825,67 @@ fn mounted(path: &str) -> (String, String) {
 /// given; `None` for a program that is no shell, or a shell without one.
 /// The program is the file the kernel ran (`proc.exec.filename`), never
 /// `argv[0]`, which the caller sets as it likes.
+///
+/// The options are read as a POSIX shell reads them: they end at the
+/// first operand or `--`; `-o` and `-O` (and bash's `--rcfile`,
+/// `--init-file`) take one; `-c` makes the first operand the command; and
+/// `-n` (or `-o noexec`) reads the command without running it, so no
+/// command is run at all.
 fn shell_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
     if !SHELLS.contains(&base_name(program)) {
         return None;
     }
-    let at = argv
-        .get(1..)?
-        .iter()
-        .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))?;
-    argv.get(at + 2)
+    let mut command = false;
+    let mut at = 1;
+    while let Some(arg) = argv.get(at) {
+        if arg == "--" || arg == "-" {
+            at += 1;
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            at += if matches!(long, "rcfile" | "init-file") {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        let (set, flags) = match (arg.strip_prefix('-'), arg.strip_prefix('+')) {
+            (Some(flags), _) => (true, flags),
+            (None, Some(flags)) => (false, flags),
+            (None, None) => break,
+        };
+        if flags.is_empty() {
+            break;
+        }
+        at += 1;
+        for (n, flag) in flags.char_indices() {
+            match flag {
+                'c' if set => command = true,
+                'n' if set => return None,
+                'o' | 'O' => {
+                    // The operand: the rest of the cluster, else the next
+                    // argument.
+                    let rest = &flags[n + 1..];
+                    let operand = if rest.is_empty() {
+                        at += 1;
+                        argv.get(at - 1).map(String::as_str)
+                    } else {
+                        Some(rest)
+                    };
+                    if set && flag == 'o' && operand == Some("noexec") {
+                        return None;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    if !command {
+        return None;
+    }
+    argv.get(at)
 }
 
 /// The last part of a path.
@@ -2242,6 +2298,38 @@ mod tests {
             " && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c",
         ] {
             assert!(!carries(&declared, "/bin/bash", &shell(other)), "{other}");
+        }
+        // Options as a shell reads them: an operand ends them, `-n` runs
+        // nothing.
+        for other in [
+            &words(&["bash", "/dev/null", "-c", "echo boxcar-m4 > marker.txt"]),
+            &words(&["bash", "-n", "-c", "echo boxcar-m4 > marker.txt"]),
+            &words(&["bash", "-nc", "echo boxcar-m4 > marker.txt"]),
+            &words(&["bash", "-o", "noexec", "-c", "echo boxcar-m4 > marker.txt"]),
+            &words(&["bash", "--", "-c", "echo boxcar-m4 > marker.txt"]),
+        ] {
+            assert!(!carries(&declared, "/bin/bash", other), "{other:?}");
+        }
+        for ok in [
+            &words(&["bash", "-l", "-c", "echo boxcar-m4 > marker.txt"]),
+            &words(&["bash", "-c", "--", "echo boxcar-m4 > marker.txt"]),
+            &words(&[
+                "bash",
+                "-o",
+                "pipefail",
+                "-c",
+                "echo boxcar-m4 > marker.txt",
+            ]),
+            &words(&["bash", "+n", "--norc", "-c", "echo boxcar-m4 > marker.txt"]),
+            &words(&[
+                "bash",
+                "--rcfile",
+                "/x",
+                "-ec",
+                "echo boxcar-m4 > marker.txt",
+            ]),
+        ] {
+            assert!(carries(&declared, "/bin/bash", ok), "{ok:?}");
         }
         // A program that only calls itself a shell runs no shell command.
         assert!(!carries(

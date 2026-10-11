@@ -656,3 +656,12 @@ Made while writing the plan, 2026-10-06:
   from the request flow's opener when its entry was evicted or learned
   later, and a close is held to it. A tool id over 256 bytes becomes a
   prefix and the hash of the whole id.
+- **Hardening after the sixth review.** Model names, stop reasons and
+  tool names are cut at 256 bytes. An event-stream line dropped for size
+  or budget voids the arguments of every call under way. A shell's
+  options are read as the shell reads them (an operand or `--` ends them,
+  `-o` takes one, `-n` or `-o noexec` runs nothing). A close for a span
+  whose request flow is on record but not yet whose waits for the sensor
+  like one whose own flow's opener is unknown; the reconciler's state
+  keeps at most 16384 flows. A form field's name is decoded before the
+  dump decides whether its value is a credential's.

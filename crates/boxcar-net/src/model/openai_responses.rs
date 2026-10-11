@@ -19,8 +19,8 @@ use serde_json::Value;
 use crate::http::Retained;
 
 use super::{
-    b3, content_text, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget, RequestInfo,
-    ResponseInfo, Text, ToolClose, ToolOpen,
+    b3, content_text, label, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget,
+    RequestInfo, ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -36,7 +36,7 @@ pub fn request_value(json: &Value) -> (RequestInfo, Vec<ToolClose>) {
     let input = json.get("input");
     let items = input.and_then(Value::as_array);
     let mut info = RequestInfo {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        model: json.get("model").and_then(Value::as_str).map(label),
         stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
         messages: match input {
             Some(Value::Array(items)) => items.len() as u32,
@@ -53,7 +53,7 @@ pub fn request_value(json: &Value) -> (RequestInfo, Vec<ToolClose>) {
         t.get("name")
             .or_else(|| t.get("type"))
             .and_then(Value::as_str)
-            .map(str::to_owned)
+            .map(label)
     };
     if let Some(tools) = json.get("tools").and_then(Value::as_array) {
         info.tools = tools.iter().filter_map(tool_name).take(64).collect();
@@ -112,11 +112,8 @@ pub fn response_value(json: &Value) -> (ResponseInfo, Vec<ToolOpen>) {
         }
     }
     let info = ResponseInfo {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
-        stop_reason: json
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        model: json.get("model").and_then(Value::as_str).map(label),
+        stop_reason: json.get("status").and_then(Value::as_str).map(label),
         text_bytes: text.bytes(),
         text_b3: text.b3(),
         tool_uses: opens.len() as u32,
@@ -202,6 +199,15 @@ impl Stream {
         self
     }
 
+    /// The stream lost bytes: every call under way lost a piece, and
+    /// keeps no arguments until a whole value replaces them.
+    pub fn lose_calls(&mut self) {
+        for call in self.calls.values_mut() {
+            call.lost = true;
+            call.arguments = String::new();
+        }
+    }
+
     /// One event from the stream: the calls it completes.
     pub fn event(&mut self, event: &SseEvent) -> Vec<ToolOpen> {
         let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
@@ -230,7 +236,7 @@ impl Stream {
                     .and_then(|r| r.get("model"))
                     .and_then(Value::as_str)
                 {
-                    self.info.model = Some(model.to_owned());
+                    self.info.model = Some(label(model));
                 }
             }
             "response.output_item.added" => {
@@ -345,12 +351,12 @@ impl Stream {
                     .and_then(|r| r.get("model"))
                     .and_then(Value::as_str)
                 {
-                    self.info.model = Some(model.to_owned());
+                    self.info.model = Some(label(model));
                 }
                 self.info.stop_reason = response
                     .and_then(|r| r.get("status"))
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .map(label)
                     .or_else(|| Some(kind.trim_start_matches("response.").to_owned()));
                 let usage = usage_of(response.and_then(|r| r.get("usage")));
                 if usage.input_tokens.is_some() || usage.output_tokens.is_some() {

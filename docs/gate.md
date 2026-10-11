@@ -142,7 +142,9 @@ says why.
   other text through the free-text scrub; a body that is not text is not
   written, a line saying how many bytes it was takes its place. A form
   body (the shape of an OAuth token exchange) has its credential fields'
-  values replaced and the rest scrubbed as text.
+  values replaced, a field's name read decoded (`%70assword` is
+  `password`; a name that does not decode counts as a credential's), and
+  the rest scrubbed as text.
   The raw plaintext is not written: it would hold what the records never
   do. An exchange upgraded to WebSocket gets `http/<flow>-<stream>.ws` as
   well: its messages one after another, each with its direction and size

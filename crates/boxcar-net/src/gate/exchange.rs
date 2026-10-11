@@ -420,9 +420,10 @@ impl Observation {
                             let before = exchange.sse_events.len();
                             sse.feed(&decoded, &mut exchange.sse_events);
                             exchange.sse_count += (exchange.sse_events.len() - before) as u64;
-                            if sse.overflowed() {
+                            if sse.take_drop() {
                                 exchange.response_degraded.get_or_insert("sse_line");
                                 self.model.degraded(stream, "sse_line");
+                                self.model.lose_calls(stream);
                             }
                         }
                         self.model.response_body(stream, exchange, out);
@@ -439,6 +440,11 @@ impl Observation {
                                 sse.feed(&rest, &mut exchange.sse_events);
                                 sse.finish(&mut exchange.sse_events);
                                 exchange.sse_count += (exchange.sse_events.len() - before) as u64;
+                                if sse.take_drop() {
+                                    exchange.response_degraded.get_or_insert("sse_line");
+                                    self.model.degraded(stream, "sse_line");
+                                    self.model.lose_calls(stream);
+                                }
                             }
                         }
                         self.dump_side(&exchange, false);

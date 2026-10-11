@@ -1574,6 +1574,44 @@ fn an_evicted_executor_is_recovered_from_the_flow() {
     assert_eq!(spans[0].procs, [300], "the forged close was refused");
 }
 
+/// A close that comes before the sensor says who opened the span's own
+/// request flow waits for it: another process's close is then dropped.
+#[test]
+fn a_close_waits_for_the_spans_own_opener() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let api = "203.0.113.5:443";
+    let names = ["api.example"];
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+    steps.push(log.heartbeat(2000));
+    // The agent's flow is on record; who opened it, not yet.
+    steps.push(log.connect(2050, 1, 41000, api, &names, Verdict::Allow));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "sleep 2"})));
+    steps.push(log.tcp_connect(2150, 400, 42000, api));
+    steps.push(log.connect(2160, 2, 42000, api, &names, Verdict::Allow));
+    steps.push(log.tool_close_on(2200, "toolu_01", "error", 2));
+    // Now the sensor's record of the agent opening flow 1 arrives.
+    steps.push(log.tcp_connect(2250, 200, 41000, api));
+    steps.push(log.exec(2300, 300, 200, 10, &["sh", "-c", "sleep 2"]));
+    for at in [3000, 4000] {
+        steps.push(log.heartbeat(at));
+    }
+    steps.push(log.exit(4300, 300, 10));
+    steps.push(log.tool_close(4500, "toolu_01", "ok"));
+    for at in [5000, 6000, 7000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert_eq!(spans[0].procs, [300], "the forged close was dropped");
+    assert_eq!(spans[0].executor_tgid, Some(200));
+}
+
 /// A program that only calls itself a shell (`argv[0]` is the caller's to
 /// set) does not run the declared command: it cannot hide that the real
 /// shell of the call ran something else.

@@ -12,7 +12,7 @@ use boxcar_proto::{Evidence, Finding, FindingCategory, Payload, Record, Verdict}
 use super::dns;
 use super::paths::indicator;
 use super::spans::{EffectKind, Spans};
-use super::state::{Flow, PendingConnect, PendingEffect, ProcKey, SensorConnect, State};
+use super::state::{Flow, PendingConnect, PendingEffect, ProcKey, SensorConnect, State, MAX_FLOWS};
 use super::{
     ReconcileConfig, ATTACH_DEADLINE_NS, JOIN_WINDOW_NS, LOW_CONFIDENCE_PENALTY, SILENCE_NS,
 };
@@ -308,6 +308,14 @@ pub fn observe(
         }
         Payload::NetConnect(connect) => {
             state.last_effect_ts = Some(ts);
+            if !state.flows.contains_key(&connect.flow) {
+                state.flow_order.push_back(connect.flow);
+                while state.flow_order.len() > MAX_FLOWS {
+                    if let Some(oldest) = state.flow_order.pop_front() {
+                        state.flows.remove(&oldest);
+                    }
+                }
+            }
             state.flows.insert(
                 connect.flow,
                 Flow {

@@ -31,6 +31,8 @@ pub struct SseParser {
     /// Some line was dropped so, or for want of room in the observer's
     /// budget.
     overflowed: bool,
+    /// A line was dropped since [`SseParser::take_drop`] last asked.
+    dropped: bool,
     /// What the buffered line and the event under way take of the
     /// observer's budget.
     share: Share,
@@ -85,6 +87,7 @@ impl SseParser {
             self.buf = Vec::new();
             self.skipping = true;
             self.overflowed = true;
+            self.dropped = true;
             self.share.set(self.held());
         }
     }
@@ -101,6 +104,12 @@ impl SseParser {
     /// Whether a line was dropped for running past [`MAX_EVENT_BYTES`].
     pub fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// Whether a line was dropped since the last call: the stream has a
+    /// hole there, and what was being gathered across it is not whole.
+    pub fn take_drop(&mut self) -> bool {
+        std::mem::take(&mut self.dropped)
     }
 
     /// The event under way, if any: a stream that ended without a blank

@@ -63,10 +63,12 @@ processes and ring 0 effects to the span:
   executor closes only by a `tool.close` that came over a flow that same
   process opened: one over a flow another process opened is dropped, and
   one over a flow whose opener is not known yet waits up to 2 s to learn
-  it, then is dropped if it never does. The span stays open for its own
-  close (or is recorded as it stands at the VM's stop). A span whose
-  executor is not known, or a session without the sensor's lineage
-  programs, takes any close: there is nothing to hold it to.
+  it, then is dropped if it never does; so does one for a span whose
+  request flow is on record but not yet who opened it. The span stays
+  open for its own close (or is recorded as it stands at the VM's stop).
+  A span whose request flow is not on record at all, or a session without
+  the sensor's lineage programs, takes any close: there is nothing to
+  hold it to. The state remembers the last 16384 flows.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
   `truncated`) and takes nothing more, nor its `tool.close`.
@@ -86,7 +88,9 @@ processes and ring 0 effects to the span:
   carries, compared exactly: a declared argv is the exec's argv, the file
   run being the program it names; a declared command line is the `-c`
   command of a shell the kernel ran (`proc.exec.filename`, never
-  `argv[0]`, which the caller sets) (spaces at either end aside), or
+  `argv[0]`, which the caller sets), its options read as the shell reads
+  them (they end at the first operand or `--`, `-o` takes one, and `-n`
+  or `-o noexec` runs nothing) (spaces at either end aside), or
   Claude Code's wrapper around exactly it read as a shell reads
   it (its own setup as whole `&&` parts, then `eval '<command>' <
   /dev/null && pwd -P >| <file>`, nothing after), or, run without a

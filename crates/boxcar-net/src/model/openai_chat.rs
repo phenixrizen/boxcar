@@ -18,8 +18,8 @@ use serde_json::Value;
 use crate::http::Retained;
 
 use super::{
-    b3, content_text, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget, RequestInfo,
-    ResponseInfo, Text, ToolClose, ToolOpen,
+    b3, content_text, label, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget,
+    RequestInfo, ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -36,7 +36,7 @@ pub fn request(body: &[u8]) -> Result<(RequestInfo, Vec<ToolClose>), &'static st
         })
     });
     let mut info = RequestInfo {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        model: json.get("model").and_then(Value::as_str).map(label),
         stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
         messages: messages.map_or(0, |m| m.len() as u32),
         system_b3: system
@@ -56,7 +56,7 @@ pub fn request(body: &[u8]) -> Result<(RequestInfo, Vec<ToolClose>), &'static st
                     .and_then(Value::as_str)
             })
             .take(64)
-            .map(str::to_owned)
+            .map(label)
             .collect();
     }
     // The tool results are the `tool` messages after the last assistant
@@ -95,7 +95,7 @@ pub fn response(body: &[u8]) -> Result<(ResponseInfo, Vec<ToolOpen>), &'static s
         finish = choice
             .get("finish_reason")
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .map(label);
         let message = choice.get("message");
         if let Some(content) = message.and_then(|m| m.get("content")) {
             text.push(&content_text(content));
@@ -111,7 +111,7 @@ pub fn response(body: &[u8]) -> Result<(ResponseInfo, Vec<ToolOpen>), &'static s
     }
     let usage = json.get("usage");
     let info = ResponseInfo {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        model: json.get("model").and_then(Value::as_str).map(label),
         stop_reason: finish,
         input_tokens: u64_of(usage.and_then(|u| u.get("prompt_tokens"))),
         output_tokens: u64_of(usage.and_then(|u| u.get("completion_tokens"))),
@@ -176,6 +176,15 @@ impl Stream {
         self
     }
 
+    /// The stream lost bytes: every call under way lost a piece, and
+    /// keeps no arguments.
+    pub fn lose_calls(&mut self) {
+        for call in self.calls.values_mut() {
+            call.lost = true;
+            call.arguments = String::new();
+        }
+    }
+
     /// One chunk: the tool calls it completes (at a finish reason, or at
     /// `[DONE]`).
     pub fn event(&mut self, event: &SseEvent) -> Vec<ToolOpen> {
@@ -190,7 +199,7 @@ impl Stream {
             return Vec::new();
         };
         if let Some(model) = data.get("model").and_then(Value::as_str) {
-            self.info.model = Some(model.to_owned());
+            self.info.model = Some(label(model));
         }
         if let Some(usage) = data.get("usage").filter(|u| !u.is_null()) {
             self.info.input_tokens = u64_of(usage.get("prompt_tokens"));
@@ -252,7 +261,7 @@ impl Stream {
                 }
             }
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                self.info.stop_reason = Some(reason.to_owned());
+                self.info.stop_reason = Some(label(reason));
                 finished = true;
             }
         }

@@ -19,8 +19,8 @@ use serde_json::Value;
 use crate::http::Retained;
 
 use super::{
-    b3, content_text, tool_close, tool_open, tool_open_lost, tool_open_text, u64_of, CallBudget,
-    RequestInfo, ResponseInfo, Text, ToolClose, ToolOpen,
+    b3, content_text, label, tool_close, tool_open, tool_open_lost, tool_open_text, u64_of,
+    CallBudget, RequestInfo, ResponseInfo, Text, ToolClose, ToolOpen,
 };
 use crate::http::SseEvent;
 
@@ -29,7 +29,7 @@ pub fn request(body: &[u8]) -> Result<(RequestInfo, Vec<ToolClose>), &'static st
     let json: Value = serde_json::from_slice(body).map_err(|_| "request_json")?;
     let messages = json.get("messages").and_then(Value::as_array);
     let mut info = RequestInfo {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        model: json.get("model").and_then(Value::as_str).map(label),
         stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
         messages: messages.map_or(0, |m| m.len() as u32),
         system_b3: json
@@ -43,7 +43,7 @@ pub fn request(body: &[u8]) -> Result<(RequestInfo, Vec<ToolClose>), &'static st
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
             .take(64)
-            .map(str::to_owned)
+            .map(label)
             .collect();
     }
     // The tool results are in the last message, which the agent just
@@ -95,11 +95,8 @@ pub fn response(body: &[u8]) -> Result<(ResponseInfo, Vec<ToolOpen>), &'static s
     }
     let usage = json.get("usage");
     let info = ResponseInfo {
-        model: json.get("model").and_then(Value::as_str).map(str::to_owned),
-        stop_reason: json
-            .get("stop_reason")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        model: json.get("model").and_then(Value::as_str).map(label),
+        stop_reason: json.get("stop_reason").and_then(Value::as_str).map(label),
         input_tokens: u64_of(usage.and_then(|u| u.get("input_tokens"))),
         output_tokens: u64_of(usage.and_then(|u| u.get("output_tokens"))),
         cache_read_tokens: u64_of(usage.and_then(|u| u.get("cache_read_input_tokens"))),
@@ -143,6 +140,15 @@ impl Stream {
         self
     }
 
+    /// The stream lost bytes: every call under way lost a piece, and
+    /// keeps no arguments.
+    pub fn lose_calls(&mut self) {
+        for block in self.blocks.values_mut() {
+            block.lost = true;
+            block.json = String::new();
+        }
+    }
+
     /// One event: the `tool_use` blocks it completes.
     pub fn event(&mut self, event: &SseEvent) -> Vec<ToolOpen> {
         let mut opens = Vec::new();
@@ -165,7 +171,7 @@ impl Stream {
                 self.info.model = message
                     .and_then(|m| m.get("model"))
                     .and_then(Value::as_str)
-                    .map(str::to_owned);
+                    .map(label);
                 let usage = message.and_then(|m| m.get("usage"));
                 self.info.input_tokens = u64_of(usage.and_then(|u| u.get("input_tokens")));
                 self.info.cache_read_tokens =
@@ -242,7 +248,7 @@ impl Stream {
                     .and_then(|d| d.get("stop_reason"))
                     .and_then(Value::as_str)
                 {
-                    self.info.stop_reason = Some(reason.to_owned());
+                    self.info.stop_reason = Some(label(reason));
                 }
                 if let Some(output) = u64_of(data.get("usage").and_then(|u| u.get("output_tokens")))
                 {

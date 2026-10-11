@@ -158,6 +158,9 @@ impl Sensor {
     }
 }
 
+/// The most flows the state remembers; past it the oldest goes.
+pub const MAX_FLOWS: usize = 16384;
+
 #[derive(Debug, Default)]
 pub struct State {
     procs: HashMap<ProcKey, Proc>,
@@ -168,6 +171,9 @@ pub struct State {
     /// join window).
     pub pending_connects: VecDeque<PendingConnect>,
     pub flows: HashMap<u64, Flow>,
+    /// The flows in the order they came, to let the oldest go past
+    /// [`MAX_FLOWS`].
+    pub flow_order: VecDeque<u64>,
     pub sensor_connects: VecDeque<SensorConnect>,
     pub sensor: Sensor,
     pub dns: DnsCache,

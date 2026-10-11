@@ -115,6 +115,15 @@ pub const MAX_TOOL_NAME: usize = 1024;
 
 /// `text` cut to at most `max` bytes at a character boundary, nothing
 /// added: the same text always cuts the same way.
+/// The most bytes of a model's name or a stop reason kept.
+pub const MAX_LABEL: usize = 256;
+
+/// A short label from a reply or request (a model's name, a stop reason),
+/// cut at [`MAX_LABEL`].
+pub fn label(text: &str) -> String {
+    capped(text, MAX_LABEL)
+}
+
 /// A tool call's id as it is kept: itself, or past [`MAX_TOOL_ID`] its
 /// first [`ID_PREFIX`] bytes, `~`, and blake3 of the whole id.
 pub fn tool_id(id: &str) -> String {
