@@ -122,7 +122,9 @@ processes and ring 0 effects to the span:
   `net.connect` the span of the process its `proc.tcp_connect` named. A
   filesystem effect by the agent itself (the root or a bound executor,
   the executor by its identity, tgid and start time, since one that has
-  exited may have left its pid to another process; any process in no
+  exited may have left its pid to another process, and so at every step
+  of a process's ancestry when the reconciler asks whether it descends
+  from the agent; any process in no
   span when the sensor's lineage programs are not
   attached, since then none can be told apart) is the agent's own work (a
   `Write` tool writes from the agent): it joins the only open write tool

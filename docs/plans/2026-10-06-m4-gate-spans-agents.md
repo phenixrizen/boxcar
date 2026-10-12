@@ -728,10 +728,13 @@ Made while writing the plan, 2026-10-06:
   sends the guest on flows whose TLS it ended: its own TLS records,
   ciphertext whose keys never leave the VMM. The first version judged a
   connection TLS by its first payload's handshake header; a guest
-  chooses every byte it sends, so nothing the guest sends is kept now,
-  and the relay names the flows whose TLS the gate ends. With the same
-  change an executor is the agent by its identity (tgid and start time),
-  not its pid, which an exited executor leaves to another process; and
-  the scrubber redacts the password of curl's and wget's
+  chooses every byte it sends, so nothing the guest sends is kept now.
+  A frame to the guest keeps its payload only when the stack, handing it
+  over, finds its flow is one whose TLS the gate is ending then (a mark
+  the relay sent the dump thread could outlive a flow whose closing
+  frames the dump had no room for). With the same change an executor is
+  the agent by its identity (tgid and start time), not its pid, which an
+  exited executor leaves to another process, at every step of an
+  ancestry; and the scrubber redacts the password of curl's and wget's
   `-u`/`--user`/`-U`/`--proxy-user` values, separate, attached or after
-  `=`.
+  `=`, an argv's value whole, spaces and all.

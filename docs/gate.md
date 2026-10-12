@@ -127,9 +127,10 @@ says why.
   ARP, DNS and DHCP are kept whole. With `--dump-payloads` the frames
   the gate sends the guest on a flow whose TLS it ended are written
   whole: their payload is the gate's own TLS records, ciphertext whose
-  keys never leave the VMM. The relay tells the dump when the gate takes
-  a flow's TLS; the guest opening a connection on the same ends again
-  undoes it. What the guest sends is cut whatever it looks like, since a
+  keys never leave the VMM. The stack asks the relay as it hands each
+  frame to the guest whether the gate is ending that flow's TLS at that
+  moment, so nothing is remembered that could outlive the flow. What the
+  guest sends is cut whatever it looks like, since a
   guest can dress anything as TLS, and so is every other flow's payload,
   a plain HTTP flow's included. A frame the dump's
   queue had no room for is dropped and counted (`net.drop{reason:"dump"}`);

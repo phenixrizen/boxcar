@@ -83,7 +83,6 @@ use smoltcp::wire::EthernetAddress;
 use super::flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
 use super::{TcpLimits, GUEST_TIMEOUT, KEEP_ALIVE, SOCKET_BUFFER};
 use crate::audit::{self, close_record, DropReason};
-use crate::dump::FrameDump;
 use crate::frame;
 use crate::gate::{Direction, Inspect, InspectConfig, Message, Observer, Phase};
 use crate::http_host::{self, Request};
@@ -154,8 +153,6 @@ struct Env<'a> {
     /// The gate, when the session inspects.
     inspect: Option<&'a Arc<InspectConfig>>,
     observer: Option<&'a Observer>,
-    /// The frame dump, told which flows' TLS the gate ends.
-    dump: Option<&'a FrameDump>,
 }
 
 /// What one look at a flow came to.
@@ -374,6 +371,16 @@ impl Relay {
 
     /// The guest sent a FIN for `guest` → `dst` at sequence number `fin`.
     /// The first a flow sees is where its stream ends.
+    /// Whether the gate is ending the TLS of the flow from `guest` to
+    /// `dst` now: what the stack sends the guest on it is the gate's own
+    /// TLS records.
+    pub(crate) fn gate_tls(&self, guest: SocketAddrV4, dst: SocketAddrV4) -> bool {
+        self.table
+            .id_of(guest, dst)
+            .and_then(|id| self.table.get(id))
+            .is_some_and(|flow| flow.inspect.is_some())
+    }
+
     pub(crate) fn guest_fin_at(&mut self, guest: SocketAddrV4, dst: SocketAddrV4, fin: u32) {
         let id = self.table.id_of(guest, dst);
         if let Some(flow) = id.and_then(|id| self.table.get_mut(id)) {
@@ -449,7 +456,6 @@ impl Relay {
             now: cx.now,
             inspect: cx.inspect,
             observer: cx.observer,
-            dump: cx.dump,
         };
         for flow in self.table.flows_mut() {
             let socket = cx.sockets.get_mut::<tcp::Socket>(flow.socket);
@@ -606,7 +612,6 @@ impl Relay {
             now: cx.now,
             inspect: cx.inspect,
             observer: cx.observer,
-            dump: cx.dump,
         };
         let socket = cx.sockets.get_mut::<tcp::Socket>(flow.socket);
         let step = pump(flow, socket, &env);
@@ -1230,10 +1235,6 @@ fn start_inspect(flow: &mut Flow, start: InspectStart, env: &Env) -> Option<Step
         Ok(inspect) => {
             flow.inspect = Some(Box::new(inspect));
             flow.state = FlowState::Inspecting;
-            // What the gate sends the guest from here is its own TLS.
-            if let Some(dump) = env.dump {
-                dump.gate_tls(flow.guest, flow.dst);
-            }
             None
         }
         Err(reason) => {

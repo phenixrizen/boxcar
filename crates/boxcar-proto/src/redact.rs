@@ -91,6 +91,7 @@ fn texts(v: &mut Value) {
                 match item {
                     Value::String(_) if flag => *item = Value::String(REDACTED.to_owned()),
                     Value::String(text) if user => *text = scrub_text(&user_value(text)),
+                    Value::String(text) => *text = scrub_arg(text),
                     _ => texts(item),
                 }
                 flag = next_flag;
@@ -115,13 +116,23 @@ pub fn scrub_argv(argv: &[String]) -> Vec<String> {
             } else if user {
                 scrub_text(&user_value(arg))
             } else {
-                scrub_text(arg)
+                scrub_arg(arg)
             };
             flag = is_secret_flag(arg);
             user = is_user_flag(arg);
             out
         })
         .collect()
+}
+
+/// One whole argument through [`scrub_text`], a user flag with its value
+/// attached (`--user=alice:pw`) taken whole first: in an argv a space
+/// does not end the value.
+fn scrub_arg(arg: &str) -> String {
+    match attached_user(arg) {
+        Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
+        None => scrub_text(arg),
+    }
 }
 
 /// Flags whose value is `user:password` (curl's, wget's): `-u`,
@@ -795,6 +806,34 @@ mod tests {
         let mut v = json!({"argv": argv});
         scrub_deep(&mut v);
         assert_eq!(v, json!({"argv": want}));
+        // In an argv a value is the whole argument, spaces and quotes in
+        // it included.
+        let argv: Vec<String> = [
+            "curl",
+            "--user=alice:short pass",
+            "-ualice: leading",
+            "-u",
+            "bob:has space",
+            "--proxy-user=p:\"quoted\" pw",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let want = [
+            "curl",
+            "--user=alice:[redacted]",
+            "-ualice:[redacted]",
+            "-u",
+            "bob:[redacted]",
+            "--proxy-user=p:[redacted]",
+        ];
+        assert_eq!(scrub_argv(&argv), want);
+        let mut v = json!({"argv": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}));
+        assert_eq!(
+            scrub_text("curl --user='alice:short pass' x"),
+            "curl --user='alice:[redacted]' x"
+        );
     }
 
     #[test]

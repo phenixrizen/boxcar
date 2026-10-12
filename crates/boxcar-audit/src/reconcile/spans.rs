@@ -1253,33 +1253,35 @@ impl Spans {
             .get(span_id)
             .filter(|span| span.executor_bound)
             .and_then(|span| span.executor);
-        let Some(target) = executor.map(|key| key.tgid).or(self.session_pid) else {
+        if executor.is_none() && self.session_pid.is_none() {
             return true;
+        }
+        // The agent: the bound executor by its identity (one that has
+        // exited may have left its pid to another process), else the
+        // session root by its pid.
+        let is_agent = |candidate: ProcKey| match executor {
+            Some(executor) => candidate == executor,
+            None => self.session_pid == Some(candidate.tgid),
         };
         let mut current = key;
         for depth in 0..MAX_ANCESTRY {
             let Some(proc) = state.proc(current) else {
                 return false;
             };
-            // The agent itself is in no span; a process only on the
-            // executor's old pid is not the agent, and its own ancestry is
-            // followed as any other's. Above it, the pid is enough.
-            if proc.key.tgid == target && (depth > 0 || executor.is_none_or(|e| e == proc.key)) {
+            if is_agent(proc.key) {
                 return depth > 0;
-            }
-            if proc.ppid == target {
-                return true;
             }
             if proc.ppid <= 1 {
                 return false;
             }
-            let Some(parent) = state.attribute(proc.ppid, proc.first_ts) else {
-                return false;
-            };
-            if parent == current {
-                return false;
+            match state.attribute(proc.ppid, proc.first_ts) {
+                Some(parent) if parent == current => return false,
+                Some(parent) if is_agent(parent) => return true,
+                Some(parent) => current = parent,
+                // A parent not on record: the session root, alone, is
+                // known by its pid.
+                None => return executor.is_none() && self.session_pid == Some(proc.ppid),
             }
-            current = parent;
         }
         false
     }

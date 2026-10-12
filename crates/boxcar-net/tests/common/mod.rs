@@ -60,6 +60,15 @@ pub fn harness_gate(
     policy: Policy,
     gate: Option<(Arc<boxcar_net::InspectConfig>, boxcar_net::gate::Observer)>,
 ) -> Harness {
+    harness_gate_dump(policy, gate, None)
+}
+
+/// [`harness_gate`] with the frame dump.
+pub fn harness_gate_dump(
+    policy: Policy,
+    gate: Option<(Arc<boxcar_net::InspectConfig>, boxcar_net::gate::Observer)>,
+    dump: Option<boxcar_net::FrameDump>,
+) -> Harness {
     let mut h = harness_config(policy, |_| {});
     // The stack is rebuilt with the gate from the same pieces.
     let stack = NetStack::new(
@@ -71,7 +80,8 @@ pub fn harness_gate(
         Arc::clone(&h.policy),
     )
     .unwrap()
-    .with_inspect(gate);
+    .with_inspect(gate)
+    .with_dump(dump);
     h.stack = stack;
     h
 }

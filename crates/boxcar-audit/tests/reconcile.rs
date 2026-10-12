@@ -1250,8 +1250,11 @@ fn a_process_on_the_executors_old_pid_is_not_the_agent() {
         json!({"file_path": "/workspace/notes.txt", "content": "hello"}),
     ));
     steps.push(log.exit(2100, 200, 5));
-    // Another process, given the agent's old pid.
+    // Another process, given the agent's old pid, and a child of it.
     steps.push(log.exec(2200, 200, 100, 50, &["sh", "-c", "echo x > notes.txt"]));
+    steps.push(log.fork(2250, 200, 201, 60, false));
+    steps.push(log.exec(2260, 201, 200, 60, &["touch", "other.txt"]));
+    steps.push(log.fs_create(2270, 201, "/other.txt"));
     let create = log.fs_create(2300, 200, "/notes.txt");
     let close = log.fs_close(2310, 200, "/notes.txt", 2);
     let seqs: Vec<u64> = [&create, &close]
@@ -1273,6 +1276,9 @@ fn a_process_on_the_executors_old_pid_is_not_the_agent() {
         "{:?}",
         spans[0]
     );
+    // Its child is no tool of the old agent's either.
+    assert!(spans[0].procs.is_empty(), "{:?}", spans[0]);
+    assert!(spans[0].effects.is_empty(), "{:?}", spans[0]);
 }
 
 /// A Bash tool call whose process connected somewhere the command never

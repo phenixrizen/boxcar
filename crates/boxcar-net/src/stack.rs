@@ -342,15 +342,18 @@ impl NetStack {
         }
     }
 
-    /// The next frame for the guest, if any; a copy goes to the dump.
+    /// The next frame for the guest, if any; a copy goes to the dump,
+    /// whole in payload mode only on a flow whose TLS the gate is ending
+    /// as it goes (the gate's own records).
     pub fn pop_host_frame(&mut self) -> Option<Vec<u8>> {
         let frame = self.pipe.to_guest.pop_front()?;
-        if self
-            .dump
-            .as_ref()
-            .is_some_and(|dump| !dump.push_to_guest(&frame))
-        {
-            self.drop_frame(DropReason::Dump, Instant::now());
+        if let Some(dump) = self.dump.as_ref() {
+            let gate_tls = dump.payloads()
+                && crate::dump::tcp_ends(&frame)
+                    .is_some_and(|(remote, guest)| self.tcp.gate_tls(guest, remote));
+            if !dump.push_to_guest(&frame, gate_tls) {
+                self.drop_frame(DropReason::Dump, Instant::now());
+            }
         }
         Some(frame)
     }
@@ -567,7 +570,6 @@ impl NetStack {
             stamp: smoltcp_time(self.epoch, now),
             inspect: self.inspect.as_ref(),
             observer: self.observer.as_ref(),
-            dump: self.dump.as_ref(),
         };
         Parts {
             tcp: &mut self.tcp,
@@ -796,8 +798,6 @@ pub(crate) struct Ctx<'a> {
     /// The gate, when the session inspects.
     pub(crate) inspect: Option<&'a Arc<InspectConfig>>,
     pub(crate) observer: Option<&'a Observer>,
-    /// The frame dump, told which flows' TLS the gate ends.
-    pub(crate) dump: Option<&'a FrameDump>,
 }
 
 impl Ctx<'_> {

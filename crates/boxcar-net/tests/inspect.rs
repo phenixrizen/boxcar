@@ -20,10 +20,10 @@ use std::thread;
 use std::time::Duration;
 
 use boxcar_net::gate::{Direction, Message, Observer};
-use boxcar_net::{InspectConfig, Policy, SessionCa, Verdict};
+use boxcar_net::{DumpDir, FrameDump, InspectConfig, Policy, SessionCa, Verdict};
 use boxcar_proto::{NetClose, NetDrop, NetInspect, NetTls, Payload};
 use common::rig::{host_peer, Rig};
-use common::{harness_gate, resolve};
+use common::{harness_gate, harness_gate_dump, resolve};
 use crossbeam_channel::Receiver;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
@@ -294,6 +294,106 @@ fn an_inspected_tls_flow_is_ended_relayed_and_recorded() {
         matches!(messages.last(), Some(Message::Close { .. })),
         "{messages:?}"
     );
+}
+
+/// The source ports of the TCP/IPv4 records in `pcap` that hold payload.
+fn payload_ports(pcap: &[u8]) -> Vec<u16> {
+    let u32_at = |at: usize| u32::from_le_bytes(pcap[at..at + 4].try_into().unwrap());
+    let mut ports = Vec::new();
+    let mut at = 24;
+    while at + 16 <= pcap.len() {
+        let included = u32_at(at + 8) as usize;
+        let frame = &pcap[at + 16..at + 16 + included];
+        if frame.len() >= 54 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
+            let ihl = usize::from(frame[14] & 0x0f) * 4;
+            let tcp = &frame[14 + ihl..];
+            if tcp.len() > usize::from(tcp[12] >> 4) * 4 {
+                ports.push(u16::from_be_bytes([tcp[0], tcp[1]]));
+            }
+        }
+        at += 16 + included;
+    }
+    ports
+}
+
+/// With `--dump-payloads`, an inspected TLS flow's frames from the gate
+/// keep their payload (the gate's own TLS records); the guest's do not.
+#[test]
+fn payload_mode_keeps_the_gates_tls_records_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = DumpDir::prepare(&tmp.path().join("dump"), &[])
+        .unwrap()
+        .with_payloads(true);
+    let (dump, thread) = FrameDump::start(&dir).unwrap();
+    let request = b"GET / HTTP/1.1\r\nHost: api.example\r\n\r\n".to_vec();
+    let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+    let (addr, cert, up) = upstream(&["http/1.1"], request.len(), reply.clone());
+    let (cfg, observer, _rx) = gate(&[cert], 4096);
+    let policy = Policy::parse(&[
+        "allow 127.0.0.0/8".to_owned(),
+        format!("inspect 127.0.0.1:{}", addr.port()),
+    ])
+    .unwrap();
+    let mut rig = Rig::new(harness_gate_dump(
+        policy,
+        Some((Arc::clone(&cfg), observer)),
+        Some(dump),
+    ));
+    let (handle, _guest) = rig.connect(addr);
+    let mut client = guest_client(cfg.ca(), &["http/1.1"]);
+    drive(&mut rig, handle, &mut client, "the guest handshake", |c| {
+        !c.is_handshaking()
+    });
+    client.writer().write_all(&request).unwrap();
+    let mut got = Vec::new();
+    drive(&mut rig, handle, &mut client, "the reply", |c| {
+        let mut buf = [0; 4096];
+        if let Ok(n) = c.reader().read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+        got.len() >= reply.len()
+    });
+    rig.socket(handle).close();
+    rig.settle();
+    assert_eq!(up.join().unwrap(), request);
+    drop(rig.events());
+    assert!(thread.join(LIMIT));
+    let ports = payload_ports(&std::fs::read(dir.frames()).unwrap());
+    assert!(!ports.is_empty(), "no payload kept");
+    assert!(ports.iter().all(|p| *p == addr.port()), "{ports:?}");
+}
+
+/// With `--dump-payloads`, an inspected plain HTTP flow keeps no payload:
+/// the host's reply is plaintext.
+#[test]
+fn payload_mode_keeps_no_plain_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = DumpDir::prepare(&tmp.path().join("dump"), &[])
+        .unwrap()
+        .with_payloads(true);
+    let (dump, thread) = FrameDump::start(&dir).unwrap();
+    let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let reply: &'static [u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
+    let (addr, peer) = host_peer(request.len(), reply);
+    let (cfg, observer, _rx) = gate(&[], 4096);
+    let policy = Policy::parse(&[
+        "default allow".to_owned(),
+        "allow 127.0.0.0/8".to_owned(),
+        "inspect example.com".to_owned(),
+    ])
+    .unwrap();
+    let mut rig = Rig::new(harness_gate_dump(policy, Some((cfg, observer)), Some(dump)));
+    resolve(&mut rig.h, "example.com", std::net::Ipv4Addr::LOCALHOST);
+    let (handle, _guest) = rig.connect(addr);
+    rig.send(handle, request);
+    assert_eq!(rig.recv(handle, reply.len()), reply);
+    rig.socket(handle).close();
+    assert_eq!(rig.seen(&peer).bytes, request);
+    rig.settle();
+    drop(rig.events());
+    assert!(thread.join(LIMIT));
+    let ports = payload_ports(&std::fs::read(dir.frames()).unwrap());
+    assert!(ports.is_empty(), "{ports:?}");
 }
 
 /// Plain HTTP an `inspect` line names is relayed as it is, and the
