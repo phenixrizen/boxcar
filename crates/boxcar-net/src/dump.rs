@@ -9,10 +9,11 @@
 //!   Ethernet), cut after the frame's headers ([`headers_len`]): a TCP
 //!   payload is not written, plain HTTP's credentials included; each
 //!   record keeps the frame's original length. With `--dump-payloads`
-//!   ([`DumpDir::with_payloads`]) a TLS connection's segments are written
-//!   whole: one whose SYN the dump saw and whose first payload, either
-//!   way, is a TLS handshake record ([`TlsConns`]). That is ciphertext,
-//!   whose keys never leave the VMM; every other payload is still cut.
+//!   ([`DumpDir::with_payloads`]) the frames the gate sends the guest on
+//!   a flow whose TLS it ended are written whole ([`GateTls`]): the
+//!   gate's own TLS records, ciphertext whose keys never leave the VMM.
+//!   What the guest sends is cut whatever it looks like, and so is every
+//!   other flow's payload, a plain HTTP flow's included.
 //!   The net thread copies each frame into a bounded channel
 //!   with `try_send`; the `dump` thread writes them. A frame the channel
 //!   had no room for is dropped and counted (`net.drop{reason:"dump"}`):
@@ -33,9 +34,10 @@
 //! neither a share nor inside one, nor hold one: the audit directory's
 //! rule.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::net::SocketAddrV4;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
@@ -128,7 +130,7 @@ impl DumpDir {
     }
 
     /// The dump with `frames.pcap` keeping the payloads of TLS
-    /// connections when `payloads` ([`TlsConns`]).
+    /// flows' gate side when `payloads` ([`GateTls`]).
     pub fn with_payloads(mut self, payloads: bool) -> DumpDir {
         self.payloads = payloads;
         self
@@ -204,18 +206,29 @@ pub fn create(path: &Path) -> io::Result<File> {
 /// One frame on its way to the `dump` thread.
 struct Frame {
     at: SystemTime,
-    /// The frame's headers ([`headers_len`]).
+    /// The frame's headers ([`headers_len`]); in payload mode, the whole
+    /// of a frame to the guest.
     bytes: Vec<u8>,
     /// The whole frame's length.
     len: usize,
+    /// The stack sent it to the guest.
+    to_guest: bool,
+}
+
+/// What the `dump` thread is told, in order.
+enum Item {
+    Frame(Frame),
+    /// The gate ended this connection's TLS (payload mode).
+    GateTls(ConnKey),
 }
 
 /// The net thread's end of the frame dump. Cheap to clone: every stack of
 /// the device feeds the same file.
 #[derive(Clone)]
 pub struct FrameDump {
-    tx: Sender<Frame>,
-    /// Frames go whole to the thread, which cuts them ([`TlsConns`]).
+    tx: Sender<Item>,
+    /// Frames to the guest go whole to the thread, which cuts them
+    /// ([`GateTls`]).
     payloads: bool,
 }
 
@@ -229,26 +242,47 @@ impl FrameDump {
         let payloads = dir.payloads();
         let thread = thread::Builder::new()
             .name("dump".into())
-            .spawn(move || write_frames(rx, file, payloads.then(TlsConns::default)))?;
+            .spawn(move || write_frames(rx, file, payloads.then(GateTls::default)))?;
         Ok((FrameDump { tx, payloads }, DumpThread { thread }))
     }
 
-    /// Queues a frame for the file, and says whether there was room; the
-    /// caller counts one there was not. Never waits.
-    pub fn push(&self, bytes: &[u8]) -> bool {
+    /// Queues a frame the guest sent for the file, cut to its headers,
+    /// and says whether there was room; the caller counts one there was
+    /// not. Never waits.
+    pub fn push_from_guest(&self, bytes: &[u8]) -> bool {
+        self.push(bytes, headers_len(bytes), false)
+    }
+
+    /// Queues a frame the stack sent the guest: whole in payload mode,
+    /// for the thread to cut ([`GateTls`]), else cut to its headers.
+    pub fn push_to_guest(&self, bytes: &[u8]) -> bool {
         let kept = if self.payloads {
             bytes.len()
         } else {
             headers_len(bytes)
         };
+        self.push(bytes, kept, true)
+    }
+
+    fn push(&self, bytes: &[u8], kept: usize, to_guest: bool) -> bool {
         let frame = Frame {
             at: SystemTime::now(),
             bytes: bytes[..kept].to_vec(),
             len: bytes.len(),
+            to_guest,
         };
-        match self.tx.try_send(frame) {
+        match self.tx.try_send(Item::Frame(frame)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// The gate ended the TLS of the connection between `guest` and
+    /// `remote`: in payload mode, what it sends the guest on it is kept.
+    /// With no room to say so, it is cut like the rest.
+    pub fn gate_tls(&self, guest: SocketAddrV4, remote: SocketAddrV4) {
+        if self.payloads {
+            let _ = self.tx.try_send(Item::GateTls(conn_key(guest, remote)));
         }
     }
 }
@@ -274,20 +308,29 @@ impl DumpThread {
     }
 }
 
-/// The thread's body: each frame as a pcap record, cut by `tls` in
-/// payload mode (the frames come whole). A write that fails ends the
-/// file; the frames keep being taken so the queue drains.
-fn write_frames(rx: Receiver<Frame>, file: File, mut tls: Option<TlsConns>) {
+/// The thread's body: each frame as a pcap record, cut by `gate` in
+/// payload mode. A write that fails ends the file; the frames keep being
+/// taken so the queue drains.
+fn write_frames(rx: Receiver<Item>, file: File, mut gate: Option<GateTls>) {
     let mut out = io::BufWriter::new(file);
     let mut failed = false;
-    for frame in rx {
+    for item in rx {
+        let frame = match item {
+            Item::Frame(frame) => frame,
+            Item::GateTls(key) => {
+                if let Some(gate) = gate.as_mut() {
+                    gate.mark(key);
+                }
+                continue;
+            }
+        };
+        let kept = match gate.as_mut() {
+            Some(gate) => gate.kept_len(&frame.bytes, frame.to_guest),
+            None => frame.bytes.len(),
+        };
         if failed {
             continue;
         }
-        let kept = match tls.as_mut() {
-            Some(tls) => tls.kept_len(&frame.bytes),
-            None => frame.bytes.len(),
-        };
         if out
             .write_all(&pcap_record(frame.at, &frame.bytes[..kept], frame.len))
             .is_err()
@@ -325,88 +368,76 @@ pub fn pcap_record(at: SystemTime, frame: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
-/// The most TCP connections payload mode remembers; past it the oldest
-/// goes, and its later segments are cut.
-const MAX_TLS_CONNS: usize = 4096;
+/// The most connections payload mode remembers as the gate's TLS; past
+/// it the oldest goes, and its later frames are cut.
+const MAX_GATE_TLS: usize = 4096;
 
 /// A TCP connection by its two ends, the lesser first: the same either
 /// way.
 type ConnKey = (([u8; 16], u16), ([u8; 16], u16));
 
-/// What payload mode knows of a connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Conn {
-    /// Its SYN was seen, no payload yet.
-    Opened,
-    /// Its first payload was a TLS handshake record: kept whole.
-    Tls,
-    /// Its first payload was anything else: cut.
-    Plain,
+/// The key of the connection between `a` and `b`.
+fn conn_key(a: SocketAddrV4, b: SocketAddrV4) -> ConnKey {
+    let end = |addr: SocketAddrV4| {
+        let mut ip = [0u8; 16];
+        ip[..4].copy_from_slice(&addr.ip().octets());
+        (ip, addr.port())
+    };
+    let (a, b) = (end(a), end(b));
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
-/// Payload mode's view of the TCP connections: a connection's segments
-/// are kept whole only when the dump saw it open (its SYN) and its first
-/// payload, either way, starts a TLS handshake record. Every other frame
-/// is cut as [`headers_len`] cuts it: a connection seen only mid-stream,
-/// or forgotten, never has its payload written.
+/// Payload mode's view: the connections whose TLS the gate ended, as the
+/// relay said ([`FrameDump::gate_tls`]). A frame to the guest on one of
+/// them is written whole: its payload is the gate's own TLS records. Every
+/// other frame is cut as [`headers_len`] cuts it, and the guest's own
+/// frames always are, whatever they hold. The guest opening a connection
+/// on the same ends again (its SYN) forgets the earlier one.
 #[derive(Debug, Default)]
-pub struct TlsConns {
-    conns: HashMap<ConnKey, Conn>,
+pub struct GateTls {
+    conns: HashSet<ConnKey>,
     order: VecDeque<ConnKey>,
 }
 
-impl TlsConns {
+impl GateTls {
+    /// The gate ended the TLS of connection `key`.
+    pub fn mark(&mut self, key: ConnKey) {
+        if self.conns.insert(key) {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_GATE_TLS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.conns.remove(&oldest);
+            }
+        }
+    }
+
     /// How much of `frame` payload mode keeps.
-    pub fn kept_len(&mut self, frame: &[u8]) -> usize {
+    pub fn kept_len(&mut self, frame: &[u8], to_guest: bool) -> usize {
         let headers = headers_len(frame);
         let Some(segment) = tcp_segment(frame) else {
             return headers;
         };
-        // A SYN alone opens a connection, whatever came before on its ends.
-        if segment.flags & (TCP_SYN | TCP_ACK) == TCP_SYN {
-            self.open(segment.key);
-        }
-        let payload = &frame[segment.payload.clone()];
-        let conn = match self.conns.get(&segment.key).copied() {
-            Some(Conn::Opened) if !payload.is_empty() => {
-                let conn = if is_tls_handshake(payload) {
-                    Conn::Tls
-                } else {
-                    Conn::Plain
-                };
-                self.conns.insert(segment.key, conn);
-                conn
+        if !to_guest {
+            if segment.flags & (TCP_SYN | TCP_ACK) == TCP_SYN && self.conns.remove(&segment.key) {
+                self.order.retain(|key| *key != segment.key);
             }
-            Some(conn) => conn,
-            None => Conn::Plain,
-        };
-        if conn == Conn::Tls && !payload.is_empty() {
+            return headers;
+        }
+        if self.conns.contains(&segment.key) && !segment.payload.is_empty() {
             segment.payload.end
         } else {
             headers
-        }
-    }
-
-    fn open(&mut self, key: ConnKey) {
-        if self.conns.insert(key, Conn::Opened).is_none() {
-            self.order.push_back(key);
-        }
-        while self.order.len() > MAX_TLS_CONNS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.conns.remove(&oldest);
-            }
         }
     }
 }
 
 const TCP_SYN: u8 = 0x02;
 const TCP_ACK: u8 = 0x10;
-
-/// Whether `payload` starts a TLS handshake record (type 22, version
-/// 3.x).
-fn is_tls_handshake(payload: &[u8]) -> bool {
-    matches!(payload, [0x16, 0x03, minor, ..] if *minor <= 0x04)
-}
 
 /// A TCP segment's connection, flags, and where its payload lies in the
 /// frame (to the IP length's end, Ethernet padding left out).
@@ -948,62 +979,69 @@ mod tests {
         frame
     }
 
-    /// Payload mode keeps a connection's segments whole only when it saw
-    /// the connection open and its first payload starts a TLS handshake.
+    fn addr(last: u8, port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 2, last), port)
+    }
+
+    /// Payload mode keeps what the gate sends the guest on a connection
+    /// whose TLS it ended, and nothing the guest sends.
     #[test]
-    fn payload_mode_keeps_tls_connections_only() {
+    fn payload_mode_keeps_the_gates_tls_only() {
         const SYN: u8 = 0x02;
-        const ACK: u8 = 0x10;
-        const SYN_ACK: u8 = 0x12;
         const PSH_ACK: u8 = 0x18;
         let guest = (15, 40000);
         let host = (2, 443);
         let hello = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
-        let mut tls = TlsConns::default();
-        assert_eq!(tls.kept_len(&tcp4(guest, host, SYN, b"")), 54);
-        assert_eq!(tls.kept_len(&tcp4(host, guest, SYN_ACK, b"")), 54);
-        // A padded bare ACK has no payload: it decides nothing.
-        assert_eq!(tls.kept_len(&tcp4(guest, host, ACK, b"")), 54);
-        let first = tcp4(guest, host, PSH_ACK, &hello);
-        assert_eq!(tls.kept_len(&first), first.len());
-        let reply = tcp4(host, guest, PSH_ACK, &[0x17, 0x03, 0x03, 0, 2, 9, 9]);
-        assert_eq!(tls.kept_len(&reply), 54 + 7);
-
-        // Plain HTTP: cut, its later segments too.
-        let web = (15, 40001);
-        let server = (2, 80);
-        tls.kept_len(&tcp4(web, server, SYN, b""));
-        let get = b"GET / HTTP/1.1\r\nAuthorization: Bearer x\r\n\r\n";
-        assert_eq!(tls.kept_len(&tcp4(web, server, PSH_ACK, get)), 54);
-        assert_eq!(tls.kept_len(&tcp4(web, server, PSH_ACK, &hello)), 54);
-
-        // Seen only mid-stream: cut, though it looks like TLS.
-        let late = (15, 40002);
-        assert_eq!(tls.kept_len(&tcp4(late, host, PSH_ACK, &hello)), 54);
-
-        // The same ends opened again start over: plain is cut.
-        tls.kept_len(&tcp4(guest, host, SYN, b""));
-        assert_eq!(tls.kept_len(&tcp4(guest, host, PSH_ACK, get)), 54);
+        let reply = [0x16, 0x03, 0x03, 0x00, 0x02, 9, 9];
+        let mut gate = GateTls::default();
+        gate.kept_len(&tcp4(guest, host, SYN, b""), false);
+        // Before the relay says the gate ended its TLS: cut.
+        assert_eq!(gate.kept_len(&tcp4(host, guest, PSH_ACK, &reply), true), 54);
+        gate.mark(conn_key(addr(15, 40000), addr(2, 443)));
+        // The guest's own bytes are cut, however TLS they look.
+        assert_eq!(
+            gate.kept_len(&tcp4(guest, host, PSH_ACK, &hello), false),
+            54
+        );
+        // The gate's are kept, to the IP length's end.
+        assert_eq!(
+            gate.kept_len(&tcp4(host, guest, PSH_ACK, &reply), true),
+            54 + 7
+        );
+        // Another connection: cut.
+        let other = (15, 40001);
+        assert_eq!(gate.kept_len(&tcp4(host, other, PSH_ACK, &reply), true), 54);
+        // The guest opening the same ends again forgets the gate's TLS.
+        gate.kept_len(&tcp4(guest, host, SYN, b""), false);
+        assert_eq!(gate.kept_len(&tcp4(host, guest, PSH_ACK, &reply), true), 54);
     }
 
     #[test]
-    fn payload_mode_writes_tls_payloads_to_the_file() {
+    fn payload_mode_writes_the_gates_payloads_to_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = DumpDir::prepare(&tmp.path().join("dump"), &[])
             .unwrap()
             .with_payloads(true);
         let (dump, thread) = FrameDump::start(&dir).unwrap();
         let hello = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
-        assert!(dump.push(&tcp4((15, 40000), (2, 443), 0x02, b"")));
-        assert!(dump.push(&tcp4((15, 40000), (2, 443), 0x18, &hello)));
+        let reply = [0x16, 0x03, 0x03, 0x00, 0x02, 9, 9];
+        let (guest, host) = ((15, 40000), (2, 443));
+        assert!(dump.push_from_guest(&tcp4(guest, host, 0x02, b"")));
+        dump.gate_tls(addr(15, 40000), addr(2, 443));
+        assert!(dump.push_from_guest(&tcp4(guest, host, 0x18, &hello)));
+        assert!(dump.push_to_guest(&tcp4(host, guest, 0x18, &reply)));
         drop(dump);
         assert!(thread.join(Duration::from_secs(5)));
         let bytes = fs::read(dir.frames()).unwrap();
-        let first = 24;
-        assert_eq!(u32_at(&bytes, first + 8), 54);
-        let second = first + 16 + 54;
-        assert_eq!(u32_at(&bytes, second + 8), 64);
-        assert_eq!(&bytes[second + 16 + 54..second + 16 + 64], &hello);
+        let mut at = 24;
+        let mut kept = Vec::new();
+        while at + 16 <= bytes.len() {
+            let included = u32_at(&bytes, at + 8) as usize;
+            kept.push(included);
+            at += 16 + included;
+        }
+        assert_eq!(kept, [54, 54, 61]);
+        assert_eq!(&bytes[bytes.len() - 7..], &reply);
     }
 
     #[test]
@@ -1011,7 +1049,9 @@ mod tests {
         use proptest::prelude::*;
         proptest!(|(frame in proptest::collection::vec(any::<u8>(), 0..128))| {
             prop_assert!(headers_len(&frame) <= frame.len());
-            prop_assert!(TlsConns::default().kept_len(&frame) <= frame.len());
+            let mut gate = GateTls::default();
+            prop_assert!(gate.kept_len(&frame, true) <= frame.len());
+            prop_assert!(gate.kept_len(&frame, false) <= frame.len());
         });
     }
 
@@ -1020,8 +1060,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = DumpDir::prepare(&tmp.path().join("dump"), &[]).unwrap();
         let (dump, thread) = FrameDump::start(&dir).unwrap();
-        assert!(dump.push(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]));
-        assert!(dump.push(&[0xff; 20]));
+        assert!(dump.push_from_guest(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]));
+        assert!(dump.push_from_guest(&[0xff; 20]));
         drop(dump);
         assert!(thread.join(Duration::from_secs(5)));
         let mut bytes = Vec::new();
@@ -1050,18 +1090,18 @@ mod tests {
     fn a_full_channel_drops_and_counts() {
         // A queue nobody drains: once it is full, `push` says so at once
         // and never waits.
-        let (tx, rx) = bounded::<Frame>(2);
+        let (tx, rx) = bounded::<Item>(2);
         let dump = FrameDump {
             tx,
             payloads: false,
         };
-        assert!(dump.push(&[0; 14]));
-        assert!(dump.push(&[0; 14]));
+        assert!(dump.push_from_guest(&[0; 14]));
+        assert!(dump.push_from_guest(&[0; 14]));
         let start = std::time::Instant::now();
-        assert!(!dump.push(&[0; 14]), "the third has no room");
+        assert!(!dump.push_from_guest(&[0; 14]), "the third has no room");
         assert!(start.elapsed() < Duration::from_millis(100));
         drop(rx);
-        assert!(!dump.push(&[0; 14]), "nobody to take it");
+        assert!(!dump.push_from_guest(&[0; 14]), "nobody to take it");
     }
 
     #[test]

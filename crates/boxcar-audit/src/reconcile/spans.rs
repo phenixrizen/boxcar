@@ -1231,11 +1231,13 @@ impl Spans {
     /// Whether `key` is the agent itself: the session root, or a span's
     /// executor.
     fn is_agent(&self, key: ProcKey) -> bool {
+        // An executor by its identity, not its pid: one that has exited
+        // may have left its pid to another process.
         self.session_pid == Some(key.tgid)
             || self.open.iter().any(|id| {
-                self.spans.get(id).is_some_and(|span| {
-                    span.executor_bound && span.executor.is_some_and(|e| e.tgid == key.tgid)
-                })
+                self.spans
+                    .get(id)
+                    .is_some_and(|span| span.executor_bound && span.executor == Some(key))
             })
     }
 
@@ -1246,14 +1248,12 @@ impl Spans {
     fn reaches_agent(&self, state: &State, key: ProcKey, span_id: &str) -> bool {
         // A provisional executor (a TLS write's) is evidence, never the
         // agent: only one that opened the request's flow is.
-        let target = self
+        let executor = self
             .spans
             .get(span_id)
             .filter(|span| span.executor_bound)
-            .and_then(|span| span.executor)
-            .map(|key| key.tgid)
-            .or(self.session_pid);
-        let Some(target) = target else {
+            .and_then(|span| span.executor);
+        let Some(target) = executor.map(|key| key.tgid).or(self.session_pid) else {
             return true;
         };
         let mut current = key;
@@ -1261,7 +1261,10 @@ impl Spans {
             let Some(proc) = state.proc(current) else {
                 return false;
             };
-            if proc.key.tgid == target {
+            // The agent itself is in no span; a process only on the
+            // executor's old pid is not the agent, and its own ancestry is
+            // followed as any other's. Above it, the pid is enough.
+            if proc.key.tgid == target && (depth > 0 || executor.is_none_or(|e| e == proc.key)) {
                 return depth > 0;
             }
             if proc.ppid == target {

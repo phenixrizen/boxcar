@@ -124,12 +124,14 @@ says why.
   `DebugNet`. Open it with Wireshark or `tcpdump -r`. Each frame is cut
   after its Ethernet, IP and TCP, UDP or ICMP headers, keeping its
   original length: a TCP payload (plain HTTP's included) is never written.
-  ARP, DNS and DHCP are kept whole. With `--dump-payloads` a TLS
-  connection's segments are written whole: one the dump saw open (its
-  SYN) whose first payload, either way, starts a TLS handshake record.
-  That is ciphertext, and the gate's keys never leave the VMM. A
-  connection seen only mid-stream, or one whose first payload is
-  anything else, is cut as before. A frame the dump's
+  ARP, DNS and DHCP are kept whole. With `--dump-payloads` the frames
+  the gate sends the guest on a flow whose TLS it ended are written
+  whole: their payload is the gate's own TLS records, ciphertext whose
+  keys never leave the VMM. The relay tells the dump when the gate takes
+  a flow's TLS; the guest opening a connection on the same ends again
+  undoes it. What the guest sends is cut whatever it looks like, since a
+  guest can dress anything as TLS, and so is every other flow's payload,
+  a plain HTTP flow's included. A frame the dump's
   queue had no room for is dropped and counted (`net.drop{reason:"dump"}`);
   the net thread never waits on the dump.
 - `http/<flow>-<stream>.req` and `.resp`: each decoded exchange of an

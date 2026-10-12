@@ -497,10 +497,10 @@ pub struct RunArgs {
     /// empty, and may be neither a share nor inside one, nor hold one.
     #[arg(long, value_name = "DIR", conflicts_with = "no_net")]
     pub dump: Option<PathBuf>,
-    /// With --dump: keep the payloads of TLS connections in
-    /// `frames.pcap` (ciphertext; the gate's keys never leave the VMM).
-    /// Every other TCP payload, plain HTTP's included, is still cut to its
-    /// headers.
+    /// With --dump: keep in `frames.pcap` the payloads the gate sends the
+    /// guest on flows whose TLS it ends: its own TLS records, ciphertext
+    /// whose keys never leave the VMM. What the guest sends, and every
+    /// other payload (plain HTTP's included), is still cut to its headers.
     #[arg(long, requires = "dump")]
     pub dump_payloads: bool,
     /// Record each process's arguments (`proc.exec`'s `argv`) scrubbed as

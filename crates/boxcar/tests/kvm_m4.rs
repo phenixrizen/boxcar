@@ -992,7 +992,8 @@ fn claude_code_native_runs_a_bash_tool_inside() {
         "--dump",
         &dump,
         // The options this run also checks: what ran recorded scrubbed,
-        // compared as run; TLS payloads in the frame dump, ciphertext.
+        // compared as run; the gate's TLS records in the frame dump, and
+        // nothing the guest sent.
         "--scrub-argv",
         "--dump-payloads",
     ]);
@@ -1014,33 +1015,36 @@ fn claude_code_native_runs_a_bash_tool_inside() {
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     check_agent_run(&run, "anthropic", &scratch, &token);
     let pcap = fs::read(scratch.path("dump/frames.pcap")).unwrap();
-    assert!(
-        tls_payload_records(&pcap) > 0,
-        "no TLS payload in the frame dump"
-    );
+    let (gate, guest) = tcp_payload_records(&pcap);
+    assert!(gate > 0, "no gate TLS payload in the frame dump");
+    assert_eq!(guest, 0, "a payload the guest sent is in the frame dump");
 }
 
-/// How many of `pcap`'s records are TCP/IPv4 segments holding a TLS
-/// handshake record's start.
-fn tls_payload_records(pcap: &[u8]) -> usize {
+/// How many of `pcap`'s TCP/IPv4 records hold payload: from port 443
+/// (the gate's side of the agent's flows), and from any other port (the
+/// guest's side).
+fn tcp_payload_records(pcap: &[u8]) -> (usize, usize) {
     let u32_at =
         |at: usize| u32::from_le_bytes([pcap[at], pcap[at + 1], pcap[at + 2], pcap[at + 3]]);
     let mut at = 24;
-    let mut found = 0;
+    let (mut gate, mut guest) = (0, 0);
     while at + 16 <= pcap.len() {
         let included = u32_at(at + 8) as usize;
         let frame = &pcap[at + 16..(at + 16 + included).min(pcap.len())];
-        if frame.len() > 14 + 20 + 20 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
+        if frame.len() >= 14 + 20 + 20 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
             let ihl = usize::from(frame[14] & 0x0f) * 4;
             let tcp = &frame[14 + ihl..];
-            let payload = &tcp[usize::from(tcp[12] >> 4) * 4..];
-            if payload.starts_with(&[0x16, 0x03]) {
-                found += 1;
+            let payload = tcp.len() > usize::from(tcp[12] >> 4) * 4;
+            let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+            match (payload, src_port) {
+                (true, 443) => gate += 1,
+                (true, _) => guest += 1,
+                _ => {}
             }
         }
         at += 16 + included;
     }
-    found
+    (gate, guest)
 }
 
 /// Claude Code from npm runs a Bash tool inside. Since 2.1 the npm package

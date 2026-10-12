@@ -244,8 +244,9 @@ messages as `.ws`. DIR is made 0700, its files 0600; it must be new or
 empty, and may be neither a share nor inside one. The dump is an aid, not part of
 the audit log: nothing in it is hashed or chained. Filesystem traffic has
 its own dump, `--audit-level verbose`. With `--dump-payloads`,
-`frames.pcap` also keeps the payloads of TLS connections (ciphertext: the
-gate's keys never leave the VMM); every other TCP payload is still cut.
+`frames.pcap` also keeps what the gate sends the guest on flows whose TLS
+it ends (its own TLS records, ciphertext whose keys never leave the VMM);
+what the guest sends, and every other payload, is still cut.
 
 `boxcar run --scrub-argv` records each process's arguments, and the
 session's command, scrubbed as free text is (secret-looking values

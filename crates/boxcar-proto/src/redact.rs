@@ -84,14 +84,17 @@ fn texts(v: &mut Value) {
             // An array of strings may be an argv: a secret flag's value is
             // the next string.
             let mut flag = false;
+            let mut user = false;
             for item in items.iter_mut() {
                 let next_flag = item.as_str().is_some_and(is_secret_flag);
-                if flag && item.is_string() {
-                    *item = Value::String(REDACTED.to_owned());
-                } else {
-                    texts(item);
+                let next_user = item.as_str().is_some_and(is_user_flag);
+                match item {
+                    Value::String(_) if flag => *item = Value::String(REDACTED.to_owned()),
+                    Value::String(text) if user => *text = scrub_text(&user_value(text)),
+                    _ => texts(item),
                 }
                 flag = next_flag;
+                user = next_user;
             }
         }
         _ => {}
@@ -104,17 +107,112 @@ fn texts(v: &mut Value) {
 /// array of the same strings scrubs as [`scrub_deep`] does it.
 pub fn scrub_argv(argv: &[String]) -> Vec<String> {
     let mut flag = false;
+    let mut user = false;
     argv.iter()
         .map(|arg| {
             let out = if flag {
                 REDACTED.to_owned()
+            } else if user {
+                scrub_text(&user_value(arg))
             } else {
                 scrub_text(arg)
             };
             flag = is_secret_flag(arg);
+            user = is_user_flag(arg);
             out
         })
         .collect()
+}
+
+/// Flags whose value is `user:password` (curl's, wget's): `-u`,
+/// `--user`, `-U`, `--proxy-user`.
+const USER_FLAGS: [&str; 4] = ["-u", "--user", "-U", "--proxy-user"];
+
+fn is_user_flag(arg: &str) -> bool {
+    USER_FLAGS.contains(&arg)
+}
+
+/// A user flag's `value` (`user:password`, quoted or not) with its
+/// password redacted, a closing quote kept; a user alone, or an empty
+/// password, as it is.
+fn user_value(value: &str) -> String {
+    let Some(colon) = value.find(':') else {
+        return value.to_owned();
+    };
+    let (head, tail) = value.split_at(colon + 1);
+    let close = match value.chars().next() {
+        Some(q @ ('\'' | '"')) if tail.ends_with(q) => 1,
+        _ => 0,
+    };
+    if tail.len() == close {
+        return value.to_owned();
+    }
+    format!("{head}{REDACTED}{}", &tail[tail.len() - close..])
+}
+
+/// A word that is a user flag with its value attached (`-ualice:pw`,
+/// `--user=alice:pw`): the flag, then the value.
+fn attached_user(word: &str) -> Option<(&str, &str)> {
+    for flag in ["--user=", "--proxy-user="] {
+        if let Some(value) = word.strip_prefix(flag) {
+            return Some((flag, value));
+        }
+    }
+    let flag = word.get(..2).filter(|f| matches!(*f, "-u" | "-U"))?;
+    let value = &word[2..];
+    (value.contains(':') && !value.starts_with('-')).then_some((flag, value))
+}
+
+/// The passwords of `user:password` values after the user flags
+/// ([`USER_FLAGS`]) in `text`: the value the next word, attached, or after
+/// `=`. Words are read as a shell reads them: a quoted part, spaces and
+/// all, belongs to its word.
+fn user_flags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut after_flag = false;
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        if c.is_whitespace() {
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        let end = word_end(text, i);
+        let word = &text[i..end];
+        if after_flag {
+            out.push_str(&user_value(word));
+            after_flag = false;
+        } else if is_user_flag(word) {
+            out.push_str(word);
+            after_flag = true;
+        } else if let Some((flag, value)) = attached_user(word) {
+            out.push_str(flag);
+            out.push_str(&user_value(value));
+        } else {
+            out.push_str(word);
+        }
+        i = end;
+    }
+    out
+}
+
+/// Where the shell word starting at byte `start` of `text` ends: at the
+/// first whitespace outside quotes, a backslash escaping what follows.
+fn word_end(text: &str, start: usize) -> usize {
+    let mut quote = None;
+    let mut chars = text[start..].char_indices();
+    while let Some((at, c)) = chars.next() {
+        match (quote, c) {
+            (_, '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => return start + at,
+            _ => {}
+        }
+    }
+    text.len()
 }
 
 /// `--token`, `-password`: a flag, without a value of its own, whose name
@@ -231,7 +329,9 @@ const OPAQUE_RUN: usize = 32;
 ///   `"api_key": "…"`, `Authorization: …` to the end of the line or quote),
 ///   and the word after a secret-looking `--flag`;
 /// - the word after `Bearer` or `Basic`;
-/// - the password in a URL's `user:password@`;
+/// - the password in a URL's `user:password@`, and in the
+///   `user:password` after curl's and wget's user flags (`-u`, `--user`,
+///   `-U`, `--proxy-user`), separate, attached or after `=`;
 /// - a word starting with a known token prefix (`sk-`, `ghp_`, `AKIA`,
 ///   `eyJ`, …);
 /// - a run of 32 or more letters and digits holding both.
@@ -245,7 +345,8 @@ pub fn scrub_text(text: &str) -> String {
 
 /// [`scrub_text`] without the URL pass: keys, userinfo, tokens.
 fn plain(text: &str) -> String {
-    let text = key_values(text);
+    let text = user_flags(text);
+    let text = key_values(&text);
     let text = userinfo(&text);
     words(&text)
 }
@@ -633,6 +734,67 @@ mod tests {
             scrub_argv(&["--token=abc".to_owned(), "x".to_owned()]),
             ["--token=[redacted]", "x"]
         );
+    }
+
+    #[test]
+    fn user_flag_passwords_are_redacted() {
+        let cases = [
+            (
+                "curl -u alice:short-pass https://example.test",
+                "curl -u alice:[redacted] https://example.test",
+            ),
+            ("curl --user alice:pw x", "curl --user alice:[redacted] x"),
+            ("curl -ualice:pw x", "curl -ualice:[redacted] x"),
+            ("curl --user=alice:pw x", "curl --user=alice:[redacted] x"),
+            (
+                "curl -U proxy:pw -x p:3128 x",
+                "curl -U proxy:[redacted] -x p:3128 x",
+            ),
+            (
+                "curl --proxy-user=p:pw x",
+                "curl --proxy-user=p:[redacted] x",
+            ),
+            (
+                "curl -u 'alice:pw with space' x",
+                "curl -u 'alice:[redacted]' x",
+            ),
+            ("curl -u \"alice:pw\" x", "curl -u \"alice:[redacted]\" x"),
+            ("curl -u alice x", "curl -u alice x"),
+            ("curl -u alice: x", "curl -u alice: x"),
+            ("sort -u notes.txt", "sort -u notes.txt"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text}");
+        }
+        // A key as the user, an empty password: the key is a token.
+        let key = ["sk", "test", "a1B2c3D4e5F6g7H8i9J0k1L2"].join("_");
+        let stripe = scrub_text(&format!("curl -u {key}: x"));
+        assert!(!stripe.contains("a1B2c3D4e5F6g7H8i9J0k1L2"), "{stripe}");
+
+        let argv: Vec<String> = [
+            "curl",
+            "-u",
+            "alice:short-pass",
+            "-U",
+            "p:pw",
+            "--user=a:b",
+            "x",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let want = [
+            "curl",
+            "-u",
+            "alice:[redacted]",
+            "-U",
+            "p:[redacted]",
+            "--user=a:[redacted]",
+            "x",
+        ];
+        assert_eq!(scrub_argv(&argv), want);
+        let mut v = json!({"argv": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}));
     }
 
     #[test]

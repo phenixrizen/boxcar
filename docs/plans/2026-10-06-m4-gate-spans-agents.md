@@ -724,8 +724,14 @@ Made while writing the plan, 2026-10-06:
   command is still compared and joined by what ran, and a secret-looking
   token in a command cannot by itself hide it from the `argv` rule. Off
   by default: the log then holds what ran, as before.
-  `--dump-payloads` (with `--dump`) keeps a TLS connection's payloads in
-  `frames.pcap`, ciphertext whose keys never leave the VMM; a connection
-  counts as TLS only when the dump saw its SYN and its first payload
-  starts a handshake record, so plain HTTP's credentials are still never
-  written, as the rule for the dump has it.
+  `--dump-payloads` (with `--dump`) keeps in `frames.pcap` what the gate
+  sends the guest on flows whose TLS it ended: its own TLS records,
+  ciphertext whose keys never leave the VMM. The first version judged a
+  connection TLS by its first payload's handshake header; a guest
+  chooses every byte it sends, so nothing the guest sends is kept now,
+  and the relay names the flows whose TLS the gate ends. With the same
+  change an executor is the agent by its identity (tgid and start time),
+  not its pid, which an exited executor leaves to another process; and
+  the scrubber redacts the password of curl's and wget's
+  `-u`/`--user`/`-U`/`--proxy-user` values, separate, attached or after
+  `=`.

@@ -1228,6 +1228,53 @@ fn a_write_by_the_agent_itself_lands_in_the_span() {
     assert_eq!(spans[0].effects, [6, 7]);
 }
 
+/// The agent is a process, not a pid: once a span's executor has exited,
+/// another process given the same pid is not the agent, and its writes
+/// do not land in the span as the agent's.
+#[test]
+fn a_process_on_the_executors_old_pid_is_not_the_agent() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let api = "203.0.113.5:443";
+    let names = ["api.example"];
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "agent.js"]));
+    steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+    steps.push(log.tcp_connect(1350, 200, 41000, api));
+    steps.push(log.connect(1360, 1, 41000, api, &names, Verdict::Allow));
+    steps.push(log.http_request(1400, 1, 1, 4800));
+    steps.push(log.tool_open(
+        2000,
+        "toolu_01",
+        "Write",
+        json!({"file_path": "/workspace/notes.txt", "content": "hello"}),
+    ));
+    steps.push(log.exit(2100, 200, 5));
+    // Another process, given the agent's old pid.
+    steps.push(log.exec(2200, 200, 100, 50, &["sh", "-c", "echo x > notes.txt"]));
+    let create = log.fs_create(2300, 200, "/notes.txt");
+    let close = log.fs_close(2310, 200, "/notes.txt", 2);
+    let seqs: Vec<u64> = [&create, &close]
+        .iter()
+        .map(|step| match step {
+            Step::Record(record) => record.seq,
+            Step::Tick(_) => unreachable!(),
+        })
+        .collect();
+    steps.push(create);
+    steps.push(close);
+    steps.push(log.heartbeat(3000));
+    steps.push(log.vmm_stop(3100));
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert!(
+        seqs.iter().all(|seq| !spans[0].effects.contains(seq)),
+        "{:?}",
+        spans[0]
+    );
+}
+
 /// A Bash tool call whose process connected somewhere the command never
 /// named, and said ok.
 #[test]

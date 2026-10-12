@@ -282,7 +282,11 @@ impl NetStack {
     /// address it no longer has is told so).
     pub fn push_guest_frame(&mut self, frame: &[u8]) {
         let now = Instant::now();
-        if self.dump.as_ref().is_some_and(|dump| !dump.push(frame)) {
+        if self
+            .dump
+            .as_ref()
+            .is_some_and(|dump| !dump.push_from_guest(frame))
+        {
             self.drop_frame(DropReason::Dump, now);
         }
         let dispatch = classify(frame, self.cfg.gateway);
@@ -341,7 +345,11 @@ impl NetStack {
     /// The next frame for the guest, if any; a copy goes to the dump.
     pub fn pop_host_frame(&mut self) -> Option<Vec<u8>> {
         let frame = self.pipe.to_guest.pop_front()?;
-        if self.dump.as_ref().is_some_and(|dump| !dump.push(&frame)) {
+        if self
+            .dump
+            .as_ref()
+            .is_some_and(|dump| !dump.push_to_guest(&frame))
+        {
             self.drop_frame(DropReason::Dump, Instant::now());
         }
         Some(frame)
@@ -559,6 +567,7 @@ impl NetStack {
             stamp: smoltcp_time(self.epoch, now),
             inspect: self.inspect.as_ref(),
             observer: self.observer.as_ref(),
+            dump: self.dump.as_ref(),
         };
         Parts {
             tcp: &mut self.tcp,
@@ -787,6 +796,8 @@ pub(crate) struct Ctx<'a> {
     /// The gate, when the session inspects.
     pub(crate) inspect: Option<&'a Arc<InspectConfig>>,
     pub(crate) observer: Option<&'a Observer>,
+    /// The frame dump, told which flows' TLS the gate ends.
+    pub(crate) dump: Option<&'a FrameDump>,
 }
 
 impl Ctx<'_> {
