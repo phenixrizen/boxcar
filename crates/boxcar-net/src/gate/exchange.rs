@@ -60,6 +60,30 @@ pub const USER_AGENT_CUT: usize = 512;
 /// recorded as it stands (`degraded: "too_many_exchanges"`) and let go.
 pub const MAX_EXCHANGES: usize = 512;
 
+/// The most decoded bytes of an event stream split into events at once:
+/// the model parsers take each slice's events before the next is split,
+/// so a body that decodes to many small events holds a slice's worth.
+const SSE_SLICE: usize = 16 * 1024;
+
+/// The room for events an exchange keeps between slices.
+const SSE_EVENTS_KEPT: usize = 64;
+
+/// Splits `slice` of `stream`'s decoded event stream into `exchange`'s
+/// events; a line dropped for size voids the calls under way.
+fn feed_events(model: &mut Tracker, stream: u32, exchange: &mut Exchange, slice: &[u8]) {
+    let Some(sse) = exchange.sse.as_mut() else {
+        return;
+    };
+    let before = exchange.sse_events.len();
+    sse.feed(slice, &mut exchange.sse_events);
+    exchange.sse_count += (exchange.sse_events.len() - before) as u64;
+    if sse.take_drop() {
+        exchange.response_degraded.get_or_insert("sse_line");
+        model.degraded(stream, "sse_line");
+        model.lose_calls(stream);
+    }
+}
+
 /// A request's head, as the record will say it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestHead {
@@ -458,30 +482,35 @@ impl Observation {
                             Some(sink) => sink.push(&bytes),
                             None => Vec::new(),
                         };
-                        if let Some(sse) = exchange.sse.as_mut() {
-                            let before = exchange.sse_events.len();
-                            sse.feed(&decoded, &mut exchange.sse_events);
-                            exchange.sse_count += (exchange.sse_events.len() - before) as u64;
-                            if sse.take_drop() {
-                                exchange.response_degraded.get_or_insert("sse_line");
-                                self.model.degraded(stream, "sse_line");
-                                self.model.lose_calls(stream);
+                        if exchange.sse.is_some() {
+                            for slice in decoded.chunks(SSE_SLICE) {
+                                feed_events(&mut self.model, stream, exchange, slice);
+                                self.model.response_body(stream, exchange, out);
+                                exchange.sse_events.clear();
                             }
+                            exchange.sse_events.shrink_to(SSE_EVENTS_KEPT);
+                        } else {
+                            self.model.response_body(stream, exchange, out);
                         }
-                        self.model.response_body(stream, exchange, out);
-                        exchange.sse_events.clear();
                     }
                 }
                 Event::ResponseEnd { stream } => {
                     if let Some(mut exchange) = self.exchanges.remove(&stream) {
                         exchange.last_response_at = now;
-                        if let Some(sink) = exchange.response_body.as_mut() {
-                            let rest = sink.finish();
+                        let rest = exchange
+                            .response_body
+                            .as_mut()
+                            .map(BodySink::finish)
+                            .unwrap_or_default();
+                        if exchange.sse.is_some() {
+                            for slice in rest.chunks(SSE_SLICE) {
+                                feed_events(&mut self.model, stream, &mut exchange, slice);
+                                self.model.response_body(stream, &exchange, out);
+                                exchange.sse_events.clear();
+                            }
                             if let Some(sse) = exchange.sse.as_mut() {
-                                let before = exchange.sse_events.len();
-                                sse.feed(&rest, &mut exchange.sse_events);
                                 sse.finish(&mut exchange.sse_events);
-                                exchange.sse_count += (exchange.sse_events.len() - before) as u64;
+                                exchange.sse_count += exchange.sse_events.len() as u64;
                                 if sse.take_drop() {
                                     exchange.response_degraded.get_or_insert("sse_line");
                                     self.model.degraded(stream, "sse_line");
@@ -910,6 +939,39 @@ mod tests {
             version: Version::Http1,
             headers: Headers::new(),
         }
+    }
+
+    #[test]
+    fn an_event_stream_of_many_small_events_keeps_little_room() {
+        let mut obs = observation(Some("http/1.1"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        obs.data(
+            Direction::ToHost,
+            b"GET /events HTTP/1.1\r\nHost: api.example\r\n\r\n",
+            now,
+            &mut out,
+        );
+        let events = 100_000;
+        let mut body = b"data:x\n\n".repeat(events);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+            body.len() + 8
+        );
+        body.splice(0..0, head.into_bytes());
+        obs.data(Direction::ToGuest, &body, now, &mut out);
+        let exchange = obs.exchanges().get(&1).unwrap();
+        assert!(
+            exchange.sse_events.capacity() <= 2 * SSE_EVENTS_KEPT,
+            "{}",
+            exchange.sse_events.capacity()
+        );
+        obs.data(Direction::ToGuest, b"data:y\n\n", now, &mut out);
+        let counted = out.iter().find_map(|e| match &e.payload {
+            Payload::HttpResponse(r) => Some(r.sse_events),
+            _ => None,
+        });
+        assert_eq!(counted, Some(events as u64 + 1));
     }
 
     #[test]

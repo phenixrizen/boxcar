@@ -313,6 +313,7 @@ pub fn observe(
                 while state.flow_order.len() > MAX_FLOWS {
                     if let Some(oldest) = state.flow_order.pop_front() {
                         state.flows.remove(&oldest);
+                        state.flows_let_go = true;
                     }
                 }
             }

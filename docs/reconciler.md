@@ -70,9 +70,13 @@ processes and ring 0 effects to the span:
   it, then is dropped if it never does; so does one for a span whose
   request flow is on record but not yet who opened it. The span stays
   open for its own close (or is recorded as it stands at the VM's stop).
-  A span whose request flow is not on record at all, or a session without
-  the sensor's lineage programs, takes any close: there is nothing to
-  hold it to. The state remembers the last 16384 flows.
+  Once the state has let a flow go for room (it remembers the last 16384
+  flows, and the last 4096 openers), a close for a span whose request flow
+  is not on record is dropped too: that flow may have been let go with its
+  opener, and nothing then shows the close is the executor's. A span
+  whose request flow is not on record in a log that never let one go (a
+  log without the gate's flows), or a session without the sensor's
+  lineage programs, takes any close: there is nothing to hold it to.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
   `truncated`) and takes nothing more, nor its `tool.close`.
@@ -124,7 +128,10 @@ processes and ring 0 effects to the span:
   the reconciler writes `span.effects`: the span's processes by tgid (at
   most 1024) and the seqs of its records (each process's `proc.exec`
   and the effects above, at most 4096), with `truncated` set when a limit
-  cut the list. The effects themselves are never edited.
+  cut the list: the count, or the 64 MiB that the effects of every span
+  kept may hold at once, paths included. A span's effects are let go
+  once it has settled (its count stays for `span.list`). The effects
+  themselves are never edited.
 
 Findings inside a span carry its id in `span_id` and in their envelope.
 `boxcar spans` lists the spans from the control socket's `span.list`
@@ -176,6 +183,8 @@ the thread otherwise.
   gated tests give it three seconds.
 - The reconciler keeps the last 65536 records' rings for the evidence and
   prunes DNS answers after 60 s; a session is not a database.
-- A span lists at most 1024 processes and 4096 effect records; 4096 spans
-  are kept in memory, the oldest settled one going first; `span.list`
+- A span lists at most 1024 processes and 4096 effect records, and the
+  spans kept hold at most 64 MiB of effects between them, a settled span's
+  let go; 4096 spans are kept in memory, the oldest settled one going
+  first; `span.list`
   returns at most 1024 entries.

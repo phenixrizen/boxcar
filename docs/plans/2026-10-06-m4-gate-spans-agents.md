@@ -703,3 +703,16 @@ Made while writing the plan, 2026-10-06:
   scheme by characters, not bytes, and runs a URL to the next space,
   quote, `<` or `>`: a `,` or `;` may sit in a path, and one the text puts
   after a URL is taken in, over-matching at worst.
+- **What the reconciler lets go cannot authorize a close; effects and
+  markup are bounded.** A span's close is held to who opened its request
+  flow. Once the reconciler has let a flow go for room, a span whose
+  request flow is not on record may be one whose flow, opener and
+  executor all went, so its close is dropped and the span stays open; a
+  log that never let a flow go keeps the old rule (no gate flows, nothing
+  to hold a close to). The effects of every kept span share one 64 MiB
+  budget, paths included, and a settled span's effects are let go,
+  their count kept. An event stream is split into events 16 KiB of
+  decoded body at a time, the model parsers taking each slice's events,
+  and an exchange keeps room for 64 between slices. The dump writes HTML
+  and XML bodies as their size: the free-text scrub cannot read an
+  element or an attribute as a key.

@@ -1607,6 +1607,93 @@ fn a_close_from_the_executors_sibling_is_refused() {
     }
 }
 
+/// The effects every kept span holds are bounded in bytes, not only in
+/// number: a span whose effects carry long paths stops taking them
+/// (`truncated`) before its count runs out, and once it has settled its
+/// room goes to the next span.
+#[test]
+fn span_effects_are_bounded_in_bytes() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let long = format!("/{}", "a".repeat(20_000));
+    let command = "touch x";
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": command})));
+    steps.push(log.exec(2100, 300, 100, 10, &["sh", "-c", command]));
+    for n in 0..4000u64 {
+        steps.push(log.fs_create(2200 + n / 10, 300, &format!("{long}{n}")));
+    }
+    steps.push(log.exit(2700, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    steps.push(log.tool_open(6000, "toolu_02", "Bash", json!({"command": command})));
+    steps.push(log.exec(6100, 310, 100, 20, &["sh", "-c", command]));
+    for n in 0..100u64 {
+        steps.push(log.fs_create(6200 + n, 310, &format!("{long}{n}")));
+    }
+    steps.push(log.exit(6400, 310, 20));
+    steps.push(log.tool_close(6500, "toolu_02", "ok"));
+    for at in [7000, 8000, 9000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 2);
+    assert!(spans[0].truncated);
+    assert!(spans[0].effects.len() < 4000, "{}", spans[0].effects.len());
+    assert!(!spans[1].truncated);
+    assert_eq!(spans[1].effects.len(), 101);
+}
+
+/// A span whose request flow the reconciler has let go for room, with
+/// its opener and its request's executor, has nothing to hold a close
+/// to: in a log with flows on record, its close is dropped, whoever sends
+/// it, and the span stays open.
+#[test]
+fn a_span_whose_request_flow_was_let_go_takes_no_close() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let api = "203.0.113.5:443";
+    let names = ["api.example"];
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 200, 6, &["python3", "many.py"]));
+    steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+    steps.push(log.tcp_connect(1350, 200, 41000, api));
+    steps.push(log.connect(1360, 1, 41000, api, &names, Verdict::Allow));
+    steps.push(log.http_request(1400, 1, 1, 4800));
+    // More flows than the reconciler keeps, each with its opener and a
+    // request, before the reply's tool call is seen.
+    for n in 0..16_500u64 {
+        let at = 1500 + n / 100;
+        let port = 20_000 + n as u16;
+        steps.push(log.tcp_connect(at, 400, port, api));
+        steps.push(log.connect(at, 10 + n, port, api, &names, Verdict::Allow));
+        if n < 300 {
+            steps.push(log.http_request(at, 10 + n, 1, 10));
+        }
+    }
+    steps.push(log.heartbeat(1700));
+    steps.push(log.tool_open(1800, "toolu_01", "Bash", json!({"command": "sleep 1"})));
+    steps.push(log.tcp_connect(1850, 400, 42000, api));
+    steps.push(log.connect(1860, 2, 42000, api, &names, Verdict::Allow));
+    steps.push(log.tool_close_on(1900, "toolu_01", "ok", 2));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let closed: Vec<_> = spans_of(&out)
+        .into_iter()
+        .filter(|s| s.closed_seq.is_some())
+        .collect();
+    assert!(closed.is_empty(), "{closed:?}");
+}
+
 /// A close that comes before the sensor says who opened the span's own
 /// request flow waits for it: another process's close is then dropped.
 #[test]

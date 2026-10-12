@@ -438,8 +438,11 @@ const FORM_SECRETS: [&str; 10] = [
 /// - A form (`application/x-www-form-urlencoded`, an OAuth token
 ///   exchange's shape): a credential field's value replaced, the others
 ///   scrubbed as text.
-/// - Other text (`text/*`, XML, JavaScript; or no type, valid UTF-8):
-///   through `redact::scrub_text`.
+/// - Markup (HTML, XML): not written, as the free-text scrub cannot read
+///   an element or an attribute as a key; one line says how many bytes
+///   it was.
+/// - Other text (`text/*`, JavaScript; or no type, valid UTF-8): through
+///   `redact::scrub_text`.
 /// - Anything else: not written; one line says how many bytes it was.
 pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
     let body = &body[..body.len().min(EXCHANGE_FILE_LIMIT)];
@@ -480,13 +483,15 @@ pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
             .collect();
         return fields.join("&").into_bytes();
     }
+    let markup = kind == "text/html"
+        || kind == "text/xml"
+        || kind == "application/xml"
+        || kind.ends_with("+xml");
     let textual = json_kind
         || kind.is_empty()
         || kind.starts_with("text/")
-        || kind.ends_with("+xml")
-        || kind == "application/xml"
         || kind == "application/javascript";
-    if textual {
+    if textual && !markup {
         return scrub_text(text).into_bytes();
     }
     format!("[{} bytes of {kind} not written]\n", body.len()).into_bytes()
@@ -886,6 +891,34 @@ mod tests {
         assert!(text.starts_with("c2s text 43\n{"), "{text}");
         assert!(text.contains("\"type\":\"response.create\"") && !text.contains("sk-1"));
         assert!(text.ends_with("\ns2c binary 3\n"), "{text}");
+    }
+
+    /// Markup is written as its size: an element or an attribute named
+    /// for a credential is no key the free-text scrub knows.
+    #[test]
+    fn markup_bodies_are_written_as_their_size() {
+        let cases = [
+            (
+                "application/xml",
+                &b"<login><password>sample-pass</password></login>"[..],
+            ),
+            (
+                "application/soap+xml",
+                b"<a><token>sample-token</token></a>",
+            ),
+            ("text/xml", b"<a><secret>sample-secret</secret></a>"),
+            (
+                "text/html",
+                b"<input name=\"password\" value=\"sample-pass\">",
+            ),
+        ];
+        for (kind, body) in cases {
+            let text = String::from_utf8(scrubbed_body(Some(kind), body)).unwrap();
+            assert_eq!(
+                text,
+                format!("[{} bytes of {kind} not written]\n", body.len())
+            );
+        }
     }
 
     /// A URL in a header loses its credential query values as a request

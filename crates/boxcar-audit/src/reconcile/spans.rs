@@ -53,6 +53,10 @@ use super::{JOIN_WINDOW_NS, PENDING_NS};
 pub const MAX_SPAN_PROCS: usize = 1024;
 /// The most effect records a span lists.
 pub const MAX_SPAN_EFFECTS: usize = 4096;
+/// The most bytes the effects of every span kept hold at once (the
+/// entries and their paths); past it a span takes no more, `truncated`.
+/// A span's are let go once it has settled and been recorded.
+pub const MAX_EFFECT_BYTES: usize = 64 * 1024 * 1024;
 /// How long after a span's close its effects and processes are judged.
 pub const SETTLE_NS: u64 = 1_000_000_000;
 /// The most spans kept in memory; beyond it the oldest settled span goes
@@ -251,6 +255,19 @@ pub struct Effect {
     pub kind: EffectKind,
 }
 
+impl Effect {
+    /// What it holds: the entry and its strings.
+    fn bytes(&self) -> usize {
+        let strings = match &self.kind {
+            EffectKind::Fs {
+                mount, path, to, ..
+            } => mount.capacity() + path.capacity() + to.as_ref().map_or(0, String::capacity),
+            EffectKind::Exec | EffectKind::Net { .. } => 0,
+        };
+        size_of::<Effect>() + strings
+    }
+}
+
 /// What an attributed record was.
 #[derive(Clone, Debug)]
 pub enum EffectKind {
@@ -301,6 +318,11 @@ pub struct Span {
     status: Option<String>,
     members: Vec<Member>,
     effects: Vec<Effect>,
+    /// What `effects` holds of [`MAX_EFFECT_BYTES`].
+    effect_bytes: usize,
+    /// Effects let go once the span settled and was recorded: counted,
+    /// no longer kept.
+    effects_let_go: usize,
     /// The process behind the model request: the one that opened its flow
     /// (`executor_bound`), or, provisionally, the one whose `proc.tls_io`
     /// write alone fit it; the session root otherwise.
@@ -384,6 +406,8 @@ impl Span {
             status: None,
             members: Vec::new(),
             effects: Vec::new(),
+            effect_bytes: 0,
+            effects_let_go: 0,
             executor: None,
             executor_bound: false,
             truncated: false,
@@ -434,15 +458,28 @@ impl Span {
         self.members.iter().any(|m| m.key == key)
     }
 
-    fn push_effect(&mut self, effect: Effect) {
+    /// Adds `effect`, its bytes counted in `held` (every span's) against
+    /// [`MAX_EFFECT_BYTES`].
+    fn push_effect(&mut self, effect: Effect, held: &mut usize) {
         if self.effects.iter().any(|e| e.seq == effect.seq) {
             return;
         }
-        if self.effects.len() >= MAX_SPAN_EFFECTS {
+        let bytes = effect.bytes();
+        if self.effects.len() >= MAX_SPAN_EFFECTS || *held + bytes > MAX_EFFECT_BYTES {
             self.truncated = true;
             return;
         }
+        *held += bytes;
+        self.effect_bytes += bytes;
         self.effects.push(effect);
+    }
+
+    /// Lets the effects go, keeping their count; gives back their bytes.
+    fn let_go_effects(&mut self, held: &mut usize) {
+        self.effects_let_go += self.effects.len();
+        self.effects = Vec::new();
+        *held -= self.effect_bytes;
+        self.effect_bytes = 0;
     }
 
     /// Whether a filesystem effect is on one of the declared paths.
@@ -473,7 +510,7 @@ impl Span {
             opened_seq: self.opened.0,
             closed_seq: self.closed.map(|(seq, _)| seq),
             procs: u32::try_from(self.members.len()).unwrap_or(u32::MAX),
-            effects: u32::try_from(self.effects.len()).unwrap_or(u32::MAX),
+            effects: u32::try_from(self.effects.len() + self.effects_let_go).unwrap_or(u32::MAX),
             worst_score: self.worst_score,
         }
     }
@@ -567,6 +604,8 @@ pub struct Spans {
     declared: Option<DeclaredArgs>,
     /// `tool.close`s of bound spans whose flow's opener is not known yet.
     pending_closes: VecDeque<PendingClose>,
+    /// What the kept spans' effects hold, against [`MAX_EFFECT_BYTES`].
+    effect_bytes: usize,
     /// Findings a deferred close made, for the next tick to hand over.
     deferred_findings: Vec<Finding>,
 }
@@ -607,6 +646,7 @@ impl Spans {
             flow_order: VecDeque::new(),
             declared,
             pending_closes: VecDeque::new(),
+            effect_bytes: 0,
             deferred_findings: Vec::new(),
         }
     }
@@ -869,10 +909,12 @@ impl Spans {
     /// several processes (a script's `curl`s) cannot be told from its own
     /// tools, so its spans stay open until the session ends. A close by another process is dropped (the span
     /// stays open for its own close); one where either opener is not known
-    /// yet waits [`CLOSE_WAIT_NS`] to learn them, else is dropped. A span
-    /// whose request flow is not on record at all, or a session without
-    /// the sensor's lineage programs, has nothing to hold a close to, and
-    /// takes any.
+    /// yet waits [`CLOSE_WAIT_NS`] to learn them, else is dropped. So is
+    /// one for a span whose request flow is not on record once flows have
+    /// been let go for room (it may have been, with its opener). A span
+    /// whose request flow is not on record otherwise (a log without the
+    /// gate's flows), or a session without the sensor's lineage programs,
+    /// has nothing to hold a close to, and takes any.
     pub fn close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
         if !state.sensor.lineage_ok() {
             return self.apply_close(state, record, close);
@@ -910,6 +952,10 @@ impl Spans {
             // The request's flow is known but not yet who opened it: wait
             // for the sensor to say.
             (None, _) if state.flows.contains_key(&span.request.0) => Verdict::Wait,
+            // Not on record, and flows have been let go for room: this one
+            // may have been, and who opened it with it. Nothing shows the
+            // close is the executor's: the span stays open.
+            (None, _) if state.flows_let_go => Verdict::Drop,
             // No such flow on record (a log without the gate's flows):
             // nothing to hold the close to.
             (None, _) => Verdict::Apply,
@@ -955,10 +1001,13 @@ impl Spans {
             // A member that exec'd again (a shell running its command).
             if let Some(span) = self.spans.get_mut(&id) {
                 span.note_exec(&exec.filename, &exec.argv);
-                span.push_effect(Effect {
-                    seq,
-                    kind: EffectKind::Exec,
-                });
+                span.push_effect(
+                    Effect {
+                        seq,
+                        kind: EffectKind::Exec,
+                    },
+                    &mut self.effect_bytes,
+                );
             }
             self.index_update(&id);
             return Vec::new();
@@ -1118,6 +1167,7 @@ impl Spans {
             }
             findings.extend(self.phantom_write(state, &id, now));
             findings.extend(self.orphaned_work(state, &id, now));
+            self.let_go_effects(&id);
         }
         while self
             .pending_execs
@@ -1252,10 +1302,13 @@ impl Spans {
             // the span's effect too.
             if let (true, Some(seq)) = (member_of == id, exec_seq) {
                 if let Some(span) = self.spans.get_mut(id) {
-                    span.push_effect(Effect {
-                        seq,
-                        kind: EffectKind::Exec,
-                    });
+                    span.push_effect(
+                        Effect {
+                            seq,
+                            kind: EffectKind::Exec,
+                        },
+                        &mut self.effect_bytes,
+                    );
                 }
                 self.index_update(id);
             }
@@ -1279,10 +1332,13 @@ impl Spans {
                 }
             }
             if let Some(seq) = exec_seq {
-                span.push_effect(Effect {
-                    seq,
-                    kind: EffectKind::Exec,
-                });
+                span.push_effect(
+                    Effect {
+                        seq,
+                        kind: EffectKind::Exec,
+                    },
+                    &mut self.effect_bytes,
+                );
             }
         }
         self.by_proc.insert(key, id.to_owned());
@@ -1395,7 +1451,7 @@ impl Spans {
 
     fn push_effect(&mut self, id: &str, effect: Effect) {
         if let Some(span) = self.spans.get_mut(id) {
-            span.push_effect(effect);
+            span.push_effect(effect, &mut self.effect_bytes);
         }
         self.index_update(id);
     }
@@ -1433,6 +1489,7 @@ impl Spans {
         };
         self.write_record(&id);
         if let Some(span) = self.spans.remove(&id) {
+            self.effect_bytes -= span.effect_bytes;
             for member in &span.members {
                 self.by_proc.remove(&member.key);
             }
@@ -1449,7 +1506,18 @@ impl Spans {
         span.settled = true;
         span.truncated = true;
         self.write_record(id);
+        self.let_go_effects(id);
         self.index_update(id);
+    }
+
+    /// Lets a settled, recorded span's effects go: nothing judges them
+    /// again.
+    fn let_go_effects(&mut self, id: &str) {
+        if let Some(span) = self.spans.get_mut(id) {
+            if span.settled && span.recorded {
+                span.let_go_effects(&mut self.effect_bytes);
+            }
+        }
     }
 
     fn write_record(&mut self, id: &str) {

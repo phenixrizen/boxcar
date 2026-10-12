@@ -140,8 +140,10 @@ says why.
   written as its size, since a secret split across fragments is whole in
   none of them; a body the observer did not keep whole (past 16 MiB, or
   past its budget) written as its size;
-  other text through the free-text scrub; a body that is not text is not
-  written, a line saying how many bytes it was takes its place. A form
+  other text through the free-text scrub, except markup (HTML, XML),
+  whose elements and attributes that scrub cannot read as keys; markup,
+  and a body that is not text, is not written, a line saying how many
+  bytes it was takes its place. A form
   body (the shape of an OAuth token exchange) has its credential fields'
   values replaced, a field's name read decoded (`%70assword` is
   `password`; a name that does not decode counts as a credential's), and

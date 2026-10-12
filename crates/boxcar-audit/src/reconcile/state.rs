@@ -174,6 +174,9 @@ pub struct State {
     /// The flows in the order they came, to let the oldest go past
     /// [`MAX_FLOWS`].
     pub flow_order: VecDeque<u64>,
+    /// Whether a flow has been let go for room: from then on, a flow not
+    /// on record may be one that was.
+    pub flows_let_go: bool,
     pub sensor_connects: VecDeque<SensorConnect>,
     pub sensor: Sensor,
     pub dns: DnsCache,
