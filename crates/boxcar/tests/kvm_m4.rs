@@ -550,7 +550,10 @@ fn a_stub_model_speaks_anthropic_and_the_log_gets_spans() {
     };
     let scratch = Scratch::new();
     let stub = stub_model(host, &scratch, 2);
-    let flags = stub_flags(&stub, &scratch);
+    let mut flags = stub_flags(&stub, &scratch);
+    // The script's `wget`s carry the test token on their command lines:
+    // recorded scrubbed.
+    flags.push("--scrub-argv".to_owned());
     let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
     let script = format!(
         "{}; sleep 1; {}; touch /workspace/done; sleep 4; exit 0",
@@ -601,6 +604,23 @@ fn a_stub_model_speaks_anthropic_and_the_log_gets_spans() {
     }
     assert_eq!(requests[0].data["streaming"], true);
     assert_eq!(requests[1].data["streaming"], false);
+    // With --scrub-argv the token on the `wget`s' command lines is
+    // nowhere in the log, and their execs say where it was.
+    assert!(
+        !text_under(&run.session_dir()).contains(TEST_TOKEN),
+        "the token is in the log"
+    );
+    let wgets: Vec<_> = of_kind(&records, "proc.exec")
+        .into_iter()
+        .filter(|r| r.data["argv"][0] == "wget")
+        .collect();
+    assert!(
+        wgets.len() >= 2
+            && wgets
+                .iter()
+                .all(|r| r.data["argv"].to_string().contains("[redacted]")),
+        "{wgets:?}"
+    );
     let opens = of_kind(&records, "tool.open");
     assert_eq!(opens.len(), 1, "{}", run.describe());
     assert_eq!(opens[0].data["tool_use_id"], "toolu_9");
@@ -971,6 +991,10 @@ fn claude_code_native_runs_a_bash_tool_inside() {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
         "--dump",
         &dump,
+        // The options this run also checks: what ran recorded scrubbed,
+        // compared as run; TLS payloads in the frame dump, ciphertext.
+        "--scrub-argv",
+        "--dump-payloads",
     ]);
     let run = start_env(
         &guest,
@@ -989,6 +1013,34 @@ fn claude_code_native_runs_a_bash_tool_inside() {
     .finish();
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     check_agent_run(&run, "anthropic", &scratch, &token);
+    let pcap = fs::read(scratch.path("dump/frames.pcap")).unwrap();
+    assert!(
+        tls_payload_records(&pcap) > 0,
+        "no TLS payload in the frame dump"
+    );
+}
+
+/// How many of `pcap`'s records are TCP/IPv4 segments holding a TLS
+/// handshake record's start.
+fn tls_payload_records(pcap: &[u8]) -> usize {
+    let u32_at =
+        |at: usize| u32::from_le_bytes([pcap[at], pcap[at + 1], pcap[at + 2], pcap[at + 3]]);
+    let mut at = 24;
+    let mut found = 0;
+    while at + 16 <= pcap.len() {
+        let included = u32_at(at + 8) as usize;
+        let frame = &pcap[at + 16..(at + 16 + included).min(pcap.len())];
+        if frame.len() > 14 + 20 + 20 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
+            let ihl = usize::from(frame[14] & 0x0f) * 4;
+            let tcp = &frame[14 + ihl..];
+            let payload = &tcp[usize::from(tcp[12] >> 4) * 4..];
+            if payload.starts_with(&[0x16, 0x03]) {
+                found += 1;
+            }
+        }
+        at += 16 + included;
+    }
+    found
 }
 
 /// Claude Code from npm runs a Bash tool inside. Since 2.1 the npm package

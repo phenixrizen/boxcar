@@ -235,6 +235,10 @@ pub struct VmConfig {
     /// the network's frames, and the inspected flows' plaintext and
     /// exchanges, go there. A debugging aid, not part of the log.
     pub dump: Option<boxcar_net::DumpDir>,
+    /// With `boxcar run --scrub-argv`: the sensor's `proc.exec` records
+    /// carry their argv scrubbed, and the argvs that changed wait here, as
+    /// run, for the reconciler.
+    pub scrub_argv: Option<boxcar_audit::RawArgv>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -282,6 +286,7 @@ impl VmConfig {
             inspect: None,
             spans: None,
             dump: None,
+            scrub_argv: None,
         }
     }
 }
@@ -484,7 +489,11 @@ impl Vmm {
         // The guest control channel's service and the session's terminal's,
         // when there is a vsock device.
         let services = Arc::new(ServiceRegistry::new());
-        let guest = GuestCtl::new(cfg.session.clone(), cfg.audit.clone());
+        let guest = GuestCtl::with_scrub(
+            cfg.session.clone(),
+            cfg.audit.clone(),
+            cfg.scrub_argv.is_some(),
+        );
         let vsock = VsockDevice::attach(
             &vm,
             &mem,
@@ -503,7 +512,10 @@ impl Vmm {
                 .register(boxcar_vsock::services::PTY_PORT, pty.service())
                 .map_err(|error| VmmError::Config(error.to_string()))?;
             let sensor = if cfg.sensor {
-                let sensor = SensorIngest::new(cfg.audit.clone());
+                let sensor = match &cfg.scrub_argv {
+                    Some(raw) => SensorIngest::scrubbing_argv(cfg.audit.clone(), raw.clone()),
+                    None => SensorIngest::new(cfg.audit.clone()),
+                };
                 services
                     .register(boxcar_vsock::services::SENSOR_PORT, sensor.service())
                     .map_err(|error| VmmError::Config(error.to_string()))?;

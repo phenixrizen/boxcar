@@ -34,6 +34,7 @@
 //! The thread ends with the log (the subscription's end), at `vmm.stop`
 //! after a last tick, or when [`ReconcilerHandle::finish`] asks.
 
+pub mod argv;
 pub mod clock;
 mod dns;
 mod paths;
@@ -52,6 +53,7 @@ use boxcar_proto::{Finding, Payload, Record, Ring, SpanEffects, SpanRef};
 use crate::sink::{AuditSink, Priority, Submission};
 use crate::subscribe::{Item, Next};
 use crate::Filter;
+pub use argv::{ExecKey, RawArgv};
 pub use clock::{Clock, ManualClock, SystemClock};
 use spans::Spans;
 pub use spans::{Declared, DeclaredArgs, SpanIndex};
@@ -91,6 +93,9 @@ pub struct ReconcileConfig {
     /// a declared command or path is compared exactly; without them, with
     /// the record's scrubbed copy.
     pub declared: Option<DeclaredArgs>,
+    /// The argvs as run of the execs the log records scrubbed
+    /// (`--scrub-argv`): the reconciler compares and joins by what ran.
+    pub raw_argv: Option<RawArgv>,
 }
 
 /// The reconciler's state machine: feed it records and ticks, take the

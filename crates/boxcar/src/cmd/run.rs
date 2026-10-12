@@ -18,8 +18,8 @@ use std::{env, fs, io};
 use anyhow::{bail, Context};
 use arc_swap::ArcSwap;
 use boxcar_audit::{
-    AuditSink, DeclaredArgs, ReconcileConfig, Reconciler, SpanIndex, SystemClock, WriterConfig,
-    WriterHandle,
+    AuditSink, DeclaredArgs, RawArgv, ReconcileConfig, Reconciler, SpanIndex, SystemClock,
+    WriterConfig, WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
 use boxcar_net::{DumpDir, InspectConfig, NetConfig, Policy, SessionCa};
@@ -120,7 +120,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         tell("error: --dump needs --net: without a network there is nothing to dump");
         return Ok(ExitCode::from(USAGE_EXIT));
     }
-    let dump = dump_dir(args.dump.as_deref(), &named)?;
+    let dump =
+        dump_dir(args.dump.as_deref(), &named)?.map(|dir| dir.with_payloads(args.dump_payloads));
 
     let session_id = SessionId::new();
     // The tool spans the reconciler keeps and `boxcar spans` lists.
@@ -128,6 +129,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // The model calls' arguments as sent: the gate puts them, the
     // reconciler compares what ran with them. In memory only.
     let declared = DeclaredArgs::new();
+    // With --scrub-argv, the argvs the log records scrubbed, as run: the
+    // sensor's ingest puts them, the reconciler takes them. In memory only.
+    let raw_argv = args.scrub_argv.then(RawArgv::new);
     // A session that inspects has a CA, whose key stays in this process,
     // and a trust store for the real hosts: the host's own.
     let inspect = match session_ca(&policy, &session_id)? {
@@ -255,6 +259,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         inspect,
         spans: Some(spans.clone()),
         dump,
+        scrub_argv: raw_argv.clone(),
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -274,6 +279,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             clock: Arc::new(SystemClock),
             spans: Some(spans),
             declared: Some(declared),
+            raw_argv,
         },
     )
     .context("cannot start the reconciler")?;

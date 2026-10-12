@@ -8,7 +8,12 @@
 //!   gave it, as pcap 2.4 (little endian, microsecond timestamps,
 //!   Ethernet), cut after the frame's headers ([`headers_len`]): a TCP
 //!   payload is not written, plain HTTP's credentials included; each
-//!   record keeps the frame's original length. The net thread copies each frame into a bounded channel
+//!   record keeps the frame's original length. With `--dump-payloads`
+//!   ([`DumpDir::with_payloads`]) a TLS connection's segments are written
+//!   whole: one whose SYN the dump saw and whose first payload, either
+//!   way, is a TLS handshake record ([`TlsConns`]). That is ciphertext,
+//!   whose keys never leave the VMM; every other payload is still cut.
+//!   The net thread copies each frame into a bounded channel
 //!   with `try_send`; the `dump` thread writes them. A frame the channel
 //!   had no room for is dropped and counted (`net.drop{reason:"dump"}`):
 //!   the net thread never waits on the dump.
@@ -28,6 +33,7 @@
 //! neither a share nor inside one, nor hold one: the audit directory's
 //! rule.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -57,6 +63,8 @@ pub const EXCHANGE_FILE_LIMIT: usize = 16 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct DumpDir {
     path: PathBuf,
+    /// `frames.pcap` keeps TLS connections' payloads (`--dump-payloads`).
+    payloads: bool,
 }
 
 impl DumpDir {
@@ -113,7 +121,22 @@ impl DumpDir {
         let http = resolved.join("http");
         fs::create_dir(&http)?;
         fs::set_permissions(&http, fs::Permissions::from_mode(0o700))?;
-        Ok(DumpDir { path: resolved })
+        Ok(DumpDir {
+            path: resolved,
+            payloads: false,
+        })
+    }
+
+    /// The dump with `frames.pcap` keeping the payloads of TLS
+    /// connections when `payloads` ([`TlsConns`]).
+    pub fn with_payloads(mut self, payloads: bool) -> DumpDir {
+        self.payloads = payloads;
+        self
+    }
+
+    /// Whether `frames.pcap` keeps TLS connections' payloads.
+    pub fn payloads(&self) -> bool {
+        self.payloads
     }
 
     pub fn path(&self) -> &Path {
@@ -192,6 +215,8 @@ struct Frame {
 #[derive(Clone)]
 pub struct FrameDump {
     tx: Sender<Frame>,
+    /// Frames go whole to the thread, which cuts them ([`TlsConns`]).
+    payloads: bool,
 }
 
 impl FrameDump {
@@ -201,18 +226,24 @@ impl FrameDump {
         let mut file = create(&dir.frames())?;
         file.write_all(&pcap_header())?;
         let (tx, rx) = bounded(FRAME_QUEUE);
+        let payloads = dir.payloads();
         let thread = thread::Builder::new()
             .name("dump".into())
-            .spawn(move || write_frames(rx, file))?;
-        Ok((FrameDump { tx }, DumpThread { thread }))
+            .spawn(move || write_frames(rx, file, payloads.then(TlsConns::default)))?;
+        Ok((FrameDump { tx, payloads }, DumpThread { thread }))
     }
 
     /// Queues a frame for the file, and says whether there was room; the
     /// caller counts one there was not. Never waits.
     pub fn push(&self, bytes: &[u8]) -> bool {
+        let kept = if self.payloads {
+            bytes.len()
+        } else {
+            headers_len(bytes)
+        };
         let frame = Frame {
             at: SystemTime::now(),
-            bytes: bytes[..headers_len(bytes)].to_vec(),
+            bytes: bytes[..kept].to_vec(),
             len: bytes.len(),
         };
         match self.tx.try_send(frame) {
@@ -243,17 +274,22 @@ impl DumpThread {
     }
 }
 
-/// The thread's body: each frame as a pcap record. A write that fails
-/// ends the file; the frames keep being taken so the queue drains.
-fn write_frames(rx: Receiver<Frame>, file: File) {
+/// The thread's body: each frame as a pcap record, cut by `tls` in
+/// payload mode (the frames come whole). A write that fails ends the
+/// file; the frames keep being taken so the queue drains.
+fn write_frames(rx: Receiver<Frame>, file: File, mut tls: Option<TlsConns>) {
     let mut out = io::BufWriter::new(file);
     let mut failed = false;
     for frame in rx {
         if failed {
             continue;
         }
+        let kept = match tls.as_mut() {
+            Some(tls) => tls.kept_len(&frame.bytes),
+            None => frame.bytes.len(),
+        };
         if out
-            .write_all(&pcap_record(frame.at, &frame.bytes, frame.len))
+            .write_all(&pcap_record(frame.at, &frame.bytes[..kept], frame.len))
             .is_err()
         {
             failed = true;
@@ -287,6 +323,150 @@ pub fn pcap_record(at: SystemTime, frame: &[u8], len: usize) -> Vec<u8> {
     out.extend_from_slice(&(len.max(kept).min(u32::MAX as usize) as u32).to_le_bytes());
     out.extend_from_slice(&frame[..kept]);
     out
+}
+
+/// The most TCP connections payload mode remembers; past it the oldest
+/// goes, and its later segments are cut.
+const MAX_TLS_CONNS: usize = 4096;
+
+/// A TCP connection by its two ends, the lesser first: the same either
+/// way.
+type ConnKey = (([u8; 16], u16), ([u8; 16], u16));
+
+/// What payload mode knows of a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Conn {
+    /// Its SYN was seen, no payload yet.
+    Opened,
+    /// Its first payload was a TLS handshake record: kept whole.
+    Tls,
+    /// Its first payload was anything else: cut.
+    Plain,
+}
+
+/// Payload mode's view of the TCP connections: a connection's segments
+/// are kept whole only when the dump saw it open (its SYN) and its first
+/// payload, either way, starts a TLS handshake record. Every other frame
+/// is cut as [`headers_len`] cuts it: a connection seen only mid-stream,
+/// or forgotten, never has its payload written.
+#[derive(Debug, Default)]
+pub struct TlsConns {
+    conns: HashMap<ConnKey, Conn>,
+    order: VecDeque<ConnKey>,
+}
+
+impl TlsConns {
+    /// How much of `frame` payload mode keeps.
+    pub fn kept_len(&mut self, frame: &[u8]) -> usize {
+        let headers = headers_len(frame);
+        let Some(segment) = tcp_segment(frame) else {
+            return headers;
+        };
+        // A SYN alone opens a connection, whatever came before on its ends.
+        if segment.flags & (TCP_SYN | TCP_ACK) == TCP_SYN {
+            self.open(segment.key);
+        }
+        let payload = &frame[segment.payload.clone()];
+        let conn = match self.conns.get(&segment.key).copied() {
+            Some(Conn::Opened) if !payload.is_empty() => {
+                let conn = if is_tls_handshake(payload) {
+                    Conn::Tls
+                } else {
+                    Conn::Plain
+                };
+                self.conns.insert(segment.key, conn);
+                conn
+            }
+            Some(conn) => conn,
+            None => Conn::Plain,
+        };
+        if conn == Conn::Tls && !payload.is_empty() {
+            segment.payload.end
+        } else {
+            headers
+        }
+    }
+
+    fn open(&mut self, key: ConnKey) {
+        if self.conns.insert(key, Conn::Opened).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_TLS_CONNS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.conns.remove(&oldest);
+            }
+        }
+    }
+}
+
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
+
+/// Whether `payload` starts a TLS handshake record (type 22, version
+/// 3.x).
+fn is_tls_handshake(payload: &[u8]) -> bool {
+    matches!(payload, [0x16, 0x03, minor, ..] if *minor <= 0x04)
+}
+
+/// A TCP segment's connection, flags, and where its payload lies in the
+/// frame (to the IP length's end, Ethernet padding left out).
+struct Segment {
+    key: ConnKey,
+    flags: u8,
+    payload: std::ops::Range<usize>,
+}
+
+/// The TCP segment `frame` carries over IPv4 or IPv6, if it does and its
+/// headers fit.
+fn tcp_segment(frame: &[u8]) -> Option<Segment> {
+    const ETH: usize = 14;
+    let ethertype = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
+    let (src, dst, l4, end) = match ethertype {
+        0x0800 => {
+            let ihl = usize::from(frame.get(ETH)? & 0x0f) * 4;
+            if ihl < 20 || *frame.get(ETH + 9)? != 6 {
+                return None;
+            }
+            let total = usize::from(u16::from_be_bytes([
+                *frame.get(ETH + 2)?,
+                *frame.get(ETH + 3)?,
+            ]));
+            let mut src = [0u8; 16];
+            let mut dst = [0u8; 16];
+            src[..4].copy_from_slice(frame.get(ETH + 12..ETH + 16)?);
+            dst[..4].copy_from_slice(frame.get(ETH + 16..ETH + 20)?);
+            (src, dst, ETH + ihl, ETH + total)
+        }
+        0x86dd => {
+            if *frame.get(ETH + 6)? != 6 {
+                return None;
+            }
+            let len = usize::from(u16::from_be_bytes([
+                *frame.get(ETH + 4)?,
+                *frame.get(ETH + 5)?,
+            ]));
+            let src: [u8; 16] = frame.get(ETH + 8..ETH + 24)?.try_into().ok()?;
+            let dst: [u8; 16] = frame.get(ETH + 24..ETH + 40)?.try_into().ok()?;
+            (src, dst, ETH + 40, ETH + 40 + len)
+        }
+        _ => return None,
+    };
+    let tcp = frame.get(l4..l4 + 20)?;
+    let ports = (
+        u16::from_be_bytes([tcp[0], tcp[1]]),
+        u16::from_be_bytes([tcp[2], tcp[3]]),
+    );
+    let start = l4 + usize::from(tcp[12] >> 4) * 4;
+    let end = end.min(frame.len());
+    if start > frame.len() {
+        return None;
+    }
+    let (a, b) = ((src, ports.0), (dst, ports.1));
+    Some(Segment {
+        key: if a <= b { (a, b) } else { (b, a) },
+        flags: tcp[13],
+        payload: start..end.max(start),
+    })
 }
 
 /// The UDP ports whose payload the frame dump keeps: DNS and DHCP, which
@@ -745,11 +925,93 @@ mod tests {
         assert_eq!(headers_len(&[1, 2, 3]), 3);
     }
 
+    /// A TCP/IPv4 frame from `src` to `dst` (address' last byte, port)
+    /// with `flags`, its IP length set, padded as Ethernet pads.
+    fn tcp4(src: (u8, u16), dst: (u8, u16), flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; 12];
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(40 + payload.len() as u16).to_be_bytes());
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&[10, 0, 2, src.0]);
+        ip[16..20].copy_from_slice(&[10, 0, 2, dst.0]);
+        frame.extend_from_slice(&ip);
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&src.1.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst.1.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = flags;
+        frame.extend_from_slice(&tcp);
+        frame.extend_from_slice(payload);
+        frame.resize(frame.len().max(60), 0);
+        frame
+    }
+
+    /// Payload mode keeps a connection's segments whole only when it saw
+    /// the connection open and its first payload starts a TLS handshake.
+    #[test]
+    fn payload_mode_keeps_tls_connections_only() {
+        const SYN: u8 = 0x02;
+        const ACK: u8 = 0x10;
+        const SYN_ACK: u8 = 0x12;
+        const PSH_ACK: u8 = 0x18;
+        let guest = (15, 40000);
+        let host = (2, 443);
+        let hello = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
+        let mut tls = TlsConns::default();
+        assert_eq!(tls.kept_len(&tcp4(guest, host, SYN, b"")), 54);
+        assert_eq!(tls.kept_len(&tcp4(host, guest, SYN_ACK, b"")), 54);
+        // A padded bare ACK has no payload: it decides nothing.
+        assert_eq!(tls.kept_len(&tcp4(guest, host, ACK, b"")), 54);
+        let first = tcp4(guest, host, PSH_ACK, &hello);
+        assert_eq!(tls.kept_len(&first), first.len());
+        let reply = tcp4(host, guest, PSH_ACK, &[0x17, 0x03, 0x03, 0, 2, 9, 9]);
+        assert_eq!(tls.kept_len(&reply), 54 + 7);
+
+        // Plain HTTP: cut, its later segments too.
+        let web = (15, 40001);
+        let server = (2, 80);
+        tls.kept_len(&tcp4(web, server, SYN, b""));
+        let get = b"GET / HTTP/1.1\r\nAuthorization: Bearer x\r\n\r\n";
+        assert_eq!(tls.kept_len(&tcp4(web, server, PSH_ACK, get)), 54);
+        assert_eq!(tls.kept_len(&tcp4(web, server, PSH_ACK, &hello)), 54);
+
+        // Seen only mid-stream: cut, though it looks like TLS.
+        let late = (15, 40002);
+        assert_eq!(tls.kept_len(&tcp4(late, host, PSH_ACK, &hello)), 54);
+
+        // The same ends opened again start over: plain is cut.
+        tls.kept_len(&tcp4(guest, host, SYN, b""));
+        assert_eq!(tls.kept_len(&tcp4(guest, host, PSH_ACK, get)), 54);
+    }
+
+    #[test]
+    fn payload_mode_writes_tls_payloads_to_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[])
+            .unwrap()
+            .with_payloads(true);
+        let (dump, thread) = FrameDump::start(&dir).unwrap();
+        let hello = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
+        assert!(dump.push(&tcp4((15, 40000), (2, 443), 0x02, b"")));
+        assert!(dump.push(&tcp4((15, 40000), (2, 443), 0x18, &hello)));
+        drop(dump);
+        assert!(thread.join(Duration::from_secs(5)));
+        let bytes = fs::read(dir.frames()).unwrap();
+        let first = 24;
+        assert_eq!(u32_at(&bytes, first + 8), 54);
+        let second = first + 16 + 54;
+        assert_eq!(u32_at(&bytes, second + 8), 64);
+        assert_eq!(&bytes[second + 16 + 54..second + 16 + 64], &hello);
+    }
+
     #[test]
     fn random_frames_never_panic() {
         use proptest::prelude::*;
         proptest!(|(frame in proptest::collection::vec(any::<u8>(), 0..128))| {
             prop_assert!(headers_len(&frame) <= frame.len());
+            prop_assert!(TlsConns::default().kept_len(&frame) <= frame.len());
         });
     }
 
@@ -789,7 +1051,10 @@ mod tests {
         // A queue nobody drains: once it is full, `push` says so at once
         // and never waits.
         let (tx, rx) = bounded::<Frame>(2);
-        let dump = FrameDump { tx };
+        let dump = FrameDump {
+            tx,
+            payloads: false,
+        };
         assert!(dump.push(&[0; 14]));
         assert!(dump.push(&[0; 14]));
         let start = std::time::Instant::now();

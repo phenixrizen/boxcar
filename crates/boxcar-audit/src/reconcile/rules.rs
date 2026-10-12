@@ -7,8 +7,9 @@
 use std::net::{IpAddr, SocketAddrV4};
 
 use boxcar_proto::limits::MAX_SUMMARY;
-use boxcar_proto::{Evidence, Finding, FindingCategory, Payload, Record, Verdict};
+use boxcar_proto::{Evidence, Finding, FindingCategory, Payload, ProcExec, Record, Verdict};
 
+use super::argv::ExecKey;
 use super::dns;
 use super::paths::indicator;
 use super::spans::{EffectKind, Spans};
@@ -158,6 +159,24 @@ pub fn observe(
             out.extend(resolve_pending(state, cfg, ts));
         }
         Payload::ProcExec(exec) => {
+            // Recorded scrubbed: the argv as run, kept in memory, is what
+            // is compared and joined by.
+            let raw = cfg
+                .raw_argv
+                .as_ref()
+                .zip(record.ts_guest_ns)
+                .and_then(|(raw, ts)| raw.take(ExecKey::of(exec, ts)));
+            let as_run;
+            let exec = match raw {
+                Some(argv) => {
+                    as_run = ProcExec {
+                        argv,
+                        ..exec.clone()
+                    };
+                    &as_run
+                }
+                None => exec,
+            };
             let key = ProcKey {
                 tgid: exec.tgid,
                 start_ns: exec.start_ns,

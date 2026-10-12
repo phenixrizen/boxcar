@@ -243,7 +243,14 @@ secret-looking fields scrubbed) and, for one upgraded to WebSocket, its
 messages as `.ws`. DIR is made 0700, its files 0600; it must be new or
 empty, and may be neither a share nor inside one. The dump is an aid, not part of
 the audit log: nothing in it is hashed or chained. Filesystem traffic has
-its own dump, `--audit-level verbose`.
+its own dump, `--audit-level verbose`. With `--dump-payloads`,
+`frames.pcap` also keeps the payloads of TLS connections (ciphertext: the
+gate's keys never leave the VMM); every other TCP payload is still cut.
+
+`boxcar run --scrub-argv` records each process's arguments, and the
+session's command, scrubbed as free text is (secret-looking values
+become `[redacted]`). The reconciler still compares commands with the
+arguments as run, kept in memory only.
 
 ## The sensor
 

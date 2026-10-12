@@ -87,7 +87,13 @@ processes and ring 0 effects to the span:
   copy (a log read later) compares that copy when nothing in it was
   redacted, and where something was the `argv` rule cannot tell and says
   nothing. Findings quote the record's scrubbed copy, never the
-  arguments as sent.
+  arguments as sent. With `boxcar run --scrub-argv` the log records each
+  `proc.exec`'s argv scrubbed, and the sensor's ingest keeps each argv
+  that scrubbing changed, as run, in memory (4096 execs and 8 MiB at
+  most) for the reconciler, which compares and joins by it. An argv let
+  go before the reconciler took it is compared as recorded: what was
+  redacted then does not carry the declared command, and the `argv` rule
+  says so.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)

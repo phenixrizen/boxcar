@@ -716,3 +716,16 @@ Made while writing the plan, 2026-10-06:
   and an exchange keeps room for 64 between slices. The dump writes HTML
   and XML bodies as their size: the free-text scrub cannot read an
   element or an attribute as a key.
+- **Argv scrubbing and TLS payloads are options.** Nate asked for both
+  on 2026-10-11, as options. `boxcar run --scrub-argv` records each
+  `proc.exec`'s argv, and `session.start`'s, scrubbed as free text is;
+  the sensor's ingest keeps each argv scrubbing changed, as run, in
+  memory for the reconciler (`RawArgv`, 4096 execs and 8 MiB), so a
+  command is still compared and joined by what ran, and a secret-looking
+  token in a command cannot by itself hide it from the `argv` rule. Off
+  by default: the log then holds what ran, as before.
+  `--dump-payloads` (with `--dump`) keeps a TLS connection's payloads in
+  `frames.pcap`, ciphertext whose keys never leave the VMM; a connection
+  counts as TLS only when the dump saw its SYN and its first payload
+  starts a handshake record, so plain HTTP's credentials are still never
+  written, as the rule for the dump has it.

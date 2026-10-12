@@ -12,7 +12,9 @@ use std::net::{IpAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use boxcar_audit::{Declared, DeclaredArgs, ManualClock, ReconcileConfig, Reconciler, SpanIndex};
+use boxcar_audit::{
+    Declared, DeclaredArgs, ExecKey, ManualClock, RawArgv, ReconcileConfig, Reconciler, SpanIndex,
+};
 use boxcar_proto::{
     Attrib, ClockSync, Finding, FsClose, FsCreate, FsPathOp, Hash, HashStatus, HttpRequest,
     NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec, ProcExit, ProcFork, ProcHeartbeat,
@@ -555,6 +557,16 @@ fn run_with(
     steps: Vec<Step>,
     declared: Option<DeclaredArgs>,
 ) -> (Vec<Out>, SpanIndex) {
+    run_scrubbed(sensor_expected, steps, declared, None)
+}
+
+/// [`run_with`] with the argvs as run of the execs recorded scrubbed.
+fn run_scrubbed(
+    sensor_expected: bool,
+    steps: Vec<Step>,
+    declared: Option<DeclaredArgs>,
+    raw_argv: Option<RawArgv>,
+) -> (Vec<Out>, SpanIndex) {
     let clock = Arc::new(ManualClock::new(T0));
     let index = SpanIndex::new();
     let mut reconciler = Reconciler::new(ReconcileConfig {
@@ -562,6 +574,7 @@ fn run_with(
         clock: clock.clone(),
         spans: Some(index.clone()),
         declared,
+        raw_argv,
     });
     let mut out = Vec::new();
     for step in steps {
@@ -1373,6 +1386,74 @@ fn a_redacted_argument_is_compared_as_sent() {
         let (out, _) = run_with(true, steps, Some(declared));
         let argv = findings_of(&out).iter().any(|f| f.rule == "argv");
         assert_eq!(argv, mismatch, "{ran} kept {kept}: {out:?}");
+    }
+}
+
+/// With `--scrub-argv` the log records an exec's argv scrubbed, and the
+/// reconciler compares the declared command with the argv as run, kept
+/// in memory: a command that differs only in what the record redacts is
+/// told apart. With the argv as run gone, the scrubbed copy does not
+/// carry the command, and the `argv` rule says so.
+#[test]
+fn an_argv_recorded_scrubbed_is_compared_as_run() {
+    let sent = "0123456789abcdef0123456789abcdef01234567";
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    let command = format!("git checkout {sent}");
+    for (ran, kept, mismatch) in [
+        (sent, true, false),
+        (other, true, true),
+        (sent, false, true),
+    ] {
+        let declared = DeclaredArgs::new();
+        declared.put(
+            "toolu_01",
+            Declared::Json(json!({"command": command})),
+            command.len(),
+        );
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        let mut args = json!({"command": command});
+        boxcar_proto::redact::scrub_deep(&mut args);
+        steps.push(log.tool_open(2000, "toolu_01", "Bash", args));
+        let shell = format!("git checkout {ran}");
+        let mut exec = ProcExec {
+            tid: 330,
+            tgid: 330,
+            ppid: 100,
+            uid: 1000,
+            gid: 1000,
+            filename: "/usr/bin/bash".into(),
+            argv: ["bash", "-c", &shell].map(str::to_owned).to_vec(),
+            argv_truncated: false,
+            start_ns: 10,
+            cgroup_id: 4242,
+        };
+        let raw = RawArgv::new();
+        raw.scrub(2100 * MS, &mut exec);
+        assert_eq!(exec.argv[2], "git checkout [redacted]");
+        if !kept {
+            raw.take(ExecKey::of(&exec, 2100 * MS));
+        }
+        let mut step = log.exec(2100, 330, 100, 10, &["bash", "-c", &shell]);
+        if let Step::Record(record) = &mut step {
+            record.data["argv"] = json!(exec.argv);
+        }
+        steps.push(step);
+        steps.push(log.exit(2500, 330, 10));
+        steps.push(log.tool_close(3000, "toolu_01", "ok"));
+        for at in [4000, 5000] {
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_scrubbed(true, steps, Some(declared), Some(raw.clone()));
+        let argv = findings_of(&out).iter().any(|f| f.rule == "argv");
+        assert_eq!(argv, mismatch, "{ran} kept {kept}: {out:?}");
+        assert!(raw.is_empty(), "taken");
+        let text = format!("{out:?}");
+        assert!(
+            !text.contains(ran),
+            "the argv as run stays in memory: {text}"
+        );
     }
 }
 

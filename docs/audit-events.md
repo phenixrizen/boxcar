@@ -148,7 +148,7 @@ session's process (uid and gid as configured).
 
 | Type | Fields | When |
 |---|---|---|
-| `session.start` | `argv [string]`, `cwd`, `uid`, `gid`, `pid` | Init started the session the VMM asked for. |
+| `session.start` | `argv [string]` (with `--scrub-argv`, scrubbed as `proc.exec`'s is), `cwd`, `uid`, `gid`, `pid` | Init started the session the VMM asked for. |
 | `session.exit` | `code` (or null), `signal` (or null) | The session's process ended: its exit code, or the signal that killed it; both null only when init could not tell. `boxcar run` exits with `code`, or 128 plus `signal`. |
 
 ## `control.*` (host, src `control`)
@@ -183,7 +183,7 @@ clock, tells a process from a later one with the same pid.
 
 | Type | Fields | When |
 |---|---|---|
-| `proc.exec` | `tid`, `tgid`, `ppid`, `uid`, `gid`, `filename`, `argv [string]` (256 elements and 16 KiB at most), `argv_truncated`, `start_ns`, `cgroup_id` | A process ran a new program (`execve` succeeded). |
+| `proc.exec` | `tid`, `tgid`, `ppid`, `uid`, `gid`, `filename`, `argv [string]` (256 elements and 16 KiB at most; with `boxcar run --scrub-argv`, each element scrubbed as free text is), `argv_truncated`, `start_ns`, `cgroup_id` | A process ran a new program (`execve` succeeded). |
 | `proc.fork` | `parent_tid`, `parent_tgid`, `child_pid`, `child_start_ns`, `uid`, `gid`, `thread` | A process made a new process, or (`thread`) a new thread of its own; the reconciler ties the thread to the process, since `fs.*` records name threads. |
 | `proc.exit` | `tid`, `tgid`, `exit_code` (the kernel's status word), `group_dead`, `start_ns` | A thread ended; `group_dead` when it was its process's last. |
 | `proc.connect_attempt` | `tid`, `tgid`, `family`, `proto`, `dst` (*omitted* unless IPv4 or IPv6), `dst_port` (*omitted* the same) | A process asked to connect a socket, with the destination as asked. |

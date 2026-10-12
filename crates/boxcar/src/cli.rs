@@ -497,6 +497,18 @@ pub struct RunArgs {
     /// empty, and may be neither a share nor inside one, nor hold one.
     #[arg(long, value_name = "DIR", conflicts_with = "no_net")]
     pub dump: Option<PathBuf>,
+    /// With --dump: keep the payloads of TLS connections in
+    /// `frames.pcap` (ciphertext; the gate's keys never leave the VMM).
+    /// Every other TCP payload, plain HTTP's included, is still cut to its
+    /// headers.
+    #[arg(long, requires = "dump")]
+    pub dump_payloads: bool,
+    /// Record each process's arguments (`proc.exec`'s `argv`) scrubbed as
+    /// free text is: secret-looking values replaced by `[redacted]`. The
+    /// reconciler still compares commands with the arguments as run, kept
+    /// in memory only.
+    #[arg(long)]
+    pub scrub_argv: bool,
     /// Set NAME to VALUE in the session's environment, after the defaults
     /// (PATH, HOME, TERM, LANG, BOXCAR_SESSION_ID). Repeatable. For what
     /// an agent inside needs, such as CLAUDE_CODE_OAUTH_TOKEN: the value
