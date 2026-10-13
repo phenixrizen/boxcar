@@ -738,3 +738,12 @@ Made while writing the plan, 2026-10-06:
   ancestry; and the scrubber redacts the password of curl's and wget's
   `-u`/`--user`/`-U`/`--proxy-user` values, separate, attached or after
   `=`, an argv's value whole, spaces and all.
+- **The sensor reads a candidate file once, and only a regular file.**
+  The paths the TLS resolver reads (programs the session ran, the
+  `libssl.so*` it mapped) are the guest's to change. Each is now resolved
+  to its real path, opened without following a final link or waiting on
+  what is not a file, refused unless the descriptor is a regular file of
+  at most 512 MiB, read through that cap, and the probes attach through
+  the same descriptor (`/proc/self/fd/N`): a path swapped for
+  `/dev/zero` or a pipe is refused at once, and one swapped for another
+  file after the read gets no probes at offsets read from the first.

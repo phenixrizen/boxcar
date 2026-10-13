@@ -19,9 +19,10 @@
 //! result is in.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -57,10 +58,11 @@ pub struct Offsets {
     pub read_ex: Option<u64>,
 }
 
-/// A path's symbols, found or not.
+/// A path's symbols, found or not, with the file they were read from:
+/// the programs attach to that file, whatever the path names by then.
 struct Resolved {
     path: PathBuf,
-    offsets: Result<Offsets, String>,
+    offsets: Result<(Offsets, File), String>,
 }
 
 /// The thread that reads files for their symbols, and the pipe it writes
@@ -93,7 +95,7 @@ impl Resolver {
                 let tid = unsafe { libc::gettid() };
                 let _ = tid_tx.send(u32::try_from(tid).unwrap_or(0));
                 for path in paths {
-                    let offsets = resolve(&path);
+                    let offsets = resolve_file(&path);
                     if done.send(Resolved { path, offsets }).is_err() {
                         return;
                     }
@@ -214,7 +216,13 @@ impl Attacher {
             let result = match (offsets, ebpf.as_deref_mut()) {
                 (Err(error), _) => Err(error),
                 (Ok(_), None) => Err("the programs are not loaded".to_owned()),
-                (Ok(offsets), Some(ebpf)) => attach_all(ebpf, &path, offsets),
+                // Through the descriptor: the file read, not whatever the
+                // path names now.
+                (Ok((offsets, file)), Some(ebpf)) => attach_all(
+                    ebpf,
+                    Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())),
+                    offsets,
+                ),
             };
             frames.push(frame(&path, result, ts_guest_ns));
         }
@@ -254,15 +262,55 @@ impl Default for Attacher {
 
 /// Reads `path` and finds the four functions: `SSL_write` and `SSL_read`
 /// must be there, exported or in the symbol table.
-pub fn resolve(path: &Path) -> Result<Offsets, String> {
-    let size = fs::metadata(path)
-        .map_err(|error| format!("stat: {error}"))?
-        .len();
-    if size > MAX_FILE_BYTES {
-        return Err(format!("{size} bytes: too large to read for symbols"));
+#[cfg(test)]
+fn resolve(path: &Path) -> Result<Offsets, String> {
+    resolve_file(path).map(|(offsets, _)| offsets)
+}
+
+/// `path`'s file, opened once: its links followed to the real path first
+/// (a program is often reached through one), then opened without
+/// following a link or waiting on what is not a file. Only a regular file
+/// of at most [`MAX_FILE_BYTES`] is taken: a path the guest swapped for a
+/// device or a pipe is refused, never read or waited on.
+fn open_regular(path: &Path) -> Result<File, String> {
+    let real = fs::canonicalize(path).map_err(|error| format!("resolve: {error}"))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&real)
+        .map_err(|error| format!("open: {error}"))?;
+    let meta = file.metadata().map_err(|error| format!("stat: {error}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_owned());
     }
-    let data = fs::read(path).map_err(|error| format!("read: {error}"))?;
-    let obj = object::File::parse(&*data).map_err(|error| format!("not an object: {error}"))?;
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "{} bytes: too large to read for symbols",
+            meta.len()
+        ));
+    }
+    Ok(file)
+}
+
+/// Reads `path` and finds the four functions (`SSL_write` and `SSL_read`
+/// must be there, exported or in the symbol table), with the file they
+/// were read from.
+fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
+    let file = open_regular(path)?;
+    let mut data = Vec::new();
+    (&file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|error| format!("read: {error}"))?;
+    if data.len() as u64 > MAX_FILE_BYTES {
+        return Err("grew too large to read for symbols".to_owned());
+    }
+    symbols(&data).map(|offsets| (offsets, file))
+}
+
+/// The four functions' offsets in the object `data`.
+fn symbols(data: &[u8]) -> Result<Offsets, String> {
+    let obj = object::File::parse(data).map_err(|error| format!("not an object: {error}"))?;
     let find = |name: &str| -> Result<Option<u64>, String> {
         let Some(sym) = obj
             .dynamic_symbols()
@@ -439,7 +487,11 @@ mod tests {
         };
         assert!(!attach.ok);
         assert!(
-            attach.error.as_deref().unwrap_or("").starts_with("stat:"),
+            attach
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("resolve:"),
             "{attach:?}"
         );
         assert_eq!(attach.path, "/nonexistent/libssl.so.3");
@@ -544,6 +596,33 @@ mod tests {
             .unwrap();
         let error = resolve(Path::new(shell)).unwrap_err();
         assert!(error.starts_with("SSL_write:"), "{error}");
+        // Through a link, the file it names.
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("libssl.so.3");
+        std::os::unix::fs::symlink(path, &link).unwrap();
+        assert_eq!(resolve(&link).unwrap(), offsets);
+    }
+
+    /// A path that names a device or a pipe is refused at once: never read
+    /// without end, never waited on.
+    #[test]
+    fn only_a_regular_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zero = tmp.path().join("libssl.so.3");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        let fifo = tmp.path().join("libssl.so.1.1");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid C string, and mkfifo makes a node.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send((resolve(&zero), resolve(&fifo)));
+        });
+        let (zero, fifo) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the resolver waited");
+        assert_eq!(zero.unwrap_err(), "not a regular file");
+        assert_eq!(fifo.unwrap_err(), "not a regular file");
     }
 
     #[test]
