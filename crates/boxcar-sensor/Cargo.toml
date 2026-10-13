@@ -16,6 +16,7 @@ aya = { workspace = true }
 boxcar-proto = { workspace = true }
 boxcar-sensor-common = { workspace = true, features = ["user"] }
 libc = { workspace = true }
+object = { workspace = true }
 thiserror = { workspace = true }
 
 [build-dependencies]
@@ -24,3 +25,4 @@ aya-build = { workspace = true }
 
 [dev-dependencies]
 aya-obj = { workspace = true }
+tempfile = { workspace = true }

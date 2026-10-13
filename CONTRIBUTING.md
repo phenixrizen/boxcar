@@ -28,9 +28,23 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo xtask schema && git diff --exit-code proto/   # the schemas are current
 cargo xtask test-kvm m1          # needs /dev/kvm and target/guest/*
 cargo xtask test-kvm m2          # the same, plus the tests that reach example.com
-cargo xtask test-kvm m3          # the same, with the sensor and the reconciler: the whole gated suite
+cargo xtask test-kvm m3          # the same, with the sensor and the reconciler
+cargo xtask test-kvm m4          # the same, with the gate: the whole gated suite
 cargo xtask sensor               # the eBPF lane: builds the sensor's programs and checks the object
 ```
+
+The agent tests of `test-kvm m4` need `cargo xtask rootfs debian` (Docker,
+a few minutes, about 1.5 GB) and a credential in the environment
+(`CLAUDE_CODE_OAUTH_TOKEN`; `auth.json` under `CODEX_HOME` or `~/.codex`),
+and skip, saying why, without them. CI never has them.
+
+Scenario fixtures (`crates/boxcar-audit/tests/fixtures/*.jsonl`, the
+reconciler's findings and span records for each scenario) are blessed,
+not written by hand: after a deliberate change, `BOXCAR_BLESS=1 cargo test
+-p boxcar-audit --test reconcile` rewrites them; read the diff before
+committing it. The model parsers' fixtures are inline in their tests,
+from the providers' public API documentation; nothing is recorded from a
+live account.
 
 `cargo xtask schema` writes `proto/schema/{control-v1,audit-v1,guest-v1}.json`
 and `proto/testdata/control-v1.jsonl` from the types in `boxcar-proto`; a

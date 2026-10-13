@@ -886,6 +886,368 @@
         }
       ]
     },
+    "HttpRequest": {
+      "description": "`http.request`: a request an inspected flow carried, once its body ended. Headers that carry a credential never reach the observer's records: their values are dropped at the parser.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "body_truncated",
+        "flow",
+        "method",
+        "stream",
+        "version"
+      ],
+      "properties": {
+        "authority": {
+          "description": "`:authority`, or the `Host` header, lowercase.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_b3": {
+          "description": "`b3:` and blake3 of the decoded body; `null` for an empty one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "description": "Decoded body bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "body_truncated": {
+          "description": "The body passed what the observer keeps (16 MiB): hashed, not read by the model parsers.",
+          "type": "boolean"
+        },
+        "content_encoding": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_length": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "content_type": {
+          "description": "`Content-Type` without its parameters, lowercase.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degraded": {
+          "description": "Why the request could not be read whole, if it could not: `lost`, `incomplete`, `flow_closed`, `content_encoding`, `content_decode`, a parser's reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "description": "The request target, cut at 4096 bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "description": "HTTP/2's stream id, or 1, 2, 3... for HTTP/1.1's requests in order.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "user_agent": {
+          "description": "`User-Agent`, cut at 512 bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "`1.1` or `2`.",
+          "type": "string"
+        }
+      }
+    },
+    "HttpResponse": {
+      "description": "`http.response`: the response to an `http.request`, once it ended; for a WebSocket stream, when it closed.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "body_truncated",
+        "dur_ms",
+        "flow",
+        "sse_events",
+        "status",
+        "stream",
+        "ws_messages"
+      ],
+      "properties": {
+        "body_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "body_truncated": {
+          "type": "boolean"
+        },
+        "content_encoding": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degraded": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dur_ms": {
+          "description": "From the request's first byte to the response's last, as the observer took them.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sse_events": {
+          "description": "Events of a `text/event-stream` body.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "status": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ws_messages": {
+          "description": "Messages of a WebSocket stream, both ways.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "LlmRequest": {
+      "description": "`llm.request`: a request to a model API the gate knows, read from an inspected flow once its body ended.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "flow",
+        "messages",
+        "provider",
+        "stream",
+        "streaming",
+        "tools"
+      ],
+      "properties": {
+        "body_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "description": "Decoded body bytes, and their hash, as the `http.request` has them.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "degraded": {
+          "description": "Why the body could not be read: `body_truncated`, `request_json`, or what degraded the `http.request`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow": {
+          "description": "The `flow` and `stream` of the `http.request` it was read from.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "messages": {
+          "description": "How many messages (or input items) the request carried.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "`anthropic`, `openai_chat` or `openai_responses`.",
+          "type": "string"
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "streaming": {
+          "description": "The request asked for a streamed response.",
+          "type": "boolean"
+        },
+        "system_b3": {
+          "description": "`b3:` and blake3 of the system prompt (or instructions), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "description": "The tools offered, by name, at most 64.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "LlmResponse": {
+      "description": "`llm.response`: the model's reply to an `llm.request`, once it ended.",
+      "type": "object",
+      "required": [
+        "dur_ms",
+        "flow",
+        "provider",
+        "stream",
+        "text_bytes",
+        "tool_uses"
+      ],
+      "properties": {
+        "cache_read_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "degraded": {
+          "description": "Why the reply could not be read whole: `stream_error`, `stream_unfinished`, `block_unfinished`, `call_unfinished`, `event_json`, `response_json`, `body_truncated`, `flow_closed`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dur_ms": {
+          "description": "From the request's first byte to the reply's last.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "provider": {
+          "type": "string"
+        },
+        "stop_reason": {
+          "description": "The provider's stop or finish reason, or status.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "text_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text_bytes": {
+          "description": "The assistant's text, by size and blake3 (`b3:`), never inline.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tool_uses": {
+          "description": "How many tool calls the reply made (each a `tool.open`).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "NetClose": {
       "description": "`net.close`: a flow ended.",
       "type": "object",
@@ -1068,6 +1430,54 @@
         }
       }
     },
+    "NetInspect": {
+      "description": "`net.inspect`: the gate ended an inspected flow's TLS, or could not. On `ok`, the record precedes every byte of plaintext relayed; on anything else, nothing was relayed and the flow's `net.close` says `inspect`.",
+      "type": "object",
+      "required": [
+        "flow",
+        "result"
+      ],
+      "properties": {
+        "alpn": {
+          "description": "The application protocol both legs agreed on (`h2`, `http/1.1`), or `null` for none or on failure.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "result": {
+          "description": "`ok`; `upstream_untrusted` (the real host's certificate is not one the host's store vouches for); `upstream_failed` (its handshake failed otherwise); `guest_rejected` (the guest refused the leaf, or closed during the handshake); `timeout` (the handshakes outran the gate's time).",
+          "type": "string"
+        },
+        "rule": {
+          "description": "The `inspect` line that named the flow, as written.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sni": {
+          "description": "The server name the guest asked for, or `null` for a flow to an address (a network `inspect` line).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The TLS version the guest leg speaks (`1.3`, `1.2`), or `null` on failure.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "NetTls": {
       "description": "`net.tls`: the gate's reading of a flow's first bytes, the name they asked for, and whether the flow was let through on it. The gate reads the flows a domain rule allowed: a TLS ClientHello's server name, or a plain HTTP request's `Host`.",
       "type": "object",
@@ -1090,6 +1500,10 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "inspect": {
+          "description": "Whether the policy's `inspect` lines name this flow, so the gate ends its TLS (a `net.inspect` follows) or, for plain HTTP, observes it as it is. Omitted when false.",
+          "type": "boolean"
         },
         "kind": {
           "description": "What the first bytes were read as: `tls` (a ClientHello, bytes that began like one, or none at all) or `http` (anything else, read as a plain HTTP request).",
@@ -1675,6 +2089,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/NetInspect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.inspect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/NetClose"
             },
             "type": {
@@ -2005,6 +2437,168 @@
               "type": "string",
               "enum": [
                 "proc.sensor_status"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTlsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_io"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTlsAttach"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_attach"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SpanEffects"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "span.effects"
               ]
             }
           }
@@ -2440,6 +3034,15 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "threads": {
+          "description": "The sensor's other threads (the one that reads programs for their TLS symbols): their reads of the shares are the sensor's, not the session's. Absent when it has none.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
         }
       }
     },
@@ -2472,6 +3075,60 @@
           "type": "integer",
           "format": "uint16",
           "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcTlsAttach": {
+      "description": "`proc.tls_attach`: the sensor tried to attach its TLS probes to a file: each program the session ran and each `libssl.so*` a session process mapped, once each; `error` is `limit` once after 64 paths. The sensor's own record: no `subject`.",
+      "type": "object",
+      "required": [
+        "ok",
+        "path"
+      ],
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "ProcTlsIo": {
+      "description": "`proc.tls_io`: a process wrote to or read from a TLS connection through a runtime that exports OpenSSL's `SSL_write` and `SSL_read` (or their `_ex` forms), which the sensor probed: the size and the time, never the bytes. What names the process behind a model request.",
+      "type": "object",
+      "required": [
+        "bytes",
+        "dir",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "bytes": {
+          "description": "The bytes the call carried.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "dir": {
+          "description": "`write` or `read`.",
+          "type": "string"
         },
         "tgid": {
           "type": "integer",
@@ -3014,6 +3671,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/NetInspect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.inspect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/NetClose"
             },
             "type": {
@@ -3356,6 +4031,168 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/ProcTlsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_io"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTlsAttach"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tls_attach"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.request"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LlmResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "llm.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ToolClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SpanEffects"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "span.effects"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/Finding"
             },
             "type": {
@@ -3542,6 +4379,73 @@
         }
       }
     },
+    "SpanEffects": {
+      "description": "`span.effects`: what a tool span held when it closed, or when the VM stopped with it still open: the processes the reconciler attributed to it and the records of their effects. A membership record: the effects themselves are never edited.",
+      "type": "object",
+      "required": [
+        "effects",
+        "opened_seq",
+        "procs",
+        "span_id",
+        "tool_name",
+        "truncated"
+      ],
+      "properties": {
+        "closed_seq": {
+          "description": "The seq of the `tool.close`; `null` for a span still open at `vmm.stop`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "effects": {
+          "description": "The seqs of the records attributed to the span, ascending: the `proc.exec` of each process, and the `fs.*` and `net.connect` records their work made; at most 4096.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "executor_tgid": {
+          "description": "The process that made the model request the span came from: the one a `proc.tls_io` write named, else the session's root process; `null` when neither is known.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "opened_seq": {
+          "description": "The seq of the `tool.open`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "procs": {
+          "description": "The processes attributed to the span, by tgid, in join order; at most 1024.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        },
+        "span_id": {
+          "description": "The provider's tool use id, the span's id in every record's `span`.",
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether a process or an effect was left out for the limits.",
+          "type": "boolean"
+        }
+      }
+    },
     "StopMode": {
       "description": "How to stop.",
       "oneOf": [
@@ -3587,6 +4491,97 @@
         }
       }
     },
+    "ToolClose": {
+      "description": "`tool.close`: the agent sent the tool's result back to the model, in its next request.",
+      "type": "object",
+      "required": [
+        "flow",
+        "result_bytes",
+        "result_summary",
+        "status",
+        "stream",
+        "tool_use_id"
+      ],
+      "properties": {
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "result_b3": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result_bytes": {
+          "description": "The result's text, by size and blake3 (`b3:`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "result_summary": {
+          "description": "The result in at most 512 bytes, scrubbed.",
+          "type": "string"
+        },
+        "status": {
+          "description": "`ok`, or `error` when the agent said so.",
+          "type": "string"
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool_use_id": {
+          "type": "string"
+        }
+      }
+    },
+    "ToolOpen": {
+      "description": "`tool.open`: the model asked for a tool to run. Opens the span the record's envelope names (`trace_id` the session, `span_id` the tool use id); the `tool.close` with the same id closes it.",
+      "type": "object",
+      "required": [
+        "args_summary",
+        "flow",
+        "stream",
+        "tool_name",
+        "tool_use_id"
+      ],
+      "properties": {
+        "args": {
+          "description": "The arguments, when their JSON is at most 8 KiB; omitted otherwise."
+        },
+        "args_b3": {
+          "description": "`b3:` and blake3 of the arguments' JSON.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "args_summary": {
+          "description": "The arguments in at most 512 bytes, scrubbed.",
+          "type": "string"
+        },
+        "flow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "description": "The provider's id for the call (`toolu_...`, `call_...`).",
+          "type": "string"
+        }
+      }
+    },
     "Verdict": {
       "description": "Whether something was let through.",
       "type": "string",
@@ -3617,6 +4612,13 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "inspect_ca_sha256": {
+          "description": "SHA-256 of the session CA's certificate (DER), lowercase hex, when the session's policy has an `inspect` rule: the authority the guest was told to trust for the gate's certificates. Omitted when the session has none.",
+          "type": [
+            "string",
+            "null"
           ]
         },
         "kernel": {

@@ -30,7 +30,7 @@ use self::slots::{slot, SlotId};
 
 pub use crate::console::ConsoleOut;
 pub use legacy::{EventFdTrigger, LegacyDevices, SerialDevice, I8042};
-pub use net::NetDevice;
+pub use net::{NetDevice, NetSetup};
 pub use vsock::VsockDevice;
 
 /// The tags of the virtio-fs shares, in slot order: slot 0 (`0xC000_0000`,

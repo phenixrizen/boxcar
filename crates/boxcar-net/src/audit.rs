@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
-use boxcar_proto::{NetClose, NetDrop, Payload, Ring};
+use boxcar_proto::{NetClose, NetDrop, Payload, Ring, SpanRef};
 
 use crate::tcp::FlowId;
 
@@ -36,6 +36,24 @@ pub(crate) fn record(sink: &AuditSink, payload: Payload) {
         }
     });
     match emit(sink, payload) {
+        Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
+        Err(error @ EmitError::Checkpoint) => {
+            boxcar_virtio::limited!(error, "net: audit record refused: {error}");
+        }
+    }
+}
+
+/// [`record`], for a record that belongs to a span (the gate's `tool.*`).
+pub(crate) fn record_in_span(sink: &AuditSink, payload: Payload, span: Option<SpanRef>) {
+    #[cfg(test)]
+    tests::RECORDED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&payload);
+        }
+    });
+    let mut s = submission(payload);
+    s.span = span;
+    match sink.emit(s) {
         Ok(()) | Err(EmitError::Closed | EmitError::Failed) => {}
         Err(error @ EmitError::Checkpoint) => {
             boxcar_virtio::limited!(error, "net: audit record refused: {error}");
@@ -123,13 +141,20 @@ pub enum DropReason {
     /// guest's address. (DHCP, answered by the gateway itself, may come
     /// from any address.)
     SrcSpoof,
+    /// Plaintext of an inspected flow the observer's channel had no room
+    /// for: the flow went on at the relay's pace, the observer's copy has
+    /// a hole (counted in bytes, not frames).
+    Observe,
+    /// A frame the dump's queue had no room for (`--dump`): the dump has
+    /// a hole, the guest's traffic went on.
+    Dump,
     /// Anything else: an unknown protocol, or a malformed frame.
     Other,
 }
 
 impl DropReason {
     /// Every reason, in the order [`Drops`] keeps them.
-    pub const ALL: [DropReason; 13] = [
+    pub const ALL: [DropReason; 15] = [
         DropReason::Ipv6,
         DropReason::Icmp,
         DropReason::Dhcp,
@@ -142,6 +167,8 @@ impl DropReason {
         DropReason::QueueFull,
         DropReason::TcpPendingFull,
         DropReason::SrcSpoof,
+        DropReason::Observe,
+        DropReason::Dump,
         DropReason::Other,
     ];
 
@@ -160,6 +187,8 @@ impl DropReason {
             DropReason::QueueFull => "queue_full",
             DropReason::TcpPendingFull => "tcp_pending_full",
             DropReason::SrcSpoof => "src_spoof",
+            DropReason::Observe => "observe",
+            DropReason::Dump => "dump",
             DropReason::Other => "other",
         }
     }
@@ -406,6 +435,8 @@ pub(crate) mod tests {
                 "queue_full",
                 "tcp_pending_full",
                 "src_spoof",
+                "observe",
+                "dump",
                 "other"
             ]
         );

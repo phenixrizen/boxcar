@@ -55,3 +55,56 @@ The numbers are a baseline for this machine and a debug build. They are
 not a benchmark of virtio-fs; they say that multiqueue does what it should
 (serve concurrent guest I/O from several threads) and costs little when
 the guest does not use it.
+
+# The gate's cost on an inspected download
+
+Measured 2026-10-06 for Task 7 of M4, on the development machine (WSL2,
+Linux 6.18, KVM), with a **debug build** of `boxcar` built with
+`--features boxcar/kvm-tests` (so that `BOXCAR_TEST_UPSTREAM_ROOTS` is
+read), the Alpine 3.22 minirootfs as the guest, one vCPU, and a TLS
+server on the host's own address (Python's `http.server` behind `ssl`,
+HTTP/1.1, a self-signed end-entity certificate for the address, trusted
+through the test hook) serving a 100 MB file of random bytes. The guest
+downloads the file with busybox `wget --no-check-certificate -O
+/dev/null` three times each way, in one session:
+
+- **relayed**: `--allow <host>/32:<port>` and the private range the
+  address is in, the connection relayed as any TLS connection is (the
+  gate reads the first bytes for the name and steps back);
+- **inspected**: the same with `--inspect <host>:<port>`: the guest's
+  TLS ends in boxcar, boxcar's own TLS reaches the server, the plaintext
+  is relayed byte for byte and copied to the observer, which parses the
+  HTTP/1.1 response and hashes the body (kept for parsing up to 16 MiB,
+  hashed whole).
+
+Timed by each flow's `net.close.dur_ms`, with nothing else running.
+Script: `target/perf/gate-download.sh` (kept out of the tree; reproduce
+from this description).
+
+## Results
+
+| Case | Runs, seconds | Median | MB/s at the median |
+|---|---|---|---|
+| relayed | 5.96, 12.22, 8.32 | 8.32 | 12.6 |
+| inspected | 7.66, 7.75, 8.02 | 7.75 | 13.5 |
+
+Every inspected run's `http.response` says `body_bytes: 104857600`, and
+no `net.drop{reason:"observe"}` was counted: the observer kept up.
+
+## Reading
+
+- At this build's speed the gate costs nothing measurable: the three
+  relayed runs spread over twice the difference between the two medians,
+  and the inspected runs were the steadier. What bounds both is the
+  guest's own TLS (busybox's `ssl_client` on one vCPU) and the relay's
+  copying in a debug build, not the two rustls record layers the gate
+  adds on the net thread (decrypt the guest's, encrypt for the server,
+  and back) nor the copy to the observer.
+- The observer never slows the relay: it is fed by a bounded channel
+  with `try_send`, and a chunk it has no room for is dropped and counted
+  (`net.drop{reason:"observe"}`), which marks the flow's streams degraded
+  rather than holding the guest.
+- A release build, and a guest client faster than busybox's, would move
+  both numbers; the gate's share would show then. The shape is what this
+  measurement pins: inspection is in line with the relay, not a step
+  behind it.

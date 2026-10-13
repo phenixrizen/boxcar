@@ -1,8 +1,9 @@
 # boxcar design
 
-Status: accepted 2026-09-29. This is the design the implementation plans argue
-from. Where a plan and this document disagree, this document wins until it is
-amended here.
+Status: accepted 2026-09-29; amended 2026-10-06 (section 14: the model gateway
+became the model traffic gate). This is the design the implementation plans
+argue from. Where a plan and this document disagree, this document wins until
+it is amended here.
 
 ## 1. Purpose
 
@@ -46,13 +47,15 @@ Non-goals:
 ## 3. Threat model
 
 The agent is semi-adversarial: it may try to hide its actions, exfiltrate data,
-or tamper with monitoring. It may obtain root inside the guest. The host, the
-runtime process, and the model gateway are trusted. The model provider is
-trusted for transport but its output is data.
+or tamper with monitoring. It may obtain root inside the guest. The host and the
+runtime process are trusted. The model provider is trusted for transport but
+its output is data.
 
 Consequences: ring 0 must never depend on guest cooperation; ring 1 is
-corroboration, not the record; the API key never enters the guest; the guest
-cannot reach host services except the ones the runtime deliberately exposes.
+corroboration, not the record; boxcar never holds the agent's credential (the
+agent's own login stays in the guest, and the record of what it asked the
+model is taken on the host, where the guest cannot alter it); the guest cannot
+reach host services except the ones the runtime deliberately exposes.
 
 ## 4. Architecture
 
@@ -64,10 +67,10 @@ One host process per isolate, the VMM, plus two small guest binaries.
 | Filesystem device | host | virtio-fs served in-process by fuse-backend-rs. `AuditFs` wraps the passthrough filesystem and records every operation with the guest pid, uid, and gid the FUSE header carries |
 | Network device | host | virtio-net whose backend is a user-mode TCP/IP stack on smoltcp. Guest TCP and UDP terminate in the VMM and are relayed to host sockets. DNS, DHCP, and ICMP-to-gateway are answered by the VMM |
 | vsock device | host | virtio-vsock with a Unix-socket muxer (Firecracker's hybrid protocol). Carries the guest control channel, the agent's PTY, and the sensor stream on privileged ports |
-| Model gateway | host | HTTP proxy the agent is pointed at. Holds the real API key, strips any key the agent sends, records every request and response, and extracts tool_use and tool_result blocks into spans. Speaks the Anthropic Messages API and OpenAI-compatible chat and responses APIs |
+| Model traffic gate | host | Part of the network stack. For a destination the policy marks `inspect`, the stack ends the guest's TLS itself with a certificate from a per-session CA the guest trusts, opens its own verified TLS connection to the real host, relays the plaintext byte for byte both ways, and observes it: HTTP/1.1 and HTTP/2 requests and responses become `http.*` records, and the model APIs it knows (Anthropic Messages, OpenAI chat and responses, the latter also over WebSocket) become `llm.*` and `tool.*` records whose tool_use and tool_result blocks define spans. Authentication headers are removed structurally before anything records or stores a byte. The agent keeps its own credential; boxcar never sees it as data and never injects one |
 | Guest kernel | guest | Linux 6.18 LTS built from Firecracker's microvm config plus a fragment: virtio-fs, vsock, BPF LSM, BTF, lockdown integrity, no modules, no io_uring |
-| Guest init | guest | Static Rust PID 1 in the initramfs. Mounts the rootfs, starts the sensor, drops privileges, execs the agent under a PTY forwarded over vsock |
-| Guest sensor | guest | Aya eBPF programs on exec, fork, exit, connect, plus self-protection. Streams events over vsock with a heartbeat |
+| Guest init | guest | Static Rust PID 1 in the initramfs. Mounts the rootfs, installs the session CA in the guest's trust store, starts the sensor, drops privileges, execs the agent under a PTY forwarded over vsock |
+| Guest sensor | guest | Aya eBPF programs on exec, fork, exit, connect, plus self-protection, and, where the agent's runtime exports OpenSSL's read and write functions, the size and time of each TLS write and read. Streams events over vsock with a heartbeat |
 | Audit log | host | Single writer per session. Append-only JSON lines, blake3 hash-chained, checkpointed, verifiable |
 | Reconciler | host | Joins the intent, process, and effect streams and emits findings |
 | Policy | host | TOML per session, enforced in the network stack, the filesystem decorator, and the sensor's LSM hooks |
@@ -77,15 +80,18 @@ One host process per isolate, the VMM, plus two small guest binaries.
 
 **Ring 0 (host, tamper-proof).** Everything that leaves the guest passes
 through a virtio queue the VMM services. The filesystem, network, vsock, PTY,
-and gateway events are observed by host code the guest cannot modify. The
+and gate events are observed by host code the guest cannot modify. The
 rootfs being served over virtio-fs rather than a block device is what makes
 this semantic: the VMM sees `open("/etc/passwd", O_RDWR)` by pid 142, not a
 sector write. The same holds for the network because the VMM terminates the
-guest's TCP itself.
+guest's TCP itself, and for model traffic because the TLS session the agent
+opens to an inspected host ends in the VMM, which holds the only key that
+signed the certificate the agent accepted.
 
 **Ring 1 (guest, best effort).** A small eBPF sensor started by init before
 privileges drop reports process lineage: exec with argv, fork, exit, connect
-with the full 4-tuple. It lives in the initramfs, not on the audited
+with the full 4-tuple, and, for runtimes that export OpenSSL's functions, the
+size and time of each TLS write and read. It lives in the initramfs, not on the audited
 filesystem. The agent runs without CAP_BPF, CAP_PERFMON, or CAP_SYS_ADMIN, the
 kernel is locked down, and an LSM program denies `bpf()` to everyone but the
 sensor. Ring 1 can still be silenced by a guest kernel compromise. That
@@ -110,12 +116,13 @@ not the thread group id. The reconciler maps thread ids to processes using
 ring 1 fork and exec events.
 
 Type families: `vmm.*`, `fs.*`, `net.*`, `vsock.*`, `session.*`, `control.*`,
-`policy.*`, `proc.*` (ring 1), `llm.*` and `tool.*` (gateway), `finding`,
-`checkpoint`, `sync`. New types are additive; consumers ignore unknown types.
+`policy.*`, `proc.*` (ring 1), `http.*`, `llm.*` and `tool.*` (gate),
+`finding` and `span.*` (reconciler), `checkpoint`, `sync`. New types are
+additive; consumers ignore unknown types.
 
 Limits: paths 4096 bytes, argv 256 elements and 16 KiB, summaries 512 bytes.
 Bodies over 8 KiB are hashed, never inlined. Environment values are never
-logged. The gateway strips authentication headers structurally before the
+logged. The gate strips authentication headers structurally before the
 recorder sees bytes. Writes, creates, unlinks, renames, setattr, verdicts,
 spans, and findings are never sampled. Reads may be sampled and drops are
 counted in checkpoints.
@@ -145,7 +152,7 @@ references back into the same log:
 
 ## 8. One agent action, end to end
 
-1. The model's reply passes through the gateway with a tool_use block. A span
+1. The model's reply passes through the gate with a tool_use block. A span
    opens.
 2. The agent execs curl. The sensor reports pid, parent, and argv, attached
    to the span by ancestry and time.
@@ -154,7 +161,7 @@ references back into the same log:
    supplies the pid for the flow.
 4. curl writes a file. The filesystem decorator logs create, write, and close
    with the same pid and hashes the content.
-5. The agent sends the tool_result back through the gateway. The span
+5. The agent sends the tool_result back through the gate. The span
    closes with every effect nested under it.
 
 If the sensor was silenced, steps 3 and 4 still appear with pids but without
@@ -191,7 +198,9 @@ session directory for conductor's audit route to page through.
 | Filesystem | virtio-fs in-process, no DAX | DAX would bypass the audit surface |
 | Network | user-mode stack in the VMM, no TAP | Events with semantics, policy in the data path, no root |
 | Console | 16550 serial for the kernel log; agent PTY over vsock | Avoids writing a virtio-console device |
-| Gateway | Anthropic Messages plus OpenAI chat and responses from the start | Claude Code first, Codex and most others second |
+| Model traffic | A TLS-terminating gate in the network stack with a per-session CA, not an HTTP proxy the agent is pointed at | Agents run on account logins as often as on API keys, so boxcar holds no credential; the gate sees every provider and every runtime the same way and keeps the record in ring 0 (section 14) |
+| Model APIs | Anthropic Messages plus OpenAI chat and responses from the start | Claude Code first, Codex and most others second |
+| In-guest TLS capture | Corroboration only, where the runtime exports OpenSSL's functions | The native Claude Code build (Bun, BoringSSL compiled in, no symbols) and Codex (rustls) give a probe nothing to attach to (section 14) |
 | Guest kernel | 6.18 LTS built in a Docker container | The dev host's toolchain is too old for BTF |
 | Sensor | Aya on a pinned nightly, bindings generated from our kernel's BTF | No CO-RE from Rust yet; we control the kernel so drift is a build check |
 | Log | Hash-chained from milestone 1 | Cheap, and the writer is the single serialization point anyway |
@@ -201,7 +210,7 @@ session directory for conductor's audit route to page through.
 1. Shell on the serial console with an audited virtio-fs rootfs.
 2. User-mode networking, vsock, the agent PTY, control protocol v1.
 3. Guest sensor and reconciler.
-4. Gateway, spans, Claude Code running inside.
+4. Model traffic gate, spans, Claude Code and Codex running inside.
 5. OCI images, policy files, exporters, hardening, docs.
 
 Conductor integration is a separate plan in the conductor repository after
@@ -214,3 +223,58 @@ milestone 2.
 - ptp_kvm availability on nested-virtualization hosts for clock pairing.
 - Which agents' harnesses expose a stable tool-executor process shape for
   span ancestry.
+- Content encodings beyond gzip, deflate and brotli in model responses
+  (zstd), and an agent that pins its provider's certificate: both fail
+  closed and visibly, neither is observed.
+
+## 14. Amendments
+
+### 2026-10-06: the model traffic gate replaces the model gateway
+
+The design had an HTTP proxy on the host (`10.0.2.2:8080`) that the agent
+was pointed at, which held the real API key and injected it. That shape
+assumes an API key. Claude Code and Codex are as often run on account
+logins (OAuth tokens the agent refreshes itself), where there is no key to
+hold and the agent's own session is what authenticates it; a proxy that
+rewrote credentials would have to hold the user's login, and an agent whose
+base URL is overridden may not accept its account login at all.
+
+In-guest capture of the plaintext, groundcover's approach, was considered
+as the replacement: uprobes on the TLS library's read and write functions.
+groundcover's documentation supports it for OpenSSL, Go's `crypto/tls`,
+Node.js and Java (through their agent) and says it is "unsupported for
+binaries which have been compiled without debug symbols". The native Claude
+Code build is a Bun executable with BoringSSL compiled in and no symbols
+for it; Codex's binary uses rustls, whose plaintext boundary is generic,
+inlined Rust with no stable symbol. Neither gives a probe an address. The
+approach therefore cannot be the record; it is kept as corroboration for
+runtimes that do export the functions, Node among them.
+
+What changes:
+
+- The network stack gains a gate for destinations the policy marks
+  `inspect`. It ends the guest's TLS with a leaf certificate signed by a CA
+  made for the session (the key never leaves the VMM), connects to the real
+  host with its own verified TLS, and relays the plaintext unchanged in
+  both directions. Init installs the CA in the guest's trust store and the
+  runtime variables that name it. An agent that pins its certificate fails
+  closed and visibly.
+- The gate observes HTTP/1.1 and HTTP/2 (HPACK decoded passively, content
+  decoded for gzip, deflate and brotli, SSE split into events, WebSocket
+  frames read) and records `http.*` for every inspected exchange, and
+  `llm.*` and `tool.*` for the model APIs it knows. It never modifies a
+  byte of the stream and never injects a credential. Authentication headers
+  are removed structurally before any record or dump is made.
+- The sensor adds TLS write and read events (`proc.tls_io`) for a process
+  whose executable or loaded library exports OpenSSL's functions, so that
+  the reconciler can name the process behind a model request. It is
+  corroboration, like the rest of ring 1.
+- A dump mode (`boxcar run --dump DIR`), after bitvessel's `DebugNet`,
+  writes the guest's frames as a pcap, the decrypted streams of inspected
+  flows, and each decoded HTTP exchange, for inspection by hand.
+- The `gateway` source becomes `gate`. Milestone 4 is "model traffic gate,
+  spans, Claude Code and Codex running inside".
+
+What does not change: the two rings and what each may be trusted for, the
+event envelope, the span model and the finding categories, the policy's
+place in the data path, and that the agent runs inside.

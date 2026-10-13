@@ -88,6 +88,12 @@ pub struct VmmStart {
     /// and read as none when absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<ShareRef>,
+    /// SHA-256 of the session CA's certificate (DER), lowercase hex, when
+    /// the session's policy has an `inspect` rule: the authority the guest
+    /// was told to trust for the gate's certificates. Omitted when the
+    /// session has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect_ca_sha256: Option<String>,
 }
 
 /// `vmm.stop`: the VM stopped.
@@ -555,6 +561,38 @@ pub struct NetTls {
     /// `http`.
     pub alpn: Vec<String>,
     pub verdict: Verdict,
+    /// Whether the policy's `inspect` lines name this flow, so the gate
+    /// ends its TLS (a `net.inspect` follows) or, for plain HTTP, observes
+    /// it as it is. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inspect: bool,
+}
+
+/// `net.inspect`: the gate ended an inspected flow's TLS, or could not. On
+/// `ok`, the record precedes every byte of plaintext relayed; on anything
+/// else, nothing was relayed and the flow's `net.close` says `inspect`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct NetInspect {
+    /// The `flow` of the flow's `net.connect`.
+    pub flow: u64,
+    /// The server name the guest asked for, or `null` for a flow to an
+    /// address (a network `inspect` line).
+    pub sni: Option<String>,
+    /// The application protocol both legs agreed on (`h2`, `http/1.1`),
+    /// or `null` for none or on failure.
+    pub alpn: Option<String>,
+    /// The TLS version the guest leg speaks (`1.3`, `1.2`), or `null` on
+    /// failure.
+    pub version: Option<String>,
+    /// `ok`; `upstream_untrusted` (the real host's certificate is not one
+    /// the host's store vouches for); `upstream_failed` (its handshake
+    /// failed otherwise); `guest_rejected` (the guest refused the leaf, or
+    /// closed during the handshake); `timeout` (the handshakes outran the
+    /// gate's time).
+    pub result: String,
+    /// The `inspect` line that named the flow, as written.
+    pub rule: Option<String>,
 }
 
 /// `net.close`: a flow ended.
@@ -869,6 +907,11 @@ pub struct ProcSensorStatus {
     /// The sensor's own process id in the guest, which the guards protect.
     #[serde(default)]
     pub pid: u32,
+    /// The sensor's other threads (the one that reads programs for their
+    /// TLS symbols): their reads of the shares are the sensor's, not the
+    /// session's. Absent when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<u32>,
     /// Why the sensor is degraded, when a single reason covers it (such as
     /// `no_programs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -896,6 +939,214 @@ pub struct ProgramStatus {
     /// Why it is not attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// `proc.tls_io`: a process wrote to or read from a TLS connection
+/// through a runtime that exports OpenSSL's `SSL_write` and `SSL_read`
+/// (or their `_ex` forms), which the sensor probed: the size and the
+/// time, never the bytes. What names the process behind a model request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcTlsIo {
+    pub tid: u32,
+    pub tgid: u32,
+    /// `write` or `read`.
+    pub dir: String,
+    /// The bytes the call carried.
+    pub bytes: u32,
+}
+
+/// `proc.tls_attach`: the sensor tried to attach its TLS probes to a
+/// file: each program the session ran and each `libssl.so*` a session
+/// process mapped, once each; `error` is `limit` once after 64 paths.
+/// The sensor's own record: no `subject`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcTlsAttach {
+    pub path: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `http.request`: a request an inspected flow carried, once its body
+/// ended. Headers that carry a credential never reach the observer's
+/// records: their values are dropped at the parser.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HttpRequest {
+    /// The `flow` of the flow's `net.connect`.
+    pub flow: u64,
+    /// HTTP/2's stream id, or 1, 2, 3... for HTTP/1.1's requests in order.
+    pub stream: u32,
+    /// `1.1` or `2`.
+    pub version: String,
+    pub method: String,
+    /// `:authority`, or the `Host` header, lowercase.
+    pub authority: Option<String>,
+    /// The request target, cut at 4096 bytes.
+    pub path: Option<String>,
+    /// `Content-Type` without its parameters, lowercase.
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_length: Option<u64>,
+    /// `User-Agent`, cut at 512 bytes.
+    pub user_agent: Option<String>,
+    /// Decoded body bytes.
+    pub body_bytes: u64,
+    /// `b3:` and blake3 of the decoded body; `null` for an empty one.
+    pub body_b3: Option<String>,
+    /// The body passed what the observer keeps (16 MiB): hashed, not
+    /// read by the model parsers.
+    pub body_truncated: bool,
+    /// Why the request could not be read whole, if it could not:
+    /// `lost`, `incomplete`, `flow_closed`, `content_encoding`,
+    /// `content_decode`, a parser's reason.
+    pub degraded: Option<String>,
+}
+
+/// `http.response`: the response to an `http.request`, once it ended; for
+/// a WebSocket stream, when it closed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HttpResponse {
+    pub flow: u64,
+    pub stream: u32,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub body_bytes: u64,
+    pub body_b3: Option<String>,
+    pub body_truncated: bool,
+    /// Events of a `text/event-stream` body.
+    pub sse_events: u64,
+    /// Messages of a WebSocket stream, both ways.
+    pub ws_messages: u64,
+    /// From the request's first byte to the response's last, as the
+    /// observer took them.
+    pub dur_ms: u64,
+    pub degraded: Option<String>,
+}
+
+/// `llm.request`: a request to a model API the gate knows, read from an
+/// inspected flow once its body ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LlmRequest {
+    /// The `flow` and `stream` of the `http.request` it was read from.
+    pub flow: u64,
+    pub stream: u32,
+    /// `anthropic`, `openai_chat` or `openai_responses`.
+    pub provider: String,
+    pub model: Option<String>,
+    /// The request asked for a streamed response.
+    pub streaming: bool,
+    /// How many messages (or input items) the request carried.
+    pub messages: u32,
+    /// `b3:` and blake3 of the system prompt (or instructions), if any.
+    pub system_b3: Option<String>,
+    /// The tools offered, by name, at most 64.
+    pub tools: Vec<String>,
+    pub max_tokens: Option<u64>,
+    /// Decoded body bytes, and their hash, as the `http.request` has them.
+    pub body_bytes: u64,
+    pub body_b3: Option<String>,
+    /// Why the body could not be read: `body_truncated`, `request_json`,
+    /// or what degraded the `http.request`.
+    pub degraded: Option<String>,
+}
+
+/// `llm.response`: the model's reply to an `llm.request`, once it ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LlmResponse {
+    pub flow: u64,
+    pub stream: u32,
+    pub provider: String,
+    pub model: Option<String>,
+    /// The provider's stop or finish reason, or status.
+    pub stop_reason: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    /// The assistant's text, by size and blake3 (`b3:`), never inline.
+    pub text_bytes: u64,
+    pub text_b3: Option<String>,
+    /// How many tool calls the reply made (each a `tool.open`).
+    pub tool_uses: u32,
+    /// From the request's first byte to the reply's last.
+    pub dur_ms: u64,
+    /// Why the reply could not be read whole: `stream_error`,
+    /// `stream_unfinished`, `block_unfinished`, `call_unfinished`,
+    /// `event_json`, `response_json`, `body_truncated`, `flow_closed`.
+    pub degraded: Option<String>,
+}
+
+/// `tool.open`: the model asked for a tool to run. Opens the span the
+/// record's envelope names (`trace_id` the session, `span_id` the tool use
+/// id); the `tool.close` with the same id closes it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolOpen {
+    pub flow: u64,
+    pub stream: u32,
+    /// The provider's id for the call (`toolu_...`, `call_...`).
+    pub tool_use_id: String,
+    pub tool_name: String,
+    /// `b3:` and blake3 of the arguments' JSON.
+    pub args_b3: Option<String>,
+    /// The arguments in at most 512 bytes, scrubbed.
+    pub args_summary: String,
+    /// The arguments, when their JSON is at most 8 KiB; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+}
+
+/// `tool.close`: the agent sent the tool's result back to the model, in
+/// its next request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolClose {
+    pub flow: u64,
+    pub stream: u32,
+    pub tool_use_id: String,
+    /// `ok`, or `error` when the agent said so.
+    pub status: String,
+    /// The result's text, by size and blake3 (`b3:`).
+    pub result_bytes: u64,
+    pub result_b3: Option<String>,
+    /// The result in at most 512 bytes, scrubbed.
+    pub result_summary: String,
+}
+
+/// `span.effects`: what a tool span held when it closed, or when the VM
+/// stopped with it still open: the processes the reconciler attributed to
+/// it and the records of their effects. A membership record: the effects
+/// themselves are never edited.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SpanEffects {
+    /// The provider's tool use id, the span's id in every record's `span`.
+    pub span_id: String,
+    pub tool_name: String,
+    /// The seq of the `tool.open`.
+    pub opened_seq: u64,
+    /// The seq of the `tool.close`; `null` for a span still open at
+    /// `vmm.stop`.
+    pub closed_seq: Option<u64>,
+    /// The process that made the model request the span came from: the
+    /// one a `proc.tls_io` write named, else the session's root process;
+    /// `null` when neither is known.
+    pub executor_tgid: Option<u32>,
+    /// The processes attributed to the span, by tgid, in join order; at
+    /// most 1024.
+    pub procs: Vec<u32>,
+    /// The seqs of the records attributed to the span, ascending: the
+    /// `proc.exec` of each process, and the `fs.*` and `net.connect`
+    /// records their work made; at most 4096.
+    pub effects: Vec<u64>,
+    /// Whether a process or an effect was left out for the limits.
+    pub truncated: bool,
 }
 
 /// `finding`: the reconciler's conclusion from records of both rings, with

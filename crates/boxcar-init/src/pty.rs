@@ -99,6 +99,20 @@ pub fn session_env(config: &SessionConfig) -> Vec<CString> {
             env.push(term);
         }
     }
+    // With a session CA, the variables that point the runtimes at it,
+    // unless the config set them itself.
+    if config.ca_pem.is_some() {
+        for (name, value) in crate::trust::ENV {
+            let set = env
+                .iter()
+                .any(|var| var.as_bytes().starts_with(format!("{name}=").as_bytes()));
+            if !set {
+                if let Ok(var) = CString::new(format!("{name}={value}")) {
+                    env.push(var);
+                }
+            }
+        }
+    }
     env
 }
 
@@ -634,6 +648,7 @@ mod tests {
             rows: 24,
             cols: 80,
             sysctls: Vec::new(),
+            ca_pem: None,
         }
     }
 
@@ -662,6 +677,44 @@ mod tests {
             ("OK", ""),
         ]));
         assert_eq!(texts(&env), ["OK=", "TERM=xterm-256color"]);
+    }
+
+    /// With a CA in the config, the runtimes' variables name the
+    /// certificate and the bundle, after the config's own, which win.
+    #[test]
+    fn session_env_names_the_bundle_when_the_config_has_a_ca() {
+        let mut with_ca = config(&[("PATH", "/bin")]);
+        with_ca.ca_pem =
+            Some("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n".into());
+        let env = session_env(&with_ca);
+        assert_eq!(
+            texts(&env),
+            [
+                "PATH=/bin",
+                "TERM=xterm-256color",
+                "NODE_EXTRA_CA_CERTS=/run/boxcar/ca.pem",
+                "SSL_CERT_FILE=/run/boxcar/ca-bundle.pem",
+                "CURL_CA_BUNDLE=/run/boxcar/ca-bundle.pem",
+                "REQUESTS_CA_BUNDLE=/run/boxcar/ca-bundle.pem",
+                "GIT_SSL_CAINFO=/run/boxcar/ca-bundle.pem",
+            ]
+        );
+        // The config's own value stays, and is not repeated.
+        let mut own = config(&[("SSL_CERT_FILE", "/etc/mine.pem")]);
+        own.ca_pem = with_ca.ca_pem.clone();
+        let own_env = session_env(&own);
+        let env = texts(&own_env);
+        assert_eq!(env[0], "SSL_CERT_FILE=/etc/mine.pem");
+        assert_eq!(
+            env.iter()
+                .filter(|v| v.starts_with("SSL_CERT_FILE="))
+                .count(),
+            1
+        );
+        assert!(env.contains(&"NODE_EXTRA_CA_CERTS=/run/boxcar/ca.pem"));
+        // Without a CA, nothing is added.
+        let plain = session_env(&config(&[("PATH", "/bin")]));
+        assert_eq!(texts(&plain), ["PATH=/bin", "TERM=xterm-256color"]);
     }
 
     /// The session's PATH is the one its environment gives, else init's.

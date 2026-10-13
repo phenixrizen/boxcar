@@ -18,7 +18,7 @@ reported from inside the guest by its sensor (`proc.*`).
 | `session_id` | string | A lowercase hyphenated UUIDv7, the session's. |
 | `seq` | u64 | The record's position in the session, from 1 with no gaps; the single writer assigns it. |
 | `ring` | 0 or 1 | 0: observed on the host, where the guest cannot alter it. 1: reported from inside the guest. |
-| `src` | string | Who made the record: `vmm`, `fs`, `net`, `vsock`, `control`, `session`, `policy`, `sensor` (ring 1), `reconciler` (and, later, `pty`, `guest`, `gateway`). |
+| `src` | string | Who made the record: `vmm`, `fs`, `net`, `vsock`, `control`, `session`, `policy`, `sensor` (ring 1), `reconciler`, `gate` (the model traffic gate's observer) (and, later, `pty`, `guest`). |
 | `type` | string | The dotted event type, below. New types are additive; a reader ignores types it does not know. |
 | `ts_host_ns` | u64 | Host `CLOCK_REALTIME`, nanoseconds since the epoch, when the writer took the event. The one timestamp that joins events across rings. |
 | `ts_mono_ns` | u64 | Host `CLOCK_MONOTONIC` at the same moment. |
@@ -61,7 +61,7 @@ Common pieces:
 
 | Type | Fields | When |
 |---|---|---|
-| `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none) | The VM was built and is about to run. |
+| `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none), `inspect_ca_sha256` (omitted when the policy has no `inspect` rule) | The VM was built and is about to run. `inspect_ca_sha256` is the SHA-256, lowercase hex, of the DER certificate of the session CA the guest was told to trust for the gate's certificates (`--inspect`). |
 | `vmm.stop` | `reason`, `exit_code` (or null), `console_dropped_bytes`, `stdin_dropped_bytes` | The VM stopped; the last record of a run (a closing checkpoint follows). `reason`: `guest_reset`, `guest_shutdown`, `signal`, `console_escape`, `stop_requested`, `vcpu_error`, `audit_failed`, `vmm_error`. The byte counts are console output the host never wrote out and console input it dropped (0 for a run without them). |
 | `checkpoint` | `records_since`, `dropped`, `root_hash` | The writer's summary of the records since the previous checkpoint: every 1024 records or 2 s, at a segment seal, and at close. `root_hash` is blake3 over the raw hashes of those records; `dropped` counts droppable events (`fs.read`, `net.drop`) the full channel dropped. |
 
@@ -123,12 +123,16 @@ either kind within a session.
 | `net.dhcp` | `op` (`offer` or `ack`), `yiaddr` | The gateway answered a DHCP DISCOVER or REQUEST with the static lease. |
 | `net.dns` | `txid`, `qname`, `qtype` (1 A, 28 AAAA, ...), `rcode` (0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, 1 FORMERR), `answers [string]` (the addresses given), `verdict`, `rule` | A guest DNS query was answered: NXDOMAIN when the policy denies the name, else the upstream's answer (AAAA records stripped), SERVFAIL when the upstream did not answer in 5 s. |
 | `net.connect` | `flow`, `proto` (`tcp`), `src` (`ip:port`), `dst`, `names [string]` (the names DNS answers gave `dst`, newest first), `verdict`, `rule` | A guest SYN was decided, before anything answered it. A denied one gets an RST. |
-| `net.tls` | `flow`, `kind` (`tls` or `http`), `sni` (or null), `alpn [string]`, `verdict` | The gate read a flow's first bytes: a flow a domain rule allowed must show that name as its TLS server name or HTTP `Host`, or both sides are reset. |
+| `net.tls` | `flow`, `kind` (`tls` or `http`), `sni` (or null), `alpn [string]`, `verdict`, `inspect` (omitted when false) | The gate read a flow's first bytes: a flow a domain rule allowed must show that name as its TLS server name or HTTP `Host`, or both sides are reset. `inspect` is true when an `inspect` line names the flow: a TLS flow then gets a `net.inspect`, a plain HTTP flow is observed as it is. A flow a network rule allowed gets this record only when it is inspected. |
+| `net.inspect` | `flow`, `sni` (or null), `alpn` (the protocol both legs agreed on, or null), `version` (`1.3`, `1.2`, or null), `result`, `rule` | The gate ended an inspected flow's TLS, or could not. `result`: `ok` (recorded before any plaintext moves), `upstream_untrusted` (the real host's certificate is not one the host's trust store vouches for), `upstream_failed` (its handshake failed otherwise), `guest_rejected` (the guest refused the session CA's leaf, or closed during the handshake), `timeout` (the handshakes outran the gate's time). On anything but `ok` nothing was relayed, and the flow's `net.close` says `inspect`. |
 | `net.close` | `flow`, `tx`, `rx` (payload bytes the guest sent and received), `dur_ms`, `reason` | A TCP flow or UDP mapping ended. `reason`: `fin` (closed both ways), `reset` (the host or the guest reset it), `timeout` (a host connect took over 10 s, or the guest stayed silent 60 s), `gate` (the gate denied the name, or none was shown within 16 KiB or 5 s), `refused`, `unreachable`, `error` (the host connect failed, or the guest sent data after its FIN), `evicted` (the table was full), `idle` (a UDP mapping unused for 60 s), `policy` (a new policy denies it), `shutdown` (the VM stopped). |
 | `net.udp` | `flow`, `src`, `dst`, `names`, `verdict`, `rule` | The first datagram of a UDP 5-tuple was decided. A domain allow admits no UDP (nothing in a datagram shows a name); allow UDP by address. |
-| `net.drop` | `reason`, `count` | Guest frames were dropped: at most one record a second for each reason, counting every drop since the last. `reason`: `ipv6`, `icmp` (other than echo to the gateway), `dhcp`, `dns` (too short), `dns_bogus` (an upstream answer for no query), `udp_denied` (more datagrams on a tuple refused within the minute), `udp_send`, `udp_oversize`, `udp_table_full`, `queue_full`, `tcp_pending_full`, `src_spoof`, `other`. Droppable: emitted without waiting, counted in `checkpoint.dropped` when the channel is full. |
+| `net.drop` | `reason`, `count` | Guest frames were dropped: at most one record a second for each reason, counting every drop since the last. `reason`: `ipv6`, `icmp` (other than echo to the gateway), `dhcp`, `dns` (too short), `dns_bogus` (an upstream answer for no query), `udp_denied` (more datagrams on a tuple refused within the minute), `udp_send`, `udp_oversize`, `udp_table_full`, `queue_full`, `tcp_pending_full`, `src_spoof`, `observe` (plaintext bytes of an inspected flow the observer's channel had no room for: the flow went on, the observer's copy has a hole), `dump` (a frame the `--dump` queue had no room for: the dump has a hole, the traffic went on), `other`. Droppable: emitted without waiting, counted in `checkpoint.dropped` when the channel is full. |
 
-Every allowed `net.connect` and `net.udp` has exactly one `net.close`.
+Every allowed `net.connect` and `net.udp` has exactly one `net.close`. An
+inspected TLS flow has exactly one `net.inspect`, after its `net.tls` and
+before its `net.close`; `net.close{reason:"inspect"}` ends one the gate
+could not carry.
 
 ## `vsock.*` (host, src `vsock`)
 
@@ -144,7 +148,7 @@ session's process (uid and gid as configured).
 
 | Type | Fields | When |
 |---|---|---|
-| `session.start` | `argv [string]`, `cwd`, `uid`, `gid`, `pid` | Init started the session the VMM asked for. |
+| `session.start` | `argv [string]` (with `--scrub-argv`, scrubbed as `proc.exec`'s is), `cwd`, `uid`, `gid`, `pid` | Init started the session the VMM asked for. |
 | `session.exit` | `code` (or null), `signal` (or null) | The session's process ended: its exit code, or the signal that killed it; both null only when init could not tell. `boxcar run` exits with `code`, or 128 plus `signal`. |
 
 ## `control.*` (host, src `control`)
@@ -179,7 +183,7 @@ clock, tells a process from a later one with the same pid.
 
 | Type | Fields | When |
 |---|---|---|
-| `proc.exec` | `tid`, `tgid`, `ppid`, `uid`, `gid`, `filename`, `argv [string]` (256 elements and 16 KiB at most), `argv_truncated`, `start_ns`, `cgroup_id` | A process ran a new program (`execve` succeeded). |
+| `proc.exec` | `tid`, `tgid`, `ppid`, `uid`, `gid`, `filename`, `argv [string]` (256 elements and 16 KiB at most; with `boxcar run --scrub-argv`, each element scrubbed as free text is), `argv_truncated`, `start_ns`, `cgroup_id` | A process ran a new program (`execve` succeeded). |
 | `proc.fork` | `parent_tid`, `parent_tgid`, `child_pid`, `child_start_ns`, `uid`, `gid`, `thread` | A process made a new process, or (`thread`) a new thread of its own; the reconciler ties the thread to the process, since `fs.*` records name threads. |
 | `proc.exit` | `tid`, `tgid`, `exit_code` (the kernel's status word), `group_dead`, `start_ns` | A thread ended; `group_dead` when it was its process's last. |
 | `proc.connect_attempt` | `tid`, `tgid`, `family`, `proto`, `dst` (*omitted* unless IPv4 or IPv6), `dst_port` (*omitted* the same) | A process asked to connect a socket, with the destination as asked. |
@@ -188,18 +192,60 @@ clock, tells a process from a later one with the same pid.
 | `proc.file_open` | `tid`, `tgid`, `path`, `flags`, `sample` | One open in `sample`: the only sampled record of ring 1. |
 | `proc.lsm_deny` | `tid`, `tgid`, `hook` (`bpf` or `task_kill`), `detail` (the `bpf` command, or the signal) | The sensor's self-protection refused a `bpf()` call by another process, or a signal to the sensor. Written through to disk at once. |
 | `proc.heartbeat` | `uptime_ns`, `events_emitted`, `ringbuf_drops`, `frames_sent` | The sensor is alive: once a second, with its counters since it started. `ringbuf_drops` counts events the kernel could not place in the ring buffer: lost. |
-| `proc.sensor_status` | `phase` (`attached` or `degraded`), `programs [{name, attached, error?}]`, `kernel_release`, `btf_ok`, `session_cgroup_id`, `pid` (the sensor's own), `reason` (*omitted* unless one reason covers it) | What the sensor could attach, once it has tried, and again if that changes. |
+| `proc.sensor_status` | `phase` (`attached` or `degraded`), `programs [{name, attached, error?}]`, `kernel_release`, `btf_ok`, `session_cgroup_id`, `pid` (the sensor's own), `threads` (the sensor's other threads, the TLS resolver's; *omitted* when none: their reads of the shares are the sensor's, which the reconciler leaves alone), `reason` (*omitted* unless one reason covers it) | What the sensor could attach, once it has tried, and again if that changes. |
+| `proc.tls_io` | `tid`, `tgid`, `dir` (`write` or `read`), `bytes` | A process wrote to or read from a TLS connection through a runtime that exports OpenSSL's `SSL_write` and `SSL_read` (or their `_ex` forms), which the sensor probed: the size and the time, never the bytes. What names the process behind a model request (`docs/reconciler.md`). |
+| `proc.tls_attach` | `path`, `ok`, `error` (*omitted* when ok) | The sensor tried to attach its TLS probes to a file: each program the session ran and each `libssl.so*` a session process mapped, once each; `error` is `limit` once after 64 paths, or `not a regular file` for a path that names a device, a pipe or a directory (never read). The file is opened once, its symbols read from it and the probes attached to it, whatever the path names by then. No `subject`. |
 
 The sensor's stream is framed `[u32 LE len][json]`, each frame the record's
 `type` and `data` with `ts_guest_ns` and `subject` beside them, at most 64
 KiB; `proto/schema/sensor-v1.json` and `proto/testdata/sensor-v1.jsonl`
 describe it. A frame that is not a sensor's ends the stream.
 
-## `finding` (host, src `reconciler`)
+## `http.*` (host, src `gate`)
+
+The observer's reading of an inspected flow's plaintext (`--inspect`):
+every HTTP/1.1 and HTTP/2 exchange, as the bytes moved. The observer
+takes a copy of the plaintext off the net thread; bodies are
+content-decoded (`gzip`, `deflate`, `br`), hashed whole, and kept for the
+model parsers up to 16 MiB. A header that carries a credential
+(`authorization`, `x-api-key`, `cookie`, names ending in `-token` or
+`-secret`, among others) has its value dropped at the parser: nothing
+downstream can see it. `stream` is HTTP/2's stream id, or 1, 2, 3... for
+HTTP/1.1's requests in order on the flow.
 
 | Type | Fields | When |
 |---|---|---|
-| `finding` | `category` (`unattributed_effect`, `sensor_silence`, `intent_effect_mismatch`, `indicator_removal`, `off_book_channel`, `orphaned_work`, `network_anomaly`, `privilege_probe`, `policy_denial`), `score` (0 to 100), `rule`, `summary` (512 bytes at most), `evidence [{seq, ring}]` (the records the rule read, newest last), `span_id` (*omitted* until M4), `low_confidence` | The reconciler's conclusion from records of both rings. Never sampled; a score of 70 or more is written through to disk at once. The rules are in `docs/reconciler.md`. |
+| `http.request` | `flow`, `stream`, `version` (`1.1` or `2`), `method`, `authority`, `path` (query values that are long, not plain, or under a secret-looking name replaced by `[redacted]`, the fragment dropped, then cut at 4096 bytes), `content_type`, `content_encoding`, `content_length`, `user_agent` (scrubbed as free text, cut at 512), `body_bytes` (decoded), `body_b3`, `body_truncated`, `degraded` | A request's body ended (or could not: `degraded` says why: `lost` (the observer's channel had no room), `incomplete`, `flow_closed`, `content_encoding` (a coding the observer does not decode: the raw body is hashed), `content_decode`, `decode_budget` (the body decoded past 64 MiB: the rest is hashed raw), `observe_budget` (the observer held 256 MiB across every flow: the body was hashed, not kept; or the exchange itself, with its heads, found no room: it was recorded as it stands and let go; or, with no stream, the connection's parsers would have passed it and the connection is observed no further), `too_many_exchanges` (512 exchanges were open on the flow: the oldest is recorded as it stands), `sse_line` (an event-stream line ran past 16 MiB: it was dropped), `upgrade_wait` (more than 64 KiB came while a request to switch protocols waited for its answer), `pipeline` (256 requests were waiting for their responses), `header_block_too_large` (a header block over 64 KiB, or one that decodes past 128 KiB), or a parser's reason, such as `rst_stream`: a stream that is observed no further is recorded at once). |
+| `http.response` | `flow`, `stream`, `status`, `content_type`, `content_encoding`, `body_bytes`, `body_b3`, `body_truncated`, `sse_events` (events of a `text/event-stream` body), `ws_messages` (messages of a WebSocket stream, both ways), `dur_ms` (the request's first byte to the response's last, as the observer took them), `degraded` | A response ended; for a WebSocket stream, when it closed. |
+
+## `llm.*` and `tool.*` (host, src `gate`)
+
+The model APIs the gate knows, read from the exchanges above: the
+Anthropic Messages API (`/v1/messages`), OpenAI Chat Completions
+(`/chat/completions`) and OpenAI Responses (`/responses`, as JSON, as an
+event stream, or over WebSocket), chosen by the request's path whatever
+the host. Bodies are read tolerantly: unknown fields and events are passed
+over, and a body that does not read degrades the record, never the flow.
+Text is never inline: prompts, replies and tool results appear as sizes
+and blake3 hashes, and in summaries of at most 512 bytes, scrubbed. A
+`tool.open` and the `tool.close` that answers it carry the envelope's
+`span`: `trace_id` is the session id, `span_id` the provider's tool use
+id; the reconciler attributes the processes and effects between them to
+that span (`span.effects`, docs/reconciler.md).
+
+| Type | Fields | When |
+|---|---|---|
+| `llm.request` | `flow`, `stream`, `provider` (`anthropic`, `openai_chat`, `openai_responses`), `model`, `streaming`, `messages` (count), `system_b3`, `tools [string]` (names, at most 64), `max_tokens`, `body_bytes`, `body_b3`, `degraded` | A request's body ended; over WebSocket, a `response.create` message came. The `tool.close`s it carried follow it. |
+| `tool.close` | `flow`, `stream`, `tool_use_id`, `status` (`ok` or `error`), `result_bytes`, `result_b3`, `result_summary` (scrubbed by key when it is JSON, as free text otherwise) | The request carried a tool result (`tool_result`, a `role: tool` message, a `function_call_output`): the span closes. |
+| `tool.open` | `flow`, `stream`, `tool_use_id`, `tool_name`, `args_b3`, `args_summary`, `args` (the arguments as JSON when at most 8 KiB, omitted otherwise; both scrubbed by key and in their strings) | The model's reply asked for a tool: in a stream, as soon as the call's arguments are whole; in a document, at its end. The span opens. |
+| `llm.response` | `flow`, `stream`, `provider`, `model` (cut at 256 bytes, as `stop_reason` and `llm.request`'s `model` and `tools` names are), `stop_reason`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `text_bytes`, `text_b3`, `tool_uses`, `dur_ms`, `degraded` | The reply ended (the stream's end, the document's end, or over WebSocket the `response.completed`); `degraded` says what cut it short (`stream_unfinished`, `stream_error`, `block_unfinished`, `call_unfinished`, `event_json`, `response_json`, `body_truncated`, `flow_closed`, `stream_budget` (the reply's tool calls gathered more than 16 MiB, or more than 256 were under way at once: no call grew further), `observe_budget` (the observer's 256 MiB across every flow was spent), `sse_line`). A tool id over 256 bytes is kept as its first 128 bytes, `~b3:` and the hash of the whole id, an open and its close alike, and a tool name is cut at 1 KiB; a call whose arguments lost a piece for want of room carries none (`args_summary` `[arguments not kept whole]`). |
+
+## `span.*` and `finding` (host, src `reconciler`)
+
+| Type | Fields | When |
+|---|---|---|
+| `span.effects` | `span_id`, `tool_name`, `opened_seq`, `closed_seq` (or null), `executor_tgid` (the process that opened the model request's flow; before that is known, provisionally the one process whose TLS writes fit the request; else the session root; or null), `procs [u32]` (tgids, at most 1024), `effects [u64]` (seqs, ascending, at most 4096: each process's `proc.exec` and the `fs.*` and `net.connect` records of their work), `truncated` | A tool span closed (its `tool.close` came), or the VM stopped with it open (`closed_seq` null). A membership record: what the reconciler attributed to the span (`docs/reconciler.md`); the effects themselves are never edited. The envelope's `span` names the span. |
+| `finding` | `category` (`unattributed_effect`, `sensor_silence`, `intent_effect_mismatch`, `indicator_removal`, `off_book_channel`, `orphaned_work`, `network_anomaly`, `privilege_probe`, `policy_denial`), `score` (0 to 100), `rule`, `summary` (512 bytes at most), `evidence [{seq, ring}]` (the records the rule read, newest last), `span_id` (set inside a span, omitted otherwise; the envelope's `span` then names it too), `low_confidence` | The reconciler's conclusion from records of both rings. Never sampled; a score of 70 or more is written through to disk at once. The rules are in `docs/reconciler.md`. |
 
 ## Order and durability
 

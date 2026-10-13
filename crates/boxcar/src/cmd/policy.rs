@@ -127,7 +127,11 @@ fn table(view: &PolicyView) -> String {
         ("version", view.version.to_string()),
         ("default", default.to_owned()),
     ];
-    for (name, rules) in [("allow", &view.net.allow), ("deny", &view.net.deny)] {
+    for (name, rules) in [
+        ("allow", &view.net.allow),
+        ("deny", &view.net.deny),
+        ("inspect", &view.net.inspect),
+    ] {
         if rules.is_empty() {
             rows.push((name, "(none)".to_owned()));
         }
@@ -162,6 +166,7 @@ mod tests {
             default: Verdict::Deny,
             allow: strings(allow),
             deny: strings(deny),
+            inspect: Vec::new(),
         }
     }
 
@@ -199,7 +204,7 @@ mod tests {
         };
         assert_eq!(
             table(&view),
-            "version  2\ndefault  deny\nallow    a.test\ndeny     (none)\nvsock    5000\n"
+            "version  2\ndefault  deny\nallow    a.test\ndeny     (none)\ninspect  (none)\nvsock    5000\n"
         );
     }
 }

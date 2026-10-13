@@ -12,7 +12,7 @@ use std::path::Path;
 
 use boxcar_proto::sensor::{encode, is_sensor_kind, Decoder, SensorFrame, MAX_FRAME};
 
-const KINDS: [&str; 10] = [
+const KINDS: [&str; 12] = [
     "proc.exec",
     "proc.fork",
     "proc.exit",
@@ -23,6 +23,8 @@ const KINDS: [&str; 10] = [
     "proc.lsm_deny",
     "proc.heartbeat",
     "proc.sensor_status",
+    "proc.tls_io",
+    "proc.tls_attach",
 ];
 
 fn golden() -> String {

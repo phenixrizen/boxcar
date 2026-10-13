@@ -193,6 +193,21 @@ pub enum Command {
     /// `--vsock-allow`. Every vsock connection is in the audit log.
     // Boxed: the run's arguments are most of the enum's size.
     Run(Box<RunArgs>),
+    /// List a running session's tool spans.
+    ///
+    /// A span is one tool call the model asked for: it opens when the gate
+    /// reads the tool use in the model's reply (`tool.open`) and closes
+    /// when the agent sends the result back (`tool.close`). The reconciler
+    /// attributes the processes and effects in between to it. Prints one
+    /// line per span, newest first: the span id, the tool, `open` or
+    /// `closed` with the seqs of its records, how many processes and
+    /// effect records it holds, and the worst score of a finding inside
+    /// it. `--active` keeps the open ones; `--json` prints the list as the
+    /// control socket returns it. The session is the one `--control` or
+    /// SESSION_ID names, or the only one running.
+    ///
+    /// Exits 0, or 1 when the control socket cannot be reached.
+    Spans(SpansArgs),
     /// Show a running VM's status.
     ///
     /// Asks the session's control socket and prints a short table, or with
@@ -310,6 +325,18 @@ pub struct StatusArgs {
     #[command(flatten)]
     pub session: SessionArgs,
     /// Print the status as one JSON object.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SpansArgs {
+    #[command(flatten)]
+    pub session: SessionArgs,
+    /// Only the spans still open.
+    #[arg(long)]
+    pub active: bool,
+    /// Print the list as one JSON object.
     #[arg(long)]
     pub json: bool,
 }
@@ -448,10 +475,47 @@ pub struct RunArgs {
     #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
     pub deny: Vec<String>,
     /// Read policy rules from PATH, one a line: `allow RULE`, `deny RULE`,
-    /// and at most one `default allow` or `default deny` (deny if none
-    /// says); `#` starts a comment. Its rules come first.
+    /// `inspect RULE`, and at most one `default allow` or `default deny`
+    /// (deny if none says); `#` starts a comment. Its rules come first.
     #[arg(long, value_name = "PATH", conflicts_with = "no_net")]
     pub policy_file: Option<PathBuf>,
+    /// Watch the guest's traffic to RULE, written as for `--allow` (which
+    /// must still admit it): a connection whose name, or address for a
+    /// CIDR rule, matches ends its TLS in boxcar, which connects to the
+    /// real host itself, hands the guest a certificate from this session's
+    /// CA (init puts the CA in the guest's trust store), relays the
+    /// plaintext unchanged and records the HTTP exchanges and the model
+    /// API calls it knows. The agent keeps its own credential; nothing is
+    /// injected. Repeatable.
+    #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
+    pub inspect: Vec<String>,
+    /// Write a debugging dump of the guest's network to DIR, made 0700:
+    /// `frames.pcap` with every frame either way cut to its headers, and
+    /// for inspected flows each decoded exchange (`http/`), credentials'
+    /// values left out and secret-looking fields scrubbed. Not part of the
+    /// audit log: nothing in it is hashed or chained. DIR must be new or
+    /// empty, and may be neither a share nor inside one, nor hold one.
+    #[arg(long, value_name = "DIR", conflicts_with = "no_net")]
+    pub dump: Option<PathBuf>,
+    /// With --dump: keep in `frames.pcap` the payloads the gate sends the
+    /// guest on flows whose TLS it ends: its own TLS records, ciphertext
+    /// whose keys never leave the VMM. What the guest sends, and every
+    /// other payload (plain HTTP's included), is still cut to its headers.
+    #[arg(long, requires = "dump")]
+    pub dump_payloads: bool,
+    /// Record each process's arguments (`proc.exec`'s `argv`) scrubbed as
+    /// free text is: secret-looking values replaced by `[redacted]`. The
+    /// reconciler still compares commands with the arguments as run, kept
+    /// in memory only.
+    #[arg(long)]
+    pub scrub_argv: bool,
+    /// Set NAME to VALUE in the session's environment, after the defaults
+    /// (PATH, HOME, TERM, LANG, BOXCAR_SESSION_ID). Repeatable. For what
+    /// an agent inside needs, such as CLAUDE_CODE_OAUTH_TOKEN: the value
+    /// goes to the guest's init over the control channel and into no
+    /// record.
+    #[arg(long, value_name = "NAME=VALUE", value_parser = parse_env)]
+    pub env: Vec<(String, String)>,
     /// Where the guest's DNS queries are forwarded: an address, on port 53
     /// unless given as `ip:port`. Repeatable, in order of preference.
     /// Default: the nameservers in the host's /etc/resolv.conf.
@@ -528,6 +592,23 @@ pub fn parse_upstream(text: &str) -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
+/// `--env NAME=VALUE`: the name before the first `=`, which must be
+/// there, and everything after it (possibly nothing).
+pub fn parse_env(text: &str) -> Result<(String, String), String> {
+    let Some((name, value)) = text.split_once('=') else {
+        return Err(format!("{text:?} is not NAME=VALUE"));
+    };
+    if name.is_empty() {
+        return Err(format!("{text:?}: the name is empty"));
+    }
+    if name.bytes().any(|b| b == 0 || b.is_ascii_whitespace()) || value.bytes().any(|b| b == 0) {
+        return Err(format!(
+            "{text:?}: a name has no whitespace, and neither has a NUL"
+        ));
+    }
+    Ok((name.to_owned(), value.to_owned()))
+}
+
 /// `--audit-level`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum AuditLevelArg {
@@ -537,6 +618,22 @@ pub enum AuditLevelArg {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn env_is_name_equals_value_and_nothing_else() {
+        assert_eq!(
+            super::parse_env("CLAUDE_CODE_OAUTH_TOKEN=abc=def"),
+            Ok(("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "abc=def".to_owned()))
+        );
+        assert_eq!(
+            super::parse_env("EMPTY="),
+            Ok(("EMPTY".to_owned(), String::new()))
+        );
+        assert!(super::parse_env("NOVALUE").is_err());
+        assert!(super::parse_env("=x").is_err());
+        assert!(super::parse_env("A B=x").is_err());
+        assert!(super::parse_env("A=x\0y").is_err());
+    }
+
     use std::path::Path;
 
     use super::*;
@@ -625,6 +722,7 @@ mod tests {
         for flag in [
             ["--allow", "a.example"],
             ["--deny", "a.example"],
+            ["--inspect", "a.example"],
             ["--policy-file", "p"],
             ["--dns", "9.9.9.9"],
         ] {

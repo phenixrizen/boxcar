@@ -1,0 +1,575 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The boxcar Authors
+
+//! OpenAI Responses: `POST /v1/responses`, as JSON, as an event stream,
+//! or over WebSocket (`response.create` messages in, the same events
+//! out).
+//!
+//! A request's `input` items are counted, its `instructions` hashed, its
+//! `tools` named; `function_call_output` items close the spans their
+//! `call_id`s opened. A response gives the model, the status, the usage,
+//! the output text and the `function_call` items, each a span's open once
+//! its arguments are whole (`response.output_item.done`, or the
+//! `function_call_arguments.done` for it).
+
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
+use crate::http::Retained;
+
+use super::{
+    b3, content_text, label, tool_close, tool_open_lost, tool_open_text, u64_of, CallBudget,
+    RequestInfo, ResponseInfo, Text, ToolClose, ToolOpen,
+};
+use crate::http::SseEvent;
+
+/// What a request (a `POST` body, or a `response.create` message) said,
+/// and the tool results it carried.
+pub fn request(body: &[u8]) -> Result<(RequestInfo, Vec<ToolClose>), &'static str> {
+    let json: Value = serde_json::from_slice(body).map_err(|_| "request_json")?;
+    Ok(request_value(&json))
+}
+
+/// [`request`] for a parsed value.
+pub fn request_value(json: &Value) -> (RequestInfo, Vec<ToolClose>) {
+    let input = json.get("input");
+    let items = input.and_then(Value::as_array);
+    let mut info = RequestInfo {
+        model: json.get("model").and_then(Value::as_str).map(label),
+        stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        messages: match input {
+            Some(Value::Array(items)) => items.len() as u32,
+            Some(Value::String(_)) => 1,
+            _ => 0,
+        },
+        system_b3: json
+            .get("instructions")
+            .and_then(|i| b3(content_text(i).as_bytes())),
+        tools: Vec::new(),
+        max_tokens: u64_of(json.get("max_output_tokens")),
+    };
+    let tool_name = |t: &Value| {
+        t.get("name")
+            .or_else(|| t.get("type"))
+            .and_then(Value::as_str)
+            .map(label)
+    };
+    if let Some(tools) = json.get("tools").and_then(Value::as_array) {
+        info.tools = tools.iter().filter_map(tool_name).take(64).collect();
+    }
+    let mut closes = Vec::new();
+    if let Some(items) = items {
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                // Codex declares its tools as namespaces in an input item.
+                Some("additional_tools") => {
+                    if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                        info.tools
+                            .extend(tools.iter().filter_map(tool_name).take(64));
+                        info.tools.truncate(64);
+                    }
+                }
+                Some("function_call_output") | Some("custom_tool_call_output") => {
+                    let Some(id) = item.get("call_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let output = item.get("output").cloned().unwrap_or(Value::Null);
+                    closes.push(tool_close(id, &output, false));
+                }
+                _ => {}
+            }
+        }
+    }
+    (info, closes)
+}
+
+/// A response as one JSON document (a `response` object).
+pub fn response(body: &[u8]) -> Result<(ResponseInfo, Vec<ToolOpen>), &'static str> {
+    let json: Value = serde_json::from_slice(body).map_err(|_| "response_json")?;
+    Ok(response_value(&json))
+}
+
+/// [`response`] for a parsed `response` object.
+pub fn response_value(json: &Value) -> (ResponseInfo, Vec<ToolOpen>) {
+    let mut text = Text::default();
+    let mut opens = Vec::new();
+    if let Some(output) = json.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                text.push(t);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") | Some("custom_tool_call") => opens.push(item_open(item)),
+                _ => {}
+            }
+        }
+    }
+    let info = ResponseInfo {
+        model: json.get("model").and_then(Value::as_str).map(label),
+        stop_reason: json.get("status").and_then(Value::as_str).map(label),
+        text_bytes: text.bytes(),
+        text_b3: text.b3(),
+        tool_uses: opens.len() as u32,
+        degraded: None,
+        ..usage_of(json.get("usage"))
+    };
+    (info, opens)
+}
+
+fn usage_of(usage: Option<&Value>) -> ResponseInfo {
+    ResponseInfo {
+        input_tokens: u64_of(usage.and_then(|u| u.get("input_tokens"))),
+        output_tokens: u64_of(usage.and_then(|u| u.get("output_tokens"))),
+        cache_read_tokens: u64_of(
+            usage
+                .and_then(|u| u.get("input_tokens_details"))
+                .and_then(|d| d.get("cached_tokens")),
+        ),
+        ..ResponseInfo::default()
+    }
+}
+
+/// A whole `function_call` item (JSON `arguments`) or `custom_tool_call`
+/// item (free text `input`, as Codex's `exec` tool takes it) as a span's
+/// open.
+fn item_open(item: &Value) -> ToolOpen {
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    let arguments = item
+        .get("arguments")
+        .or_else(|| item.get("input"))
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    tool_open_text(id, name, arguments)
+}
+
+/// Whether an output item is a tool call of either kind.
+fn is_call(item: Option<&Value>) -> bool {
+    matches!(
+        item.and_then(|i| i.get("type")).and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    )
+}
+
+/// A function call under way in a stream, by its output index.
+#[derive(Default)]
+struct Call {
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    done: bool,
+    /// A piece of the arguments found no room: lost until a whole value
+    /// (a `done` event's) replaces them.
+    lost: bool,
+}
+
+/// A streamed response, event by event; the same for the events of a
+/// WebSocket session.
+#[derive(Default)]
+pub struct Stream {
+    info: ResponseInfo,
+    text: Text,
+    calls: BTreeMap<u64, Call>,
+    budget: CallBudget,
+    degraded: Option<&'static str>,
+    completed: bool,
+}
+
+impl Stream {
+    pub fn new() -> Stream {
+        Stream::default()
+    }
+
+    /// The stream's tool calls take their bytes from the observer's
+    /// `retained` budget too.
+    pub fn with_retained(mut self, retained: Retained) -> Stream {
+        self.budget = CallBudget::with_retained(retained);
+        self
+    }
+
+    /// The stream lost bytes: every call under way lost a piece, and
+    /// keeps no arguments until a whole value replaces them.
+    pub fn lose_calls(&mut self) {
+        for call in self.calls.values_mut() {
+            call.lost = true;
+            call.arguments = String::new();
+        }
+    }
+
+    /// One event from the stream: the calls it completes.
+    pub fn event(&mut self, event: &SseEvent) -> Vec<ToolOpen> {
+        let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
+            if !event.data.is_empty() {
+                self.degraded.get_or_insert("event_json");
+            }
+            return Vec::new();
+        };
+        self.value(&data)
+    }
+
+    /// Whether the call at `index` is under way, or one more may be.
+    fn room(&mut self, index: u64) -> bool {
+        self.calls.contains_key(&index)
+            || CallBudget::admit_call(self.calls.len(), &mut self.degraded)
+    }
+
+    /// One event as a parsed value (a WebSocket message carries one).
+    pub fn value(&mut self, data: &Value) -> Vec<ToolOpen> {
+        let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut opens = Vec::new();
+        match kind {
+            "response.created" | "response.in_progress" => {
+                if let Some(model) = data
+                    .get("response")
+                    .and_then(|r| r.get("model"))
+                    .and_then(Value::as_str)
+                {
+                    self.info.model = Some(label(model));
+                }
+            }
+            "response.output_item.added" => {
+                let item = data.get("item");
+                let index = u64_of(data.get("output_index")).unwrap_or(0);
+                let text = |key: &str| {
+                    item.and_then(|i| i.get(key))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                };
+                let (item_id, call_id, name) = (text("id"), text("call_id"), text("name"));
+                if is_call(item)
+                    && self.room(index)
+                    && self.budget.admit(
+                        item_id.len() + call_id.len() + name.len(),
+                        &mut self.degraded,
+                    )
+                {
+                    let call = self.calls.entry(index).or_default();
+                    call.item_id = item_id.to_owned();
+                    call.call_id = call_id.to_owned();
+                    call.name = name.to_owned();
+                    if let Some(args) = item
+                        .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
+                        .and_then(Value::as_str)
+                    {
+                        if self.budget.admit(args.len(), &mut self.degraded) {
+                            call.arguments = args.to_owned();
+                        } else {
+                            call.lost = true;
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+                let index = u64_of(data.get("output_index")).unwrap_or(0);
+                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                    if self.room(index) {
+                        let admitted = self.budget.admit(delta.len(), &mut self.degraded);
+                        let call = self.calls.entry(index).or_default();
+                        if call.lost {
+                        } else if admitted {
+                            call.arguments.push_str(delta);
+                        } else {
+                            call.lost = true;
+                            call.arguments = String::new();
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
+                let index = u64_of(data.get("output_index")).unwrap_or(0);
+                if let Some(args) = data
+                    .get("arguments")
+                    .or_else(|| data.get("input"))
+                    .and_then(Value::as_str)
+                {
+                    if self.room(index) && self.budget.admit(args.len(), &mut self.degraded) {
+                        // A whole value: what was lost is whole again.
+                        let call = self.calls.entry(index).or_default();
+                        call.arguments = args.to_owned();
+                        call.lost = false;
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                let index = u64_of(data.get("output_index")).unwrap_or(0);
+                let item = data.get("item");
+                let text = |key: &str| item.and_then(|i| i.get(key)).and_then(Value::as_str);
+                let added = text("call_id").map_or(0, str::len)
+                    + text("name").map_or(0, str::len)
+                    + text("arguments")
+                        .or_else(|| text("input"))
+                        .map_or(0, str::len);
+                // What the done event adds is charged like any other: a call
+                // that does not fit is not made.
+                if is_call(item) && self.budget.admit(added, &mut self.degraded) {
+                    let mut call = self.calls.remove(&index).unwrap_or_default();
+                    if let Some(id) = text("call_id") {
+                        call.call_id = id.to_owned();
+                    }
+                    if let Some(name) = text("name") {
+                        call.name = name.to_owned();
+                    }
+                    if let Some(args) = text("arguments").or_else(|| text("input")) {
+                        call.arguments = args.to_owned();
+                        call.lost = false;
+                    }
+                    call.done = true;
+                    self.info.tool_uses += 1;
+                    let id = if call.call_id.is_empty() {
+                        &call.item_id
+                    } else {
+                        &call.call_id
+                    };
+                    opens.push(if call.lost {
+                        tool_open_lost(id, &call.name)
+                    } else {
+                        tool_open_text(id, &call.name, &call.arguments)
+                    });
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                    self.text.push(delta);
+                }
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                self.completed = true;
+                let response = data.get("response");
+                if let Some(model) = response
+                    .and_then(|r| r.get("model"))
+                    .and_then(Value::as_str)
+                {
+                    self.info.model = Some(label(model));
+                }
+                self.info.stop_reason = response
+                    .and_then(|r| r.get("status"))
+                    .and_then(Value::as_str)
+                    .map(label)
+                    .or_else(|| Some(kind.trim_start_matches("response.").to_owned()));
+                let usage = usage_of(response.and_then(|r| r.get("usage")));
+                if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                    self.info.input_tokens = usage.input_tokens;
+                    self.info.output_tokens = usage.output_tokens;
+                    self.info.cache_read_tokens = usage.cache_read_tokens;
+                }
+            }
+            "error" => {
+                self.degraded.get_or_insert("stream_error");
+            }
+            _ => {}
+        }
+        opens
+    }
+
+    /// The stream ended: what it said, and the calls never marked done.
+    pub fn finish(mut self) -> (ResponseInfo, Vec<ToolOpen>) {
+        let mut opens = Vec::new();
+        for (_, call) in std::mem::take(&mut self.calls) {
+            if call.done {
+                continue;
+            }
+            self.degraded.get_or_insert("call_unfinished");
+            self.info.tool_uses += 1;
+            let id = if call.call_id.is_empty() {
+                &call.item_id
+            } else {
+                &call.call_id
+            };
+            opens.push(tool_open_text(id, &call.name, &call.arguments));
+        }
+        if !self.completed {
+            self.degraded.get_or_insert("stream_unfinished");
+        }
+        self.info.text_bytes = self.text.bytes();
+        self.info.text_b3 = self.text.b3();
+        self.info.degraded = self.degraded;
+        (self.info, opens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sse(data: &str) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: data.to_owned(),
+            id: None,
+        }
+    }
+
+    /// Codex's tools: a `custom_tool_call` whose input is free text, built
+    /// from its deltas, opens at its item's end with the text as the
+    /// summary and no inline arguments; its `custom_tool_call_output`
+    /// closes it; the namespaces an `additional_tools` item declares are
+    /// the tools offered.
+    #[test]
+    fn custom_tool_calls_open_from_their_input_and_their_outputs_close() {
+        let mut stream = Stream::new();
+        let mut opens = Vec::new();
+        opens.extend(stream.value(&serde_json::json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_c", "name": "exec", "input": ""}})));
+        opens.extend(stream.value(&serde_json::json!({"type": "response.custom_tool_call_input.delta", "output_index": 1, "delta": "text(await tools.exec_command({cmd:\"echo"})));
+        opens.extend(stream.value(&serde_json::json!({"type": "response.custom_tool_call_input.delta", "output_index": 1, "delta": " hi\",workdir:\"/workspace\"}));"})));
+        assert!(opens.is_empty(), "not whole yet");
+        opens.extend(stream.value(&serde_json::json!({"type": "response.custom_tool_call_input.done", "output_index": 1, "input": "text(await tools.exec_command({cmd:\"echo hi\",workdir:\"/workspace\"}));"})));
+        opens.extend(stream.value(&serde_json::json!({"type": "response.output_item.done", "output_index": 1, "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_c", "name": "exec", "input": "text(await tools.exec_command({cmd:\"echo hi\",workdir:\"/workspace\"}));", "status": "completed"}})));
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].tool_use_id, "call_c");
+        assert_eq!(opens[0].tool_name, "exec");
+        assert_eq!(opens[0].args, None, "free text is no JSON");
+        assert!(opens[0].args_summary.contains("cmd:\"echo hi\""));
+        let (info, _) = stream.finish();
+        assert_eq!(info.tool_uses, 1);
+
+        let (info, closes) = request(br#"{"model":"m","stream":true,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions"},{"type":"namespace","name":"clock"}]},{"type":"custom_tool_call_output","call_id":"call_c","output":[{"type":"input_text","text":"Script completed\nOutput:\nhi\n"}]}]}"#).unwrap();
+        assert_eq!(info.tools, ["functions", "clock"]);
+        assert_eq!(info.messages, 2);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].tool_use_id, "call_c");
+        assert_eq!(closes[0].status, "ok");
+        assert!(closes[0].result_summary.contains("hi"));
+    }
+
+    #[test]
+    fn a_request_counts_items_names_tools_and_closes_outputs() {
+        let body = serde_json::json!({
+            "model": "gpt-5-codex",
+            "stream": true,
+            "instructions": "You are Codex.",
+            "max_output_tokens": 8192,
+            "tools": [{"type": "function", "name": "shell"}, {"type": "web_search"}],
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "ls"}]},
+                {"type": "function_call", "call_id": "call_a", "name": "shell", "arguments": "{\"command\":[\"ls\"]}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "a\nb\n"}
+            ]
+        });
+        let (info, closes) = request(body.to_string().as_bytes()).unwrap();
+        assert_eq!(info.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(info.messages, 3);
+        assert_eq!(info.system_b3, b3(b"You are Codex."));
+        assert_eq!(info.tools, ["shell", "web_search"]);
+        assert_eq!(info.max_tokens, Some(8192));
+        assert_eq!(closes.len(), 1);
+        assert_eq!(
+            (closes[0].tool_use_id.as_str(), closes[0].result_bytes),
+            ("call_a", 4)
+        );
+        let (info, _) = request(br#"{"model":"m","input":"hi"}"#).unwrap();
+        assert_eq!(info.messages, 1);
+    }
+
+    #[test]
+    fn a_json_response_opens_its_function_calls() {
+        let body = serde_json::json!({
+            "model": "gpt-5-codex",
+            "status": "completed",
+            "usage": {"input_tokens": 70, "output_tokens": 12, "input_tokens_details": {"cached_tokens": 64}},
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Listing."}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_b", "name": "shell", "arguments": "{\"command\":[\"ls\",\"-la\"]}"}
+            ]
+        });
+        let (info, opens) = response(body.to_string().as_bytes()).unwrap();
+        assert_eq!(info.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(
+            (
+                info.input_tokens,
+                info.output_tokens,
+                info.cache_read_tokens
+            ),
+            (Some(70), Some(12), Some(64))
+        );
+        assert_eq!(info.text_b3, b3(b"Listing."));
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].tool_use_id, "call_b");
+        assert_eq!(
+            opens[0].args,
+            Some(serde_json::json!({"command": ["ls", "-la"]}))
+        );
+    }
+
+    #[test]
+    fn streamed_function_calls_open_when_their_item_is_done() {
+        let mut stream = Stream::new();
+        let mut opens = Vec::new();
+        opens.extend(stream.event(&sse(
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+        )));
+        opens.extend(stream.event(&sse(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#)));
+        opens.extend(stream.event(&sse(
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"List"}"#,
+        )));
+        opens.extend(stream.event(&sse(
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"ing."}"#,
+        )));
+        opens.extend(stream.event(&sse(r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_b","name":"shell","arguments":""}}"#)));
+        opens.extend(stream.event(&sse(r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"command\":"}"#)));
+        opens.extend(stream.event(&sse(r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"[\"ls\"]}"}"#)));
+        opens.extend(stream.event(&sse(r#"{"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"command\":[\"ls\"]}"}"#)));
+        assert!(opens.is_empty());
+        opens.extend(stream.event(&sse(r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_b","name":"shell","arguments":"{\"command\":[\"ls\"]}"}}"#)));
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].args, Some(serde_json::json!({"command": ["ls"]})));
+        opens.extend(stream.event(&sse(r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":70,"output_tokens":12}}}"#)));
+        let (info, late) = stream.finish();
+        assert!(late.is_empty());
+        assert_eq!(info.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(info.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(
+            (info.input_tokens, info.output_tokens),
+            (Some(70), Some(12))
+        );
+        assert_eq!(info.text_b3, b3(b"Listing."));
+        assert_eq!(info.tool_uses, 1);
+        assert_eq!(info.degraded, None);
+    }
+
+    /// Over WebSocket the same events arrive as messages, with the
+    /// request as a `response.create` message.
+    #[test]
+    fn websocket_messages_are_the_same_values() {
+        let create = serde_json::json!({"type": "response.create", "model": "gpt-5-codex", "input": "hi", "stream": true});
+        let (info, _) = request_value(&create);
+        assert_eq!(info.model.as_deref(), Some("gpt-5-codex"));
+        let mut stream = Stream::new();
+        stream.value(&serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "call_id": "call_z", "name": "shell"}}));
+        let opens = stream.value(&serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "function_call", "call_id": "call_z", "name": "shell", "arguments": "{}"}}));
+        assert_eq!(opens.len(), 1);
+        let (info, _) = stream.finish();
+        assert_eq!(info.degraded, Some("stream_unfinished"));
+    }
+
+    /// A done event's metadata counts against the reply's budget: done
+    /// events with large names and nothing else stop making calls.
+    #[test]
+    fn done_events_count_against_the_budget() {
+        use crate::model::STREAM_CALL_BYTES;
+        let mut stream = Stream::new();
+        let name = "n".repeat(1024 * 1024);
+        let mut made = 0;
+        for index in 0..(STREAM_CALL_BYTES / name.len() + 8) {
+            let event = serde_json::json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": {"type": "function_call", "call_id": format!("c{index}"), "name": name, "arguments": ""}
+            });
+            made += stream.value(&event).len();
+        }
+        assert!(made <= STREAM_CALL_BYTES / name.len(), "{made}");
+        let (info, _) = stream.finish();
+        assert_eq!(info.degraded, Some("stream_budget"));
+    }
+}

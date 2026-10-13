@@ -1,0 +1,2 @@
+{"category":"intent_effect_mismatch","score":55,"rule":"hidden_net","summary":"the Bash tool call toolu_01 ended ok, and its work went where nothing in the call named: make (pid 341) connected to 203.0.113.9:443 (telemetry.example)","evidence":[{"seq":4,"ring":0},{"seq":7,"ring":1},{"seq":9,"ring":1},{"seq":10,"ring":0},{"seq":13,"ring":0}],"span_id":"toolu_01","low_confidence":false}
+{"type":"span.effects","data":{"span_id":"toolu_01","tool_name":"Bash","opened_seq":4,"closed_seq":13,"executor_tgid":100,"procs":[340,341],"effects":[5,7,10],"truncated":false}}

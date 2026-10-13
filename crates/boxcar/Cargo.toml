@@ -21,9 +21,14 @@ boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
 boxcar-net = { workspace = true }
+# The gated tests' extra upstream roots are certificates (`--features kvm-tests`).
+rustls-pki-types = { workspace = true }
 boxcar-vsock = { workspace = true }
 arc-swap = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# The M4 gated tests run a TLS stub on the loopback for the gate to reach.
+rustls = { workspace = true }
+rcgen = { workspace = true }

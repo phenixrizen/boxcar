@@ -78,6 +78,15 @@ pub struct PendingEffect {
     pub what: String,
 }
 
+/// A `net.connect` to an address no DNS answer named, waiting for the
+/// sensor's connect that names its process before it is judged.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingConnect {
+    pub flow: u64,
+    pub seq: u64,
+    pub ts: u64,
+}
+
 /// A flow ring 0 relays, from its `net.connect`.
 #[derive(Clone, Debug)]
 pub struct Flow {
@@ -86,6 +95,10 @@ pub struct Flow {
     pub proto: String,
     pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
+    /// The names the stack had for the destination.
+    pub names: Vec<String>,
+    /// The policy let it through.
+    pub allowed: bool,
     /// The process whose `proc.tcp_connect` matched, once one did.
     pub proc_key: Option<ProcKey>,
     pub proc_seq: Option<u64>,
@@ -114,11 +127,23 @@ pub struct Sensor {
     pub silence_open: bool,
     /// The never-attached finding was made.
     pub never_attached_reported: bool,
+    /// The sensor's own process and its other threads, from
+    /// `proc.sensor_status`: their reads of the programs the session runs
+    /// (to find the TLS symbols) are the sensor's own, not the session's.
+    pub pid: Option<u32>,
+    pub threads: HashSet<u32>,
 }
 
 impl Sensor {
     pub fn is_attached(&self, program: &str) -> bool {
         self.attached.contains(program)
+    }
+
+    /// Whether `tid` is boxcar's own in the guest: the sensor's threads,
+    /// or init (pid 1), whose reads of the shares (the trust store it
+    /// binds) are nobody's work either.
+    pub fn is_own(&self, tid: u32) -> bool {
+        tid == 1 || self.pid == Some(tid) || self.threads.contains(&tid)
     }
 
     /// Whether every program the exec/fork/exit joins need is attached.
@@ -133,16 +158,31 @@ impl Sensor {
     }
 }
 
+/// The most flows the state remembers; past it the oldest goes.
+pub const MAX_FLOWS: usize = 16384;
+
 #[derive(Debug, Default)]
 pub struct State {
     procs: HashMap<ProcKey, Proc>,
     /// Each thread's memberships, oldest first.
     threads: HashMap<u32, Vec<Membership>>,
     pub pending: VecDeque<PendingEffect>,
+    /// Connects without a name, waiting for their process (at most the
+    /// join window).
+    pub pending_connects: VecDeque<PendingConnect>,
     pub flows: HashMap<u64, Flow>,
+    /// The flows in the order they came, to let the oldest go past
+    /// [`MAX_FLOWS`].
+    pub flow_order: VecDeque<u64>,
+    /// Whether a flow has been let go for room: from then on, a flow not
+    /// on record may be one that was.
+    pub flows_let_go: bool,
     pub sensor_connects: VecDeque<SensorConnect>,
     pub sensor: Sensor,
     pub dns: DnsCache,
+    /// The session's id, from the first record: the trace id of every
+    /// span.
+    pub session_id: Option<String>,
     /// Host time and seq of `session.start`.
     pub session_start: Option<(u64, u64)>,
     /// Host time of the last ring 0 effect (fs or net).

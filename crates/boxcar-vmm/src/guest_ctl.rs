@@ -50,6 +50,7 @@ use boxcar_proto::control::{GuestStatus, SessionOutcome};
 use boxcar_proto::guest::{
     decode, encode, GuestMsg, GuestProtoError, HostMsg, LineBuf, LogLevel, MAX_LINE,
 };
+use boxcar_proto::redact::scrub_argv;
 use boxcar_proto::{ClockSync, Payload, Ring, SessionExit, SessionStart, Subject};
 use boxcar_vsock::{ConnMeta, Deny};
 
@@ -100,6 +101,8 @@ pub enum SendError {
 pub struct GuestCtl {
     session: SessionConfig,
     audit: AuditSink,
+    /// `session.start` records the command scrubbed (`--scrub-argv`).
+    scrub_argv: bool,
     /// Set once the one connection of the VMM's life is taken.
     taken: AtomicBool,
     /// Set by [`close`](GuestCtl::close): the sync thread ends.
@@ -136,9 +139,16 @@ impl GuestCtl {
     /// idle until its [`service`](GuestCtl::service) takes init's
     /// connection.
     pub fn new(session: SessionConfig, audit: AuditSink) -> Arc<GuestCtl> {
+        GuestCtl::with_scrub(session, audit, false)
+    }
+
+    /// [`GuestCtl::new`], recording the session's command in
+    /// `session.start` scrubbed when `scrub_argv` (`--scrub-argv`).
+    pub fn with_scrub(session: SessionConfig, audit: AuditSink, scrub_argv: bool) -> Arc<GuestCtl> {
         Arc::new(GuestCtl {
             session,
             audit,
+            scrub_argv,
             taken: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             next_ping: AtomicU64::new(0),
@@ -453,7 +463,11 @@ impl GuestCtl {
         self.record(
             pid,
             Payload::SessionStart(SessionStart {
-                argv: session.argv.clone(),
+                argv: if self.scrub_argv {
+                    scrub_argv(&session.argv)
+                } else {
+                    session.argv.clone()
+                },
                 cwd: session.cwd.clone(),
                 uid: session.uid,
                 gid: session.gid,
@@ -631,6 +645,7 @@ mod tests {
             rows: 24,
             cols: 80,
             sysctls: Vec::new(),
+            ca_pem: None,
         }
     }
 
@@ -901,6 +916,28 @@ mod tests {
             let subject = record.subject.unwrap();
             assert_eq!((subject.pid, subject.uid, subject.gid), (42, 1000, 1000));
         }
+    }
+
+    /// With `--scrub-argv` the session's command is recorded scrubbed.
+    #[test]
+    fn a_scrubbing_channel_records_the_command_scrubbed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(tmp.path(), SessionId::new())).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let mut config = session();
+        config.argv = ["/bin/sh", "-c", "client --password demo-pass"]
+            .map(str::to_owned)
+            .to_vec();
+        let ctl = GuestCtl::with_scrub(config, sink, true);
+        ctl.lock().status.init_ready = true;
+        ctl.on_started(42);
+        writer.close().unwrap();
+        let records = records(&session_dir);
+        assert_eq!(
+            records[0].data["argv"],
+            serde_json::json!(["/bin/sh", "-c", "client --password [redacted]"])
+        );
     }
 
     /// One connection a VMM life: after a driver rebind, a second init

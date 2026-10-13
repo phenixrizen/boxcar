@@ -43,11 +43,13 @@ mod payloads;
 pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
-    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, NetClose,
-    NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp, OpResult, PolicyChanged,
-    ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
-    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, SensorPhase, SessionExit,
-    SessionStart, SetAttr, ShareRef, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
+    HttpResponse, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop,
+    NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit,
+    ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
+    ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SensorPhase, SessionExit,
+    SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop,
+    VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -116,7 +118,8 @@ pub enum Source {
     Guest,
     Sensor,
     Reconciler,
-    Gateway,
+    /// The model traffic gate: `http.*`, `llm.*` and `tool.*`.
+    Gate,
     Control,
     /// The guest's session, as its init reports it over the control
     /// channel.
@@ -150,7 +153,10 @@ impl Source {
             Some(Source::Policy)
         } else if kind.starts_with("proc.") {
             Some(Source::Sensor)
-        } else if kind == "finding" {
+        } else if kind.starts_with("http.") || kind.starts_with("llm.") || kind.starts_with("tool.")
+        {
+            Some(Source::Gate)
+        } else if kind == "finding" || kind.starts_with("span.") {
             Some(Source::Reconciler)
         } else {
             None
@@ -433,6 +439,8 @@ pub enum Payload {
     NetConnect(NetConnect),
     #[serde(rename = "net.tls")]
     NetTls(NetTls),
+    #[serde(rename = "net.inspect")]
+    NetInspect(NetInspect),
     #[serde(rename = "net.close")]
     NetClose(NetClose),
     #[serde(rename = "net.drop")]
@@ -471,6 +479,24 @@ pub enum Payload {
     ProcHeartbeat(ProcHeartbeat),
     #[serde(rename = "proc.sensor_status")]
     ProcSensorStatus(ProcSensorStatus),
+    #[serde(rename = "proc.tls_io")]
+    ProcTlsIo(ProcTlsIo),
+    #[serde(rename = "proc.tls_attach")]
+    ProcTlsAttach(ProcTlsAttach),
+    #[serde(rename = "http.request")]
+    HttpRequest(HttpRequest),
+    #[serde(rename = "http.response")]
+    HttpResponse(HttpResponse),
+    #[serde(rename = "llm.request")]
+    LlmRequest(LlmRequest),
+    #[serde(rename = "llm.response")]
+    LlmResponse(LlmResponse),
+    #[serde(rename = "tool.open")]
+    ToolOpen(ToolOpen),
+    #[serde(rename = "tool.close")]
+    ToolClose(ToolClose),
+    #[serde(rename = "span.effects")]
+    SpanEffects(SpanEffects),
     #[serde(rename = "finding")]
     Finding(Finding),
 }
@@ -507,6 +533,7 @@ impl Payload {
             Payload::NetDns(_) => "net.dns",
             Payload::NetConnect(_) => "net.connect",
             Payload::NetTls(_) => "net.tls",
+            Payload::NetInspect(_) => "net.inspect",
             Payload::NetClose(_) => "net.close",
             Payload::NetDrop(_) => "net.drop",
             Payload::NetUdp(_) => "net.udp",
@@ -526,6 +553,15 @@ impl Payload {
             Payload::ProcLsmDeny(_) => "proc.lsm_deny",
             Payload::ProcHeartbeat(_) => "proc.heartbeat",
             Payload::ProcSensorStatus(_) => "proc.sensor_status",
+            Payload::ProcTlsIo(_) => "proc.tls_io",
+            Payload::ProcTlsAttach(_) => "proc.tls_attach",
+            Payload::HttpRequest(_) => "http.request",
+            Payload::HttpResponse(_) => "http.response",
+            Payload::LlmRequest(_) => "llm.request",
+            Payload::LlmResponse(_) => "llm.response",
+            Payload::ToolOpen(_) => "tool.open",
+            Payload::ToolClose(_) => "tool.close",
+            Payload::SpanEffects(_) => "span.effects",
             Payload::Finding(_) => "finding",
         }
     }
@@ -562,6 +598,7 @@ impl Payload {
             | Payload::NetDns(_)
             | Payload::NetConnect(_)
             | Payload::NetTls(_)
+            | Payload::NetInspect(_)
             | Payload::NetClose(_)
             | Payload::NetDrop(_)
             | Payload::NetUdp(_) => Source::Net,
@@ -578,8 +615,16 @@ impl Payload {
             | Payload::ProcFileOpen(_)
             | Payload::ProcLsmDeny(_)
             | Payload::ProcHeartbeat(_)
-            | Payload::ProcSensorStatus(_) => Source::Sensor,
-            Payload::Finding(_) => Source::Reconciler,
+            | Payload::ProcSensorStatus(_)
+            | Payload::ProcTlsIo(_)
+            | Payload::ProcTlsAttach(_) => Source::Sensor,
+            Payload::HttpRequest(_)
+            | Payload::HttpResponse(_)
+            | Payload::LlmRequest(_)
+            | Payload::LlmResponse(_)
+            | Payload::ToolOpen(_)
+            | Payload::ToolClose(_) => Source::Gate,
+            Payload::SpanEffects(_) | Payload::Finding(_) => Source::Reconciler,
         }
     }
 
@@ -614,7 +659,7 @@ mod tests {
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
     /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 47] = [
+    const KINDS: [&str; 57] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -642,6 +687,7 @@ mod tests {
         "net.dns",
         "net.connect",
         "net.tls",
+        "net.inspect",
         "net.close",
         "net.drop",
         "net.udp",
@@ -661,6 +707,15 @@ mod tests {
         "proc.lsm_deny",
         "proc.heartbeat",
         "proc.sensor_status",
+        "proc.tls_io",
+        "proc.tls_attach",
+        "http.request",
+        "http.response",
+        "llm.request",
+        "llm.response",
+        "tool.open",
+        "tool.close",
+        "span.effects",
         "finding",
     ];
 
@@ -723,6 +778,7 @@ mod tests {
                             host_root: "/tmp/ws".into(),
                         },
                     ],
+                    inspect_ca_sha256: Some("ab".repeat(32)),
                 }),
                 json!({
                     "version": "0.1.0",
@@ -735,6 +791,7 @@ mod tests {
                         {"tag": "root", "host_root": "/k/rootfs"},
                         {"tag": "workspace", "host_root": "/tmp/ws"},
                     ],
+                    "inspect_ca_sha256": "ab".repeat(32),
                 }),
             ),
             (
@@ -1124,6 +1181,7 @@ mod tests {
                     sni: Some("example.com".into()),
                     alpn: vec!["h2".into(), "http/1.1".into()],
                     verdict: Verdict::Allow,
+                    inspect: true,
                 }),
                 json!({
                     "flow": 7,
@@ -1131,6 +1189,25 @@ mod tests {
                     "sni": "example.com",
                     "alpn": ["h2", "http/1.1"],
                     "verdict": "allow",
+                    "inspect": true,
+                }),
+            ),
+            (
+                Payload::NetInspect(NetInspect {
+                    flow: 7,
+                    sni: Some("example.com".into()),
+                    alpn: Some("h2".into()),
+                    version: Some("1.3".into()),
+                    result: "ok".into(),
+                    rule: Some("inspect example.com:443".into()),
+                }),
+                json!({
+                    "flow": 7,
+                    "sni": "example.com",
+                    "alpn": "h2",
+                    "version": "1.3",
+                    "result": "ok",
+                    "rule": "inspect example.com:443",
                 }),
             ),
             (
@@ -1409,6 +1486,7 @@ mod tests {
                     btf_ok: true,
                     session_cgroup_id: 4242,
                     pid: 77,
+                    threads: vec![78],
                     reason: None,
                 }),
                 json!({
@@ -1421,6 +1499,186 @@ mod tests {
                     "btf_ok": true,
                     "session_cgroup_id": 4242,
                     "pid": 77,
+                    "threads": [78],
+                }),
+            ),
+            (
+                Payload::ProcTlsIo(ProcTlsIo {
+                    tid: 213,
+                    tgid: 212,
+                    dir: "write".into(),
+                    bytes: 4096,
+                }),
+                json!({"tid": 213, "tgid": 212, "dir": "write", "bytes": 4096}),
+            ),
+            (
+                Payload::ProcTlsAttach(ProcTlsAttach {
+                    path: "/bin/busybox".into(),
+                    ok: false,
+                    error: Some("SSL_write: symbol not found".into()),
+                }),
+                json!({"path": "/bin/busybox", "ok": false, "error": "SSL_write: symbol not found"}),
+            ),
+            (
+                Payload::HttpRequest(HttpRequest {
+                    flow: 7,
+                    stream: 1,
+                    version: "2".into(),
+                    method: "POST".into(),
+                    authority: Some("api.anthropic.com".into()),
+                    path: Some("/v1/messages".into()),
+                    content_type: Some("application/json".into()),
+                    content_encoding: Some("gzip".into()),
+                    content_length: Some(2048),
+                    user_agent: Some("claude-cli/2.1.290".into()),
+                    body_bytes: 9012,
+                    body_b3: Some(format!("b3:{}", "ab".repeat(32))),
+                    body_truncated: false,
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7,
+                    "stream": 1,
+                    "version": "2",
+                    "method": "POST",
+                    "authority": "api.anthropic.com",
+                    "path": "/v1/messages",
+                    "content_type": "application/json",
+                    "content_encoding": "gzip",
+                    "content_length": 2048,
+                    "user_agent": "claude-cli/2.1.290",
+                    "body_bytes": 9012,
+                    "body_b3": format!("b3:{}", "ab".repeat(32)),
+                    "body_truncated": false,
+                    "degraded": null,
+                }),
+            ),
+            (
+                Payload::HttpResponse(HttpResponse {
+                    flow: 7,
+                    stream: 1,
+                    status: 200,
+                    content_type: Some("text/event-stream".into()),
+                    content_encoding: None,
+                    body_bytes: 4567,
+                    body_b3: Some(format!("b3:{}", "cd".repeat(32))),
+                    body_truncated: false,
+                    sse_events: 42,
+                    ws_messages: 0,
+                    dur_ms: 3210,
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7,
+                    "stream": 1,
+                    "status": 200,
+                    "content_type": "text/event-stream",
+                    "content_encoding": null,
+                    "body_bytes": 4567,
+                    "body_b3": format!("b3:{}", "cd".repeat(32)),
+                    "body_truncated": false,
+                    "sse_events": 42,
+                    "ws_messages": 0,
+                    "dur_ms": 3210,
+                    "degraded": null,
+                }),
+            ),
+            (
+                Payload::LlmRequest(LlmRequest {
+                    flow: 7,
+                    stream: 1,
+                    provider: "anthropic".into(),
+                    model: Some("claude-fable-5-1".into()),
+                    streaming: true,
+                    messages: 3,
+                    system_b3: Some(format!("b3:{}", "ef".repeat(32))),
+                    tools: vec!["Bash".into(), "Write".into()],
+                    max_tokens: Some(4096),
+                    body_bytes: 9012,
+                    body_b3: Some(format!("b3:{}", "ab".repeat(32))),
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7, "stream": 1, "provider": "anthropic",
+                    "model": "claude-fable-5-1", "streaming": true, "messages": 3,
+                    "system_b3": format!("b3:{}", "ef".repeat(32)),
+                    "tools": ["Bash", "Write"], "max_tokens": 4096,
+                    "body_bytes": 9012, "body_b3": format!("b3:{}", "ab".repeat(32)),
+                    "degraded": null,
+                }),
+            ),
+            (
+                Payload::LlmResponse(LlmResponse {
+                    flow: 7,
+                    stream: 1,
+                    provider: "anthropic".into(),
+                    model: Some("claude-fable-5-1".into()),
+                    stop_reason: Some("tool_use".into()),
+                    input_tokens: Some(1200),
+                    output_tokens: Some(80),
+                    cache_read_tokens: Some(1000),
+                    text_bytes: 64,
+                    text_b3: Some(format!("b3:{}", "12".repeat(32))),
+                    tool_uses: 1,
+                    dur_ms: 2100,
+                    degraded: None,
+                }),
+                json!({
+                    "flow": 7, "stream": 1, "provider": "anthropic",
+                    "model": "claude-fable-5-1", "stop_reason": "tool_use",
+                    "input_tokens": 1200, "output_tokens": 80, "cache_read_tokens": 1000,
+                    "text_bytes": 64, "text_b3": format!("b3:{}", "12".repeat(32)),
+                    "tool_uses": 1, "dur_ms": 2100, "degraded": null,
+                }),
+            ),
+            (
+                Payload::ToolOpen(ToolOpen {
+                    flow: 7,
+                    stream: 1,
+                    tool_use_id: "toolu_01".into(),
+                    tool_name: "Bash".into(),
+                    args_b3: Some(format!("b3:{}", "34".repeat(32))),
+                    args_summary: "{\"command\":\"ls -la\"}".into(),
+                    args: Some(json!({"command": "ls -la"})),
+                }),
+                json!({
+                    "flow": 7, "stream": 1, "tool_use_id": "toolu_01", "tool_name": "Bash",
+                    "args_b3": format!("b3:{}", "34".repeat(32)),
+                    "args_summary": "{\"command\":\"ls -la\"}",
+                    "args": {"command": "ls -la"},
+                }),
+            ),
+            (
+                Payload::ToolClose(ToolClose {
+                    flow: 7,
+                    stream: 3,
+                    tool_use_id: "toolu_01".into(),
+                    status: "ok".into(),
+                    result_bytes: 2048,
+                    result_b3: Some(format!("b3:{}", "56".repeat(32))),
+                    result_summary: "total 0".into(),
+                }),
+                json!({
+                    "flow": 7, "stream": 3, "tool_use_id": "toolu_01", "status": "ok",
+                    "result_bytes": 2048, "result_b3": format!("b3:{}", "56".repeat(32)),
+                    "result_summary": "total 0",
+                }),
+            ),
+            (
+                Payload::SpanEffects(SpanEffects {
+                    span_id: "toolu_01".into(),
+                    tool_name: "Bash".into(),
+                    opened_seq: 40,
+                    closed_seq: Some(58),
+                    executor_tgid: Some(212),
+                    procs: vec![230, 231],
+                    effects: vec![41, 44, 52],
+                    truncated: false,
+                }),
+                json!({
+                    "span_id": "toolu_01", "tool_name": "Bash", "opened_seq": 40,
+                    "closed_seq": 58, "executor_tgid": 212, "procs": [230, 231],
+                    "effects": [41, 44, 52], "truncated": false,
                 }),
             ),
             (
@@ -1483,6 +1741,93 @@ mod tests {
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
             (
+                Payload::ProcTlsAttach(ProcTlsAttach {
+                    path: "/usr/bin/node".into(),
+                    ok: true,
+                    error: None,
+                }),
+                json!({"path": "/usr/bin/node", "ok": true}),
+            ),
+            (
+                Payload::SpanEffects(SpanEffects {
+                    span_id: "call_x".into(),
+                    tool_name: "shell".into(),
+                    opened_seq: 40,
+                    closed_seq: None,
+                    executor_tgid: None,
+                    procs: Vec::new(),
+                    effects: Vec::new(),
+                    truncated: false,
+                }),
+                json!({
+                    "span_id": "call_x", "tool_name": "shell", "opened_seq": 40,
+                    "closed_seq": null, "executor_tgid": null, "procs": [], "effects": [],
+                    "truncated": false,
+                }),
+            ),
+            (
+                Payload::ToolOpen(ToolOpen {
+                    flow: 8,
+                    stream: 1,
+                    tool_use_id: "call_x".into(),
+                    tool_name: "shell".into(),
+                    args_b3: None,
+                    args_summary: String::new(),
+                    args: None,
+                }),
+                json!({
+                    "flow": 8, "stream": 1, "tool_use_id": "call_x", "tool_name": "shell",
+                    "args_b3": null, "args_summary": "",
+                }),
+            ),
+            (
+                Payload::HttpRequest(HttpRequest {
+                    flow: 8,
+                    stream: 3,
+                    version: "1.1".into(),
+                    method: "GET".into(),
+                    authority: None,
+                    path: None,
+                    content_type: None,
+                    content_encoding: None,
+                    content_length: None,
+                    user_agent: None,
+                    body_bytes: 0,
+                    body_b3: None,
+                    body_truncated: false,
+                    degraded: Some("lost".into()),
+                }),
+                json!({
+                    "flow": 8, "stream": 3, "version": "1.1", "method": "GET",
+                    "authority": null, "path": null, "content_type": null,
+                    "content_encoding": null, "content_length": null, "user_agent": null,
+                    "body_bytes": 0, "body_b3": null, "body_truncated": false,
+                    "degraded": "lost",
+                }),
+            ),
+            (
+                Payload::HttpResponse(HttpResponse {
+                    flow: 8,
+                    stream: 3,
+                    status: 0,
+                    content_type: None,
+                    content_encoding: None,
+                    body_bytes: 0,
+                    body_b3: None,
+                    body_truncated: true,
+                    sse_events: 0,
+                    ws_messages: 2,
+                    dur_ms: 0,
+                    degraded: Some("flow_closed".into()),
+                }),
+                json!({
+                    "flow": 8, "stream": 3, "status": 0, "content_type": null,
+                    "content_encoding": null, "body_bytes": 0, "body_b3": null,
+                    "body_truncated": true, "sse_events": 0, "ws_messages": 2, "dur_ms": 0,
+                    "degraded": "flow_closed",
+                }),
+            ),
+            (
                 Payload::VmmStart(VmmStart {
                     version: "0.1.0".into(),
                     kernel: artifact("/k/vmlinux", 0x11),
@@ -1491,6 +1836,7 @@ mod tests {
                     vcpus: 1,
                     mem_mib: 128,
                     shares: Vec::new(),
+                    inspect_ca_sha256: None,
                 }),
                 json!({
                     "version": "0.1.0",
@@ -1613,8 +1959,21 @@ mod tests {
                     sni: None,
                     alpn: Vec::new(),
                     verdict: Verdict::Deny,
+                    inspect: false,
                 }),
                 json!({"flow": 9, "kind": "http", "sni": null, "alpn": [], "verdict": "deny"}),
+            ),
+            (
+                // An upstream the host's store does not vouch for, to an address.
+                Payload::NetInspect(NetInspect {
+                    flow: 9,
+                    sni: None,
+                    alpn: None,
+                    version: None,
+                    result: "upstream_untrusted".into(),
+                    rule: None,
+                }),
+                json!({"flow": 9, "sni": null, "alpn": null, "version": null, "result": "upstream_untrusted", "rule": null}),
             ),
             (
                 // Denied by the policy's default, to an address no DNS
@@ -1786,8 +2145,13 @@ mod tests {
                 Source::Policy
             } else if payload.kind().starts_with("proc.") {
                 Source::Sensor
-            } else if payload.kind() == "finding" {
+            } else if payload.kind() == "finding" || payload.kind().starts_with("span.") {
                 Source::Reconciler
+            } else if payload.kind().starts_with("http.")
+                || payload.kind().starts_with("llm.")
+                || payload.kind().starts_with("tool.")
+            {
+                Source::Gate
             } else {
                 Source::Vmm
             };
@@ -1806,9 +2170,10 @@ mod tests {
         assert_eq!(Source::from_kind("proc.exec"), Some(Source::Sensor));
         assert_eq!(Source::from_kind("proc.heartbeat"), Some(Source::Sensor));
         assert_eq!(Source::from_kind("finding"), Some(Source::Reconciler));
+        assert_eq!(Source::from_kind("span.effects"), Some(Source::Reconciler));
         for other in [
-            "tool.open",
-            "llm.request",
+            "tools.open",
+            "llms.request",
             "proc",
             "process.exec",
             "syncs",
@@ -1835,7 +2200,7 @@ mod tests {
 
     #[test]
     fn from_record_rejects_unknown_kinds_and_malformed_data() {
-        let unknown = record("tool.open", Source::Gateway, json!({}));
+        let unknown = record("tool.open", Source::Gate, json!({}));
         assert!(Payload::from_record(&unknown).is_err());
         let known_kind_bad_data = record("proc.exec", Source::Sensor, json!({"argv": ["ls"]}));
         assert!(Payload::from_record(&known_kind_bad_data).is_err());
@@ -2211,7 +2576,7 @@ mod tests {
             (Source::Guest, "guest"),
             (Source::Sensor, "sensor"),
             (Source::Reconciler, "reconciler"),
-            (Source::Gateway, "gateway"),
+            (Source::Gate, "gate"),
             (Source::Control, "control"),
             (Source::Session, "session"),
             (Source::Policy, "policy"),

@@ -58,6 +58,10 @@ enum Milestone {
     /// M3: everything M2 runs, with the sensor in the initramfs and the
     /// reconciler beside the log, plus the M3 end-to-end tests (`kvm_m3`).
     M3,
+    /// M4: everything M3 runs, plus the M4 end-to-end tests (`kvm_m4`):
+    /// the model traffic gate, with inspected flows to example.com and to
+    /// test upstreams on the loopback.
+    M4,
 }
 
 impl Milestone {
@@ -66,6 +70,7 @@ impl Milestone {
             Milestone::M1 => "m1",
             Milestone::M2 => "m2",
             Milestone::M3 => "m3",
+            Milestone::M4 => "m4",
         }
     }
 
@@ -74,7 +79,7 @@ impl Milestone {
     fn net_env(self) -> &'static str {
         match self {
             Milestone::M1 => "0",
-            Milestone::M2 | Milestone::M3 => {
+            Milestone::M2 | Milestone::M3 | Milestone::M4 => {
                 if example_com_resolves() {
                     "1"
                 } else {
@@ -125,7 +130,7 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
 /// The arguments after `cargo` that run `milestone`'s gated tests.
 fn cargo_test_args(milestone: Milestone) -> Vec<OsString> {
     let args: &[&str] = match milestone {
-        Milestone::M1 | Milestone::M2 | Milestone::M3 => &[
+        Milestone::M1 | Milestone::M2 | Milestone::M3 | Milestone::M4 => &[
             "test",
             "-p",
             "boxcar-vmm",
@@ -146,6 +151,9 @@ struct Artifacts {
     kernel: PathBuf,
     initramfs: PathBuf,
     rootfs: PathBuf,
+    /// The agents' guest (`cargo xtask rootfs debian`), which only the
+    /// agent tests need: they skip without it.
+    debian: PathBuf,
 }
 
 impl Artifacts {
@@ -155,16 +163,22 @@ impl Artifacts {
             kernel: guest_dir.join("vmlinux"),
             initramfs: guest_dir.join("initramfs.cpio"),
             rootfs: guest_dir.join("rootfs-alpine"),
+            debian: guest_dir.join("rootfs-debian"),
         }
     }
 
-    /// The variables that tell the tests where they are.
-    fn env(&self) -> [(&'static str, PathBuf); 3] {
-        [
+    /// The variables that tell the tests where they are; the Debian guest
+    /// is named only when it has been built.
+    fn env(&self) -> Vec<(&'static str, PathBuf)> {
+        let mut env = vec![
             ("BOXCAR_TEST_KERNEL", self.kernel.clone()),
             ("BOXCAR_TEST_INITRAMFS", self.initramfs.clone()),
             ("BOXCAR_TEST_ROOTFS", self.rootfs.clone()),
-        ]
+        ];
+        if self.debian.is_dir() {
+            env.push(("BOXCAR_TEST_ROOTFS_DEBIAN", self.debian.clone()));
+        }
+        env
     }
 }
 
@@ -253,6 +267,13 @@ mod tests {
             strings(cargo_test_args(Milestone::M2))
         );
         assert_eq!(Milestone::M3.net_env(), Milestone::M2.net_env());
+        // M4 runs the same packages and names itself too.
+        assert_eq!(
+            strings(cargo_test_args(Milestone::M4)),
+            strings(cargo_test_args(Milestone::M3))
+        );
+        assert_eq!(Milestone::M4.name(), "m4");
+        assert_eq!(Milestone::M4.net_env(), Milestone::M3.net_env());
         // M1 never reaches the network.
         assert_eq!(Milestone::M1.net_env(), "0");
         assert!(["0", "1"].contains(&Milestone::M2.net_env()));
@@ -262,6 +283,7 @@ mod tests {
     fn the_tests_are_told_where_the_artifacts_are() {
         let guest = Artifacts::under(Path::new("/r/target/guest"));
         let vars = guest.env();
+        assert_eq!(vars.len(), 3, "no Debian guest at /r: not named");
         let env: Vec<(&str, &Path)> = vars
             .iter()
             .map(|(var, path)| (*var, path.as_path()))
@@ -280,6 +302,30 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn the_debian_guest_is_named_once_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest = Artifacts::under(dir.path());
+        assert!(guest
+            .env()
+            .iter()
+            .all(|(var, _)| *var != "BOXCAR_TEST_ROOTFS_DEBIAN"));
+        fs::create_dir(dir.path().join("rootfs-debian")).unwrap();
+        let vars = guest.env();
+        assert_eq!(
+            vars.last().map(|(var, path)| (*var, path.clone())),
+            Some((
+                "BOXCAR_TEST_ROOTFS_DEBIAN",
+                dir.path().join("rootfs-debian")
+            ))
+        );
+        // Not required: the agent tests skip without it.
+        fs::write(dir.path().join("vmlinux"), b"").unwrap();
+        fs::write(dir.path().join("initramfs.cpio"), b"").unwrap();
+        fs::create_dir(dir.path().join("rootfs-alpine")).unwrap();
+        assert_eq!(missing(&guest, Ok(())), None);
     }
 
     #[test]

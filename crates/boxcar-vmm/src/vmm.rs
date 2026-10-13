@@ -33,7 +33,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
-use boxcar_net::{NetConfig, Policy};
+use boxcar_net::{InspectConfig, NetConfig, Policy};
 use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
@@ -57,7 +57,9 @@ use crate::console::ConsoleWriter;
 use crate::control::{ControlServer, VmmOps};
 use crate::devices::legacy::COM1_GSI;
 use crate::devices::slots::{present_slots, DeviceSet};
-use crate::devices::{DeviceError, FsDevices, FsOptions, LegacyDevices, NetDevice, VsockDevice};
+use crate::devices::{
+    DeviceError, FsDevices, FsOptions, LegacyDevices, NetDevice, NetSetup, VsockDevice,
+};
 use crate::guest_ctl::{GuestCtl, SessionConfig, CLOSE_DEADLINE};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
@@ -220,6 +222,23 @@ pub struct VmConfig {
     pub session: SessionConfig,
     /// The control socket, if any: see [`ControlConfig`].
     pub control: Option<ControlConfig>,
+    /// The gate, when the session's policy has an `inspect` line: the
+    /// session's CA (whose leaves the network stack hands the guest, and
+    /// whose fingerprint `vmm.start` records) and the trust store for the
+    /// real hosts. `session.ca_pem` (set by `boxcar run`) carries the CA's
+    /// certificate to the guest. The key never leaves this process.
+    pub inspect: Option<Arc<InspectConfig>>,
+    /// The reconciler's span index, when the run keeps one: the control
+    /// socket's `span.list` reads it.
+    pub spans: Option<boxcar_audit::SpanIndex>,
+    /// The dump directory (`boxcar run --dump`), when the run has one:
+    /// the network's frames, and the inspected flows' plaintext and
+    /// exchanges, go there. A debugging aid, not part of the log.
+    pub dump: Option<boxcar_net::DumpDir>,
+    /// With `boxcar run --scrub-argv`: the sensor's `proc.exec` records
+    /// carry their argv scrubbed, and the argvs that changed wait here, as
+    /// run, for the reconciler.
+    pub scrub_argv: Option<boxcar_audit::RawArgv>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -264,6 +283,10 @@ impl VmConfig {
             sensor: true,
             session: SessionConfig::for_user(shell, uid, gid),
             control: None,
+            inspect: None,
+            spans: None,
+            dump: None,
+            scrub_argv: None,
         }
     }
 }
@@ -455,14 +478,22 @@ impl Vmm {
             &mem,
             &mut mmio,
             &mut slots,
-            cfg.net.as_ref(),
-            &cfg.audit,
-            &cfg.policy,
+            cfg.net.as_ref().map(|net| NetSetup {
+                cfg: net,
+                audit: &cfg.audit,
+                policy: &cfg.policy,
+                inspect: cfg.inspect.clone(),
+                dump: cfg.dump.clone(),
+            }),
         )?;
         // The guest control channel's service and the session's terminal's,
         // when there is a vsock device.
         let services = Arc::new(ServiceRegistry::new());
-        let guest = GuestCtl::new(cfg.session.clone(), cfg.audit.clone());
+        let guest = GuestCtl::with_scrub(
+            cfg.session.clone(),
+            cfg.audit.clone(),
+            cfg.scrub_argv.is_some(),
+        );
         let vsock = VsockDevice::attach(
             &vm,
             &mem,
@@ -481,7 +512,10 @@ impl Vmm {
                 .register(boxcar_vsock::services::PTY_PORT, pty.service())
                 .map_err(|error| VmmError::Config(error.to_string()))?;
             let sensor = if cfg.sensor {
-                let sensor = SensorIngest::new(cfg.audit.clone());
+                let sensor = match &cfg.scrub_argv {
+                    Some(raw) => SensorIngest::scrubbing_argv(cfg.audit.clone(), raw.clone()),
+                    None => SensorIngest::new(cfg.audit.clone()),
+                };
                 services
                     .register(boxcar_vsock::services::SENSOR_PORT, sensor.service())
                     .map_err(|error| VmmError::Config(error.to_string()))?;
@@ -544,6 +578,7 @@ impl Vmm {
             pty,
             sensor,
             policy: Arc::new(live_policy),
+            spans: cfg.spans.clone(),
         });
 
         let start = VmmStart {
@@ -557,6 +592,10 @@ impl Vmm {
             vcpus: u32::from(cfg.vcpus),
             mem_mib: cfg.mem_mib,
             shares: share_refs(&cfg.fs_shares),
+            inspect_ca_sha256: cfg
+                .inspect
+                .as_ref()
+                .map(|gate| gate.ca().fingerprint_sha256().to_owned()),
         };
         tracing::debug!("vmm.start: {start:?}");
         cfg.audit.emit(Submission {

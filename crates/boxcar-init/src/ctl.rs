@@ -618,6 +618,7 @@ mod tests {
             rows: 24,
             cols: 80,
             sysctls: Vec::new(),
+            ca_pem: None,
         }
     }
 

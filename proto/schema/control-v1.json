@@ -298,7 +298,7 @@
       ],
       "properties": {
         "capabilities": {
-          "description": "The op families the server serves beyond `status` and `stop`, such as `pty`, `audit` and `policy.net`.",
+          "description": "The op families the server serves beyond `status` and `stop`, such as `pty`, `audit`, `policy.net` and `policy.inspect`.",
           "type": "array",
           "items": {
             "type": "string"
@@ -336,7 +336,7 @@
       }
     },
     "NetPolicy": {
-      "description": "The network policy as `policy.get` reports it and `policy.update` takes it: `{\"default\":\"deny\",\"allow\":[\"example.com:443\"],\"deny\":[\"10.0.0.0/8\"]}`. Each rule is a target as `boxcar run --allow` takes it: `name[:port]`, `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The policy in force puts every deny before every allow, in the order given, as `boxcar run` orders `--deny` and `--allow`: the first rule that matches decides, so a deny wins over an allow of the same target. A policy file whose allows and denies are interleaved reads back from `policy.get` in this shape, which is the same policy only when no allow before a deny matches what the deny does.",
+      "description": "The network policy as `policy.get` reports it and `policy.update` takes it: `{\"default\":\"deny\",\"allow\":[\"example.com:443\"],\"deny\":[\"10.0.0.0/8\"], \"inspect\":[\"api.example.com:443\"]}`. Each rule is a target as `boxcar run --allow` takes it: `name[:port]`, `*.name[:port]`, `address[:port]` or `address/prefix[:port]`. The policy in force puts every deny before every allow, in the order given, as `boxcar run` orders `--deny` and `--allow`: the first rule that matches decides, so a deny wins over an allow of the same target. A policy file whose allows and denies are interleaved reads back from `policy.get` in this shape, which is the same policy only when no allow before a deny matches what the deny does.",
       "type": "object",
       "required": [
         "default"
@@ -356,6 +356,14 @@
         },
         "deny": {
           "description": "The deny rules, as targets, in order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inspect": {
+          "description": "The inspect lines, as targets, in order: destinations whose TLS the gate ends and whose traffic it observes, once an allow rule admitted the connection. They decide no verdict. Absent in older servers' views.",
           "default": [],
           "type": "array",
           "items": {
@@ -853,8 +861,14 @@
             "guest",
             "sensor",
             "reconciler",
-            "gateway",
             "control"
+          ]
+        },
+        {
+          "description": "The model traffic gate: `http.*`, `llm.*` and `tool.*`.",
+          "type": "string",
+          "enum": [
+            "gate"
           ]
         },
         {
@@ -872,6 +886,84 @@
           ]
         }
       ]
+    },
+    "SpanEntry": {
+      "description": "One tool span as `span.list` reports it: the reconciler's index entry, kept current while the span is open and once more when it closes.",
+      "type": "object",
+      "required": [
+        "effects",
+        "opened_seq",
+        "procs",
+        "span_id",
+        "tool_name",
+        "worst_score"
+      ],
+      "properties": {
+        "closed_seq": {
+          "description": "The seq of the `tool.close`; absent while the span is open.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "effects": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "opened_seq": {
+          "description": "The seq of the `tool.open`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "procs": {
+          "description": "How many processes and effect records the span holds so far.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "span_id": {
+          "description": "The provider's tool use id.",
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "worst_score": {
+          "description": "The highest score of a finding inside the span; 0 with none.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SpanList": {
+      "description": "The result of `span.list`: `{\"spans\":[...]}`, newest first, at most [`MAX_SPAN_LIST`] entries. Empty on a VM whose session has no spans yet, and on one with no reconciler index.",
+      "type": "object",
+      "required": [
+        "spans"
+      ],
+      "properties": {
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SpanEntry"
+          }
+        }
+      }
+    },
+    "SpanListParams": {
+      "description": "The parameters of `span.list`: `{\"active_only\":true}` for the spans still open; the default, or no parameters, lists the closed ones too.",
+      "type": "object",
+      "properties": {
+        "active_only": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
     },
     "SpanRef": {
       "description": "Where an event sits in a trace.",

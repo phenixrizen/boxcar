@@ -1,0 +1,2 @@
+{"type":"span.effects","data":{"span_id":"toolu_01","tool_name":"Bash","opened_seq":4,"closed_seq":9,"executor_tgid":100,"procs":[350,351],"effects":[5,7],"truncated":false}}
+{"category":"orphaned_work","score":50,"rule":"orphaned_work","summary":"1 process of the Bash tool call toolu_01 still ran a second after it closed: python3 (pid 351)","evidence":[{"seq":7,"ring":1},{"seq":9,"ring":0}],"span_id":"toolu_01","low_confidence":false}

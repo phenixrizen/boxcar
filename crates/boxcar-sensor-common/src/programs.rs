@@ -17,6 +17,12 @@ pub enum ProgramKind {
     SleepableLsm,
     /// A function entry (`fentry/<hook>`).
     FEntry,
+    /// A probe on a user function (`uprobe`), attached by the userspace
+    /// sensor to each file that exports the symbol `hook` names.
+    UProbe,
+    /// A probe on a user function's return (`uretprobe`), attached the
+    /// same way.
+    URetProbe,
 }
 
 /// One of the sensor's programs.
@@ -41,9 +47,20 @@ const fn program(name: &'static str, kind: ProgramKind, hook: &'static str) -> P
     }
 }
 
+/// A TLS probe: loaded with the others, attached later to each file that
+/// exports `symbol`; optional, as a session may run nothing that does.
+const fn tls(name: &'static str, kind: ProgramKind, symbol: &'static str) -> Program {
+    Program {
+        name,
+        kind,
+        hook: symbol,
+        optional: true,
+    }
+}
+
 /// The programs, in the order the loader attaches them: the two guards
 /// last, `bpf_guard` very last, since loading is itself a `bpf()` call.
-pub const PROGRAMS: [Program; 9] = [
+pub const PROGRAMS: [Program; 15] = [
     program(
         "sched_process_exec",
         ProgramKind::BtfTracepoint,
@@ -72,22 +89,34 @@ pub const PROGRAMS: [Program; 9] = [
         ProgramKind::FEntry,
         "__x64_sys_memfd_create",
     ),
+    tls("ssl_write", ProgramKind::UProbe, "SSL_write"),
+    tls("ssl_write_ex", ProgramKind::UProbe, "SSL_write_ex"),
+    tls("ssl_read", ProgramKind::UProbe, "SSL_read"),
+    tls("ssl_read_ret", ProgramKind::URetProbe, "SSL_read"),
+    tls("ssl_read_ex", ProgramKind::UProbe, "SSL_read_ex"),
+    tls("ssl_read_ex_ret", ProgramKind::URetProbe, "SSL_read_ex"),
     program("kill_guard", ProgramKind::Lsm, "task_kill"),
     program("bpf_guard", ProgramKind::Lsm, "bpf"),
 ];
 
 /// The maps, with their `bpf_map_type` numbers: the ring buffer the events
-/// travel in, and the two per-CPU counters.
-pub const MAPS: [(&str, u32); 3] = [
+/// travel in, the two per-CPU counters, and the TLS reads under way.
+pub const MAPS: [(&str, u32); 4] = [
     ("EVENTS", BPF_MAP_TYPE_RINGBUF),
     ("DROPS", BPF_MAP_TYPE_PERCPU_ARRAY),
     ("SAMPLES", BPF_MAP_TYPE_PERCPU_ARRAY),
+    ("TLS_READS", BPF_MAP_TYPE_HASH),
 ];
 
+/// `BPF_MAP_TYPE_HASH`.
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
 /// `BPF_MAP_TYPE_RINGBUF`.
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 /// `BPF_MAP_TYPE_PERCPU_ARRAY`.
 pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+
+/// How many threads may be inside `SSL_read` or `SSL_read_ex` at once.
+pub const TLS_READS_ENTRIES: u32 = 1024;
 
 /// The ring buffer's size in bytes.
 pub const RING_BUFFER_BYTES: u32 = 256 * 1024;
@@ -121,10 +150,22 @@ mod tests {
         assert_eq!(PROGRAMS[PROGRAMS.len() - 2].name, "kill_guard");
         assert_eq!(
             PROGRAMS.iter().filter(|p| p.optional).count(),
-            1,
-            "only file_open is optional"
+            7,
+            "file_open and the six TLS probes are optional"
         );
-        assert_eq!(MAPS.len(), 3);
+        assert_eq!(PROGRAMS.len(), 15);
+        let tls = || {
+            PROGRAMS
+                .iter()
+                .filter(|p| matches!(p.kind, ProgramKind::UProbe | ProgramKind::URetProbe))
+        };
+        assert_eq!(tls().count(), 6);
+        assert!(tls().all(|p| p.optional && p.hook.starts_with("SSL_")));
+        assert_eq!(
+            tls().filter(|p| p.kind == ProgramKind::URetProbe).count(),
+            2
+        );
+        assert_eq!(MAPS.len(), 4);
         assert_eq!(
             LICENSE.len() + 1,
             13,

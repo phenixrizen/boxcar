@@ -23,14 +23,15 @@ use boxcar_proto::control::{
     self, to_line, AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, ErrorBody,
     ErrorCode, Hello, NetPolicy, PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams,
     PtyAttached, PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Ready, Request, Response,
-    SensorState, SensorStatus, StateEvent, Status, StopMode, StopParams, VmState, VsockPolicy,
+    SensorState, SensorStatus, SpanEntry, SpanList, SpanListParams, StateEvent, Status, StopMode,
+    StopParams, VmState, VsockPolicy,
 };
 use boxcar_proto::guest::{GuestMsg, HostMsg, SessionConfig};
 use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{
     Hash, NetConnect, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
-    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, Ring,
-    SensorPhase, SessionId, Source, Subject, Verdict,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach,
+    ProcTlsIo, ProgramStatus, Ring, SensorPhase, SessionId, Source, Subject, Verdict,
 };
 use schemars::gen::{SchemaGenerator, SchemaSettings};
 use schemars::schema::{RootSchema, Schema, SchemaObject};
@@ -131,6 +132,8 @@ pub fn control_schema() -> RootSchema {
         SchemaGenerator::subschema_for::<PolicyView>,
         SchemaGenerator::subschema_for::<PolicyUpdateParams>,
         SchemaGenerator::subschema_for::<PolicyUpdated>,
+        SchemaGenerator::subschema_for::<SpanListParams>,
+        SchemaGenerator::subschema_for::<SpanList>,
         SchemaGenerator::subschema_for::<Ready>,
     ] {
         define(&mut gen);
@@ -230,6 +233,7 @@ pub fn sensor_lines() -> Result<Vec<u8>> {
                 btf_ok: true,
                 session_cgroup_id: 4242,
                 pid: 77,
+                threads: vec![78],
                 reason: None,
             }),
         ),
@@ -348,6 +352,25 @@ pub fn sensor_lines() -> Result<Vec<u8>> {
                 frames_sent: 10,
             }),
         ),
+        frame(
+            2_000_000_000,
+            None,
+            Payload::ProcTlsAttach(ProcTlsAttach {
+                path: "/lib/libssl.so.3".to_owned(),
+                ok: true,
+                error: None,
+            }),
+        ),
+        frame(
+            2_100_000_000,
+            subject,
+            Payload::ProcTlsIo(ProcTlsIo {
+                tid: 212,
+                tgid: 212,
+                dir: "write".to_owned(),
+                bytes: 517,
+            }),
+        ),
     ];
     let mut out = Vec::new();
     for frame in &frames {
@@ -412,9 +435,16 @@ pub fn control_lines() -> Result<Vec<u8>> {
         out.extend(message.line()?);
         Ok(())
     };
-    let capabilities = ["pty", "audit", "policy.net", "findings"]
-        .map(str::to_owned)
-        .to_vec();
+    let capabilities = [
+        "pty",
+        "audit",
+        "policy.net",
+        "policy.inspect",
+        "findings",
+        "spans",
+    ]
+    .map(str::to_owned)
+    .to_vec();
     line(&Ready {
         ready: true,
         control: format!("/run/user/1000/boxcar/{SESSION}/control.sock"),
@@ -515,6 +545,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
                 .map(str::to_owned)
                 .to_vec(),
             deny: vec!["10.0.0.0/8".to_owned()],
+            inspect: vec!["api.anthropic.com:443".to_owned()],
         },
         vsock: VsockPolicy {
             allow_ports: vec![5000],
@@ -532,6 +563,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
                     .map(str::to_owned)
                     .to_vec(),
                 deny: vec!["10.0.0.0/8".to_owned()],
+                inspect: vec!["api.anthropic.com:443".to_owned()],
             }),
             vsock: None,
         })?,
@@ -577,6 +609,36 @@ pub fn control_lines() -> Result<Vec<u8>> {
         ))?;
     }
 
+    line(&Request::new(
+        17,
+        "span.list",
+        serde_json::to_value(SpanListParams { active_only: false })?,
+    ))?;
+    line(&Response::success(
+        17,
+        serde_json::to_value(SpanList {
+            spans: vec![
+                SpanEntry {
+                    span_id: "toolu_02".to_owned(),
+                    tool_name: "Write".to_owned(),
+                    opened_seq: 61,
+                    closed_seq: None,
+                    procs: 0,
+                    effects: 1,
+                    worst_score: 0,
+                },
+                SpanEntry {
+                    span_id: "toolu_01".to_owned(),
+                    tool_name: "Bash".to_owned(),
+                    opened_seq: 40,
+                    closed_seq: Some(58),
+                    procs: 2,
+                    effects: 3,
+                    worst_score: 55,
+                },
+            ],
+        })?,
+    ))?;
     line(&Request::new(
         16,
         "stop",
@@ -639,6 +701,9 @@ mod tests {
             "PolicyView",
             "PolicyUpdateParams",
             "PolicyUpdated",
+            "SpanListParams",
+            "SpanList",
+            "SpanEntry",
             "Ready",
             "Record",
             "SensorStatus",
@@ -684,6 +749,7 @@ mod tests {
             "Finding",
             "FindingCategory",
             "Evidence",
+            "SpanEffects",
         ] {
             assert!(audit.definitions.contains_key(name), "audit: {name}");
         }
@@ -740,6 +806,8 @@ mod tests {
                 "proc.memfd",
                 "proc.sensor_status",
                 "proc.tcp_connect",
+                "proc.tls_attach",
+                "proc.tls_io",
             ]
         );
         assert_eq!(sensor_lines().unwrap(), sensor_lines().unwrap());

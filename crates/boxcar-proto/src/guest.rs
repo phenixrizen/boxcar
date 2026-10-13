@@ -123,6 +123,13 @@ pub struct SessionConfig {
     /// own fixed ones: `[name, value]` with dotted names, such as
     /// `["vm.overcommit_memory", "1"]`.
     pub sysctls: Vec<(String, String)>,
+    /// The session CA's certificate as PEM, when the session's policy has
+    /// an `inspect` rule: init writes it to `/run/boxcar/ca.pem`, puts it
+    /// in the guest's trust store and names it in the session's
+    /// environment. The certificate only, never a key; at most
+    /// [`MAX_CA_PEM`] bytes. Absent (and omitted) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
 }
 
 /// What a session runs when no command is given: a login shell.
@@ -160,6 +167,7 @@ impl SessionConfig {
             rows: 24,
             cols: 80,
             sysctls: Vec::new(),
+            ca_pem: None,
         }
     }
 }
@@ -185,6 +193,11 @@ impl ConfigError {
 /// The most bytes of a hostname, as the kernel takes it.
 pub const MAX_HOSTNAME: usize = 64;
 
+/// The most bytes of `ca_pem` a config may carry: an ECDSA CA certificate
+/// is under 1 KiB, and the control channel's line limit is for the command
+/// and its environment.
+pub const MAX_CA_PEM: usize = 8 * 1024;
+
 impl SessionConfig {
     /// Whether init can run this session, checked the same way by the VMM
     /// before it boots and by init when it gets the config:
@@ -197,6 +210,8 @@ impl SessionConfig {
     ///   read as "leave this id alone" (the session would stay root);
     /// - `hostname`: 1 to 64 bytes of letters, digits, `-` and `.`;
     /// - `term`: not empty, no NUL; `rows` and `cols`: at least 1;
+    /// - `ca_pem`, when given: ASCII, at most [`MAX_CA_PEM`] bytes, holding
+    ///   a `CERTIFICATE` block and nothing that says `PRIVATE KEY`;
     /// - the whole config line within [`MAX_LINE`].
     pub fn validate(&self) -> Result<(), ConfigError> {
         let no_nul = |field, text: &str| {
@@ -255,6 +270,26 @@ impl SessionConfig {
                 "terminal size",
                 format!("{} by {}", self.rows, self.cols),
             ));
+        }
+        if let Some(pem) = &self.ca_pem {
+            if pem.len() > MAX_CA_PEM {
+                return Err(ConfigError::new(
+                    "ca_pem",
+                    format!("{} bytes, over {MAX_CA_PEM}", pem.len()),
+                ));
+            }
+            if !pem.is_ascii() || pem.contains('\0') {
+                return Err(ConfigError::new("ca_pem", "it is not ASCII text"));
+            }
+            if !pem.contains("-----BEGIN CERTIFICATE-----") {
+                return Err(ConfigError::new("ca_pem", "it holds no CERTIFICATE block"));
+            }
+            if pem.contains("PRIVATE KEY") {
+                return Err(ConfigError::new(
+                    "ca_pem",
+                    "it holds a private key, which never goes to the guest",
+                ));
+            }
         }
         match encode(&HostMsg::Config(self.clone())) {
             Ok(_) => Ok(()),
@@ -413,8 +448,12 @@ mod tests {
             rows: 24,
             cols: 80,
             sysctls: pairs(&[("vm.overcommit_memory", "1")]),
+            ca_pem: None,
         }
     }
+
+    const CA_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBszCCAVkCFA==\n-----END CERTIFICATE-----\n";
 
     /// Every message, with the exact JSON it travels as: the wire table.
     fn guest_cases() -> Vec<(GuestMsg, Value)> {
@@ -686,6 +725,38 @@ mod tests {
     }
 
     /// One check for both sides: what the VMM accepts, init runs.
+    /// The CA travels as a PEM certificate and is omitted from the line
+    /// when there is none; a key never passes.
+    #[test]
+    fn a_ca_pem_is_a_certificate_and_never_a_key() {
+        let mut cfg = config();
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("ca_pem"));
+        cfg.ca_pem = Some(CA_PEM.to_owned());
+        assert_eq!(cfg.validate(), Ok(()));
+        let line = serde_json::to_string(&HostMsg::Config(cfg.clone())).unwrap();
+        assert!(
+            line.contains("\"ca_pem\":\"-----BEGIN CERTIFICATE-----"),
+            "{line}"
+        );
+        let back: HostMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, HostMsg::Config(cfg.clone()));
+        // A line from before the field reads as none.
+        let old: SessionConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["/bin/sh"], "env": [], "cwd": "/", "uid": 0, "gid": 0,
+            "hostname": "boxcar", "term": "xterm", "rows": 24, "cols": 80, "sysctls": []
+        }))
+        .unwrap();
+        assert_eq!(old.ca_pem, None);
+        let mut cfg = config();
+        cfg.ca_pem = Some("x".repeat(MAX_CA_PEM));
+        let error = cfg.validate().unwrap_err();
+        assert_eq!(error.field, "ca_pem");
+        assert!(
+            error.to_string().contains("no CERTIFICATE block"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_config_that_cannot_be_run_is_refused_with_its_field() {
         assert_eq!(config().validate(), Ok(()));
@@ -713,6 +784,12 @@ mod tests {
             ("term", |c| c.term.clear()),
             ("terminal size", |c| c.rows = 0),
             ("terminal size", |c| c.cols = 0),
+            ("ca_pem", |c| c.ca_pem = Some("x".repeat(MAX_CA_PEM + 1))),
+            ("ca_pem", |c| c.ca_pem = Some(format!("{CA_PEM}\u{e9}"))),
+            ("ca_pem", |c| c.ca_pem = Some("not a certificate".into())),
+            ("ca_pem", |c| {
+                c.ca_pem = Some(format!("{CA_PEM}-----BEGIN PRIVATE KEY-----\nAA==\n"))
+            }),
             ("config", |c| c.argv.push("y".repeat(MAX_LINE))),
         ];
         for (field, change) in cases {

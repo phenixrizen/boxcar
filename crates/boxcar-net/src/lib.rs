@@ -27,6 +27,13 @@
 //!   5-tuple the policy allows by address.
 //! - [`stack`]: the queues, smoltcp's interface (the far end of the
 //!   relayed connections), and the counted drops.
+//! - [`gate`]: the model traffic gate, for the destinations the policy
+//!   marks `inspect`: the session's CA and the leaves it signs, the TLS
+//!   legs, and the observer that takes the plaintext.
+//! - [`http`]: the observer's parsers: HTTP/1.1, HTTP/2, bodies, event
+//!   streams and WebSocket, read passively.
+//! - [`model`]: the model APIs the observer knows, whose requests, replies
+//!   and tool calls become `llm.*` and `tool.*` records.
 //! - [`audit`]: the `net.*` records.
 //! - [`config`]: the addressing, the DNS upstreams, and the relays' bounds.
 //! - [`device`]: the virtio-net device in front of the stack, and the net
@@ -40,9 +47,13 @@ pub mod config;
 pub mod device;
 pub mod dhcp;
 pub mod dns;
+pub mod dump;
 pub mod frame;
+pub mod gate;
+pub mod http;
 pub mod http_host;
 pub mod icmp;
+pub mod model;
 pub mod policy;
 pub mod sni;
 pub mod stack;
@@ -53,8 +64,10 @@ pub mod upstream;
 pub use audit::DropReason;
 pub use config::{ConfigError, NetConfig};
 pub use device::VirtioNet;
+pub use dump::{DumpDir, FrameDump};
 pub use frame::Dispatch;
-pub use policy::{Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
+pub use gate::{InspectConfig, LeafTarget, SessionCa};
+pub use policy::{Inspect, Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};
 pub use tcp::{TcpLimits, TCP_TOKEN_BASE};
 pub use udp::{UdpLimits, UDP_TOKEN_BASE};

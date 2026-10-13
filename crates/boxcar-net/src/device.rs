@@ -103,6 +103,9 @@ use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 use vmm_sys_util::timerfd::TimerFd;
 
 use crate::config::{ConfigError, NetConfig};
+use crate::dump::{DumpDir, DumpThread, FrameDump};
+use crate::gate::observe::ObserverThread;
+use crate::gate::{InspectConfig, Observer};
 use crate::policy::Policy;
 use crate::stack::{FdChange, Interest, NetStack, QUEUE_CAP};
 use crate::tcp::flow::FlowIds;
@@ -217,6 +220,16 @@ pub struct VirtioNet {
     counters: Arc<NetCounters>,
     /// The net thread; `None` when the device is not activated.
     worker: Option<WorkerHandle>,
+    /// The gate, when the session inspects: every stack the device builds
+    /// gets it, and the one `gate-observe` thread takes their plaintext
+    /// for the device's life.
+    inspect: Option<Arc<InspectConfig>>,
+    observer: Option<Observer>,
+    observer_thread: Option<ObserverThread>,
+    /// The frame dump (`--dump`), when the session has one: every stack
+    /// the device builds feeds it, and the one `dump` thread writes.
+    dump: Option<FrameDump>,
+    dump_thread: Option<DumpThread>,
 }
 
 impl VirtioNet {
@@ -229,9 +242,62 @@ impl VirtioNet {
         sink: AuditSink,
         policy: Arc<ArcSwap<Policy>>,
     ) -> Result<VirtioNet, ConfigError> {
+        VirtioNet::with_inspect(cfg, sink, policy, None)
+    }
+
+    /// [`VirtioNet::new`] with the gate: with `inspect`, flows the policy's
+    /// `inspect` lines name have their TLS ended in the stack and their
+    /// plaintext observed by the `gate-observe` thread, started here.
+    pub fn with_inspect(
+        cfg: NetConfig,
+        sink: AuditSink,
+        policy: Arc<ArcSwap<Policy>>,
+        inspect: Option<Arc<InspectConfig>>,
+    ) -> Result<VirtioNet, ConfigError> {
+        VirtioNet::with_dump(cfg, sink, policy, inspect, None)
+    }
+
+    /// [`VirtioNet::with_inspect`] with the dump: with `dump`, every frame
+    /// either way goes to its `frames.pcap` through the `dump` thread,
+    /// started here, and the observer writes the inspected flows'
+    /// plaintext and exchanges into it.
+    pub fn with_dump(
+        cfg: NetConfig,
+        sink: AuditSink,
+        policy: Arc<ArcSwap<Policy>>,
+        inspect: Option<Arc<InspectConfig>>,
+        dump: Option<DumpDir>,
+    ) -> Result<VirtioNet, ConfigError> {
         let ids = FlowIds::default();
+        let (observer, observer_thread) = match &inspect {
+            Some(gate) => {
+                let (observer, rx) = Observer::channel();
+                let trace_id = gate.ca().session_id().to_owned();
+                let thread = ObserverThread::spawn(
+                    rx,
+                    sink.clone(),
+                    trace_id,
+                    dump.clone(),
+                    gate.declared().cloned(),
+                )
+                .map_err(|error| ConfigError::Observer(error.to_string()))?;
+                (Some(observer), Some(thread))
+            }
+            None => (None, None),
+        };
+        let (frame_dump, dump_thread) = match &dump {
+            Some(dir) => {
+                let (frames, thread) =
+                    FrameDump::start(dir).map_err(|error| ConfigError::Dump(error.to_string()))?;
+                (Some(frames), Some(thread))
+            }
+            None => (None, None),
+        };
+        let gate = inspect.clone().zip(observer.clone());
         let spare =
-            NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?;
+            NetStack::with_flow_ids(cfg.clone(), sink.clone(), Arc::clone(&policy), ids.clone())?
+                .with_inspect(gate)
+                .with_dump(frame_dump.clone());
         let wake = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)
             .map_err(|error| ConfigError::Wake(error.to_string()))?;
         Ok(VirtioNet {
@@ -244,6 +310,11 @@ impl VirtioNet {
             ids,
             counters: Arc::new(NetCounters::default()),
             worker: None,
+            inspect,
+            observer,
+            observer_thread,
+            dump: frame_dump,
+            dump_thread,
         })
     }
 
@@ -266,12 +337,14 @@ impl VirtioNet {
     fn take_stack(&mut self) -> Result<NetStack, ConfigError> {
         match self.spare.take() {
             Some(stack) => Ok(stack),
-            None => NetStack::with_flow_ids(
+            None => Ok(NetStack::with_flow_ids(
                 self.cfg.clone(),
                 self.sink.clone(),
                 Arc::clone(&self.policy),
                 self.ids.clone(),
-            ),
+            )?
+            .with_inspect(self.inspect.clone().zip(self.observer.clone()))
+            .with_dump(self.dump.clone())),
         }
     }
 }
@@ -374,10 +447,43 @@ impl VirtioDevice for VirtioNet {
     }
 }
 
+impl VirtioNet {
+    /// The device's end, before the log's: the net thread stops (and
+    /// records the end of every flow), then the observer takes what is
+    /// queued, records what is still open and is joined, then the dump.
+    /// So every record they make is in the log before `vmm.stop`. Waits
+    /// at most [`JOIN_LIMIT`] on each; a second call does nothing.
+    pub fn shutdown(&mut self) {
+        // No thread may outlive the device: the net thread first, then the
+        // observer, which ends once the last sender (the stacks') is gone.
+        self.reset();
+        self.spare = None;
+        self.observer = None;
+        if let Some(thread) = self.observer_thread.take() {
+            if !thread.join(JOIN_LIMIT) {
+                boxcar_virtio::limited!(
+                    warn,
+                    "virtio-net: the observer thread did not stop within {JOIN_LIMIT:?}; leaving it \
+                     behind"
+                );
+            }
+        }
+        // The dump thread ends once the last sender (the stacks') is gone.
+        self.dump = None;
+        if let Some(thread) = self.dump_thread.take() {
+            if !thread.join(JOIN_LIMIT) {
+                boxcar_virtio::limited!(
+                    warn,
+                    "virtio-net: the dump thread did not stop within {JOIN_LIMIT:?}; leaving it behind"
+                );
+            }
+        }
+    }
+}
+
 impl Drop for VirtioNet {
     fn drop(&mut self) {
-        // No thread may outlive the device.
-        self.reset();
+        self.shutdown();
     }
 }
 
@@ -1955,16 +2061,22 @@ mod tests {
             .collect()
     }
 
+    /// Waits for a thread named `name`: a new thread names itself once it
+    /// runs, and until then has its parent's name.
+    fn wait_for_thread(name: &str) {
+        let deadline = Instant::now() + THREAD_LIMIT;
+        while !thread_names().iter().any(|n| n == name) {
+            assert!(Instant::now() < deadline, "no {name}: {:?}", thread_names());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn rx_stops_when_no_chain_is_free_and_resumes_on_kick() {
         let session = Session::new();
         let mut driver = Driver::new(session.device());
         driver.handshake();
-        assert!(
-            thread_names().iter().any(|n| n == "net"),
-            "{:?}",
-            thread_names()
-        );
+        wait_for_thread("net");
         let mem = driver.mem.clone();
         let rx = queue_mock(&mem, RX_QUEUE as u32);
         let tx = queue_mock(&mem, TX_QUEUE as u32);
@@ -2034,10 +2146,15 @@ mod tests {
         let dst = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 80);
         for port in [40_000, 40_001] {
             let mem = driver.mem.clone();
-            // The driver sets its rings up afresh, used rings included.
+            // The driver sets its rings up afresh, available and used: a
+            // ring left as the last activation had it would hand the new
+            // one the last SYN again.
             for q in [RX_QUEUE, TX_QUEUE] {
-                let used = queue_start(q as u32).0 + USED_RING_OFFSET;
-                mem.write_obj(0u32, GuestAddress(used)).unwrap();
+                let start = queue_start(q as u32).0;
+                let avail = start + 16 * u64::from(QUEUE_LEN);
+                mem.write_obj(0u32, GuestAddress(avail)).unwrap();
+                mem.write_obj(0u32, GuestAddress(start + USED_RING_OFFSET))
+                    .unwrap();
             }
             driver.handshake();
             let tx = queue_mock(&mem, TX_QUEUE as u32);
@@ -2066,5 +2183,56 @@ mod tests {
                 (2, "10.0.2.15:40001".to_owned())
             ]
         );
+    }
+
+    /// The device's shutdown waits for the observer: what it still held is
+    /// in the log before anything written after the shutdown returns.
+    #[test]
+    fn shutdown_records_what_the_observer_held_first() {
+        use crate::gate::{Direction as PlainDir, Message};
+        let session = Session::new();
+        let inspect = crate::gate::tls::tests::config(&[]);
+        let mut net = VirtioNet::with_inspect(
+            session.config(),
+            session.sink.clone(),
+            Session::policy(),
+            Some(inspect),
+        )
+        .unwrap();
+        let observer = net.observer.clone().unwrap();
+        let dst = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 80);
+        observer.send(Message::Open {
+            flow: 7,
+            dst,
+            name: Some("api.example".into()),
+            alpn: None,
+            tls: false,
+        });
+        for _ in 0..200 {
+            observer.send(Message::Data {
+                flow: 7,
+                dir: PlainDir::ToHost,
+                bytes: b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx".to_vec(),
+            });
+        }
+        drop(observer);
+        net.shutdown();
+        crate::audit::record(
+            &session.sink,
+            boxcar_proto::Payload::NetDrop(boxcar_proto::NetDrop {
+                reason: "marker".into(),
+                count: 1,
+            }),
+        );
+        let records = session.records();
+        let marker = records.iter().position(|r| r.kind == "net.drop").unwrap();
+        let requests: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == "http.request")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(requests.len(), 200, "{}", requests.len());
+        assert!(requests.iter().all(|&i| i < marker));
     }
 }

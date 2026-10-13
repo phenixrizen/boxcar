@@ -25,6 +25,11 @@
 //! its life, like the control channel: a later one is refused as
 //! `reactivated`.
 //!
+//! With `boxcar run --scrub-argv` ([`SensorIngest::scrubbing_argv`]) each
+//! `proc.exec`'s argv is scrubbed before its record is made; an argv that
+//! changed is kept as run, in memory only, for the reconciler
+//! ([`RawArgv`]).
+//!
 //! [`SensorIngest::status`] is what the control socket's `status` reports
 //! under `sensor`: `waiting` until the sensor says what it attached,
 //! `attached` or `degraded` as it said, `silent` once its stream ended or
@@ -37,7 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boxcar_audit::{AuditSink, Priority, Submission};
+use boxcar_audit::{AuditSink, Priority, RawArgv, Submission};
 use boxcar_proto::control::{SensorState, SensorStatus};
 use boxcar_proto::sensor::{Decoder, SensorFrame};
 use boxcar_proto::{Payload, Ring, SensorPhase};
@@ -56,6 +61,8 @@ const READ_CHUNK: usize = 16384;
 pub struct SensorIngest {
     audit: AuditSink,
     silence: Duration,
+    /// With `--scrub-argv`: where the argvs as run go.
+    raw_argv: Option<RawArgv>,
     /// Set once the one connection of the VMM's life is taken.
     taken: AtomicBool,
     state: Mutex<State>,
@@ -86,6 +93,19 @@ impl SensorIngest {
         Arc::new(SensorIngest {
             audit,
             silence,
+            raw_argv: None,
+            taken: AtomicBool::new(false),
+            state: Mutex::new(State::default()),
+        })
+    }
+
+    /// A service that records each `proc.exec` with its argv scrubbed,
+    /// keeping in `raw_argv` the argvs that changed, as run.
+    pub fn scrubbing_argv(audit: AuditSink, raw_argv: RawArgv) -> Arc<SensorIngest> {
+        Arc::new(SensorIngest {
+            audit,
+            silence: SILENCE,
+            raw_argv: Some(raw_argv),
             taken: AtomicBool::new(false),
             state: Mutex::new(State::default()),
         })
@@ -194,7 +214,7 @@ impl SensorIngest {
 
     /// Notes what the frame says about the sensor, then records it; waits
     /// for room in the log.
-    fn record(&self, frame: SensorFrame) {
+    fn record(&self, mut frame: SensorFrame) {
         {
             let mut state = self.lock();
             match &frame.payload {
@@ -205,6 +225,9 @@ impl SensorIngest {
                 Payload::ProcSensorStatus(status) => state.phase = Some(status.phase),
                 _ => {}
             }
+        }
+        if let (Some(raw), Payload::ProcExec(exec)) = (&self.raw_argv, &mut frame.payload) {
+            raw.scrub(frame.ts_guest_ns, exec);
         }
         // A closed or failed log stops the VM by itself.
         let _ = self.audit.emit(submission(frame));
@@ -247,7 +270,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    use boxcar_audit::{LogReader, Priority, WriterConfig};
+    use boxcar_audit::{ExecKey, LogReader, Priority, WriterConfig};
     use boxcar_proto::control::SensorState;
     use boxcar_proto::sensor::{encode, SensorFrame};
     use boxcar_proto::{
@@ -325,6 +348,7 @@ mod tests {
                 btf_ok: true,
                 session_cgroup_id: 4242,
                 pid: 77,
+                threads: Vec::new(),
                 reason: None,
             }),
         }
@@ -419,6 +443,44 @@ mod tests {
         assert_eq!(exec.data["argv"], json!(["ls", "-l"]));
         assert_eq!(records[2].subject, None);
         assert_eq!(records[2].ts_guest_ns, Some(800));
+    }
+
+    /// With `--scrub-argv` an exec's argv is recorded scrubbed, and the
+    /// argv as run waits in memory for the reconciler; an argv with
+    /// nothing to scrub is recorded as it is, and nothing waits for it.
+    #[test]
+    fn a_scrubbing_ingest_records_argv_scrubbed_and_keeps_it_as_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(tmp.path(), SessionId::new())).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let raw = RawArgv::new();
+        let ingest = SensorIngest::scrubbing_argv(sink, raw.clone());
+        let mut guest = connect(&ingest);
+        let secret = ["curl", "--token=demo-token", "https://x.test/"];
+        guest
+            .write_all(&encode(&exec_frame(777, &secret)).unwrap())
+            .unwrap();
+        guest
+            .write_all(&encode(&exec_frame(778, &["ls", "-l"])).unwrap())
+            .unwrap();
+        guest
+            .write_all(&encode(&heartbeat_frame(800, 1)).unwrap())
+            .unwrap();
+        wait_for(&ingest, "the heartbeat", |s| s.heartbeats == 1);
+        drop(guest);
+        writer.close().unwrap();
+        let records = log(&session_dir);
+        assert_eq!(
+            records[0].data["argv"],
+            json!(["curl", "--token=[redacted]", "https://x.test/"])
+        );
+        assert_eq!(records[1].data["argv"], json!(["ls", "-l"]));
+        let text = std::fs::read_to_string(session_dir.join("events.000001.jsonl")).unwrap();
+        assert!(!text.contains("demo-token"), "{text}");
+        assert_eq!(raw.len(), 1);
+        let exec: ProcExec = serde_json::from_value(records[0].data.clone()).unwrap();
+        assert_eq!(raw.take(ExecKey::of(&exec, 777)).unwrap(), secret);
     }
 
     #[test]

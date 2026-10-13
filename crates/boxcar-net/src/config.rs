@@ -178,6 +178,9 @@ pub enum ConfigError {
     /// text.
     #[error("cannot make the policy wake eventfd: {0}")]
     Wake(String),
+    /// The dump's file or thread could not be made.
+    #[error("the dump: {0}")]
+    Dump(String),
     #[error("host name {0:?} is not 1 to 63 ASCII letters, digits and hyphens")]
     Hostname(String),
     #[error("the network interface has no room for {0}")]
@@ -186,6 +189,9 @@ pub enum ConfigError {
     NoDnsUpstream,
     #[error("no DNS upstream could be given a socket: {0}")]
     DnsUpstream(String),
+    /// The gate's observer thread could not be started: the error's text.
+    #[error("cannot start the gate's observer thread: {0}")]
+    Observer(String),
     #[error("{0}")]
     TcpLimits(&'static str),
     #[error("{0}")]

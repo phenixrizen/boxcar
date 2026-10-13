@@ -10,6 +10,7 @@ mod events;
 mod nofile;
 mod policy;
 pub(crate) mod run;
+mod spans;
 mod status;
 mod stop;
 
@@ -57,6 +58,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Events(args) => events::run(&args),
         Command::Policy(command) => policy::run(command),
         Command::Run(args) => run::run(*args),
+        Command::Spans(args) => spans::run(&args),
         Command::Status(args) => status::run(&args),
         Command::Stop(args) => stop::run(&args),
     }
