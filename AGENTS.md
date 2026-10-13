@@ -83,9 +83,21 @@ gh issue create -R phenixrizen/boxcar --title "..." --body-file body.md \
 gh project item-add 2 --owner phenixrizen --url <issue or pull request URL>
 ```
 
-A card's column is its `Status` field (`gh project field-list 2 --owner
-phenixrizen` names the field and its options; `gh project item-edit` sets
-it).
+A card's column is its `Status` field (project
+`PVT_kwHOAJ6Ua84Bm2Lc`, field `PVTSSF_lAHOAJ6Ua84Bm2Lczhlde_Q`; options
+Backlog `62f77888`, Ready `9374d965`, In progress `0505c404`, In review
+`b8a1aae3`, Done `4b745587`). To move issue or pull request N:
+
+```bash
+item=$(gh project item-list 2 --owner phenixrizen --format json --limit 500 \
+    --jq '.items[] | select(.content.number == N) | .id')
+gh project item-edit --id "$item" --project-id PVT_kwHOAJ6Ua84Bm2Lc \
+    --field-id PVTSSF_lAHOAJ6Ua84Bm2Lczhlde_Q --single-select-option-id 0505c404
+```
+
+`gh project item-add ... --format json --jq .id` gives a new card's id
+directly, and `gh project field-list 2 --owner phenixrizen --format json`
+lists the fields and their option ids if the board changes.
 
 The board needs the `project` scope on the gh token
 (`gh auth refresh -h github.com -s project`); issues and labels do not.
