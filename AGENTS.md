@@ -75,9 +75,11 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
      `Fixes #N` only for a merge into `main`: a finishing pull request
      stacked on another branch leaves the issue open and In review, and
      the pull request that carries it into `main` repeats `Fixes #N`.
-  An issue is never closed by hand as fixed before its fix is on `main`;
-  one closed as a duplicate or not planned says why. A pull request's own
-  card goes In review when it opens and Done when it merges.
+  An issue is never closed by hand as fixed before its fix is on `main`.
+  A duplicate is closed by naming the issue it repeats. An issue is
+  closed as not planned only when the owner drops it, its comment saying
+  why. A pull request's own card goes In review when it opens and Done
+  when it merges.
 - A review finding outside the change's scope becomes an issue (see
   Reviews).
 - The exception is a security finding, as defined under Reviews: it never
