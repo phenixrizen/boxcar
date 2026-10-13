@@ -65,9 +65,13 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
   GitHub shows every newline in an issue body as a break.
 - A bug found while working is fixed in that round, not parked. It still
   gets an issue, In progress, closed by the fix's pull request.
-- A card moves to In progress when its branch starts, to In review when
-  the pull request opens, and to Done when it merges. The pull request's
-  body says `Fixes #N` for each issue it closes, so the merge closes them.
+- An issue's card moves to In progress when work on it starts (its
+  branch), to In review when the pull request that finishes it opens, and
+  to Done when that pull request merges; its body says `Fixes #N`, so the
+  merge closes the issue. A pull request that does only part of an issue
+  says `Part of #N`: it closes nothing, and the issue stays open and In
+  progress until the pull request that finishes it. A pull request's own
+  card goes In review when it opens and Done when it merges.
 - A review finding outside the change's scope becomes an issue (see
   Reviews).
 - The exception is a security finding, as defined under Reviews: it never
@@ -80,24 +84,14 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
 ```bash
 gh issue create -R phenixrizen/boxcar --title "..." --body-file body.md \
     --label enhancement --label "area: gate"
-gh project item-add 2 --owner phenixrizen --url <issue or pull request URL>
+python3 scripts/board.py <issue or pull request number> <status>
 ```
 
-A card's column is its `Status` field (project
-`PVT_kwHOAJ6Ua84Bm2Lc`, field `PVTSSF_lAHOAJ6Ua84Bm2Lczhlde_Q`; options
-Backlog `62f77888`, Ready `9374d965`, In progress `0505c404`, In review
-`b8a1aae3`, Done `4b745587`). To move issue or pull request N:
-
-```bash
-item=$(gh project item-list 2 --owner phenixrizen --format json --limit 500 \
-    --jq '.items[] | select(.content.number == N) | .id')
-gh project item-edit --id "$item" --project-id PVT_kwHOAJ6Ua84Bm2Lc \
-    --field-id PVTSSF_lAHOAJ6Ua84Bm2Lczhlde_Q --single-select-option-id 0505c404
-```
-
-`gh project item-add ... --format json --jq .id` gives a new card's id
-directly, and `gh project field-list 2 --owner phenixrizen --format json`
-lists the fields and their option ids if the board changes.
-
-The board needs the `project` scope on the gh token
-(`gh auth refresh -h github.com -s project`); issues and labels do not.
+`scripts/board.py` puts the issue or pull request on the board when it is
+not there yet and sets its Status (Backlog, Ready, In progress, In review
+or Done; case does not matter). It needs the `project` scope on the gh
+token (`gh auth refresh -h github.com -s project`); issues and labels do
+not. The board's ids, should a command need them: project
+`PVT_kwHOAJ6Ua84Bm2Lc`, Status field `PVTSSF_lAHOAJ6Ua84Bm2Lczhlde_Q`
+(`gh project field-list 2 --owner phenixrizen --format json` lists its
+options and their ids).
