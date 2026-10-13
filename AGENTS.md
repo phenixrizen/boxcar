@@ -51,8 +51,8 @@ python3 scripts/codex_review.py "<focus: the risks this change touches>"
 ## Issues and the board
 
 The backlog is the repository's GitHub issues, on the `boxcar` project
-board (phenixrizen's GitHub Projects), kanban style: Backlog, Ready, In
-progress, In review, Done. There is no todo file.
+board (https://github.com/users/phenixrizen/projects/2), kanban style:
+Backlog, Ready, In progress, In review, Done. There is no todo file.
 
 - Every bug known and every feature or limitation set aside is an issue,
   labelled `bug` or `enhancement` and with one `area: ...` label (`fs`,
@@ -80,7 +80,12 @@ progress, In review, Done. There is no todo file.
 ```bash
 gh issue create -R phenixrizen/boxcar --title "..." --body-file body.md \
     --label enhancement --label "area: gate"
+gh project item-add 2 --owner phenixrizen --url <issue or pull request URL>
 ```
+
+A card's column is its `Status` field (`gh project field-list 2 --owner
+phenixrizen` names the field and its options; `gh project item-edit` sets
+it).
 
 The board needs the `project` scope on the gh token
 (`gh auth refresh -h github.com -s project`); issues and labels do not.
