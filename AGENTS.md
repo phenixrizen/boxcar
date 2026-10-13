@@ -67,11 +67,15 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
   gets an issue, In progress, closed by the fix's pull request.
 - An issue's card moves to In progress when work on it starts (its
   branch), to In review when the pull request that finishes it opens, and
-  to Done when that pull request merges; its body says `Fixes #N`, so the
-  merge closes the issue. A pull request that does only part of an issue
-  says `Part of #N`: it closes nothing, and the issue stays open and In
-  progress until the pull request that finishes it. A pull request's own
-  card goes In review when it opens and Done when it merges.
+  to Done when that fix reaches `main`. The pull request's body says
+  `Fixes #N`, and GitHub closes the issue only when a pull request saying
+  so merges into `main`: a pull request stacked on another branch says
+  `Fixes #N` too, the pull request that carries it into `main` repeats
+  it, and until that merges the issue stays open and In review. A pull
+  request that does only part of an issue says `Part of #N`: it closes
+  nothing, and the issue stays open and In progress until the pull
+  request that finishes it. A pull request's own card goes In review when
+  it opens and Done when it merges.
 - A review finding outside the change's scope becomes an issue (see
   Reviews).
 - The exception is a security finding, as defined under Reviews: it never
