@@ -65,17 +65,19 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
   GitHub shows every newline in an issue body as a break.
 - A bug found while working is fixed in that round, not parked. It still
   gets an issue, In progress, closed by the fix's pull request.
-- An issue's card moves to In progress when work on it starts (its
-  branch), to In review when the pull request that finishes it opens, and
-  to Done when that fix reaches `main`. The pull request's body says
-  `Fixes #N`, and GitHub closes the issue only when a pull request saying
-  so merges into `main`: a pull request stacked on another branch says
-  `Fixes #N` too, the pull request that carries it into `main` repeats
-  it, and until that merges the issue stays open and In review. A pull
-  request that does only part of an issue says `Part of #N`: it closes
-  nothing, and the issue stays open and In progress until the pull
-  request that finishes it. A pull request's own card goes In review when
-  it opens and Done when it merges.
+- An issue's card goes through one order:
+  1. In progress while the work is under way, from its branch's start. A
+     pull request that does only part of it says `Part of #N` and closes
+     nothing.
+  2. In review once the pull request that finishes it opens. Its body
+     says `Fixes #N`.
+  3. Done, and closed, only when the fix reaches `main`. GitHub acts on
+     `Fixes #N` only for a merge into `main`: a finishing pull request
+     stacked on another branch leaves the issue open and In review, and
+     the pull request that carries it into `main` repeats `Fixes #N`.
+  An issue is never closed by hand as fixed before its fix is on `main`;
+  one closed as a duplicate or not planned says why. A pull request's own
+  card goes In review when it opens and Done when it merges.
 - A review finding outside the change's scope becomes an issue (see
   Reviews).
 - The exception is a security finding, as defined under Reviews: it never
