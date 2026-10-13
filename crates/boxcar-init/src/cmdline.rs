@@ -53,6 +53,12 @@ pub fn net_enabled(args: &BTreeMap<String, String>) -> bool {
     args.get("net").is_some_and(|value| value == "1")
 }
 
+/// Whether init starts the sensor (ring 1): it does unless `boxcar.sensor=0`
+/// (`boxcar run --no-sensor`).
+pub fn sensor_enabled(args: &BTreeMap<String, String>) -> bool {
+    args.get("sensor").is_none_or(|value| value != "0")
+}
+
 /// [`parse`] of `/proc/cmdline`. `/proc` must already be mounted.
 pub fn read() -> io::Result<BTreeMap<String, String>> {
     Ok(parse(&fs::read_to_string(PROC_CMDLINE)?))
@@ -147,6 +153,10 @@ mod tests {
     #[test]
     fn the_network_is_on_only_with_boxcar_net_1() {
         assert!(net_enabled(&parse("boxcar.mode=console boxcar.net=1")));
+        // The sensor runs unless told not to.
+        assert!(sensor_enabled(&parse("boxcar.mode=vsock")));
+        assert!(sensor_enabled(&parse("boxcar.mode=vsock boxcar.sensor=1")));
+        assert!(!sensor_enabled(&parse("boxcar.mode=vsock boxcar.sensor=0")));
         for cmdline in [
             "boxcar.mode=console",
             "boxcar.net=0",

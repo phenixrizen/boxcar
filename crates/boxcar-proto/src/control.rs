@@ -298,6 +298,9 @@ pub struct Status {
     /// The virtio devices present, by slot name in slot order, such as
     /// `fs:root` and `fs:workspace`.
     pub devices: Vec<String>,
+    /// The guest's sensor, ring 1. A server from before it reports none.
+    #[serde(default)]
+    pub sensor: SensorStatus,
 }
 
 /// What the guest's init has reported. The default is nothing yet.
@@ -320,6 +323,40 @@ pub struct AuditStatus {
     pub next_seq: u64,
     /// Whether the writer has failed, which stops the VM.
     pub failed: bool,
+}
+
+/// The guest's sensor (ring 1), as the VMM sees its stream on vsock port
+/// 1026. The default is a VM that runs no sensor.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SensorStatus {
+    pub state: SensorState,
+    /// Heartbeats taken so far.
+    pub heartbeats: u64,
+    /// Host `CLOCK_REALTIME`, in nanoseconds, when the last heartbeat
+    /// arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_ns: Option<u64>,
+}
+
+/// Where the sensor stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SensorState {
+    /// The VM runs no sensor: it has no vsock device, or was started with
+    /// `--no-sensor`.
+    #[default]
+    Off,
+    /// A sensor is expected and has not reported its status yet.
+    Waiting,
+    /// The sensor attached every program and heartbeats.
+    Attached,
+    /// The sensor runs with programs missing; `proc.sensor_status` says
+    /// which.
+    Degraded,
+    /// The sensor's stream ended, or no heartbeat came for 3 s.
+    Silent,
 }
 
 /// The parameters of `stop`.
@@ -493,6 +530,10 @@ pub struct AuditSubscribeParams {
     /// Only the records attributed to this guest process (`subject.pid`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Only records whose `data.score` is at least this (findings carry
+    /// one; a record without a score passes). 0 to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<u8>,
 }
 
 impl AuditSubscribeParams {
@@ -512,6 +553,11 @@ impl AuditSubscribeParams {
                     "a type prefix is 1 to {MAX_AUDIT_TYPE_LEN} bytes, not {}",
                     prefix.len()
                 ));
+            }
+        }
+        if let Some(score) = self.min_score {
+            if score > 100 {
+                return Err(format!("min_score {score}: 0 to 100"));
             }
         }
         Ok(())
@@ -1050,6 +1096,11 @@ mod tests {
                 failed: false,
             },
             devices: vec!["fs:root".into(), "fs:workspace".into()],
+            sensor: SensorStatus {
+                state: SensorState::Attached,
+                heartbeats: 61,
+                last_heartbeat_ns: Some(1_700_000_000_000_000_007),
+            },
         };
         let mut wire = json!({
             "state": "running",
@@ -1061,10 +1112,31 @@ mod tests {
             "guest": {"init_ready": true, "session_pid": 7, "exit": {"code": 3, "signal": null}},
             "audit": {"next_seq": 12, "failed": false},
             "devices": ["fs:root", "fs:workspace"],
+            "sensor": {"state": "attached", "heartbeats": 61, "last_heartbeat_ns": 1_700_000_000_000_000_007_u64},
         });
         assert_eq!(serde_json::to_value(&status).unwrap(), wire);
         wire["new_field"] = json!(1);
-        assert_eq!(serde_json::from_value::<Status>(wire).unwrap(), status);
+        assert_eq!(
+            serde_json::from_value::<Status>(wire.clone()).unwrap(),
+            status
+        );
+        // A server from before the sensor reports none: `off`, no heartbeat.
+        wire.as_object_mut().unwrap().remove("sensor");
+        let older = serde_json::from_value::<Status>(wire).unwrap();
+        assert_eq!(older.sensor, SensorStatus::default());
+        assert_eq!(
+            serde_json::to_value(&older.sensor).unwrap(),
+            json!({"state": "off", "heartbeats": 0})
+        );
+        for (state, name) in [
+            (SensorState::Off, "off"),
+            (SensorState::Waiting, "waiting"),
+            (SensorState::Attached, "attached"),
+            (SensorState::Degraded, "degraded"),
+            (SensorState::Silent, "silent"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), json!(name));
+        }
 
         for (state, name) in [
             (VmState::Booting, "booting"),
@@ -1327,19 +1399,26 @@ mod tests {
         assert_eq!(none.check(), Ok(()));
         assert_eq!(serde_json::to_value(&none).unwrap(), json!({}));
 
-        let all: AuditSubscribeParams = serde_json::from_value(
-            json!({"from_seq": 0, "types": ["net.", "fs.write"], "pid": 42, "extra": 1}),
-        )
+        let all: AuditSubscribeParams = serde_json::from_value(json!({
+            "from_seq": 0, "types": ["net.", "fs.write"], "pid": 42, "min_score": 70, "extra": 1,
+        }))
         .unwrap();
         assert_eq!(
-            (all.from_seq, all.types.as_slice(), all.pid),
+            (all.from_seq, all.types.as_slice(), all.pid, all.min_score),
             (
                 Some(0),
                 ["net.".to_owned(), "fs.write".to_owned()].as_slice(),
-                Some(42)
+                Some(42),
+                Some(70)
             )
         );
         assert_eq!(all.check(), Ok(()));
+        assert_eq!(serde_json::to_value(&all).unwrap()["min_score"], json!(70));
+        // The score is 0 to 100: 101 parses as a u8 and fails the check.
+        let over: AuditSubscribeParams = serde_json::from_value(json!({"min_score": 101})).unwrap();
+        assert!(over.check().is_err());
+        let top: AuditSubscribeParams = serde_json::from_value(json!({"min_score": 100})).unwrap();
+        assert_eq!(top.check(), Ok(()));
 
         for bad in [
             json!({"from_seq": -1}),
@@ -1348,6 +1427,8 @@ mod tests {
             json!({"pid": 4294967296u64}),
             json!({"types": "net."}),
             json!({"types": [1]}),
+            json!({"min_score": 256}),
+            json!({"min_score": -1}),
         ] {
             assert!(
                 serde_json::from_value::<AuditSubscribeParams>(bad.clone()).is_err(),

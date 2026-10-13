@@ -1,0 +1,1 @@
+{"category":"network_anomaly","score":70,"rule":"dns_entropy","summary":"20 DNS queries within 10 s whose first labels carry 3.9 bits of entropy on average: names that look made up","evidence":[{"seq":25,"ring":0}],"low_confidence":false}

@@ -1,0 +1,1 @@
+{"category":"privilege_probe","score":80,"rule":"lsm_deny","summary":"probe (pid 700) was refused at the sensor's bpf hook (0): a probe of the guest's protections","evidence":[{"seq":5,"ring":1}],"low_confidence":false}

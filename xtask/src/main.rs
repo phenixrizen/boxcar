@@ -10,7 +10,9 @@ mod initramfs;
 mod kernel;
 mod rootfs;
 mod schema;
+mod sensor;
 mod test_kvm;
+mod vmlinux;
 
 /// Build tasks for boxcar.
 #[derive(Parser)]
@@ -31,10 +33,20 @@ enum Command {
     /// Run a milestone's KVM-gated tests; skips (exit 0) without /dev/kvm or
     /// the guest artifacts.
     TestKvm(test_kvm::TestKvmArgs),
-    /// Write the JSON Schemas of the control protocol, the audit records and
-    /// the guest channel to proto/schema, and the control protocol's golden
-    /// lines to proto/testdata/control-v1.jsonl.
+    /// Write the JSON Schemas of the control protocol, the audit records,
+    /// the guest channel and the sensor stream to proto/schema, and the
+    /// golden lines to proto/testdata.
     Schema,
+    /// Generate the sensor's kernel type bindings from target/guest/vmlinux's
+    /// BTF (in the kernel build image) and record the BTF hash.
+    GenVmlinux,
+    /// Fail if target/guest/vmlinux's BTF is not the one the sensor's
+    /// bindings were generated from.
+    CheckVmlinux,
+    /// Build the guest sensor for the guest target with its eBPF programs
+    /// (needs the pinned nightly and bpf-linker) and check the object: the
+    /// eBPF lane.
+    Sensor,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -44,6 +56,9 @@ fn main() -> anyhow::Result<()> {
         Command::Rootfs(args) => rootfs::run(&args),
         Command::TestKvm(args) => test_kvm::run(&args),
         Command::Schema => schema::run(),
+        Command::GenVmlinux => vmlinux::gen(),
+        Command::CheckVmlinux => vmlinux::check(),
+        Command::Sensor => sensor::run(),
     }
 }
 
@@ -53,10 +68,11 @@ mod tests {
 
     /// `m1` and `m2` are the milestones with gated tests.
     #[test]
-    fn test_kvm_takes_m1_and_m2() {
+    fn test_kvm_takes_m1_m2_and_m3() {
         assert!(Cli::try_parse_from(["xtask", "test-kvm", "m1"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "test-kvm", "m2"]).is_ok());
-        for bad in [&["xtask", "test-kvm", "m3"][..], &["xtask", "test-kvm"]] {
+        assert!(Cli::try_parse_from(["xtask", "test-kvm", "m3"]).is_ok());
+        for bad in [&["xtask", "test-kvm", "m4"][..], &["xtask", "test-kvm"]] {
             let error = Cli::try_parse_from(bad).err().unwrap();
             assert_eq!(error.exit_code(), 2, "{bad:?}: {error}");
         }

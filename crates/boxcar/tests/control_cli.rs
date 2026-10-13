@@ -24,6 +24,7 @@ const SESSION: &str = "01999a8e-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
 
 fn status() -> Status {
     Status {
+        sensor: Default::default(),
         state: VmState::Running,
         session_id: SESSION.into(),
         pid: 4242,

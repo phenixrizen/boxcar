@@ -119,6 +119,15 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "min_score": {
+          "description": "Only records whose `data.score` is at least this (findings carry one; a record without a score passes). 0 to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "minimum": 0.0
+        },
         "pid": {
           "description": "Only the records attributed to this guest process (`subject.pid`).",
           "type": [
@@ -735,6 +744,74 @@
         1
       ]
     },
+    "SensorState": {
+      "description": "Where the sensor stands.",
+      "oneOf": [
+        {
+          "description": "The VM runs no sensor: it has no vsock device, or was started with `--no-sensor`.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        },
+        {
+          "description": "A sensor is expected and has not reported its status yet.",
+          "type": "string",
+          "enum": [
+            "waiting"
+          ]
+        },
+        {
+          "description": "The sensor attached every program and heartbeats.",
+          "type": "string",
+          "enum": [
+            "attached"
+          ]
+        },
+        {
+          "description": "The sensor runs with programs missing; `proc.sensor_status` says which.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        },
+        {
+          "description": "The sensor's stream ended, or no heartbeat came for 3 s.",
+          "type": "string",
+          "enum": [
+            "silent"
+          ]
+        }
+      ]
+    },
+    "SensorStatus": {
+      "description": "The guest's sensor (ring 1), as the VMM sees its stream on vsock port 1026. The default is a VM that runs no sensor.",
+      "type": "object",
+      "required": [
+        "heartbeats",
+        "state"
+      ],
+      "properties": {
+        "heartbeats": {
+          "description": "Heartbeats taken so far.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "last_heartbeat_ns": {
+          "description": "Host `CLOCK_REALTIME`, in nanoseconds, when the last heartbeat arrived.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "state": {
+          "$ref": "#/definitions/SensorState"
+        }
+      }
+    },
     "SessionId": {
       "description": "A session id: a UUIDv7 in lowercase hyphenated text.",
       "type": "string",
@@ -873,6 +950,14 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        },
+        "sensor": {
+          "description": "The guest's sensor, ring 1. A server from before it reports none.",
+          "default": {
+            "heartbeats": 0,
+            "state": "off"
+          },
+          "$ref": "#/definitions/SensorStatus"
         },
         "session_id": {
           "type": "string"

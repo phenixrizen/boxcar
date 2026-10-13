@@ -1,0 +1,15 @@
+[package]
+name = "boxcar-sensor-common"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The events the boxcar guest sensor's eBPF programs hand to its userspace: no_std, repr(C)"
+
+[features]
+# `user` adds the `aya::Pod` impls the userspace loader reads the events with.
+user = ["dep:aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }

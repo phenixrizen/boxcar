@@ -21,7 +21,10 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::Args;
 
 /// Name of the Docker image `guest/kernel/Dockerfile` builds.
-const IMAGE: &str = "boxcar-kernel-builder";
+pub(crate) const IMAGE: &str = "boxcar-kernel-builder";
+
+/// The script `cargo xtask kernel` runs in the image.
+const BUILD_SCRIPT: &str = "/src/build.sh";
 
 /// `CONFIG_DEBUG_INFO_BTF` needs this pahole (major, minor) or newer.
 const MIN_PAHOLE: (u32, u32) = (1, 22);
@@ -56,7 +59,7 @@ pub fn run(args: &KernelArgs) -> Result<()> {
     if args.native {
         build_native(&kernel_dir, &out_dir, &cache_dir, args.jobs)?;
     } else {
-        build_in_docker(&kernel_dir, &out_dir, &cache_dir, args.jobs)?;
+        run_in_docker(&kernel_dir, &out_dir, &cache_dir, args.jobs, BUILD_SCRIPT)?;
     }
 
     // build.sh has already checked this; checking the artifact that was
@@ -77,15 +80,20 @@ pub fn run(args: &KernelArgs) -> Result<()> {
 
     let vmlinux = out_dir.join("vmlinux");
     println!("target/guest/vmlinux blake3: {}", blake3_of_file(&vmlinux)?);
-    Ok(())
+    // A kernel whose BTF changed must not be used with the sensor's stale
+    // bindings by mistake.
+    crate::vmlinux::check_after_kernel_build()
 }
 
-/// Builds the builder image and runs `build.sh` in it as the invoking user.
-fn build_in_docker(
+/// Builds the builder image and runs `script` (a path inside the image,
+/// such as `/src/build.sh`) in it as the invoking user, with the kernel
+/// directory at `/src`, the output at `/out` and the cache at `/cache`.
+pub(crate) fn run_in_docker(
     kernel_dir: &Path,
     out_dir: &Path,
     cache_dir: &Path,
     jobs: Option<NonZeroUsize>,
+    script: &str,
 ) -> Result<()> {
     let mut build = Command::new("docker");
     build.args(["build", "-t", IMAGE]).arg(kernel_dir);
@@ -95,12 +103,12 @@ fn build_in_docker(
     let gid = id_of("-g")?;
     let mut run = Command::new("docker");
     run.args(docker_run_args(
-        &uid, &gid, jobs, kernel_dir, out_dir, cache_dir,
+        &uid, &gid, jobs, kernel_dir, out_dir, cache_dir, script,
     ));
     run_checked(&mut run, "docker run")
 }
 
-/// The arguments after `docker` that run the build: user-owned output, a
+/// The arguments after `docker` that run `script`: user-owned output, a
 /// writable `HOME` (the kernel build writes `.cache` files) and the three
 /// mounts. `--rm` leaves no container behind.
 fn docker_run_args(
@@ -110,6 +118,7 @@ fn docker_run_args(
     kernel_dir: &Path,
     out_dir: &Path,
     cache_dir: &Path,
+    script: &str,
 ) -> Vec<OsString> {
     let mount = |host: &Path, guest: &str| {
         let mut spec = host.as_os_str().to_owned();
@@ -133,7 +142,7 @@ fn docker_run_args(
     ] {
         args.extend(["-v".into(), mount(host, guest)]);
     }
-    args.extend([IMAGE, "bash", "/src/build.sh"].map(OsString::from));
+    args.extend([IMAGE, "bash", script].map(OsString::from));
     args
 }
 
@@ -433,6 +442,7 @@ CONFIG_IO_URING=n
             Path::new("/r/guest/kernel"),
             Path::new("/r/target/guest"),
             Path::new("/r/target/kernel-cache"),
+            BUILD_SCRIPT,
         )
         .into_iter()
         .map(|arg| arg.into_string().unwrap())
@@ -470,6 +480,13 @@ CONFIG_IO_URING=n
             Path::new("/k"),
             Path::new("/o"),
             Path::new("/c"),
+            "/src/gen-vmlinux.sh",
+        );
+        assert!(
+            args.last()
+                .map(|a| a.to_string_lossy().into_owned())
+                .as_deref()
+                == Some("/src/gen-vmlinux.sh")
         );
         assert!(!args
             .iter()

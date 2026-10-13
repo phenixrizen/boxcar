@@ -1,0 +1,1 @@
+{"category":"network_anomaly","score":65,"rule":"sni_mismatch","summary":"curl (pid 600) named example.com to 203.0.113.9:443, but the DNS answers for example.com were 93.184.216.34","evidence":[{"seq":4,"ring":1},{"seq":7,"ring":1},{"seq":8,"ring":0},{"seq":9,"ring":0}],"low_confidence":false}

@@ -66,6 +66,46 @@
         }
       }
     },
+    "ClockSync": {
+      "description": "`sync`: a pairing of the guest's clock with the host's. The VMM pings init over the control channel and times the pong: the guest's `CLOCK_MONOTONIC` when it answered, against the host's at the round trip's midpoint. `ts_host_ns` stays the one timestamp that joins events across rings; this says how far the guest's clock stands from the host's, and how surely.",
+      "type": "object",
+      "required": [
+        "guest_mono_ns",
+        "host_mono_ns",
+        "method",
+        "offset_ns",
+        "rtt_ns"
+      ],
+      "properties": {
+        "guest_mono_ns": {
+          "description": "The guest's `CLOCK_MONOTONIC` when it answered, in nanoseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "host_mono_ns": {
+          "description": "The host's `CLOCK_MONOTONIC` at the round trip's midpoint.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "method": {
+          "description": "How the pair was taken: `vsock_rtt`.",
+          "type": "string"
+        },
+        "offset_ns": {
+          "description": "`host_mono_ns` minus `guest_mono_ns`.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "rtt_ns": {
+          "description": "The round trip, in nanoseconds: the pairing is no surer than this.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
     "ControlConnect": {
       "description": "`control.connect`: a process connected to the control socket. It is served (`allow`) only when its uid is the VMM's; otherwise the connection is closed before the hello (`deny`).",
       "type": "object",
@@ -109,6 +149,88 @@
           "$ref": "#/definitions/StopMode"
         }
       }
+    },
+    "Evidence": {
+      "description": "A record a finding rests on.",
+      "type": "object",
+      "required": [
+        "ring",
+        "seq"
+      ],
+      "properties": {
+        "ring": {
+          "$ref": "#/definitions/Ring"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Finding": {
+      "description": "`finding`: the reconciler's conclusion from records of both rings, with the records it read as evidence. Never sampled; a score of 70 or more is written through to disk at once.",
+      "type": "object",
+      "required": [
+        "category",
+        "evidence",
+        "low_confidence",
+        "rule",
+        "score",
+        "summary"
+      ],
+      "properties": {
+        "category": {
+          "$ref": "#/definitions/FindingCategory"
+        },
+        "evidence": {
+          "description": "The records the rule read, newest last.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Evidence"
+          }
+        },
+        "low_confidence": {
+          "description": "Whether a join or clock the rule relied on was weak: the score was lowered for it.",
+          "type": "boolean"
+        },
+        "rule": {
+          "description": "The rule that fired, by name (see docs/reconciler.md).",
+          "type": "string"
+        },
+        "score": {
+          "description": "0 to 100: how strongly the evidence says the agent hid something.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "span_id": {
+          "description": "The span the finding belongs to (M4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "description": "What was seen, in words; at most 512 bytes.",
+          "type": "string"
+        }
+      }
+    },
+    "FindingCategory": {
+      "description": "The kinds of finding; see the design's section 7.",
+      "type": "string",
+      "enum": [
+        "unattributed_effect",
+        "sensor_silence",
+        "intent_effect_mismatch",
+        "indicator_removal",
+        "off_book_channel",
+        "orphaned_work",
+        "network_anomaly",
+        "privilege_probe",
+        "policy_denial"
+      ]
     },
     "FsClose": {
       "description": "`fs.close`: a handle was released.",
@@ -1688,6 +1810,222 @@
               ]
             }
           }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ClockSync"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "sync"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExec"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exec"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFork"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.fork"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcConnectAttempt"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.connect_attempt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTcpConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tcp_connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcMemfd"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.memfd"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFileOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.file_open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcLsmDeny"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.lsm_deny"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcHeartbeat"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.heartbeat"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcSensorStatus"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.sensor_status"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Finding"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "finding"
+              ]
+            }
+          }
         }
       ]
     },
@@ -1710,6 +2048,463 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        }
+      }
+    },
+    "ProcConnectAttempt": {
+      "description": "`proc.connect_attempt`: a process asked to connect a socket (the LSM's `socket_connect`), with the destination as it asked for it. `dst` and `dst_port` are set for IPv4 and IPv6; another family carries only its number.",
+      "type": "object",
+      "required": [
+        "family",
+        "proto",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "dst": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ip"
+        },
+        "dst_port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "family": {
+          "description": "The address family, as `AF_INET` is 2 and `AF_INET6` 10.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "proto": {
+          "description": "The socket's transport, such as `tcp` or `udp`.",
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcExec": {
+      "description": "`proc.exec`: a process in the session ran a new program, reported by the sensor after a successful `execve`. The `subject` is the thread that called it, which is the process's leader from then on.",
+      "type": "object",
+      "required": [
+        "argv",
+        "argv_truncated",
+        "cgroup_id",
+        "filename",
+        "gid",
+        "ppid",
+        "start_ns",
+        "tgid",
+        "tid",
+        "uid"
+      ],
+      "properties": {
+        "argv": {
+          "description": "The arguments, at most 256 and 16 KiB in all.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "argv_truncated": {
+          "description": "Whether `argv` was cut to fit.",
+          "type": "boolean"
+        },
+        "cgroup_id": {
+          "description": "The cgroup the process is in: the session's.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "filename": {
+          "description": "The program, as the kernel resolved it.",
+          "type": "string"
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ppid": {
+          "description": "The parent process's id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_ns": {
+          "description": "The process's start time on the guest's clock: with `tgid`, the process's identity across pid reuse.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "description": "The calling thread's id and its process's.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcExit": {
+      "description": "`proc.exit`: a thread in the session ended. `group_dead` when it was the last of its process.",
+      "type": "object",
+      "required": [
+        "exit_code",
+        "group_dead",
+        "start_ns",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "exit_code": {
+          "description": "The kernel's exit code word: the status `wait` reports, signal included.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "group_dead": {
+          "type": "boolean"
+        },
+        "start_ns": {
+          "description": "The process's start time, as `proc.exec` and `proc.fork` gave it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcFileOpen": {
+      "description": "`proc.file_open`: one open in `sample`, with the path the kernel resolved. The only sampled record of ring 1.",
+      "type": "object",
+      "required": [
+        "flags",
+        "path",
+        "sample",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "flags": {
+          "description": "The open's `f_flags`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "sample": {
+          "description": "The sampling: this record stands for `sample` opens.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcFork": {
+      "description": "`proc.fork`: a process in the session made a new process, or a new thread (`thread`): the reconciler needs both, since the filesystem records name the thread that acted.",
+      "type": "object",
+      "required": [
+        "child_pid",
+        "child_start_ns",
+        "gid",
+        "parent_tgid",
+        "parent_tid",
+        "uid"
+      ],
+      "properties": {
+        "child_pid": {
+          "description": "The new process's id (its leader thread's, the same), or the new thread's id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "child_start_ns": {
+          "description": "The new task's start time on the guest's clock.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parent_tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parent_tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "thread": {
+          "description": "Whether the new task is a thread of the parent's process rather than a process of its own.",
+          "default": false,
+          "type": "boolean"
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcHeartbeat": {
+      "description": "`proc.heartbeat`: the sensor is alive, once a second. The counters are since it started.",
+      "type": "object",
+      "required": [
+        "events_emitted",
+        "frames_sent",
+        "ringbuf_drops",
+        "uptime_ns"
+      ],
+      "properties": {
+        "events_emitted": {
+          "description": "Events the sensor took from the kernel's ring buffer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "frames_sent": {
+          "description": "Frames written to the stream, heartbeats included.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ringbuf_drops": {
+          "description": "Events the kernel could not place in the ring buffer: lost.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "uptime_ns": {
+          "description": "Since the sensor started, on the guest's clock.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcLsmDeny": {
+      "description": "`proc.lsm_deny`: the sensor's self-protection refused something. `hook` is `bpf` (a `bpf()` call by a process other than the sensor, `detail` its command number) or `task_kill` (a signal to the sensor, `detail` the signal number).",
+      "type": "object",
+      "required": [
+        "detail",
+        "hook",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "detail": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "hook": {
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcMemfd": {
+      "description": "`proc.memfd`: a process made an anonymous memory file (`memfd_create`): a place to hold or run bytes the audited filesystem never sees.",
+      "type": "object",
+      "required": [
+        "flags",
+        "name",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "flags": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "description": "The name given, at most 256 bytes.",
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcSensorStatus": {
+      "description": "`proc.sensor_status`: what the sensor could attach, sent once it has tried, and again if that changes.",
+      "type": "object",
+      "required": [
+        "btf_ok",
+        "kernel_release",
+        "phase",
+        "programs",
+        "session_cgroup_id"
+      ],
+      "properties": {
+        "btf_ok": {
+          "description": "Whether the kernel offers its BTF (`/sys/kernel/btf/vmlinux`).",
+          "type": "boolean"
+        },
+        "kernel_release": {
+          "description": "The guest kernel's release string.",
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/SensorPhase"
+        },
+        "pid": {
+          "description": "The sensor's own process id in the guest, which the guards protect.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "programs": {
+          "description": "Every program the sensor carries, attached or not.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProgramStatus"
+          }
+        },
+        "reason": {
+          "description": "Why the sensor is degraded, when a single reason covers it (such as `no_programs`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_cgroup_id": {
+          "description": "The session cgroup the sensor filters on.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcTcpConnect": {
+      "description": "`proc.tcp_connect`: the kernel sent a connection's first segment: the full 4-tuple once the source port was chosen, which is what joins the flow ring 0 relays (`net.connect`) to the process.",
+      "type": "object",
+      "required": [
+        "dst",
+        "dst_port",
+        "src",
+        "src_port",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "dst": {
+          "type": "string",
+          "format": "ip"
+        },
+        "dst_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "src": {
+          "type": "string",
+          "format": "ip"
+        },
+        "src_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProgramStatus": {
+      "description": "One of the sensor's programs.",
+      "type": "object",
+      "required": [
+        "attached",
+        "name"
+      ],
+      "properties": {
+        "attached": {
+          "type": "boolean"
+        },
+        "error": {
+          "description": "Why it is not attached.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
         }
       }
     },
@@ -1816,6 +2611,25 @@
       "enum": [
         0,
         1
+      ]
+    },
+    "SensorPhase": {
+      "description": "How much of the sensor runs.",
+      "oneOf": [
+        {
+          "description": "Every program is attached.",
+          "type": "string",
+          "enum": [
+            "attached"
+          ]
+        },
+        {
+          "description": "Some program is not; `programs` says which, and the reconciler skips the rules that need it.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        }
       ]
     },
     "SessionExit": {

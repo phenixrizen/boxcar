@@ -34,29 +34,44 @@ const DIRS: [&str; 5] = ["dev", "proc", "sys", "run", "newroot"];
 const DEVICES: [(&str, u32, u32, u32); 2] =
     [("dev/console", 0o600, 5, 1), ("dev/null", 0o666, 1, 3)];
 
-/// Builds the guest init and writes `target/guest/initramfs.cpio`.
+/// Builds the guest init and the guest sensor and writes
+/// `target/guest/initramfs.cpio`. The sensor is built with its eBPF
+/// programs, which needs the pinned nightly and bpf-linker (CONTRIBUTING);
+/// `AYA_BUILD_SKIP` is unset here on purpose, so a sensor with no programs
+/// never lands in the artifact by mistake.
 pub fn run() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .context("xtask manifest directory has no parent")?;
 
-    let mut build = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    build.args(build_init_args()).current_dir(root);
-    let status = build.status().context("failed to start cargo build")?;
-    ensure!(
-        status.success(),
-        "cargo build of boxcar-init failed: {status}"
-    );
+    let mut binaries = Vec::new();
+    for (package, args) in [
+        ("boxcar-init", build_init_args()),
+        ("boxcar-sensor", build_sensor_args()),
+    ] {
+        let mut build = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        build
+            .args(args)
+            .current_dir(root)
+            .env_remove("AYA_BUILD_SKIP");
+        let status = build.status().context("failed to start cargo build")?;
+        ensure!(
+            status.success(),
+            "cargo build of {package} failed: {status}"
+        );
+        let path = root.join("target").join(TARGET).join("guest").join(package);
+        let binary = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        ensure!(
+            u32::try_from(binary.len()).is_ok(),
+            "{} is larger than a cpio entry can hold",
+            path.display()
+        );
+        binaries.push(binary);
+    }
+    let [init, sensor] = <[Vec<u8>; 2]>::try_from(binaries)
+        .map_err(|_| anyhow::anyhow!("two binaries were built"))?;
 
-    let init_path = root.join("target").join(TARGET).join("guest/boxcar-init");
-    let init = fs::read(&init_path).with_context(|| format!("read {}", init_path.display()))?;
-    ensure!(
-        u32::try_from(init.len()).is_ok(),
-        "{} is larger than a cpio entry can hold",
-        init_path.display()
-    );
-
-    let archive = build_initramfs(&init);
+    let archive = build_initramfs(&init, &sensor);
     let out_dir = root.join("target/guest");
     fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
     let out_path = out_dir.join("initramfs.cpio");
@@ -72,10 +87,20 @@ pub fn run() -> Result<()> {
 
 /// The arguments after `cargo` that build the static guest init.
 fn build_init_args() -> Vec<OsString> {
+    build_args("boxcar-init")
+}
+
+/// The arguments after `cargo` that build the static guest sensor.
+fn build_sensor_args() -> Vec<OsString> {
+    build_args("boxcar-sensor")
+}
+
+/// A static musl build of `package` with the `guest` profile.
+fn build_args(package: &str) -> Vec<OsString> {
     [
         "build",
         "-p",
-        "boxcar-init",
+        package,
         "--target",
         TARGET,
         "--profile",
@@ -85,20 +110,21 @@ fn build_init_args() -> Vec<OsString> {
     .to_vec()
 }
 
-/// The newc archive for a given init binary.
+/// The newc archive for the init and sensor binaries.
 ///
 /// Entries, in this order: the directories `dev`, `proc`, `sys`, `run` and
-/// `newroot` (mode 0755), `init` (mode 0755, the binary), the character
-/// devices `dev/console` (0600, 5:1) and `dev/null` (0666, 1:3), then the
-/// `TRAILER!!!` entry. Inode numbers count up from 1; the trailer keeps the
+/// `newroot` (mode 0755), `init` (mode 0755, the init binary),
+/// `boxcar-sensor` (mode 0755, the sensor binary, which init opens before
+/// it switches the root), the character devices `dev/console` (0600, 5:1)
+/// and `dev/null` (0666, 1:3), then the `TRAILER!!!` entry. Inode numbers count up from 1; the trailer keeps the
 /// cpio crate's 0. Every entry has uid 0, gid 0, mtime 0 and nlink 1, the
 /// directories too (the kernel only looks at nlink for regular files).
 ///
 /// # Panics
 ///
-/// If `init_binary` is 4 GiB or larger, which a cpio entry cannot describe;
+/// If a binary is 4 GiB or larger, which a cpio entry cannot describe;
 /// [`run`] checks that first.
-pub fn build_initramfs(init_binary: &[u8]) -> Vec<u8> {
+pub fn build_initramfs(init_binary: &[u8], sensor_binary: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut ino = 0;
     let mut entry = |name: &str, mode: u32| {
@@ -110,6 +136,7 @@ pub fn build_initramfs(init_binary: &[u8]) -> Vec<u8> {
         out = append(out, entry(name, S_IFDIR | 0o755), &[]);
     }
     out = append(out, entry("init", S_IFREG | 0o755), init_binary);
+    out = append(out, entry("boxcar-sensor", S_IFREG | 0o755), sensor_binary);
     for (name, permissions, major, minor) in DEVICES {
         let device = entry(name, S_IFCHR | permissions)
             .rdev_major(major)
@@ -136,6 +163,7 @@ mod tests {
 
     /// Not a multiple of 4 bytes, so the archive has to pad the file data.
     const STUB: &[u8] = b"\x7fELF-stub";
+    const SENSOR_STUB: &[u8] = b"\x7fELF-sensor-stub";
 
     /// One archive entry as `cpio::newc::Reader` reads it back.
     #[derive(Debug, PartialEq)]
@@ -200,7 +228,7 @@ mod tests {
 
     #[test]
     fn archive_starts_with_newc_magic_and_ends_with_the_trailer() {
-        let archive = build_initramfs(STUB);
+        let archive = build_initramfs(STUB, SENSOR_STUB);
         assert_eq!(&archive[..6], b"070701");
         // The trailer name, its NUL, and the three pad bytes that bring the
         // 110-byte header plus 11 name bytes up to a multiple of 4.
@@ -213,7 +241,7 @@ mod tests {
 
     #[test]
     fn entries_come_in_the_fixed_order_with_exact_modes_and_devices() {
-        let got: Vec<_> = parse(&build_initramfs(STUB))
+        let got: Vec<_> = parse(&build_initramfs(STUB, SENSOR_STUB))
             .into_iter()
             .map(|e| (e.name, e.mode, e.ino, e.rdev))
             .collect();
@@ -224,8 +252,9 @@ mod tests {
             ("run", 0o040755, 4, (0, 0)),
             ("newroot", 0o040755, 5, (0, 0)),
             ("init", 0o100755, 6, (0, 0)),
-            ("dev/console", 0o020600, 7, (5, 1)),
-            ("dev/null", 0o020666, 8, (1, 3)),
+            ("boxcar-sensor", 0o100755, 7, (0, 0)),
+            ("dev/console", 0o020600, 8, (5, 1)),
+            ("dev/null", 0o020666, 9, (1, 3)),
         ]
         .into_iter()
         .map(|(name, mode, ino, rdev)| (name.to_owned(), mode, ino, rdev))
@@ -235,15 +264,19 @@ mod tests {
 
     #[test]
     fn init_carries_the_binary_and_nothing_else_has_data() {
-        for entry in parse(&build_initramfs(STUB)) {
-            let want: &[u8] = if entry.name == "init" { STUB } else { b"" };
+        for entry in parse(&build_initramfs(STUB, SENSOR_STUB)) {
+            let want: &[u8] = match entry.name.as_str() {
+                "init" => STUB,
+                "boxcar-sensor" => SENSOR_STUB,
+                _ => b"",
+            };
             assert_eq!(entry.data, want, "{}", entry.name);
         }
     }
 
     #[test]
     fn every_entry_is_root_owned_at_time_zero_with_one_link() {
-        for entry in parse(&build_initramfs(STUB)) {
+        for entry in parse(&build_initramfs(STUB, SENSOR_STUB)) {
             assert_eq!(
                 (entry.uid, entry.gid, entry.mtime, entry.nlink),
                 (0, 0, 0, 1),
@@ -255,6 +288,9 @@ mod tests {
 
     #[test]
     fn same_input_gives_the_same_bytes() {
-        assert_eq!(build_initramfs(STUB), build_initramfs(STUB));
+        assert_eq!(
+            build_initramfs(STUB, SENSOR_STUB),
+            build_initramfs(STUB, SENSOR_STUB)
+        );
     }
 }

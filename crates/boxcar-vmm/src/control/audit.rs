@@ -139,7 +139,7 @@ pub(crate) fn subscribe(
     let filter = Filter {
         kinds: params.types,
         pid: params.pid,
-        min_score: None,
+        min_score: params.min_score,
     };
     let subscription = audit
         .subscribe_with_queue(params.from_seq.unwrap_or(1), filter, limits.queue)

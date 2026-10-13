@@ -401,6 +401,7 @@ mod tests {
 
     fn fake_status() -> Status {
         Status {
+            sensor: Default::default(),
             state: VmState::Running,
             session_id: "fake".into(),
             pid: 7,

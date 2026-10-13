@@ -17,6 +17,10 @@ serde_json = { workspace = true }
 boxcar-proto = { workspace = true, features = ["hash", "schema"] }
 schemars = { workspace = true }
 serde = { workspace = true }
+# `cargo xtask sensor`: the eBPF lane parses the built object and checks it
+# against the table both sides share.
+aya-obj = { workspace = true }
+boxcar-sensor-common = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

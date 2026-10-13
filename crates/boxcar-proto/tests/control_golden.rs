@@ -101,7 +101,10 @@ fn every_golden_line_parses_as_what_it_is_and_everything_appears() {
                     let hello: Hello = serde_json::from_str(line).unwrap();
                     assert_eq!(hello.protocol, "boxcar.control");
                     assert_eq!(hello.versions, [1]);
-                    assert_eq!(hello.capabilities, ["pty", "audit", "policy.net"]);
+                    assert_eq!(
+                        hello.capabilities,
+                        ["pty", "audit", "policy.net", "findings"]
+                    );
                 }
                 "state" => {
                     serde_json::from_str::<StateEvent>(line).unwrap();

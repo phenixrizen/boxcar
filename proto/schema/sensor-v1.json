@@ -1,0 +1,3759 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "boxcar sensor stream v1",
+  "description": "One frame on vsock port 1026 from the guest's sensor to the VMM, its length prefix not counted: a SensorFrame, whose `type` and `data` are a `proc.*` record's as the audit Payload shapes them. See docs/audit-events.md.",
+  "$ref": "#/definitions/SensorFrame",
+  "definitions": {
+    "ArtifactRef": {
+      "description": "A file the VMM loaded, identified by where it was and what it held.",
+      "type": "object",
+      "required": [
+        "blake3",
+        "path"
+      ],
+      "properties": {
+        "blake3": {
+          "$ref": "#/definitions/Hash"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "Attrib": {
+      "description": "Whose identity a record carries as its `subject`.",
+      "oneOf": [
+        {
+          "description": "The process that made the request.",
+          "type": "string",
+          "enum": [
+            "caller"
+          ]
+        },
+        {
+          "description": "The process that opened the handle, when the request itself has no usable caller (pid 0, or a write-back from the page cache).",
+          "type": "string",
+          "enum": [
+            "handle"
+          ]
+        }
+      ]
+    },
+    "Checkpoint": {
+      "description": "`checkpoint`: a summary the log writer chains in periodically, so a reader can check a stretch of the log against one hash.",
+      "type": "object",
+      "required": [
+        "dropped",
+        "records_since",
+        "root_hash"
+      ],
+      "properties": {
+        "dropped": {
+          "description": "Droppable events that were dropped because the audit channel was full.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "records_since": {
+          "description": "Records written since the previous checkpoint.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "root_hash": {
+          "description": "blake3 over the raw hashes of the records since the previous checkpoint.",
+          "$ref": "#/definitions/Hash"
+        }
+      }
+    },
+    "ClockSync": {
+      "description": "`sync`: a pairing of the guest's clock with the host's. The VMM pings init over the control channel and times the pong: the guest's `CLOCK_MONOTONIC` when it answered, against the host's at the round trip's midpoint. `ts_host_ns` stays the one timestamp that joins events across rings; this says how far the guest's clock stands from the host's, and how surely.",
+      "type": "object",
+      "required": [
+        "guest_mono_ns",
+        "host_mono_ns",
+        "method",
+        "offset_ns",
+        "rtt_ns"
+      ],
+      "properties": {
+        "guest_mono_ns": {
+          "description": "The guest's `CLOCK_MONOTONIC` when it answered, in nanoseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "host_mono_ns": {
+          "description": "The host's `CLOCK_MONOTONIC` at the round trip's midpoint.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "method": {
+          "description": "How the pair was taken: `vsock_rtt`.",
+          "type": "string"
+        },
+        "offset_ns": {
+          "description": "`host_mono_ns` minus `guest_mono_ns`.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "rtt_ns": {
+          "description": "The round trip, in nanoseconds: the pairing is no surer than this.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ControlConnect": {
+      "description": "`control.connect`: a process connected to the control socket. It is served (`allow`) only when its uid is the VMM's; otherwise the connection is closed before the hello (`deny`).",
+      "type": "object",
+      "required": [
+        "pid",
+        "uid",
+        "verdict"
+      ],
+      "properties": {
+        "pid": {
+          "description": "The peer's process id and user id, from `SO_PEERCRED`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "verdict": {
+          "$ref": "#/definitions/Verdict"
+        }
+      }
+    },
+    "ControlStop": {
+      "description": "`control.stop`: a control client asked the VM to stop.",
+      "type": "object",
+      "required": [
+        "by_pid",
+        "mode"
+      ],
+      "properties": {
+        "by_pid": {
+          "description": "The client's process id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mode": {
+          "$ref": "#/definitions/StopMode"
+        }
+      }
+    },
+    "Evidence": {
+      "description": "A record a finding rests on.",
+      "type": "object",
+      "required": [
+        "ring",
+        "seq"
+      ],
+      "properties": {
+        "ring": {
+          "$ref": "#/definitions/Ring"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Finding": {
+      "description": "`finding`: the reconciler's conclusion from records of both rings, with the records it read as evidence. Never sampled; a score of 70 or more is written through to disk at once.",
+      "type": "object",
+      "required": [
+        "category",
+        "evidence",
+        "low_confidence",
+        "rule",
+        "score",
+        "summary"
+      ],
+      "properties": {
+        "category": {
+          "$ref": "#/definitions/FindingCategory"
+        },
+        "evidence": {
+          "description": "The records the rule read, newest last.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Evidence"
+          }
+        },
+        "low_confidence": {
+          "description": "Whether a join or clock the rule relied on was weak: the score was lowered for it.",
+          "type": "boolean"
+        },
+        "rule": {
+          "description": "The rule that fired, by name (see docs/reconciler.md).",
+          "type": "string"
+        },
+        "score": {
+          "description": "0 to 100: how strongly the evidence says the agent hid something.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "span_id": {
+          "description": "The span the finding belongs to (M4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "description": "What was seen, in words; at most 512 bytes.",
+          "type": "string"
+        }
+      }
+    },
+    "FindingCategory": {
+      "description": "The kinds of finding; see the design's section 7.",
+      "type": "string",
+      "enum": [
+        "unattributed_effect",
+        "sensor_silence",
+        "intent_effect_mismatch",
+        "indicator_removal",
+        "off_book_channel",
+        "orphaned_work",
+        "network_anomaly",
+        "privilege_probe",
+        "policy_denial"
+      ]
+    },
+    "FsClose": {
+      "description": "`fs.close`: a handle was released.",
+      "type": "object",
+      "required": [
+        "attrib",
+        "bytes_read",
+        "bytes_written",
+        "fh",
+        "hash_status",
+        "mount",
+        "path",
+        "path_at_open"
+      ],
+      "properties": {
+        "attrib": {
+          "$ref": "#/definitions/Attrib"
+        },
+        "blake3": {
+          "description": "The content hash, when `hash_status` is `ok`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bytes_read": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "bytes_written": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "fh": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash_status": {
+          "$ref": "#/definitions/HashStatus"
+        },
+        "mount": {
+          "type": "string"
+        },
+        "open_seq": {
+          "description": "The `seq` of the record that opened this handle, when known.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "path": {
+          "description": "The path at close time.",
+          "type": "string"
+        },
+        "path_at_open": {
+          "description": "The path when the handle was opened; differs after a rename.",
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "description": "The file size at close, when it was measured.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ts_release_ns": {
+          "description": "Host `CLOCK_REALTIME`, nanoseconds since the epoch, when the guest released the handle: the producer's time, before the hash that completes the record, which can come a while later. 0 in logs written before it existed.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "FsCreate": {
+      "description": "`fs.create`.",
+      "type": "object",
+      "required": [
+        "fh",
+        "flags",
+        "mode",
+        "mount",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "fh": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flags": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsDenied": {
+      "description": "`fs.denied`: an operation was refused for lack of permission.",
+      "type": "object",
+      "required": [
+        "errno",
+        "mount",
+        "op",
+        "path"
+      ],
+      "properties": {
+        "errno": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "mount": {
+          "type": "string"
+        },
+        "op": {
+          "description": "The refused operation: `lookup`, `access`, `open`, and so on.",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "FsFallocate": {
+      "description": "`fs.fallocate`.",
+      "type": "object",
+      "required": [
+        "len",
+        "mode",
+        "mount",
+        "offset",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "len": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mount": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsIo": {
+      "description": "`fs.read` and `fs.write`.",
+      "type": "object",
+      "required": [
+        "attrib",
+        "fh",
+        "len",
+        "mount",
+        "offset",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "attrib": {
+          "description": "Whose identity the record's `subject` is: the caller's, or the handle opener's when the request had no usable caller (pid 0, or a write-back from the page cache).",
+          "$ref": "#/definitions/Attrib"
+        },
+        "fh": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "len": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mount": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsLink": {
+      "description": "`fs.link`: `path` is the new name and `target_path` the file it links to.",
+      "type": "object",
+      "required": [
+        "mount",
+        "path",
+        "result",
+        "target_path"
+      ],
+      "properties": {
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        },
+        "target_path": {
+          "type": "string"
+        }
+      }
+    },
+    "FsMkdir": {
+      "description": "`fs.mkdir`.",
+      "type": "object",
+      "required": [
+        "mode",
+        "mount",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsMknod": {
+      "description": "`fs.mknod`.",
+      "type": "object",
+      "required": [
+        "mode",
+        "mount",
+        "path",
+        "rdev",
+        "result"
+      ],
+      "properties": {
+        "mode": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rdev": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsMount": {
+      "description": "`fs.mount`: a virtio-fs share was attached.",
+      "type": "object",
+      "required": [
+        "cache_policy",
+        "guest_path",
+        "host_root",
+        "mount"
+      ],
+      "properties": {
+        "cache_policy": {
+          "type": "string"
+        },
+        "guest_path": {
+          "description": "Where the guest mounts it.",
+          "type": "string"
+        },
+        "host_root": {
+          "description": "The host directory it serves.",
+          "type": "string"
+        },
+        "mount": {
+          "description": "The share's tag, such as `root` or `workspace`.",
+          "type": "string"
+        }
+      }
+    },
+    "FsOpen": {
+      "description": "`fs.open`.",
+      "type": "object",
+      "required": [
+        "exec",
+        "fh",
+        "flags",
+        "flags_decoded",
+        "mount",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "exec": {
+          "description": "The open is for `execve`.",
+          "type": "boolean"
+        },
+        "fh": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flags": {
+          "description": "The raw `open(2)` flags.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "flags_decoded": {
+          "description": "Names of the flags set in `flags`, such as `O_RDWR` and `O_CREAT`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsPathOp": {
+      "description": "`fs.unlink`, `fs.rmdir`, and `fs.readdir`: an operation on one path.",
+      "type": "object",
+      "required": [
+        "mount",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "FsRename": {
+      "description": "`fs.rename`.",
+      "type": "object",
+      "required": [
+        "flags",
+        "from",
+        "mount",
+        "result",
+        "to"
+      ],
+      "properties": {
+        "flags": {
+          "description": "The `renameat2(2)` flags.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "from": {
+          "type": "string"
+        },
+        "mount": {
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        },
+        "to": {
+          "type": "string"
+        }
+      }
+    },
+    "FsSetattr": {
+      "description": "`fs.setattr`.",
+      "type": "object",
+      "required": [
+        "mount",
+        "path",
+        "result",
+        "set"
+      ],
+      "properties": {
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        },
+        "set": {
+          "$ref": "#/definitions/SetAttr"
+        }
+      }
+    },
+    "FsSymlink": {
+      "description": "`fs.symlink`: `path` is the new link and `target` what it points to.",
+      "type": "object",
+      "required": [
+        "mount",
+        "path",
+        "result",
+        "target"
+      ],
+      "properties": {
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        },
+        "target": {
+          "type": "string"
+        }
+      }
+    },
+    "FsXattr": {
+      "description": "`fs.xattr`: an extended attribute was set or removed.",
+      "type": "object",
+      "required": [
+        "mount",
+        "name",
+        "op",
+        "path",
+        "result"
+      ],
+      "properties": {
+        "mount": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "op": {
+          "description": "`set` or `remove`.",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/OpResult"
+        }
+      }
+    },
+    "Hash": {
+      "description": "A blake3 digest: `b3:` followed by 64 lowercase hex digits.",
+      "type": "string",
+      "pattern": "^b3:[0-9a-f]{64}$"
+    },
+    "HashStatus": {
+      "description": "Whether the content of a closed file was hashed, and if not, why.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        },
+        {
+          "description": "Hashed; `blake3` is set.",
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        {
+          "description": "The file changed while it was being hashed.",
+          "type": "string",
+          "enum": [
+            "raced"
+          ]
+        },
+        {
+          "description": "The file no longer exists.",
+          "type": "string",
+          "enum": [
+            "gone"
+          ]
+        },
+        {
+          "description": "Larger than the hashing limit.",
+          "type": "string",
+          "enum": [
+            "skipped_size"
+          ]
+        },
+        {
+          "description": "Nothing was written through the handle, so there is nothing to hash.",
+          "type": "string",
+          "enum": [
+            "not_hashed"
+          ]
+        }
+      ]
+    },
+    "NetClose": {
+      "description": "`net.close`: a flow ended.",
+      "type": "object",
+      "required": [
+        "dur_ms",
+        "flow",
+        "reason",
+        "rx",
+        "tx"
+      ],
+      "properties": {
+        "dur_ms": {
+          "description": "How long the flow lasted, in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect` or `net.udp`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reason": {
+          "description": "Why it ended, such as `fin`, `rst`, `timeout`, `evicted` or `idle`.",
+          "type": "string"
+        },
+        "rx": {
+          "description": "Payload bytes the guest received.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tx": {
+          "description": "Payload bytes the guest sent.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "NetConnect": {
+      "description": "`net.connect`: a guest connection attempt and the policy's verdict on it.",
+      "type": "object",
+      "required": [
+        "dst",
+        "flow",
+        "names",
+        "proto",
+        "src",
+        "verdict"
+      ],
+      "properties": {
+        "dst": {
+          "description": "The address and port the guest asked for.",
+          "type": "string"
+        },
+        "flow": {
+          "description": "The flow's id, unique within the session. The flow's `net.tls` and `net.close` carry it too.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "names": {
+          "description": "The names the guest's DNS answers gave `dst`'s address, newest first.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "proto": {
+          "description": "The transport, such as `tcp`.",
+          "type": "string"
+        },
+        "rule": {
+          "description": "The policy rule that decided, as written; `null` when the policy's default did.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "src": {
+          "description": "The guest's address and source port.",
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/definitions/Verdict"
+        }
+      }
+    },
+    "NetDhcp": {
+      "description": "`net.dhcp`: the network stack answered a guest DHCP message with the session's static lease.",
+      "type": "object",
+      "required": [
+        "op",
+        "yiaddr"
+      ],
+      "properties": {
+        "op": {
+          "description": "`offer`, the answer to a DISCOVER, or `ack`, the answer to a REQUEST.",
+          "type": "string"
+        },
+        "yiaddr": {
+          "description": "The address the reply leases to the guest.",
+          "type": "string",
+          "format": "ipv4"
+        }
+      }
+    },
+    "NetDns": {
+      "description": "`net.dns`: a guest DNS query, the policy's verdict on its name, and the answer the guest got.",
+      "type": "object",
+      "required": [
+        "answers",
+        "qname",
+        "qtype",
+        "rcode",
+        "txid",
+        "verdict"
+      ],
+      "properties": {
+        "answers": {
+          "description": "The addresses the answer gave, as text.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "qname": {
+          "description": "The name asked for.",
+          "type": "string"
+        },
+        "qtype": {
+          "description": "The query type, by its DNS number: 1 is A, 28 is AAAA.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "rcode": {
+          "description": "The response code the guest got, by its DNS number: 0 is NOERROR, 2 SERVFAIL, 3 NXDOMAIN.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "rule": {
+          "description": "The policy rule that decided, as written; `null` when the policy's default did.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "txid": {
+          "description": "The transaction id the guest gave the query.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "verdict": {
+          "$ref": "#/definitions/Verdict"
+        }
+      }
+    },
+    "NetDrop": {
+      "description": "`net.drop`: the network stack dropped guest frames. Made at most once a second for each reason, counting every drop since the last.",
+      "type": "object",
+      "required": [
+        "count",
+        "reason"
+      ],
+      "properties": {
+        "count": {
+          "description": "Frames dropped for this reason since the last `net.drop` for it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reason": {
+          "description": "Why, such as `ipv6` or `icmp`.",
+          "type": "string"
+        }
+      }
+    },
+    "NetTls": {
+      "description": "`net.tls`: the gate's reading of a flow's first bytes, the name they asked for, and whether the flow was let through on it. The gate reads the flows a domain rule allowed: a TLS ClientHello's server name, or a plain HTTP request's `Host`.",
+      "type": "object",
+      "required": [
+        "alpn",
+        "flow",
+        "kind",
+        "verdict"
+      ],
+      "properties": {
+        "alpn": {
+          "description": "The ALPN protocols the ClientHello offered, in its order; empty for `http`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "kind": {
+          "description": "What the first bytes were read as: `tls` (a ClientHello, bytes that began like one, or none at all) or `http` (anything else, read as a plain HTTP request).",
+          "type": "string"
+        },
+        "sni": {
+          "description": "The name asked for: for `tls`, the server name the ClientHello named; for `http`, the request's `Host` (lowercase, without its port). `null` when there was none to read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict": {
+          "$ref": "#/definitions/Verdict"
+        }
+      }
+    },
+    "NetUdp": {
+      "description": "`net.udp`: the first datagram of a guest UDP flow, and the policy's verdict on it.",
+      "type": "object",
+      "required": [
+        "dst",
+        "flow",
+        "names",
+        "src",
+        "verdict"
+      ],
+      "properties": {
+        "dst": {
+          "description": "The address and port the guest sent to.",
+          "type": "string"
+        },
+        "flow": {
+          "description": "The flow's id, unique within the session (TCP and UDP flows share one count); its `net.close` carries it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "names": {
+          "description": "The names the guest's DNS answers gave `dst`'s address, newest first.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rule": {
+          "description": "The policy rule that decided, as written; `null` when the policy's default did.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "src": {
+          "description": "The guest's address and source port.",
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/definitions/Verdict"
+        }
+      }
+    },
+    "OpResult": {
+      "description": "How one operation ended. Present on every filesystem event that performs an operation, so readers can filter failures without knowing the event.",
+      "type": "object",
+      "required": [
+        "ok"
+      ],
+      "properties": {
+        "err": {
+          "description": "The symbolic name of `errno`, such as `EACCES`, when Linux defines one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "errno": {
+          "description": "The Linux errno of a failure.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Payload": {
+      "description": "The typed payloads: one variant per event kind this crate defines.\n\nAdjacently tagged, so it serializes as `{\"type\": \"fs.open\", \"data\": {...}}`, which are the two fields a [`Record`] carries at its top level. New kinds are additive, and a consumer ignores kinds it does not know.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VmmStart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.start"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VmmStop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.stop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMount"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mount"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsCreate"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.create"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.read"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.write"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.unlink"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.rmdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMkdir"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mkdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMknod"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mknod"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsSymlink"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.symlink"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsLink"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.link"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsRename"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.rename"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsSetattr"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.setattr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsFallocate"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.fallocate"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsXattr"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.xattr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsDenied"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.denied"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.readdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Checkpoint"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "checkpoint"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ControlConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "control.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ControlStop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "control.stop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDhcp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.dhcp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDns"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.dns"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetTls"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.tls"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDrop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.drop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetUdp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.udp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VsockConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vsock.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VsockClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vsock.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SessionStart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session.start"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SessionExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/PolicyChanged"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.changed"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ClockSync"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "sync"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExec"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exec"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFork"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.fork"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcConnectAttempt"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.connect_attempt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTcpConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tcp_connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcMemfd"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.memfd"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFileOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.file_open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcLsmDeny"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.lsm_deny"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcHeartbeat"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.heartbeat"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcSensorStatus"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.sensor_status"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Finding"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "finding"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PolicyChanged": {
+      "description": "`policy.changed`: a control client replaced the session's policy (the control socket's `policy.update`): the network rules, the vsock allowlist, or both. The new policy decides every later query, connection and datagram, and what was open and it denies is closed (`net.close{reason:\"policy\"}`).",
+      "type": "object",
+      "required": [
+        "by_pid",
+        "version"
+      ],
+      "properties": {
+        "by_pid": {
+          "description": "The client's process id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "version": {
+          "description": "The policy's version from now on: 1 is the policy the VM started with, and each update adds one. `policy.get` reports it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcConnectAttempt": {
+      "description": "`proc.connect_attempt`: a process asked to connect a socket (the LSM's `socket_connect`), with the destination as it asked for it. `dst` and `dst_port` are set for IPv4 and IPv6; another family carries only its number.",
+      "type": "object",
+      "required": [
+        "family",
+        "proto",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "dst": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ip"
+        },
+        "dst_port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "family": {
+          "description": "The address family, as `AF_INET` is 2 and `AF_INET6` 10.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "proto": {
+          "description": "The socket's transport, such as `tcp` or `udp`.",
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcExec": {
+      "description": "`proc.exec`: a process in the session ran a new program, reported by the sensor after a successful `execve`. The `subject` is the thread that called it, which is the process's leader from then on.",
+      "type": "object",
+      "required": [
+        "argv",
+        "argv_truncated",
+        "cgroup_id",
+        "filename",
+        "gid",
+        "ppid",
+        "start_ns",
+        "tgid",
+        "tid",
+        "uid"
+      ],
+      "properties": {
+        "argv": {
+          "description": "The arguments, at most 256 and 16 KiB in all.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "argv_truncated": {
+          "description": "Whether `argv` was cut to fit.",
+          "type": "boolean"
+        },
+        "cgroup_id": {
+          "description": "The cgroup the process is in: the session's.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "filename": {
+          "description": "The program, as the kernel resolved it.",
+          "type": "string"
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ppid": {
+          "description": "The parent process's id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_ns": {
+          "description": "The process's start time on the guest's clock: with `tgid`, the process's identity across pid reuse.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "description": "The calling thread's id and its process's.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcExit": {
+      "description": "`proc.exit`: a thread in the session ended. `group_dead` when it was the last of its process.",
+      "type": "object",
+      "required": [
+        "exit_code",
+        "group_dead",
+        "start_ns",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "exit_code": {
+          "description": "The kernel's exit code word: the status `wait` reports, signal included.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "group_dead": {
+          "type": "boolean"
+        },
+        "start_ns": {
+          "description": "The process's start time, as `proc.exec` and `proc.fork` gave it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcFileOpen": {
+      "description": "`proc.file_open`: one open in `sample`, with the path the kernel resolved. The only sampled record of ring 1.",
+      "type": "object",
+      "required": [
+        "flags",
+        "path",
+        "sample",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "flags": {
+          "description": "The open's `f_flags`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "path": {
+          "type": "string"
+        },
+        "sample": {
+          "description": "The sampling: this record stands for `sample` opens.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcFork": {
+      "description": "`proc.fork`: a process in the session made a new process, or a new thread (`thread`): the reconciler needs both, since the filesystem records name the thread that acted.",
+      "type": "object",
+      "required": [
+        "child_pid",
+        "child_start_ns",
+        "gid",
+        "parent_tgid",
+        "parent_tid",
+        "uid"
+      ],
+      "properties": {
+        "child_pid": {
+          "description": "The new process's id (its leader thread's, the same), or the new thread's id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "child_start_ns": {
+          "description": "The new task's start time on the guest's clock.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parent_tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "parent_tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "thread": {
+          "description": "Whether the new task is a thread of the parent's process rather than a process of its own.",
+          "default": false,
+          "type": "boolean"
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcHeartbeat": {
+      "description": "`proc.heartbeat`: the sensor is alive, once a second. The counters are since it started.",
+      "type": "object",
+      "required": [
+        "events_emitted",
+        "frames_sent",
+        "ringbuf_drops",
+        "uptime_ns"
+      ],
+      "properties": {
+        "events_emitted": {
+          "description": "Events the sensor took from the kernel's ring buffer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "frames_sent": {
+          "description": "Frames written to the stream, heartbeats included.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ringbuf_drops": {
+          "description": "Events the kernel could not place in the ring buffer: lost.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "uptime_ns": {
+          "description": "Since the sensor started, on the guest's clock.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcLsmDeny": {
+      "description": "`proc.lsm_deny`: the sensor's self-protection refused something. `hook` is `bpf` (a `bpf()` call by a process other than the sensor, `detail` its command number) or `task_kill` (a signal to the sensor, `detail` the signal number).",
+      "type": "object",
+      "required": [
+        "detail",
+        "hook",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "detail": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "hook": {
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcMemfd": {
+      "description": "`proc.memfd`: a process made an anonymous memory file (`memfd_create`): a place to hold or run bytes the audited filesystem never sees.",
+      "type": "object",
+      "required": [
+        "flags",
+        "name",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "flags": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "description": "The name given, at most 256 bytes.",
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcSensorStatus": {
+      "description": "`proc.sensor_status`: what the sensor could attach, sent once it has tried, and again if that changes.",
+      "type": "object",
+      "required": [
+        "btf_ok",
+        "kernel_release",
+        "phase",
+        "programs",
+        "session_cgroup_id"
+      ],
+      "properties": {
+        "btf_ok": {
+          "description": "Whether the kernel offers its BTF (`/sys/kernel/btf/vmlinux`).",
+          "type": "boolean"
+        },
+        "kernel_release": {
+          "description": "The guest kernel's release string.",
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/SensorPhase"
+        },
+        "pid": {
+          "description": "The sensor's own process id in the guest, which the guards protect.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "programs": {
+          "description": "Every program the sensor carries, attached or not.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProgramStatus"
+          }
+        },
+        "reason": {
+          "description": "Why the sensor is degraded, when a single reason covers it (such as `no_programs`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_cgroup_id": {
+          "description": "The session cgroup the sensor filters on.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcTcpConnect": {
+      "description": "`proc.tcp_connect`: the kernel sent a connection's first segment: the full 4-tuple once the source port was chosen, which is what joins the flow ring 0 relays (`net.connect`) to the process.",
+      "type": "object",
+      "required": [
+        "dst",
+        "dst_port",
+        "src",
+        "src_port",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "dst": {
+          "type": "string",
+          "format": "ip"
+        },
+        "dst_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "src": {
+          "type": "string",
+          "format": "ip"
+        },
+        "src_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProgramStatus": {
+      "description": "One of the sensor's programs.",
+      "type": "object",
+      "required": [
+        "attached",
+        "name"
+      ],
+      "properties": {
+        "attached": {
+          "type": "boolean"
+        },
+        "error": {
+          "description": "Why it is not attached.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "Ring": {
+      "description": "Which side of the VM boundary made the record: 0 the host, 1 the guest.",
+      "type": "integer",
+      "enum": [
+        0,
+        1
+      ]
+    },
+    "SensorFrame": {
+      "description": "One record from the sensor: the guest's clock when it happened, the process it is about, and the record's `type` and `data`.",
+      "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VmmStart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.start"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VmmStop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.stop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMount"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mount"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsCreate"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.create"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.read"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsIo"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.write"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.unlink"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.rmdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMkdir"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mkdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsMknod"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.mknod"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsSymlink"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.symlink"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsLink"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.link"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsRename"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.rename"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsSetattr"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.setattr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsFallocate"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.fallocate"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsXattr"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.xattr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsDenied"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.denied"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsPathOp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.readdir"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Checkpoint"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "checkpoint"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ControlConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "control.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ControlStop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "control.stop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDhcp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.dhcp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDns"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.dns"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetTls"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.tls"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDrop"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.drop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetUdp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.udp"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VsockConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vsock.connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/VsockClose"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vsock.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SessionStart"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session.start"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/SessionExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/PolicyChanged"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.changed"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ClockSync"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "sync"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExec"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exec"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFork"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.fork"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcConnectAttempt"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.connect_attempt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcTcpConnect"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.tcp_connect"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcMemfd"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.memfd"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcFileOpen"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.file_open"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcLsmDeny"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.lsm_deny"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcHeartbeat"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.heartbeat"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcSensorStatus"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.sensor_status"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/Finding"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "finding"
+              ]
+            }
+          }
+        }
+      ],
+      "required": [
+        "ts_guest_ns"
+      ],
+      "properties": {
+        "subject": {
+          "description": "The thread the record is about, with its user; none for the sensor's own records (heartbeat, status).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Subject"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ts_guest_ns": {
+          "description": "The guest's `CLOCK_MONOTONIC`, in nanoseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SensorPhase": {
+      "description": "How much of the sensor runs.",
+      "oneOf": [
+        {
+          "description": "Every program is attached.",
+          "type": "string",
+          "enum": [
+            "attached"
+          ]
+        },
+        {
+          "description": "Some program is not; `programs` says which, and the reconciler skips the rules that need it.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        }
+      ]
+    },
+    "SessionExit": {
+      "description": "`session.exit`: the session's process ended, as init reported it: its exit code, or the signal that killed it. Both are `null` only when init could not tell.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "signal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      }
+    },
+    "SessionStart": {
+      "description": "`session.start`: the guest's init started the session the VMM's config asked for. Reported by init (ring 1); the record's subject is the session's process.",
+      "type": "object",
+      "required": [
+        "argv",
+        "cwd",
+        "gid",
+        "pid",
+        "uid"
+      ],
+      "properties": {
+        "argv": {
+          "description": "The command, as the config gave it.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "description": "Where it started.",
+          "type": "string"
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "pid": {
+          "description": "Its process id in the guest.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "uid": {
+          "description": "Who it runs as.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SetAttr": {
+      "description": "The attributes a `setattr` asked to change. Unset fields were not part of the request and are omitted from the JSON.",
+      "type": "object",
+      "properties": {
+        "atime": {
+          "description": "Seconds since the Unix epoch.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "gid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mode": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mtime": {
+          "description": "Seconds since the Unix epoch.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "uid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ShareRef": {
+      "description": "A directory the VM was given over virtio-fs.",
+      "type": "object",
+      "required": [
+        "host_root",
+        "tag"
+      ],
+      "properties": {
+        "host_root": {
+          "description": "The host directory it serves.",
+          "type": "string"
+        },
+        "tag": {
+          "description": "The share's tag, such as `root` or `workspace`.",
+          "type": "string"
+        }
+      }
+    },
+    "StopMode": {
+      "description": "How to stop.",
+      "oneOf": [
+        {
+          "description": "Ask the guest to end its session first.",
+          "type": "string",
+          "enum": [
+            "graceful"
+          ]
+        },
+        {
+          "description": "Stop the vCPUs at once.",
+          "type": "string",
+          "enum": [
+            "force"
+          ]
+        }
+      ]
+    },
+    "Subject": {
+      "description": "The guest identity an event is attributed to.",
+      "type": "object",
+      "required": [
+        "gid",
+        "pid",
+        "uid"
+      ],
+      "properties": {
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Verdict": {
+      "description": "Whether something was let through.",
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "VmmStart": {
+      "description": "`vmm.start`: the VM was built and is about to run.",
+      "type": "object",
+      "required": [
+        "cmdline",
+        "kernel",
+        "mem_mib",
+        "vcpus",
+        "version"
+      ],
+      "properties": {
+        "cmdline": {
+          "type": "string"
+        },
+        "initramfs": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ArtifactRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kernel": {
+          "$ref": "#/definitions/ArtifactRef"
+        },
+        "mem_mib": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "shares": {
+          "description": "The virtio-fs shares, in slot order. Omitted when there are none, and read as none when absent.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ShareRef"
+          }
+        },
+        "vcpus": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "version": {
+          "description": "The boxcar version.",
+          "type": "string"
+        }
+      }
+    },
+    "VmmStop": {
+      "description": "`vmm.stop`: the VM stopped.",
+      "type": "object",
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "console_dropped_bytes": {
+          "description": "Console bytes the guest wrote that the host never wrote out: the oldest bytes the console's ring dropped when the host's stdout (or the console file) fell behind, bytes a failed write lost, and what was still undelivered when the stop sequence gave up waiting for a stalled writer. 0 when the console kept up. Absent in logs written before it existed, and read as 0.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "stdin_dropped_bytes": {
+          "description": "Bytes typed at the console that the host dropped because the guest was not reading them: the oldest input beyond what the serial FIFO and the host's 4 KiB holding buffer could take. 0 for a run with no console input. Absent in logs written before it existed, and read as 0.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "VsockClose": {
+      "description": "`vsock.close`: a vsock connection that a `vsock.connect` let through ended.",
+      "type": "object",
+      "required": [
+        "dir",
+        "port",
+        "rx",
+        "tx"
+      ],
+      "properties": {
+        "dir": {
+          "description": "The `dir` of the connection's `vsock.connect`.",
+          "type": "string"
+        },
+        "port": {
+          "description": "The `port` of the connection's `vsock.connect`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "rx": {
+          "description": "Payload bytes the guest received.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tx": {
+          "description": "Payload bytes the guest sent.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "VsockConnect": {
+      "description": "`vsock.connect`: a vsock connection between the guest and the host, and whether it was let through.\n\nA guest connection to an internal port (1024, 1025, 1026) is served by the VMM only from a guest source port below 1024, and only the first such connection to each port; a guest connection to any other port reaches the host socket `<uds>_<port>` only when the port is allowlisted. A host connection, through the vsock socket, is recorded once the guest accepts it.",
+      "type": "object",
+      "required": [
+        "dir",
+        "peer",
+        "port",
+        "src_port",
+        "verdict"
+      ],
+      "properties": {
+        "dir": {
+          "description": "Who connected: `guest` or `host`.",
+          "type": "string"
+        },
+        "peer": {
+          "description": "The other end: for a guest connection, `internal` (a VMM service) or `uds` (the host socket `<uds>_<port>`); for a host connection, `guest`.",
+          "type": "string"
+        },
+        "port": {
+          "description": "The port connected to: the host port for a guest connection, the guest port for a host one.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reason": {
+          "description": "Why a connection was refused: `unprivileged` (an internal port from a guest source port of 1024 or more), `duplicate` (an internal port that was already connected), `no_service` (an internal port nothing serves), `port` (a port that is not allowlisted), or the reason the service at an internal port gave, such as `reactivated` (the guest control channel takes one connection in the VMM's life, and this is a later one, after the guest re-activated its vsock driver). `null` when it was let through.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "src_port": {
+          "description": "The connecting side's port: the guest's source port, or the port the VMM gave a host connection.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "verdict": {
+          "$ref": "#/definitions/Verdict"
+        }
+      }
+    }
+  }
+}

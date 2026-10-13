@@ -298,6 +298,11 @@ pub struct EventsArgs {
     /// Only records attributed to the guest process with this pid.
     #[arg(long, value_name = "PID")]
     pub pid: Option<u32>,
+
+    /// Only records whose score is at least this (findings carry one; a
+    /// record without a score passes). 0 to 100.
+    #[arg(long, value_name = "SCORE", value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub min_score: Option<u8>,
 }
 
 #[derive(Debug, Args)]
@@ -467,6 +472,12 @@ pub struct RunArgs {
     /// from), and the socket carries the connection. Default: on with
     /// shares, off with `--no-fs`. The last of `--vsock` and `--no-vsock`
     /// wins.
+    /// Run the guest without its sensor (ring 1 of the audit log): no
+    /// `proc.*` records, and `status` says the sensor is off. Implied by
+    /// --no-vsock, which leaves the sensor no way to reach the host.
+    #[arg(long)]
+    pub no_sensor: bool,
+
     #[arg(long, overrides_with = "no_vsock")]
     pub vsock: bool,
     /// No vsock device: the guest runs M1's console session (see `run`).

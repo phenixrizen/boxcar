@@ -1,0 +1,1 @@
+{"category":"off_book_channel","score":75,"rule":"memfd_create","summary":"guest thread 999 made an anonymous memory file \"stage\": bytes the audited filesystem never sees","evidence":[{"seq":5,"ring":1}],"low_confidence":false}

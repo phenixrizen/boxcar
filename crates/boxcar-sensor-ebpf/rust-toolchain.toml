@@ -1,0 +1,6 @@
+# The eBPF programs need a nightly for -Z build-std on bpfel-unknown-none.
+# boxcar-sensor's build.rs names the same toolchain; this file makes a build
+# by hand in this directory use it too.
+[toolchain]
+channel = "nightly-2026-06-01"
+components = ["rust-src"]

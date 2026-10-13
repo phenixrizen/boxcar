@@ -10,6 +10,7 @@
 //! - [`ids`]: session identifiers.
 //! - [`limits`]: size limits for record fields, and the cut that enforces them.
 //! - [`redact`]: scrubbing secrets out of a value before it is recorded.
+//! - [`sensor`]: the sensor stream from the guest's sensor to the VMM.
 //!
 //! # Features
 //!
@@ -26,16 +27,19 @@ pub mod guestcmd;
 pub mod ids;
 pub mod limits;
 pub mod redact;
+pub mod sensor;
 
 #[cfg(feature = "hash")]
 pub use audit::genesis_prev;
 pub use audit::{
-    ArtifactRef, Attrib, Checkpoint, ControlConnect, ControlStop, FsClose, FsCreate, FsDenied,
-    FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr,
-    FsSymlink, FsXattr, Hash, HashStatus, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetTls,
-    NetUdp, OpResult, ParseHashError, Payload, PolicyChanged, Record, Ring, SessionExit,
-    SessionStart, SetAttr, ShareRef, Source, SpanRef, Subject, Verdict, VmmStart, VmmStop,
-    VsockClose, VsockConnect, SCHEMA_VERSION,
+    ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
+    FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
+    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hash, HashStatus, NetClose,
+    NetConnect, NetDhcp, NetDns, NetDrop, NetTls, NetUdp, OpResult, ParseHashError, Payload,
+    PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
+    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, Record, Ring,
+    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, Source, SpanRef, Subject, Verdict,
+    VmmStart, VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

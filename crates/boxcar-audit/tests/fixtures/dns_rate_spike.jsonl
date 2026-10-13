@@ -1,0 +1,1 @@
+{"category":"network_anomaly","score":70,"rule":"dns_rate","summary":"51 DNS queries within 10 s: more than a session's lookups","evidence":[{"seq":57,"ring":0}],"low_confidence":false}

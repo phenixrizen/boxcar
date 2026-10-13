@@ -2,15 +2,17 @@
 // Copyright 2026 The boxcar Authors
 
 //! `cargo xtask schema`: the JSON Schemas of the control protocol, the
-//! audit records and the guest control channel, and the control protocol's
-//! golden lines.
+//! audit records, the guest control channel and the sensor stream, and the
+//! golden lines of the control protocol and the sensor stream.
 //!
 //! Written from the types in `boxcar-proto` (built with its `schema`
-//! feature) to `proto/schema/{control-v1,audit-v1,guest-v1}.json`, draft 7,
-//! and `proto/testdata/control-v1.jsonl`, one example of each control
-//! message. The output is deterministic (sorted keys, fixed examples), so
-//! CI runs this and fails on a difference: a change to the types must come
-//! with its schemas.
+//! feature) to `proto/schema/{control-v1,audit-v1,guest-v1,sensor-v1}.json`,
+//! draft 7, `proto/testdata/control-v1.jsonl`, one example of each control
+//! message, and `proto/testdata/sensor-v1.jsonl`, one frame of each sensor
+//! record type (as JSON lines; on the wire each is length-prefixed). The
+//! output is deterministic (sorted keys, fixed examples), so CI runs this
+//! and fails on a difference: a change to the types must come with its
+//! schemas.
 
 use std::fs;
 use std::path::Path;
@@ -21,10 +23,15 @@ use boxcar_proto::control::{
     self, to_line, AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, ErrorBody,
     ErrorCode, Hello, NetPolicy, PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams,
     PtyAttached, PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Ready, Request, Response,
-    StateEvent, Status, StopMode, StopParams, VmState, VsockPolicy,
+    SensorState, SensorStatus, StateEvent, Status, StopMode, StopParams, VmState, VsockPolicy,
 };
 use boxcar_proto::guest::{GuestMsg, HostMsg, SessionConfig};
-use boxcar_proto::{Hash, NetConnect, Ring, SessionId, Source, Subject, Verdict};
+use boxcar_proto::sensor::SensorFrame;
+use boxcar_proto::{
+    Hash, NetConnect, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProgramStatus, Ring,
+    SensorPhase, SessionId, Source, Subject, Verdict,
+};
 use schemars::gen::{SchemaGenerator, SchemaSettings};
 use schemars::schema::{RootSchema, Schema, SchemaObject};
 use serde_json::json;
@@ -33,11 +40,13 @@ use serde_json::json;
 const SCHEMA_DIR: &str = "proto/schema";
 /// Where the control protocol's golden lines go.
 const CONTROL_LINES: &str = "proto/testdata/control-v1.jsonl";
+/// Where the sensor stream's golden frames go.
+const SENSOR_LINES: &str = "proto/testdata/sensor-v1.jsonl";
 
 /// The session id every example names.
 const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-/// Writes the three schemas and the golden lines.
+/// Writes the four schemas and the golden lines.
 pub fn run() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -48,6 +57,7 @@ pub fn run() -> Result<()> {
         ("control-v1.json", control_schema()),
         ("audit-v1.json", audit_schema()),
         ("guest-v1.json", guest_schema()),
+        ("sensor-v1.json", sensor_schema()),
     ] {
         let path = schemas.join(name);
         let mut text = serde_json::to_string_pretty(&schema)?;
@@ -58,6 +68,9 @@ pub fn run() -> Result<()> {
     let lines = root.join(CONTROL_LINES);
     fs::write(&lines, control_lines()?).with_context(|| format!("write {}", lines.display()))?;
     println!("wrote {}", lines.display());
+    let frames = root.join(SENSOR_LINES);
+    fs::write(&frames, sensor_lines()?).with_context(|| format!("write {}", frames.display()))?;
+    println!("wrote {}", frames.display());
     Ok(())
 }
 
@@ -166,6 +179,187 @@ pub fn guest_schema() -> RootSchema {
     )
 }
 
+/// The sensor stream: a frame is a `SensorFrame`, whose `type` and `data`
+/// are the audit `Payload`'s.
+pub fn sensor_schema() -> RootSchema {
+    let mut gen = generator();
+    let frame = gen.subschema_for::<SensorFrame>();
+    gen.subschema_for::<Payload>();
+    root(
+        gen,
+        "boxcar sensor stream v1",
+        "One frame on vsock port 1026 from the guest's sensor to the VMM, its length prefix \
+         not counted: a SensorFrame, whose `type` and `data` are a `proc.*` record's as the \
+         audit Payload shapes them. See docs/audit-events.md.",
+        vec![frame],
+    )
+}
+
+/// The golden frames: one record of each sensor type, as the sensor would
+/// send them during one session, as JSON lines.
+pub fn sensor_lines() -> Result<Vec<u8>> {
+    let subject = Some(Subject {
+        pid: 212,
+        uid: 1000,
+        gid: 1000,
+    });
+    let frame = |ts_guest_ns: u64, subject: Option<Subject>, payload: Payload| SensorFrame {
+        ts_guest_ns,
+        subject,
+        payload,
+    };
+    let frames = [
+        frame(
+            1_000_000_000,
+            None,
+            Payload::ProcSensorStatus(ProcSensorStatus {
+                phase: SensorPhase::Degraded,
+                programs: vec![
+                    ProgramStatus {
+                        name: "sched_process_exec".to_owned(),
+                        attached: true,
+                        error: None,
+                    },
+                    ProgramStatus {
+                        name: "file_open".to_owned(),
+                        attached: false,
+                        error: Some("the hook is not sleepable here".to_owned()),
+                    },
+                ],
+                kernel_release: "6.18.54".to_owned(),
+                btf_ok: true,
+                session_cgroup_id: 4242,
+                pid: 77,
+                reason: None,
+            }),
+        ),
+        frame(
+            1_500_000_000,
+            Some(Subject {
+                pid: 200,
+                uid: 1000,
+                gid: 1000,
+            }),
+            Payload::ProcFork(ProcFork {
+                parent_tid: 200,
+                parent_tgid: 200,
+                child_pid: 212,
+                child_start_ns: 1_499_990_000,
+                uid: 1000,
+                gid: 1000,
+                thread: false,
+            }),
+        ),
+        frame(
+            1_500_100_000,
+            subject,
+            Payload::ProcExec(ProcExec {
+                tid: 212,
+                tgid: 212,
+                ppid: 200,
+                uid: 1000,
+                gid: 1000,
+                filename: "/usr/bin/curl".to_owned(),
+                argv: ["curl", "-sS", "https://example.com/"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                argv_truncated: false,
+                start_ns: 1_499_990_000,
+                cgroup_id: 4242,
+            }),
+        ),
+        frame(
+            1_500_200_000,
+            subject,
+            Payload::ProcConnectAttempt(ProcConnectAttempt {
+                tid: 212,
+                tgid: 212,
+                family: 2,
+                proto: "tcp".to_owned(),
+                dst: "93.184.215.14".parse().ok(),
+                dst_port: Some(443),
+            }),
+        ),
+        frame(
+            1_500_200_500,
+            subject,
+            Payload::ProcTcpConnect(ProcTcpConnect {
+                tid: 212,
+                tgid: 212,
+                src: "10.0.2.15"
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                src_port: 40000,
+                dst: "93.184.215.14"
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                dst_port: 443,
+            }),
+        ),
+        frame(
+            1_600_000_000,
+            subject,
+            Payload::ProcFileOpen(ProcFileOpen {
+                tid: 212,
+                tgid: 212,
+                path: "/dev/shm/stage".to_owned(),
+                flags: 0o100002,
+                sample: 64,
+            }),
+        ),
+        frame(
+            1_600_100_000,
+            subject,
+            Payload::ProcMemfd(ProcMemfd {
+                tid: 212,
+                tgid: 212,
+                name: "stage".to_owned(),
+                flags: 1,
+            }),
+        ),
+        frame(
+            1_700_000_000,
+            subject,
+            Payload::ProcLsmDeny(ProcLsmDeny {
+                tid: 212,
+                tgid: 212,
+                hook: "bpf".to_owned(),
+                detail: 5,
+            }),
+        ),
+        frame(
+            1_800_000_000,
+            subject,
+            Payload::ProcExit(ProcExit {
+                tid: 212,
+                tgid: 212,
+                exit_code: 256,
+                group_dead: true,
+                start_ns: 1_499_990_000,
+            }),
+        ),
+        frame(
+            2_000_000_000,
+            None,
+            Payload::ProcHeartbeat(ProcHeartbeat {
+                uptime_ns: 1_000_000_000,
+                events_emitted: 8,
+                ringbuf_drops: 0,
+                frames_sent: 10,
+            }),
+        ),
+    ];
+    let mut out = Vec::new();
+    for frame in &frames {
+        frame
+            .check()
+            .with_context(|| format!("the {} example", frame.payload.kind()))?;
+        out.extend(serde_json::to_vec(frame)?);
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
 /// A record as the log would hold it, for the `audit` event's example.
 fn example_record() -> Record {
     Record {
@@ -218,7 +412,9 @@ pub fn control_lines() -> Result<Vec<u8>> {
         out.extend(message.line()?);
         Ok(())
     };
-    let capabilities = ["pty", "audit", "policy.net"].map(str::to_owned).to_vec();
+    let capabilities = ["pty", "audit", "policy.net", "findings"]
+        .map(str::to_owned)
+        .to_vec();
     line(&Ready {
         ready: true,
         control: format!("/run/user/1000/boxcar/{SESSION}/control.sock"),
@@ -246,6 +442,11 @@ pub fn control_lines() -> Result<Vec<u8>> {
         devices: ["fs:root", "fs:workspace", "net", "vsock"]
             .map(str::to_owned)
             .to_vec(),
+        sensor: SensorStatus {
+            state: SensorState::Attached,
+            heartbeats: 61,
+            last_heartbeat_ns: Some(1_700_000_000_000_000_000),
+        },
     };
     line(&Response::success(1, serde_json::to_value(&status)?))?;
 
@@ -293,6 +494,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
             from_seq: Some(1),
             types: vec!["net.".to_owned()],
             pid: Some(212),
+            min_score: Some(70),
         })?,
     ))?;
     line(&Response::success(
@@ -439,6 +641,8 @@ mod tests {
             "PolicyUpdated",
             "Ready",
             "Record",
+            "SensorStatus",
+            "SensorState",
         ] {
             assert!(control.definitions.contains_key(name), "control: {name}");
         }
@@ -474,6 +678,12 @@ mod tests {
             "NetConnect",
             "FsClose",
             "PolicyChanged",
+            "ClockSync",
+            "ProcExec",
+            "ProcSensorStatus",
+            "Finding",
+            "FindingCategory",
+            "Evidence",
         ] {
             assert!(audit.definitions.contains_key(name), "audit: {name}");
         }
@@ -486,6 +696,53 @@ mod tests {
         for name in ["GuestMsg", "HostMsg", "SessionConfig", "LogLevel"] {
             assert!(guest.definitions.contains_key(name), "guest: {name}");
         }
+
+        let sensor = sensor_schema();
+        for name in [
+            "SensorFrame",
+            "Payload",
+            "Subject",
+            "ProcExec",
+            "ProcHeartbeat",
+        ] {
+            assert!(sensor.definitions.contains_key(name), "sensor: {name}");
+        }
+        assert_eq!(
+            sensor.schema.reference.as_deref(),
+            Some("#/definitions/SensorFrame")
+        );
+    }
+
+    /// One frame of each sensor record type, every one a frame the stream
+    /// accepts.
+    #[test]
+    fn the_sensor_lines_cover_every_proc_type() {
+        let text = String::from_utf8(sensor_lines().unwrap()).unwrap();
+        let mut kinds: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let frame: SensorFrame = serde_json::from_str(line).unwrap();
+                frame.check().unwrap();
+                frame.payload.kind().to_owned()
+            })
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [
+                "proc.connect_attempt",
+                "proc.exec",
+                "proc.exit",
+                "proc.file_open",
+                "proc.fork",
+                "proc.heartbeat",
+                "proc.lsm_deny",
+                "proc.memfd",
+                "proc.sensor_status",
+                "proc.tcp_connect",
+            ]
+        );
+        assert_eq!(sensor_lines().unwrap(), sensor_lines().unwrap());
     }
 
     /// The output is the same every time: CI compares it with what is

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "xtask"]
+# The eBPF programs build for bpfel-unknown-none on a pinned nightly, through
+# boxcar-sensor's build.rs: a crate of their own, with their own lock file,
+# so the stable `--workspace` commands never touch them.
+exclude = ["crates/boxcar-sensor-ebpf"]
 
 [workspace.package]
 edition = "2021"
@@ -21,6 +25,7 @@ boxcar-fs = { path = "crates/boxcar-fs" }
 boxcar-vmm = { path = "crates/boxcar-vmm" }
 boxcar-net = { path = "crates/boxcar-net" }
 boxcar-vsock = { path = "crates/boxcar-vsock" }
+boxcar-sensor-common = { path = "crates/boxcar-sensor-common" }
 
 # rust-vmm and fuse-backend-rs: exact pins, one coherent vm-memory 0.17 set.
 # crates.io only: no git dependencies and no [patch] sections.
@@ -55,6 +60,13 @@ cpio = "0.4"   # xtask only
 tempfile = "3" # dev only
 
 # The user-mode network stack (boxcar-net).
+# The guest sensor (M3): aya loads the eBPF programs in the guest, aya-build
+# builds them from boxcar-sensor's build.rs, aya-obj parses the built object
+# on the host for the eBPF lane's checks.
+aya = "0.14"
+aya-obj = "0.3"
+aya-build = "0.2"
+
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-raw"] }
 socket2 = { version = "0.5", features = ["all"] }
 arc-swap = "1"

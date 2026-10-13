@@ -349,6 +349,7 @@ impl Ops for VmmOps {
             "pty".to_owned(),
             "audit".to_owned(),
             "policy.net".to_owned(),
+            "findings".to_owned(),
         ]
     }
 }
@@ -516,7 +517,10 @@ mod tests {
         let handle = fixture.handle.clone();
         let ops = VmmOps::new(handle.clone());
         assert_eq!(ops.status(), handle.status());
-        assert_eq!(ops.capabilities(), ["pty", "audit", "policy.net"]);
+        assert_eq!(
+            ops.capabilities(),
+            ["pty", "audit", "policy.net", "findings"]
+        );
 
         let mut conn = ConnCtx::new(1, 0);
         let other = Request::new(1, "pty.detach", Value::Null);
@@ -640,7 +644,7 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net"])
+            json!(["pty", "audit", "policy.net", "findings"])
         );
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
         assert_eq!(response["result"]["raw"], true, "{response}");
@@ -966,7 +970,7 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net"])
+            json!(["pty", "audit", "policy.net", "findings"])
         );
 
         // The response comes first, though the log has records to send.
@@ -1218,7 +1222,7 @@ mod tests {
         let mut wire = Wire::new(&fixture);
         assert_eq!(
             wire.hello["capabilities"],
-            json!(["pty", "audit", "policy.net"])
+            json!(["pty", "audit", "policy.net", "findings"])
         );
         let before = wire.request("policy.get", Value::Null);
         assert_eq!(

@@ -1,7 +1,10 @@
 [licenses]
 # The graph's needs and nothing more: every listed license is used by at least
 # one crate. Add a license only after deciding it belongs in a shipped binary.
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "0BSD"]
+# Zlib: foldhash, hashbrown's hasher, reached through aya and object (M3, the
+# guest sensor and the eBPF lane); permissive, with no notice requirement
+# beyond the source.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "0BSD", "Zlib"]
 
 [bans]
 multiple-versions = "deny"

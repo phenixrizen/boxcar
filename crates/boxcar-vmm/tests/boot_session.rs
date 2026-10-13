@@ -336,7 +336,14 @@ fn the_session_exit_code_and_output_come_back() {
             )
         })
         .collect();
-    assert_eq!(connects, [(1024, 1023), (1025, 1022)], "{records:?}");
+    // Init's two, and the sensor's: 1026 from 1021 (see `boot_sensor`).
+    let mut connects = connects;
+    connects.sort_unstable();
+    assert_eq!(
+        connects,
+        [(1024, 1023), (1025, 1022), (1026, 1021)],
+        "{records:?}"
+    );
 }
 
 #[test]
