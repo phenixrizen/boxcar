@@ -36,8 +36,8 @@ python3 scripts/codex_review.py "<focus: the risks this change touches>"
   reconciler scenario, a gated run) or traced in the code before it is
   fixed; one the code refutes is answered with the lines that refute it.
 - The pull request's body lists the findings and what became of each. One
-  outside the change's scope goes to the next milestone's plan, never
-  dropped silently.
+  outside the change's scope becomes an issue (below), never dropped
+  silently.
 - A security finding (a way for the guest or anyone else to gain access,
   read what it should not, alter or escape the audit, or deny service)
   never goes into this repository, a pull request, a commit message or a
@@ -47,3 +47,40 @@ python3 scripts/codex_review.py "<focus: the risks this change touches>"
   No security fix starts without the owner's go-ahead.
 - When the review cannot run (no login, no network), the pull request says
   so: a limitation, not a pass.
+
+## Issues and the board
+
+The backlog is the repository's GitHub issues, on the `boxcar` project
+board (phenixrizen's GitHub Projects), kanban style: Backlog, Ready, In
+progress, In review, Done. There is no todo file.
+
+- Every bug known and every feature or limitation set aside is an issue,
+  labelled `bug` or `enhancement` and with one `area: ...` label (`fs`,
+  `vmm`, `net`, `gate`, `sensor`, `reconciler`, `audit`, `cli`, `tests`,
+  `docs`; add one when a part of the project has none), on the board in
+  Backlog. A milestone plan's tasks become issues once the owner accepts
+  the plan.
+- An issue says what is wrong or wanted, how to see it, what is expected,
+  and the cause as far as it is known. Write each paragraph on one line:
+  GitHub shows every newline in an issue body as a break.
+- A bug found while working is fixed in that round, not parked. It still
+  gets an issue, In progress, closed by the fix's pull request.
+- A card moves to In progress when its branch starts, to In review when
+  the pull request opens, and to Done when it merges. The pull request's
+  body says `Fixes #N` for each issue it closes, so the merge closes them.
+- A review finding outside the change's scope becomes an issue (see
+  Reviews).
+- The exception is a security finding, as defined under Reviews: it never
+  becomes an issue, a card, pull request text or a commit message until
+  its fix has shipped. It stays in the owner's private security-findings
+  document, which keeps its status.
+- An agent that only commits locally reports the issues it would open;
+  whoever pushes opens them and moves the cards.
+
+```bash
+gh issue create -R phenixrizen/boxcar --title "..." --body-file body.md \
+    --label enhancement --label "area: gate"
+```
+
+The board needs the `project` scope on the gh token
+(`gh auth refresh -h github.com -s project`); issues and labels do not.
