@@ -2061,16 +2061,22 @@ mod tests {
             .collect()
     }
 
+    /// Waits for a thread named `name`: a new thread names itself once it
+    /// runs, and until then has its parent's name.
+    fn wait_for_thread(name: &str) {
+        let deadline = Instant::now() + THREAD_LIMIT;
+        while !thread_names().iter().any(|n| n == name) {
+            assert!(Instant::now() < deadline, "no {name}: {:?}", thread_names());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn rx_stops_when_no_chain_is_free_and_resumes_on_kick() {
         let session = Session::new();
         let mut driver = Driver::new(session.device());
         driver.handshake();
-        assert!(
-            thread_names().iter().any(|n| n == "net"),
-            "{:?}",
-            thread_names()
-        );
+        wait_for_thread("net");
         let mem = driver.mem.clone();
         let rx = queue_mock(&mem, RX_QUEUE as u32);
         let tx = queue_mock(&mem, TX_QUEUE as u32);
@@ -2140,10 +2146,15 @@ mod tests {
         let dst = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 80);
         for port in [40_000, 40_001] {
             let mem = driver.mem.clone();
-            // The driver sets its rings up afresh, used rings included.
+            // The driver sets its rings up afresh, available and used: a
+            // ring left as the last activation had it would hand the new
+            // one the last SYN again.
             for q in [RX_QUEUE, TX_QUEUE] {
-                let used = queue_start(q as u32).0 + USED_RING_OFFSET;
-                mem.write_obj(0u32, GuestAddress(used)).unwrap();
+                let start = queue_start(q as u32).0;
+                let avail = start + 16 * u64::from(QUEUE_LEN);
+                mem.write_obj(0u32, GuestAddress(avail)).unwrap();
+                mem.write_obj(0u32, GuestAddress(start + USED_RING_OFFSET))
+                    .unwrap();
             }
             driver.handshake();
             let tx = queue_mock(&mem, TX_QUEUE as u32);
