@@ -129,32 +129,49 @@ pub fn scrub_argv(argv: &[String]) -> Vec<String> {
 /// secret-looking name (`--cookie=a; b=c`, `API_TOKEN=a b`,
 /// `Authorization: Basic a b`) or to a user flag (`--user=alice:pw`)
 /// taken whole first: in an argv neither a space nor a `;` ends the
-/// value. A secret name goes first, so a single-dash option that starts
-/// like `-u` (`-user-password=a b:c`) is not read as a user flag.
+/// value. A secret name's value goes first, and what is left goes on
+/// through the user-flag and text rules, so a name that is itself a
+/// credential (`-u<key>:pw`) is not kept, nor a single-dash option that
+/// starts like `-u` (`-user-password=a b:c`) read as a user flag.
 fn scrub_arg(arg: &str) -> String {
-    if let Some(name) = attached_secret(arg) {
-        return format!("{name}{REDACTED}");
-    }
+    let whole;
+    let arg = match attached_secret(arg) {
+        Some(name) => {
+            whole = format!("{name}{REDACTED}");
+            whole.as_str()
+        }
+        None => arg,
+    };
     match attached_user(arg) {
         Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
         None => scrub_text(arg),
     }
 }
 
-/// The name of a word that gives a secret-looking name a value after its
-/// first `=` or `:`, the separator included; none when the value is
-/// empty. The name may start with `-`, `+` or `/` (`--cookie`, `+token`,
-/// `/password`), be quoted (`'password'`), and hold dots (a property's
-/// `-Ddb.password`); `Basic`, an auth scheme, counts as secret.
+/// The name of a word that gives a secret-looking name a value after a
+/// `=` or `:`, the separator included; none when the value is empty. The
+/// separators are tried from the first, so the most is taken:
+/// `--password:a=b` loses `a=b`, and `--Db:Password=a b` (a namespaced
+/// key) loses `a b`. The name may start with `-`, `+` or `/` (`--cookie`,
+/// `+token`, `/password`), be quoted (`'password'`), and hold dots and
+/// colons (`-Ddb.password`, `Db:Password`); `Basic`, an auth scheme,
+/// counts as secret.
 fn attached_secret(word: &str) -> Option<&str> {
-    let at = word.find(['=', ':'])?;
-    let (name, value) = (&word[..at], &word[at + 1..]);
-    let bare = unquoted(name.trim_start_matches(['-', '+', '/']));
-    let secret = !value.is_empty()
-        && !bare.is_empty()
-        && bare.chars().all(|c| is_key_char(c) || c == '.')
-        && (is_secret_key(bare) || bare.eq_ignore_ascii_case("basic"));
-    secret.then_some(&word[..=at])
+    let mut seps = [word.find('='), word.find(':')];
+    seps.sort();
+    seps.into_iter()
+        .flatten()
+        .find(|&at| {
+            let (name, value) = (&word[..at], &word[at + 1..]);
+            let bare = unquoted(name.trim_start_matches(['-', '+', '/']));
+            !value.is_empty()
+                && !bare.is_empty()
+                && bare
+                    .chars()
+                    .all(|c| is_key_char(c) || matches!(c, '.' | ':'))
+                && (is_secret_key(bare) || bare.eq_ignore_ascii_case("basic"))
+        })
+        .map(|at| &word[..=at])
 }
 
 /// `name` without the matching quotes around it, if it has them.
@@ -887,6 +904,8 @@ mod tests {
             "Basic=alpha beta",
             "Authorization: Bearer alpha beta",
             "-user-password=alpha beta:gamma",
+            "--Db:Password=alpha beta",
+            "--Service:ApiKey=alpha;beta",
             "--output=two words",
             "LANG=C.UTF-8",
             "https://x.test/?a=b c",
@@ -908,6 +927,8 @@ mod tests {
             "Basic=[redacted]",
             "Authorization:[redacted]",
             "-user-password=[redacted]",
+            "--Db:Password=[redacted]",
+            "--Service:ApiKey=[redacted]",
             "--output=two words",
             "LANG=C.UTF-8",
             "https://x.test/?a=b c",
@@ -918,6 +939,18 @@ mod tests {
         assert_eq!(v, json!({"argv": want}));
         let again: Vec<String> = want.map(str::to_owned).to_vec();
         assert_eq!(scrub_argv(&again), want, "scrubbing is stable");
+        // A user that is itself a credential goes with the password.
+        let key = ["sk", "test", "a1B2c3D4e5F6g7H8i9J0k1L2"].join("_");
+        for scrubbed in [
+            scrub_argv(&[format!("-u{key}:x")]),
+            scrub_argv(&[format!("-u{key}x:x")]),
+        ] {
+            assert!(
+                !scrubbed[0].contains("a1B2c3D4e5F6g7H8i9J0k1L2"),
+                "{scrubbed:?}"
+            );
+            assert!(scrubbed[0].ends_with(":[redacted]"), "{scrubbed:?}");
+        }
         // A flag with a `:` in it may still take the next argument as its
         // value: both go.
         for (argv, want) in [
