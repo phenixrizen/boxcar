@@ -125,31 +125,46 @@ pub fn scrub_argv(argv: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// One whole argument through [`scrub_text`], a value attached with `=`
-/// to a user flag (`--user=alice:pw`) or to a secret-looking name
-/// (`--cookie=a; b=c`, `API_TOKEN=a b`) taken whole first: in an argv
-/// neither a space nor a `;` ends the value.
+/// One whole argument through [`scrub_text`], a value attached to a
+/// secret-looking name (`--cookie=a; b=c`, `API_TOKEN=a b`,
+/// `Authorization: Basic a b`) or to a user flag (`--user=alice:pw`)
+/// taken whole first: in an argv neither a space nor a `;` ends the
+/// value. A secret name goes first, so a single-dash option that starts
+/// like `-u` (`-user-password=a b:c`) is not read as a user flag.
 fn scrub_arg(arg: &str) -> String {
-    if let Some((flag, value)) = attached_user(arg) {
-        return format!("{flag}{}", scrub_text(&user_value(value)));
+    if let Some(name) = attached_secret(arg) {
+        return format!("{name}{REDACTED}");
     }
-    match attached_secret(arg) {
-        Some(name) => format!("{name}={REDACTED}"),
+    match attached_user(arg) {
+        Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
         None => scrub_text(arg),
     }
 }
 
-/// The name of a word that gives a secret-looking name (`--cookie`,
-/// `-token`, `API_TOKEN`, a property's `-Ddb.password`) a value after
-/// `=`; none when the value is empty.
+/// The name of a word that gives a secret-looking name a value after its
+/// first `=` or `:`, the separator included; none when the value is
+/// empty. The name may start with `-`, `+` or `/` (`--cookie`, `+token`,
+/// `/password`), be quoted (`'password'`), and hold dots (a property's
+/// `-Ddb.password`); `Basic`, an auth scheme, counts as secret.
 fn attached_secret(word: &str) -> Option<&str> {
-    let (name, value) = word.split_once('=')?;
-    let bare = name.trim_start_matches('-');
+    let at = word.find(['=', ':'])?;
+    let (name, value) = (&word[..at], &word[at + 1..]);
+    let bare = unquoted(name.trim_start_matches(['-', '+', '/']));
     let secret = !value.is_empty()
         && !bare.is_empty()
         && bare.chars().all(|c| is_key_char(c) || c == '.')
-        && is_secret_key(bare);
-    secret.then_some(name)
+        && (is_secret_key(bare) || bare.eq_ignore_ascii_case("basic"));
+    secret.then_some(&word[..=at])
+}
+
+/// `name` without the matching quotes around it, if it has them.
+fn unquoted(name: &str) -> &str {
+    for q in ['\'', '"'] {
+        if let Some(inner) = name.strip_prefix(q).and_then(|n| n.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    name
 }
 
 /// Flags whose value is `user:password` (curl's, wget's): `-u`,
@@ -243,11 +258,13 @@ fn word_end(text: &str, start: usize) -> usize {
     text.len()
 }
 
-/// `--token`, `-password`: a flag, without a value of its own, whose name
-/// looks like a secret's.
+/// `--token`, `-password`: a flag, without a value of its own (none after
+/// `=`, nor after `:` as in `--password:pw`), whose name looks like a
+/// secret's.
 fn is_secret_flag(arg: &str) -> bool {
     arg.starts_with('-')
         && !arg.contains('=')
+        && attached_secret(arg).is_none()
         && arg.len() > 1
         && is_secret_key(arg.trim_start_matches('-'))
 }
@@ -864,6 +881,13 @@ mod tests {
             "API_TOKEN=a b",
             "-Ddb.password=first second",
             "-Dapp.cookie=a; b=c",
+            "/password=alpha beta",
+            "+password=alpha beta",
+            "'password'=alpha beta",
+            "--password:alpha'beta",
+            "Basic=alpha beta",
+            "Authorization: Bearer alpha beta",
+            "-user-password=alpha beta:gamma",
             "--output=two words",
             "LANG=C.UTF-8",
             "https://x.test/?a=b c",
@@ -879,6 +903,13 @@ mod tests {
             "API_TOKEN=[redacted]",
             "-Ddb.password=[redacted]",
             "-Dapp.cookie=[redacted]",
+            "/password=[redacted]",
+            "+password=[redacted]",
+            "'password'=[redacted]",
+            "--password:[redacted]",
+            "Basic=[redacted]",
+            "Authorization:[redacted]",
+            "-user-password=[redacted]",
             "--output=two words",
             "LANG=C.UTF-8",
             "https://x.test/?a=b c",
