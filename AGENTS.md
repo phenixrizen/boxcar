@@ -57,7 +57,7 @@ python3 scripts/codex_review.py "<focus: the risks this change touches>"
   exposes it, needs it fixed or makes a test fail; see Issues and the
   board) is fixed before the change merges, where One change per pull
   request puts it: on the branch when the change introduces it or it is
-  in the change's own code, in a pull request of its own that merges
+  in code the change touches, in a pull request of its own that merges
   first when it is a defect already on `main` in code the change does not
   otherwise touch. One that is independent of the change is split off (an
   issue, or the private document for a security finding, and the owner's
@@ -118,15 +118,17 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
   leads, who asks. A security finding, the change's or not, follows the
   same ask but goes to the owner's private document instead of an issue,
   and its fix waits for the owner's go-ahead (see Reviews).
-- **One change per pull request.** A bug fixed now that lies in code the
-  change does not otherwise touch and is already on `main` (one the owner
-  said to fix now, or a defect the change exposes or needs fixed there)
-  gets its own branch and pull request from `main`, not more commits on
-  the change's branch, so each review stays on one thing. When the change
-  depends on that fix (it exposes or needs it), that pull request merges
-  first, and the change, rebased on it, is tested and reviewed again
-  before it merges. A defect the change introduces, wherever it shows, is
-  fixed on its branch, as is any in the change's own code.
+- **One change per pull request.** A bug the owner said to fix now, being
+  independent of the change, gets its own branch and pull request from
+  `main`, even in code the change touches; so does a defect already on
+  `main` that the change exposes or needs fixed in code the change does
+  not otherwise touch. Neither becomes more commits on the change's
+  branch, so each review stays on one thing. When the change depends on
+  such a fix (it exposes or needs it), that pull request merges first,
+  and the change, rebased on it, is tested and reviewed again before it
+  merges. Any other bug in the current stream of work (one the change
+  introduces, wherever it shows, or one in code the change touches) is
+  fixed on its branch.
 - An issue's card goes through one order:
   1. In progress while the work is under way, from its branch's start. A
      pull request that does only part of it says `Part of #N` and closes
