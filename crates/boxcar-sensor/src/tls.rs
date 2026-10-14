@@ -19,7 +19,7 @@
 //! result is in.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::ops::Range;
@@ -322,9 +322,11 @@ fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
         .metadata()
         .map_err(|error| format!("stat: {error}"))?
         .len();
-    let data = Budgeted::new(&file, len);
-    let offsets = symbols(&data);
-    if data.over.get() {
+    let (offsets, over) = {
+        let data = Budgeted::new(&file, len);
+        (symbols(&data), data.over.get())
+    };
+    if over {
         return Err(format!(
             "its symbols take more than {} MiB to read",
             MAX_READ_BYTES >> 20
@@ -336,13 +338,16 @@ fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
 /// A file read on demand for object's parser, each read kept in a buffer
 /// of its own for the parse and charged against [`MAX_READ_BYTES`] before
 /// it is made: past the budget a read fails and nothing more is read.
-/// Nothing is shared or rehashed, so what it holds is what it charged.
+/// Nothing is rehashed or copied, so what it holds is what it charged. A
+/// range read twice gives the same bytes, so what [`section_count`]
+/// checks is what object parses, whatever a writer does to the file.
 struct Budgeted<'f> {
     file: &'f File,
     len: u64,
-    /// Every read, kept until the parse is done: a slice object holds
-    /// points into one of these boxes, whose bytes never move.
-    kept: RefCell<Vec<Box<[u8]>>>,
+    /// Every range read, by offset and size, owned here until drop.
+    ranges: RefCell<BTreeMap<(u64, u64), *mut [u8]>>,
+    /// Every name read, owned here until drop.
+    names: RefCell<Vec<*mut [u8]>>,
     left: Cell<u64>,
     over: Cell<bool>,
 }
@@ -352,7 +357,8 @@ impl<'f> Budgeted<'f> {
         Budgeted {
             file,
             len,
-            kept: RefCell::new(Vec::new()),
+            ranges: RefCell::new(BTreeMap::new()),
+            names: RefCell::new(Vec::new()),
             left: Cell::new(MAX_READ_BYTES),
             over: Cell::new(false),
         }
@@ -375,16 +381,6 @@ impl<'f> Budgeted<'f> {
         self.left.set(self.left.get().saturating_add(bytes));
     }
 
-    /// Keeps `bytes` for the rest of the parse and lends them out.
-    fn keep(&self, bytes: Box<[u8]>) -> &[u8] {
-        let lent: *const [u8] = &*bytes;
-        self.kept.borrow_mut().push(bytes);
-        // SAFETY: the box's bytes stay where they are while it is in
-        // `kept`, which only grows and is dropped with `self`; nothing
-        // writes to them after this.
-        unsafe { &*lent }
-    }
-
     /// Reads up to `buf.len()` bytes at `offset`, fewer only at the end
     /// of the file.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, ()> {
@@ -401,6 +397,29 @@ impl<'f> Budgeted<'f> {
     }
 }
 
+impl Drop for Budgeted<'_> {
+    fn drop(&mut self) {
+        let ranges = std::mem::take(self.ranges.get_mut());
+        let names = std::mem::take(self.names.get_mut());
+        for owned in ranges.into_values().chain(names) {
+            // SAFETY: each pointer came from `Box::into_raw` and is freed
+            // here once; no slice lent from it outlives `self`.
+            drop(unsafe { Box::from_raw(owned) });
+        }
+    }
+}
+
+/// `owned`'s bytes, lent for as long as the store that owns it.
+///
+/// # Safety
+///
+/// `owned` came from `Box::into_raw`, is held by a [`Budgeted`] that frees
+/// it only when dropped, and is never written again.
+unsafe fn lend<'a>(owned: *mut [u8]) -> &'a [u8] {
+    // SAFETY: as the caller promises.
+    unsafe { &*owned }
+}
+
 impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
     fn len(self) -> Result<u64, ()> {
         Ok(self.len)
@@ -410,6 +429,10 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
         if size == 0 {
             return Ok(&[]);
         }
+        if let Some(&owned) = self.ranges.borrow().get(&(offset, size)) {
+            // SAFETY: an owned read of this store, never written again.
+            return Ok(unsafe { lend(owned) });
+        }
         if offset.checked_add(size).is_none_or(|end| end > self.len) {
             return Err(());
         }
@@ -418,7 +441,10 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
         if self.read_at(&mut bytes, offset)? != bytes.len() {
             return Err(());
         }
-        Ok(self.keep(bytes))
+        let owned = Box::into_raw(bytes);
+        self.ranges.borrow_mut().insert((offset, size), owned);
+        // SAFETY: just made from a box and kept by this store.
+        Ok(unsafe { lend(owned) })
     }
 
     fn read_bytes_at_until(self, range: Range<u64>, delimiter: u8) -> Result<&'a [u8], ()> {
@@ -434,7 +460,10 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
         };
         bytes.truncate(end);
         self.refund(most - end as u64);
-        Ok(self.keep(bytes.into_boxed_slice()))
+        let owned = Box::into_raw(bytes.into_boxed_slice());
+        self.names.borrow_mut().push(owned);
+        // SAFETY: just made from a box and kept by this store.
+        Ok(unsafe { lend(owned) })
     }
 }
 
@@ -944,6 +973,39 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.contains("more than 64 MiB"), "{error}");
         assert!(peak < MAX_READ_BYTES as usize, "{peak}");
+    }
+
+    /// A range read twice gives the bytes of its first read: a header
+    /// rewritten on disk between the section check and the parse (to
+    /// declare a million sections) is not what object parses.
+    #[test]
+    fn the_parse_sees_the_header_the_check_saw() {
+        let shell = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .unwrap();
+        let elf = fs::read(fs::canonicalize(shell).unwrap()).unwrap();
+        let declared = usize::from(u16::from_le_bytes([elf[0x3c], elf[0x3d]]));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("libssl.so.3");
+        fs::write(&path, &elf).unwrap();
+        let file = File::open(&path).unwrap();
+        let data = Budgeted::new(&file, elf.len() as u64);
+        assert_eq!(section_count(&data).unwrap(), declared);
+        let mut changed = elf.clone();
+        changed[0x3c..0x3e].copy_from_slice(&0u16.to_le_bytes());
+        let first = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        changed[first + 0x20..first + 0x28].copy_from_slice(&1_000_000u64.to_le_bytes());
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(&changed[..first + 64], 0)
+            .unwrap();
+        assert_eq!(section_count(&data).unwrap(), declared);
+        let obj = object::File::parse(&data).unwrap();
+        // object leaves out section 0, the null one.
+        assert_eq!(obj.sections().count(), declared - 1);
     }
 
     /// The host's OpenSSL resolves within a small part of the budget.
