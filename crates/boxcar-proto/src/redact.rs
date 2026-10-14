@@ -125,14 +125,31 @@ pub fn scrub_argv(argv: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// One whole argument through [`scrub_text`], a user flag with its value
-/// attached (`--user=alice:pw`) taken whole first: in an argv a space
-/// does not end the value.
+/// One whole argument through [`scrub_text`], a value attached with `=`
+/// to a user flag (`--user=alice:pw`) or to a secret-looking name
+/// (`--cookie=a; b=c`, `API_TOKEN=a b`) taken whole first: in an argv
+/// neither a space nor a `;` ends the value.
 fn scrub_arg(arg: &str) -> String {
-    match attached_user(arg) {
-        Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
+    if let Some((flag, value)) = attached_user(arg) {
+        return format!("{flag}{}", scrub_text(&user_value(value)));
+    }
+    match attached_secret(arg) {
+        Some(name) => format!("{name}={REDACTED}"),
         None => scrub_text(arg),
     }
+}
+
+/// The name of a word that gives a secret-looking name (`--cookie`,
+/// `-token`, `API_TOKEN`) a value after `=`; none when the value is
+/// empty.
+fn attached_secret(word: &str) -> Option<&str> {
+    let (name, value) = word.split_once('=')?;
+    let bare = name.trim_start_matches('-');
+    let secret = !value.is_empty()
+        && !bare.is_empty()
+        && bare.chars().all(is_key_char)
+        && is_secret_key(bare);
+    secret.then_some(name)
 }
 
 /// Flags whose value is `user:password` (curl's, wget's): `-u`,
@@ -740,7 +757,7 @@ mod tests {
         let mut v = json!({"command": argv});
         scrub_deep(&mut v);
         assert_eq!(v, json!({"command": want}));
-        // The flag with its value in one argument is the text rule's.
+        // The flag with its value in one argument loses the value too.
         assert_eq!(
             scrub_argv(&["--token=abc".to_owned(), "x".to_owned()]),
             ["--token=[redacted]", "x"]
@@ -834,6 +851,40 @@ mod tests {
             scrub_text("curl --user='alice:short pass' x"),
             "curl --user='alice:[redacted]' x"
         );
+    }
+
+    #[test]
+    fn a_value_attached_to_a_secret_name_is_taken_whole_in_an_argv() {
+        let argv: Vec<String> = [
+            "curl",
+            "--cookie=theme=light; session=demo",
+            "--password=two words",
+            "-token='quoted' and, punctuated; too",
+            "--api-key=",
+            "API_TOKEN=a b",
+            "--output=two words",
+            "LANG=C.UTF-8",
+            "https://x.test/?a=b c",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let want = [
+            "curl",
+            "--cookie=[redacted]",
+            "--password=[redacted]",
+            "-token=[redacted]",
+            "--api-key=",
+            "API_TOKEN=[redacted]",
+            "--output=two words",
+            "LANG=C.UTF-8",
+            "https://x.test/?a=b c",
+        ];
+        assert_eq!(scrub_argv(&argv), want);
+        let mut v = json!({"argv": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}));
+        let again: Vec<String> = want.map(str::to_owned).to_vec();
+        assert_eq!(scrub_argv(&again), want, "scrubbing is stable");
     }
 
     #[test]
