@@ -13,6 +13,10 @@ user's), never the newest copy in the cache.
 
 It reviews the commits origin/main...HEAD (the plugin's --base), not the
 working tree, and waits for the result, in the directory it is run from.
+It first fetches the base's remote and refuses a branch that is behind its
+base, or one whose base cannot be fetched or compared: the review is of
+what will merge, so a branch is rebased onto the current base first (a
+branch stacked on another names that one with --base, once).
 Only --base <ref> (in place of origin/main) and --scope <auto|branch|
 working-tree> may go before the focus; any other flag is refused, the
 plugin's directory options among them, since the installation is chosen
@@ -41,6 +45,65 @@ GIT_LOCAL_ENV = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_P
 
 class NotInstalled(Exception):
     pass
+
+
+class BaseUnknown(Exception):
+    pass
+
+
+class BaseRepeated(Exception):
+    pass
+
+
+def base_of(argv: list[str]) -> str:
+    """The base the review compares with: --base's one value, else origin/main.
+    A second --base is refused: the plugin takes the last, and the check
+    must look at the base the review uses."""
+    found = []
+    for i, a in enumerate(argv):
+        if a == "--base" and i + 1 < len(argv):
+            found.append(argv[i + 1])
+        elif a.startswith("--base="):
+            found.append(a.split("=", 1)[1])
+    if len(found) > 1:
+        raise BaseRepeated("--base is given more than once; give the base the review compares with once")
+    return found[0] if found else "origin/main"
+
+
+def remote_of(base: str, run=subprocess.run, env: dict[str, str] | None = None) -> tuple[str, str]:
+    """The remote whose branch base names, by its full ref
+    (refs/remotes/<remote>/<branch>), and that branch; ("", "") for a local
+    base."""
+    r = run(["git", "rev-parse", "--symbolic-full-name", base], capture_output=True, text=True, env=env)
+    full = r.stdout.strip() if r.returncode == 0 else ""
+    if not full.startswith("refs/remotes/"):
+        return "", ""
+    rest = full[len("refs/remotes/"):]
+    remotes = run(["git", "remote"], capture_output=True, text=True, env=env)
+    names = remotes.stdout.split() if remotes.returncode == 0 else []
+    for name in sorted(names, key=len, reverse=True):
+        if rest.startswith(name + "/"):
+            return name, rest[len(name) + 1:]
+    return "", ""
+
+
+def behind(base: str, run=subprocess.run, env: dict[str, str] | None = None) -> int:
+    """How many commits base has that HEAD lacks, once base's remote is
+    fetched by its own refspec when base is a remote's branch (however it is
+    spelled). A fetch that fails refuses the review: what the remote holds
+    is unknown."""
+    remote, branch = remote_of(base, run, env)
+    if remote:
+        # The branch itself, by refspec: a plain fetch of the remote refreshes only
+        # the refspecs the checkout is configured with (a single-branch clone's one).
+        f = run(["git", "fetch", "-q", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"],
+                capture_output=True, text=True, env=env)
+        if f.returncode != 0:
+            raise BaseUnknown(f"could not fetch {remote}/{branch} ({f.stderr.strip() or 'fetch failed'}): the review needs the current {base}")
+    r = run(["git", "rev-list", "--count", f"HEAD..{base}"], capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        raise BaseUnknown(f"cannot compare this branch with {base}: {r.stderr.strip() or 'unknown revision'}")
+    return int(r.stdout.strip() or "0")
 
 
 def clean_env(env: dict[str, str]) -> dict[str, str]:
@@ -103,6 +166,16 @@ def main(argv: list[str]) -> int:
     bad = refused_flag(argv)
     if bad:
         sys.stderr.write(f"codex_review: {bad} is refused: only --base and --scope go before the focus; run it from the repository to review\n")
+        return 2
+    try:
+        base = base_of(argv)
+        count = behind(base, env=clean_env(dict(os.environ)))
+    except (BaseRepeated, BaseUnknown) as e:
+        sys.stderr.write(f"codex_review: {e}\n")
+        return 2
+    if count:
+        sys.stderr.write(f"codex_review: this branch is {count} commit{'s' if count != 1 else ''} behind {base}: rebase onto it first, "
+                         "so the review covers what will merge (a branch stacked on another names that one with --base)\n")
         return 2
     try:
         reg = registry_path(dict(os.environ))
