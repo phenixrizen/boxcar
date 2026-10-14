@@ -18,13 +18,13 @@
 //! offsets found, is done on the loop, when the resolver's pipe says a
 //! result is in.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -37,7 +37,7 @@ use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{Payload, ProcTlsAttach};
 use object::elf::{FileHeader32, FileHeader64};
 use object::read::elf::FileHeader;
-use object::read::{ReadCache, ReadRef};
+use object::read::ReadRef;
 use object::{Endianness, Object, ObjectSection, ObjectSymbol};
 
 use crate::status::cut;
@@ -57,10 +57,12 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// at once, however large the file. A runtime with OpenSSL linked in
 /// (Node's 120 MB binary) needs about 25 MiB.
 const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
-/// What a name read costs: object's cache reads at most this much of it.
+/// The most of a name read at once; a longer one is refused, as object's
+/// own cache does.
 const MAX_NAME_READ: u64 = 4096;
-/// What every read costs past its bytes: the cache entry holding it.
-const ENTRY_COST: u64 = 64;
+/// What every read costs past its bytes: the allocator's header for its
+/// buffer and its slot in the list of reads, that list's growth included.
+const ENTRY_COST: u64 = 96;
 /// The most sections a file may declare to be parsed for its symbols:
 /// what object keeps for each section is not a read, so it is bounded by
 /// count. Libraries and programs have a few dozen.
@@ -316,7 +318,11 @@ fn open_regular(path: &Path) -> Result<File, String> {
 /// within [`MAX_READ_BYTES`].
 fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
     let file = open_regular(path)?;
-    let data = Budgeted::new(&file);
+    let len = file
+        .metadata()
+        .map_err(|error| format!("stat: {error}"))?
+        .len();
+    let data = Budgeted::new(&file, len);
     let offsets = symbols(&data);
     if data.over.get() {
         return Err(format!(
@@ -327,19 +333,26 @@ fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
     offsets.map(|offsets| (offsets, file))
 }
 
-/// A file read on demand through object's cache, each read charged
-/// against [`MAX_READ_BYTES`] before it is made: past the budget a read
-/// fails and nothing more is read.
+/// A file read on demand for object's parser, each read kept in a buffer
+/// of its own for the parse and charged against [`MAX_READ_BYTES`] before
+/// it is made: past the budget a read fails and nothing more is read.
+/// Nothing is shared or rehashed, so what it holds is what it charged.
 struct Budgeted<'f> {
-    cache: ReadCache<&'f File>,
+    file: &'f File,
+    len: u64,
+    /// Every read, kept until the parse is done: a slice object holds
+    /// points into one of these boxes, whose bytes never move.
+    kept: RefCell<Vec<Box<[u8]>>>,
     left: Cell<u64>,
     over: Cell<bool>,
 }
 
 impl<'f> Budgeted<'f> {
-    fn new(file: &'f File) -> Budgeted<'f> {
+    fn new(file: &'f File, len: u64) -> Budgeted<'f> {
         Budgeted {
-            cache: ReadCache::new(file),
+            file,
+            len,
+            kept: RefCell::new(Vec::new()),
             left: Cell::new(MAX_READ_BYTES),
             over: Cell::new(false),
         }
@@ -357,24 +370,71 @@ impl<'f> Budgeted<'f> {
             }
         }
     }
+
+    fn refund(&self, bytes: u64) {
+        self.left.set(self.left.get().saturating_add(bytes));
+    }
+
+    /// Keeps `bytes` for the rest of the parse and lends them out.
+    fn keep(&self, bytes: Box<[u8]>) -> &[u8] {
+        let lent: *const [u8] = &*bytes;
+        self.kept.borrow_mut().push(bytes);
+        // SAFETY: the box's bytes stay where they are while it is in
+        // `kept`, which only grows and is dropped with `self`; nothing
+        // writes to them after this.
+        unsafe { &*lent }
+    }
+
+    /// Reads up to `buf.len()` bytes at `offset`, fewer only at the end
+    /// of the file.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, ()> {
+        let mut done = 0;
+        while done < buf.len() {
+            match self.file.read_at(&mut buf[done..], offset + done as u64) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(done)
+    }
 }
 
 impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
     fn len(self) -> Result<u64, ()> {
-        (&self.cache).len()
+        Ok(self.len)
     }
 
     fn read_bytes_at(self, offset: u64, size: u64) -> Result<&'a [u8], ()> {
+        if size == 0 {
+            return Ok(&[]);
+        }
+        if offset.checked_add(size).is_none_or(|end| end > self.len) {
+            return Err(());
+        }
         self.charge(size.saturating_add(ENTRY_COST))?;
-        (&self.cache).read_bytes_at(offset, size)
+        let mut bytes = vec![0; usize::try_from(size).map_err(|_| ())?].into_boxed_slice();
+        if self.read_at(&mut bytes, offset)? != bytes.len() {
+            return Err(());
+        }
+        Ok(self.keep(bytes))
     }
 
     fn read_bytes_at_until(self, range: Range<u64>, delimiter: u8) -> Result<&'a [u8], ()> {
-        self.charge(MAX_NAME_READ + ENTRY_COST)?;
-        let name = (&self.cache).read_bytes_at_until(range, delimiter)?;
-        let unused = MAX_NAME_READ.saturating_sub(name.len() as u64);
-        self.left.set(self.left.get() + unused);
-        Ok(name)
+        if range.start > range.end || range.end > self.len {
+            return Err(());
+        }
+        let most = (range.end - range.start).min(MAX_NAME_READ);
+        self.charge(most + ENTRY_COST)?;
+        let mut bytes = vec![0; most as usize];
+        let read = self.read_at(&mut bytes, range.start)?;
+        let Some(end) = bytes[..read].iter().position(|&b| b == delimiter) else {
+            return Err(());
+        };
+        bytes.truncate(end);
+        self.refund(most - end as u64);
+        Ok(self.keep(bytes.into_boxed_slice()))
     }
 }
 
@@ -831,6 +891,59 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.contains("more than 4096 to parse"), "{error}");
         assert!(peak < 1 << 20, "{peak}");
+    }
+
+    /// A symbol table of 600,000 symbols, each with an address and a name
+    /// of its own (short names, so the reads are many and small): the
+    /// resolver stops at the budget, and what it holds at its peak, every
+    /// buffer and its list of reads included, stays within it.
+    #[test]
+    fn many_small_names_stay_within_the_budget() {
+        let shell = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .unwrap();
+        let mut elf = fs::read(fs::canonicalize(shell).unwrap()).unwrap();
+        let word = |elf: &[u8], at: usize| usize::from(u16::from_le_bytes([elf[at], elf[at + 1]]));
+        let (entry, count) = (word(&elf, 0x3a), word(&elf, 0x3c));
+        let headers = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        const SHT_DYNSYM: u32 = 11;
+        let dynsym = (0..count)
+            .map(|n| headers + n * entry)
+            .find(|&at| u32::from_le_bytes(elf[at + 4..at + 8].try_into().unwrap()) == SHT_DYNSYM)
+            .expect("a dynamic symbol table");
+        let link = u32::from_le_bytes(elf[dynsym + 0x28..dynsym + 0x2c].try_into().unwrap());
+        let dynstr = headers + link as usize * entry;
+        let symbols: u64 = 600_000;
+        elf.resize(elf.len().next_multiple_of(8), 0);
+        let table = elf.len() as u64;
+        for n in 0..symbols {
+            let mut sym = [0u8; 24];
+            sym[0..4].copy_from_slice(&(1 + 2 * n as u32).to_le_bytes());
+            sym[4] = 0x12;
+            sym[6..8].copy_from_slice(&1u16.to_le_bytes());
+            sym[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+            elf.extend_from_slice(&sym);
+        }
+        let names = elf.len() as u64;
+        elf.push(0);
+        for _ in 0..symbols {
+            elf.extend_from_slice(b"a\0");
+        }
+        let set = |elf: &mut Vec<u8>, at: usize, value: u64| {
+            elf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        set(&mut elf, dynsym + 0x18, table);
+        set(&mut elf, dynsym + 0x20, symbols * 24);
+        set(&mut elf, dynstr + 0x18, names);
+        set(&mut elf, dynstr + 0x20, 1 + 2 * symbols);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("libssl.so.3");
+        fs::write(&path, &elf).unwrap();
+        let (result, peak) = meter::peak(|| resolve(&path));
+        let error = result.unwrap_err();
+        assert!(error.contains("more than 64 MiB"), "{error}");
+        assert!(peak < MAX_READ_BYTES as usize, "{peak}");
     }
 
     /// The host's OpenSSL resolves within a small part of the budget.
