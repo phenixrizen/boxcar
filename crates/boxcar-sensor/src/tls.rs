@@ -35,8 +35,10 @@ use aya::programs::UProbe;
 use aya::Ebpf;
 use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{Payload, ProcTlsAttach};
+use object::elf::{FileHeader32, FileHeader64};
+use object::read::elf::FileHeader;
 use object::read::{ReadCache, ReadRef};
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{Endianness, Object, ObjectSection, ObjectSymbol};
 
 use crate::status::cut;
 
@@ -57,8 +59,12 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 /// What a name read costs: object's cache reads at most this much of it.
 const MAX_NAME_READ: u64 = 4096;
-/// What a name costs past its bytes: the cache entry holding it.
-const NAME_ENTRY_COST: u64 = 64;
+/// What every read costs past its bytes: the cache entry holding it.
+const ENTRY_COST: u64 = 64;
+/// The most sections a file may declare to be parsed for its symbols:
+/// what object keeps for each section is not a read, so it is bounded by
+/// count. Libraries and programs have a few dozen.
+const MAX_SECTIONS: usize = 4096;
 
 /// Where the four functions sit in a file, as offsets from its start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,12 +365,12 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
     }
 
     fn read_bytes_at(self, offset: u64, size: u64) -> Result<&'a [u8], ()> {
-        self.charge(size)?;
+        self.charge(size.saturating_add(ENTRY_COST))?;
         (&self.cache).read_bytes_at(offset, size)
     }
 
     fn read_bytes_at_until(self, range: Range<u64>, delimiter: u8) -> Result<&'a [u8], ()> {
-        self.charge(MAX_NAME_READ + NAME_ENTRY_COST)?;
+        self.charge(MAX_NAME_READ + ENTRY_COST)?;
         let name = (&self.cache).read_bytes_at_until(range, delimiter)?;
         let unused = MAX_NAME_READ.saturating_sub(name.len() as u64);
         self.left.set(self.left.get() + unused);
@@ -372,10 +378,32 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
     }
 }
 
+/// How many sections the ELF file `data` declares, from its header (and
+/// its first section header, where the count is too large for the
+/// header): read before object parses the rest. Zero for what is not
+/// ELF, which object then refuses.
+fn section_count<'a, R: ReadRef<'a>>(data: R) -> object::read::Result<usize> {
+    fn count<'a, H: FileHeader, R: ReadRef<'a>>(data: R) -> object::read::Result<usize> {
+        let header = H::parse(data)?;
+        header.shnum(header.endian()?, data)
+    }
+    match object::FileKind::parse(data) {
+        Ok(object::FileKind::Elf32) => count::<FileHeader32<Endianness>, R>(data),
+        Ok(object::FileKind::Elf64) => count::<FileHeader64<Endianness>, R>(data),
+        _ => Ok(0),
+    }
+}
+
 /// The four functions' offsets in the object `data`, its symbols read
 /// once: the dynamic ones first, then the symbol table.
 fn symbols<'a, R: ReadRef<'a>>(data: R) -> Result<Offsets, String> {
     const NAMES: [&str; 4] = ["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"];
+    let sections = section_count(data).map_err(|error| format!("not an object: {error}"))?;
+    if sections > MAX_SECTIONS {
+        return Err(format!(
+            "{sections} sections: more than {MAX_SECTIONS} to parse for symbols"
+        ));
+    }
     let obj = object::File::parse(data).map_err(|error| format!("not an object: {error}"))?;
     let mut found = [None; 4];
     for sym in obj.dynamic_symbols().chain(obj.symbols()) {
@@ -501,6 +529,62 @@ fn cut_path(path: &Path) -> String {
     }
     text[..end].to_owned()
 }
+
+/// A test-only allocator that keeps, per thread, what the thread holds
+/// and the most it held: what a resolve really takes, cache entries and
+/// object's own allocations included.
+#[cfg(test)]
+mod meter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static HELD: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub struct Meter;
+
+    // SAFETY: every call goes to the system allocator with the caller's
+    // arguments; the counting only touches this thread's cells.
+    unsafe impl GlobalAlloc for Meter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller's layout, as GlobalAlloc requires.
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                held(layout.size() as isize);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from `alloc` with this layout.
+            unsafe { System.dealloc(ptr, layout) };
+            held(-(layout.size() as isize));
+        }
+    }
+
+    fn held(change: isize) {
+        let _ = HELD.try_with(|held| {
+            let now = held.get().saturating_add_signed(change);
+            held.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+
+    /// `f`'s result and the most this thread held while it ran, past what
+    /// it held before.
+    pub fn peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = HELD.with(Cell::get);
+        PEAK.with(|peak| peak.set(before));
+        let out = f();
+        (out, PEAK.with(Cell::get).saturating_sub(before))
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static METER: meter::Meter = meter::Meter;
 
 #[cfg(test)]
 mod tests {
@@ -709,8 +793,62 @@ mod tests {
             .unwrap()
             .set_len(offset + size)
             .unwrap();
-        let error = resolve(&path).unwrap_err();
+        let (result, peak) = meter::peak(|| resolve(&path));
+        let error = result.unwrap_err();
         assert!(error.contains("more than 64 MiB"), "{error}");
+        assert!(peak < (MAX_READ_BYTES + (1 << 20)) as usize, "{peak}");
+    }
+
+    /// A file that declares more sections than a program has (counted in
+    /// its first section header, the form for counts past 65535) is
+    /// refused before it is parsed, and the resolver holds next to
+    /// nothing for it.
+    #[test]
+    fn a_file_with_too_many_sections_is_refused_before_parsing() {
+        let shell = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .unwrap();
+        let mut elf = fs::read(fs::canonicalize(shell).unwrap()).unwrap();
+        let count: u64 = 100_000;
+        let headers: u64 = 16 << 20;
+        elf[0x28..0x30].copy_from_slice(&headers.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&0u16.to_le_bytes());
+        elf[0x3e..0x40].copy_from_slice(&0u16.to_le_bytes());
+        elf.resize(headers as usize + 64, 0);
+        let first = headers as usize;
+        elf[first + 0x20..first + 0x28].copy_from_slice(&count.to_le_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("libssl.so.3");
+        fs::write(&path, &elf).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(headers + count * 64)
+            .unwrap();
+        let (result, peak) = meter::peak(|| resolve(&path));
+        let error = result.unwrap_err();
+        assert!(error.contains("more than 4096 to parse"), "{error}");
+        assert!(peak < 1 << 20, "{peak}");
+    }
+
+    /// The host's OpenSSL resolves within a small part of the budget.
+    #[test]
+    fn a_library_resolves_within_a_small_part_of_the_budget() {
+        let candidates = [
+            "/lib/x86_64-linux-gnu/libssl.so.3",
+            "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+            "/usr/lib64/libssl.so.3",
+            "/lib/libssl.so.3",
+        ];
+        let Some(path) = candidates.iter().find(|p| Path::new(p).is_file()) else {
+            eprintln!("skipped: no libssl.so.3 on this host");
+            return;
+        };
+        let (result, peak) = meter::peak(|| resolve(Path::new(path)));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(peak < 16 << 20, "{peak}");
     }
 
     /// A path that names a device or a pipe is refused at once: never read
