@@ -258,13 +258,13 @@ fn word_end(text: &str, start: usize) -> usize {
     text.len()
 }
 
-/// `--token`, `-password`: a flag, without a value of its own (none after
-/// `=`, nor after `:` as in `--password:pw`), whose name looks like a
-/// secret's.
+/// `--token`, `-password`: a flag, without a value of its own, whose name
+/// looks like a secret's. A `:` does not make a value its own: in
+/// `--Secrets:ApiKey VALUE` (.NET's configuration keys) it is part of the
+/// name, so the next argument is taken as the value all the same.
 fn is_secret_flag(arg: &str) -> bool {
     arg.starts_with('-')
         && !arg.contains('=')
-        && attached_secret(arg).is_none()
         && arg.len() > 1
         && is_secret_key(arg.trim_start_matches('-'))
 }
@@ -884,7 +884,6 @@ mod tests {
             "/password=alpha beta",
             "+password=alpha beta",
             "'password'=alpha beta",
-            "--password:alpha'beta",
             "Basic=alpha beta",
             "Authorization: Bearer alpha beta",
             "-user-password=alpha beta:gamma",
@@ -906,7 +905,6 @@ mod tests {
             "/password=[redacted]",
             "+password=[redacted]",
             "'password'=[redacted]",
-            "--password:[redacted]",
             "Basic=[redacted]",
             "Authorization:[redacted]",
             "-user-password=[redacted]",
@@ -920,6 +918,24 @@ mod tests {
         assert_eq!(v, json!({"argv": want}));
         let again: Vec<String> = want.map(str::to_owned).to_vec();
         assert_eq!(scrub_argv(&again), want, "scrubbing is stable");
+        // A flag with a `:` in it may still take the next argument as its
+        // value: both go.
+        for (argv, want) in [
+            (
+                ["--Secrets:ApiKey", "alpha beta"],
+                ["--Secrets:[redacted]", "[redacted]"],
+            ),
+            (
+                ["--password:alpha'beta", "next"],
+                ["--password:[redacted]", "[redacted]"],
+            ),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            assert_eq!(scrub_argv(&argv), want);
+            let mut v = json!({"argv": argv});
+            scrub_deep(&mut v);
+            assert_eq!(v, json!({"argv": want}));
+        }
     }
 
     #[test]
