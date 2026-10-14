@@ -18,9 +18,11 @@
 //! offsets found, is done on the loop, when the resolver's pipe says a
 //! result is in.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
+use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -33,6 +35,7 @@ use aya::programs::UProbe;
 use aya::Ebpf;
 use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{Payload, ProcTlsAttach};
+use object::read::{ReadCache, ReadRef};
 use object::{Object, ObjectSection, ObjectSymbol};
 
 use crate::status::cut;
@@ -45,8 +48,17 @@ pub const FIRST_SWEEP: Duration = Duration::from_millis(50);
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// The most processes followed at once.
 const MAX_TGIDS: usize = 4096;
-/// The most bytes of a file read for its symbols.
+/// The largest file looked at for symbols.
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+/// The most bytes read out of a file for its symbols: its headers, its
+/// symbol tables and their names together, all the resolver holds of it
+/// at once, however large the file. A runtime with OpenSSL linked in
+/// (Node's 120 MB binary) needs about 25 MiB.
+const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
+/// What a name read costs: object's cache reads at most this much of it.
+const MAX_NAME_READ: u64 = 4096;
+/// What a name costs past its bytes: the cache entry holding it.
+const NAME_ENTRY_COST: u64 = 64;
 
 /// Where the four functions sit in a file, as offsets from its start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,56 +306,120 @@ fn open_regular(path: &Path) -> Result<File, String> {
 
 /// Reads `path` and finds the four functions (`SSL_write` and `SSL_read`
 /// must be there, exported or in the symbol table), with the file they
-/// were read from.
+/// were read from. Only the parts of the file the symbols need are read,
+/// within [`MAX_READ_BYTES`].
 fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
     let file = open_regular(path)?;
-    let mut data = Vec::new();
-    (&file)
-        .take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut data)
-        .map_err(|error| format!("read: {error}"))?;
-    if data.len() as u64 > MAX_FILE_BYTES {
-        return Err("grew too large to read for symbols".to_owned());
+    let data = Budgeted::new(&file);
+    let offsets = symbols(&data);
+    if data.over.get() {
+        return Err(format!(
+            "its symbols take more than {} MiB to read",
+            MAX_READ_BYTES >> 20
+        ));
     }
-    symbols(&data).map(|offsets| (offsets, file))
+    offsets.map(|offsets| (offsets, file))
 }
 
-/// The four functions' offsets in the object `data`.
-fn symbols(data: &[u8]) -> Result<Offsets, String> {
+/// A file read on demand through object's cache, each read charged
+/// against [`MAX_READ_BYTES`] before it is made: past the budget a read
+/// fails and nothing more is read.
+struct Budgeted<'f> {
+    cache: ReadCache<&'f File>,
+    left: Cell<u64>,
+    over: Cell<bool>,
+}
+
+impl<'f> Budgeted<'f> {
+    fn new(file: &'f File) -> Budgeted<'f> {
+        Budgeted {
+            cache: ReadCache::new(file),
+            left: Cell::new(MAX_READ_BYTES),
+            over: Cell::new(false),
+        }
+    }
+
+    fn charge(&self, bytes: u64) -> Result<(), ()> {
+        match self.left.get().checked_sub(bytes) {
+            Some(left) => {
+                self.left.set(left);
+                Ok(())
+            }
+            None => {
+                self.over.set(true);
+                Err(())
+            }
+        }
+    }
+}
+
+impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
+    fn len(self) -> Result<u64, ()> {
+        (&self.cache).len()
+    }
+
+    fn read_bytes_at(self, offset: u64, size: u64) -> Result<&'a [u8], ()> {
+        self.charge(size)?;
+        (&self.cache).read_bytes_at(offset, size)
+    }
+
+    fn read_bytes_at_until(self, range: Range<u64>, delimiter: u8) -> Result<&'a [u8], ()> {
+        self.charge(MAX_NAME_READ + NAME_ENTRY_COST)?;
+        let name = (&self.cache).read_bytes_at_until(range, delimiter)?;
+        let unused = MAX_NAME_READ.saturating_sub(name.len() as u64);
+        self.left.set(self.left.get() + unused);
+        Ok(name)
+    }
+}
+
+/// The four functions' offsets in the object `data`, its symbols read
+/// once: the dynamic ones first, then the symbol table.
+fn symbols<'a, R: ReadRef<'a>>(data: R) -> Result<Offsets, String> {
+    const NAMES: [&str; 4] = ["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"];
     let obj = object::File::parse(data).map_err(|error| format!("not an object: {error}"))?;
-    let find = |name: &str| -> Result<Option<u64>, String> {
-        let Some(sym) = obj
-            .dynamic_symbols()
-            .chain(obj.symbols())
-            .find(|sym| sym.name().is_ok_and(|n| n == name) && sym.address() != 0)
-        else {
+    let mut found = [None; 4];
+    for sym in obj.dynamic_symbols().chain(obj.symbols()) {
+        if sym.address() == 0 {
+            continue;
+        }
+        let Ok(name) = sym.name() else {
+            continue;
+        };
+        if let Some(at) = NAMES.iter().position(|n| *n == name) {
+            found[at].get_or_insert((sym.address(), sym.section_index()));
+            if found.iter().all(Option::is_some) {
+                break;
+            }
+        }
+    }
+    let translate = matches!(
+        obj.kind(),
+        object::ObjectKind::Dynamic | object::ObjectKind::Executable
+    );
+    let offset = |at: usize| -> Result<Option<u64>, String> {
+        let Some((address, index)) = found[at] else {
             return Ok(None);
         };
-        let translate = matches!(
-            obj.kind(),
-            object::ObjectKind::Dynamic | object::ObjectKind::Executable
-        );
         if !translate {
-            return Ok(Some(sym.address()));
+            return Ok(Some(address));
         }
-        let index = sym
-            .section_index()
-            .ok_or_else(|| format!("{name}: not in a section"))?;
+        let name = NAMES[at];
+        let index = index.ok_or_else(|| format!("{name}: not in a section"))?;
         let section = obj
             .section_by_index(index)
             .map_err(|error| format!("{name}: {error}"))?;
         let (file_offset, _) = section
             .file_range()
             .ok_or_else(|| format!("{name}: its section has no bytes in the file"))?;
-        Ok(Some(sym.address() - section.address() + file_offset))
+        Ok(Some(address - section.address() + file_offset))
     };
-    let write = find("SSL_write")?.ok_or_else(|| "SSL_write: not exported".to_owned())?;
-    let read = find("SSL_read")?.ok_or_else(|| "SSL_read: not exported".to_owned())?;
+    let write = offset(0)?.ok_or_else(|| "SSL_write: not exported".to_owned())?;
+    let read = offset(1)?.ok_or_else(|| "SSL_read: not exported".to_owned())?;
     Ok(Offsets {
         write,
         read,
-        write_ex: find("SSL_write_ex")?,
-        read_ex: find("SSL_read_ex")?,
+        write_ex: offset(2)?,
+        read_ex: offset(3)?,
     })
 }
 
@@ -601,6 +677,40 @@ mod tests {
         let link = tmp.path().join("libssl.so.3");
         std::os::unix::fs::symlink(path, &link).unwrap();
         assert_eq!(resolve(&link).unwrap(), offsets);
+    }
+
+    /// A file whose symbol table claims hundreds of MiB (sparse, so it
+    /// costs nothing on disk) is refused once its reads pass the budget,
+    /// never read into memory whole.
+    #[test]
+    fn a_symbol_table_past_the_read_budget_is_refused() {
+        let shell = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .unwrap();
+        let mut elf = fs::read(fs::canonicalize(shell).unwrap()).unwrap();
+        let word = |at: usize| usize::from(u16::from_le_bytes([elf[at], elf[at + 1]]));
+        let (entry, count) = (word(0x3a), word(0x3c));
+        let headers = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        const SHT_DYNSYM: u32 = 11;
+        let at = (0..count)
+            .map(|n| headers + n * entry)
+            .find(|&at| u32::from_le_bytes(elf[at + 4..at + 8].try_into().unwrap()) == SHT_DYNSYM)
+            .expect("a dynamic symbol table");
+        let (offset, size): (u64, u64) = (16 << 20, 24 * (16 << 20));
+        elf[at + 0x18..at + 0x20].copy_from_slice(&offset.to_le_bytes());
+        elf[at + 0x20..at + 0x28].copy_from_slice(&size.to_le_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("libssl.so.3");
+        fs::write(&path, &elf).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(offset + size)
+            .unwrap();
+        let error = resolve(&path).unwrap_err();
+        assert!(error.contains("more than 64 MiB"), "{error}");
     }
 
     /// A path that names a device or a pipe is refused at once: never read

@@ -244,6 +244,72 @@ fn an_inspected_connection_to_an_untrusted_host_fails_closed() {
     drop(upstream);
 }
 
+/// A program on a share whose dynamic symbol table claims 384 MiB (the
+/// file sparse, so it costs nothing on disk) is refused by the sensor's
+/// resolver within its read budget, in a guest of the default memory,
+/// and ring 1 goes on reporting after it.
+#[test]
+fn a_program_with_a_vast_symbol_table_leaves_ring_1_running() {
+    let Some(guest) = guest_or_skip("a_program_with_a_vast_symbol_table_leaves_ring_1_running")
+    else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut elf = fs::read(guest.rootfs.join("bin/busybox")).unwrap();
+    let word = |at: usize| usize::from(u16::from_le_bytes([elf[at], elf[at + 1]]));
+    let (entry, count) = (word(0x3a), word(0x3c));
+    let headers = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+    const SHT_DYNSYM: u32 = 11;
+    let at = (0..count)
+        .map(|n| headers + n * entry)
+        .find(|&at| u32::from_le_bytes(elf[at + 4..at + 8].try_into().unwrap()) == SHT_DYNSYM)
+        .expect("busybox has a dynamic symbol table");
+    let (offset, size): (u64, u64) = (16 << 20, 24 * (16 << 20));
+    elf[at + 0x18..at + 0x20].copy_from_slice(&offset.to_le_bytes());
+    elf[at + 0x20..at + 0x28].copy_from_slice(&size.to_le_bytes());
+    let program = scratch.path("workspace").join("vast");
+    fs::write(&program, &elf).unwrap();
+    let file = fs::File::options().write(true).open(&program).unwrap();
+    file.set_len(offset + size).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &[],
+        &[
+            "/bin/sh",
+            "-c",
+            "/workspace/vast true; sleep 2; /bin/date; sleep 2",
+        ],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    let records = run.records();
+    let attached = of_kind(&records, "proc.tls_attach");
+    let vast = attached
+        .iter()
+        .find(|r| r.data["path"] == "/workspace/vast")
+        .unwrap_or_else(|| {
+            panic!(
+                "no proc.tls_attach for /workspace/vast among {attached:?}\n{}",
+                run.describe()
+            )
+        });
+    assert_eq!(vast.data["ok"], false, "{vast:?}");
+    assert!(
+        vast.data["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("more than 64 MiB")),
+        "{vast:?}"
+    );
+    let after = of_kind(&records, "proc.exec")
+        .into_iter()
+        .any(|r| r.seq > vast.seq && r.data["filename"] == "/bin/date");
+    assert!(after, "ring 1 stopped reporting\n{}", run.describe());
+}
+
 /// Ring 1 sees the TLS of a runtime that exports OpenSSL's functions:
 /// busybox's `ssl_client` loads `libssl.so.3`, which the sensor finds in
 /// its maps and attaches its probes to, so the next download's writes and
