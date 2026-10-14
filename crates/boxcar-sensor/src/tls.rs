@@ -469,25 +469,27 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
 
 /// How many sections the ELF file `data` declares, from its header (and
 /// its first section header, where the count is too large for the
-/// header): read before object parses the rest. Zero for what is not
-/// ELF, which object then refuses.
-fn section_count<'a, R: ReadRef<'a>>(data: R) -> object::read::Result<usize> {
+/// header): read before object parses the rest. Anything but ELF is
+/// refused here, before object's generic parser (which other crates'
+/// features can widen to more formats) allocates anything for it.
+fn section_count<'a, R: ReadRef<'a>>(data: R) -> Result<usize, String> {
     fn count<'a, H: FileHeader, R: ReadRef<'a>>(data: R) -> object::read::Result<usize> {
         let header = H::parse(data)?;
         header.shnum(header.endian()?, data)
     }
-    match object::FileKind::parse(data) {
+    let counted = match object::FileKind::parse(data) {
         Ok(object::FileKind::Elf32) => count::<FileHeader32<Endianness>, R>(data),
         Ok(object::FileKind::Elf64) => count::<FileHeader64<Endianness>, R>(data),
-        _ => Ok(0),
-    }
+        _ => return Err("not an object: not ELF".to_owned()),
+    };
+    counted.map_err(|error| format!("not an object: {error}"))
 }
 
 /// The four functions' offsets in the object `data`, its symbols read
 /// once: the dynamic ones first, then the symbol table.
 fn symbols<'a, R: ReadRef<'a>>(data: R) -> Result<Offsets, String> {
     const NAMES: [&str; 4] = ["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"];
-    let sections = section_count(data).map_err(|error| format!("not an object: {error}"))?;
+    let sections = section_count(data)?;
     if sections > MAX_SECTIONS {
         return Err(format!(
             "{sections} sections: more than {MAX_SECTIONS} to parse for symbols"
@@ -1006,6 +1008,22 @@ mod tests {
         let obj = object::File::parse(&data).unwrap();
         // object leaves out section 0, the null one.
         assert_eq!(obj.sections().count(), declared - 1);
+    }
+
+    /// A file in another object format (Mach-O, which object can parse
+    /// when other crates ask for it) is refused before it is parsed, and
+    /// the resolver holds next to nothing for it.
+    #[test]
+    fn only_elf_is_parsed() {
+        let mut macho = vec![0u8; 4096];
+        macho[0..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
+        macho[4..8].copy_from_slice(&0x0100_0007_u32.to_le_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("libssl.so.3");
+        fs::write(&path, &macho).unwrap();
+        let (result, peak) = meter::peak(|| resolve(&path));
+        assert_eq!(result.unwrap_err(), "not an object: not ELF");
+        assert!(peak < 1 << 16, "{peak}");
     }
 
     /// The host's OpenSSL resolves within a small part of the budget.
