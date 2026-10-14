@@ -6,7 +6,7 @@ The design this plan argues from is `docs/specs/2026-09-29-boxcar-design.md` (mi
 
 ## 1. Where things stand
 
-- Repository `/home/nater/go/src/github.com/phenixrizen/boxcar`, branch `m5`, created from `m4` at `5f2f21e`. M4 is PR #4 against `main` (https://github.com/phenixrizen/boxcar/pull/4), CI green, not merged when this was written; M3 is merged (`f30f1aa`). When PR #4 merges, merge `main` into `m5`; do not rewrite pushed commits without asking.
+- Repository `/home/nater/go/src/github.com/phenixrizen/boxcar`, branch `m5`, rebased onto `main` at `35981d7`: M4 (PR #4) and the process rules in `AGENTS.md` (PRs #18, #19) are merged. The branch holds this plan only; section 2 says how the tasks ship. Do not rewrite pushed commits without asking.
 - Three findings from the last review of M4 are tracked privately (S68, S69, S70; the owner has the document). They are Task 1, and need the owner's go-ahead like every security fix. Nothing about them goes into this repository, a commit message or a PR body beyond what each fix changes.
 - What M5 can lean on, with the file that has it:
 
@@ -38,8 +38,14 @@ The design this plan argues from is `docs/specs/2026-09-29-boxcar-design.md` (mi
 - Every task ends with all of these clean: `cargo test --workspace`; `cargo clippy --workspace --all-targets --features boxcar-vmm/kvm-tests,boxcar/kvm-tests -- -D warnings`; `cargo fmt --all --check`; `cargo deny check`; `cargo xtask schema` leaving no diff under `proto/`; `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`; `cargo xtask sensor` and `cargo xtask check-vmlinux` when the sensor crates change; `cargo xtask test-kvm m3` and `m4` when the VMM, the net stack, the filesystem, init, the sensor, the audit crate or the CLI change, and `m5` from Task 3 on. The gated suites run on the test box (sync with `rsync -a --delete --exclude /target --exclude .git`; `TMPDIR=/dev/shm`; `ulimit -n $(ulimit -Hn)`; copy `target/guest/initramfs.cpio` and the musl sensor after a guest change).
 - Tests first: each test fails for the right reason before the code exists. No `unwrap`, `expect` or `panic!` outside tests. Nothing logs on a vCPU thread or on the stop path. A guest never blocks the VMM, ring 1 never blocks ring 0, the gate never modifies a byte it relays, and no credential value (registry credentials included) reaches a record, a dump, a log line, a fixture or test output.
 - Every new file carries `// SPDX-License-Identifier: Apache-2.0` and `// Copyright 2026 The boxcar Authors` (the eBPF crate's sources `MIT OR GPL-2.0`).
-- Commits: `git commit -s`, one logical change each, subjects from this plan verbatim, body ending with `Co-Authored-By:` naming the executing session's model, `Claude-Session: <the session's URL>`, then the sign-off. Never commit `target/`. GitHub's push protection refuses credential-shaped literals (a Stripe test key in a unit test was refused in M4): build fake credentials at run time. Push and open the PR only when section 7 says so.
-- Every judgment call goes into the commit message or section 8, appended as work proceeds. Deferred findings are reported at the end, explicitly.
+- Commits: `git commit -s`, one logical change each, subjects from this plan verbatim, body ending with `Co-Authored-By:` naming the executing session's model, `Claude-Session: <the session's URL>`, then the sign-off. Never commit `target/`. GitHub's push protection refuses credential-shaped literals (a Stripe test key in a unit test was refused in M4): build fake credentials at run time.
+- Every judgment call goes into the commit message or section 8, appended as work proceeds by the task's pull request. Deferred findings are reported at the end, explicitly.
+- How the work ships, under `AGENTS.md` (Issues and the board, Reviews):
+  - This plan goes in first, as a docs pull request from `m5`, once the owner accepts it; its tasks then become issues on the board.
+  - Each task is its own branch from `main` and its own pull request, merged before the next task's code starts (one change per pull request). Task 1 is a pull request per fix.
+  - Tasks 1, 2, 3, 4, 5 and 7 change a state machine, a protocol, concurrency or a security behaviour: each starts with its own plan, `docs/plans/<branch>.md`, reviewed by Codex before its code (written neutrally for Task 1, where a fix with one cause, in one place, adding no state, needs none). Tasks 6 and 8 need none unless their review says otherwise.
+  - Code goes one task at a time: nearly every task touches `cli.rs`, `cmd/run.rs`, the workspace manifest or the lock file, so none runs in a parallel worktree beside another. A task's plan, a file of its own, may be written and reviewed while the task before it is in review.
+  - Review rounds are bounded as `AGENTS.md` says: two for a plan, three for code before the findings are sorted, five the stop. M4's single pull request took more than twenty; tasks this size should not.
 
 ## 3. Binding technical constraints
 
@@ -99,7 +105,7 @@ The design this plan argues from is `docs/specs/2026-09-29-boxcar-design.md` (mi
 
 ### Task 1: the privately tracked findings S68 to S70
 
-Fix each, under the owner's go-ahead, with a test that fails before the fix, the proposed fixes being in the private document. Commits describe the change, never the weakness, and their subjects are chosen when each fix is made; nothing about them is written here or anywhere in the repository before they ship. `test-kvm m3` and `m4` on the box, with a rebuilt initramfs where the sensor changes.
+Fix each, under the owner's go-ahead, with a test that fails before the fix, the proposed fixes being in the private document. Commits describe the change, never the weakness, and their subjects are chosen when each fix is made; nothing about them is written here or anywhere in the repository before they ship. The checks and gated suites as section 2 says.
 
 ### Task 2: the image store and the registry client
 
@@ -133,7 +139,7 @@ The syscall list from `strace -f -c` over the gated suites on the test box, `har
 
 - Every task's checks clean; `cargo xtask test-kvm m1` to `m5` green on the test box under `--seccomp enforce`, the agents' tests included.
 - The demo: `boxcar run --image docker.io/library/alpine:3.22 --policy agent-isolate -- sh -c 'apk add curl && curl -sI https://dl-cdn.alpinelinux.org'`, then `boxcar audit verify` and `boxcar audit export --format otlp --otlp-endpoint` to a collector on the test box; the trace's shape (session, model calls, tool spans, findings as events) recorded in the PR.
-- A Codex review of the branch per the repository's rule (findings private until fixed); then push `m5`, open the PR against `main` (after PR #4 is merged and merged into `m5`), with section 8's decisions summarized and every review finding's outcome.
+- Each task's pull request carries its Codex reviews per the repository's rule (findings private until fixed), its decisions appended to section 8, and every review finding's outcome. M5 is finished when Task 8's merges, with the demo recorded in it.
 
 ## 8. Decisions (appended while executing this plan)
 
