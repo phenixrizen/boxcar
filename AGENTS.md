@@ -2,7 +2,9 @@
 
 The design is `docs/specs/2026-09-29-boxcar-design.md`; each milestone has a
 plan under `docs/plans/` whose section 8 records the rulings made while
-executing it. `CONTRIBUTING.md` has the checks every change passes and the
+executing it; a change to a state machine, a protocol, concurrency or a
+security behaviour has a plan of its own there, reviewed before its code
+(see Reviews). `CONTRIBUTING.md` has the checks every change passes and the
 gated KVM suite (`cargo xtask test-kvm m4`).
 
 ## Reviews
@@ -22,11 +24,63 @@ cached copy, and an ambiguous registry is refused):
 python3 scripts/codex_review.py "<focus: the risks this change touches>"
 ```
 
+- **The plan is reviewed before the code** when a change touches a state
+  machine (a flow in the relay or the gate, the reconciler's spans, a
+  device's queues, a session's start and stop), a protocol, concurrency
+  or a security behaviour. The change's first commit is
+  `docs/plans/<branch>.md`: the events that can interact and every order
+  they can come in, the invariants that must hold in all of them (say,
+  "the gate relays every byte unchanged, however the flow's ends close"),
+  what is out of scope, and the tests that will pin each ordering. Codex
+  reviews the plan alone (`codex_review.py --base <the commit before the
+  plan> "review this plan: <focus>"`, so the review sees only the plan's
+  commits) before any code is written; its findings change the plan, and
+  the revision is reviewed once more. A plan still blocked after its
+  second review is not revised again on the agent's own: the agent
+  reports it, and the owner decides. Only once a review finds nothing that
+  blocks, or the owner says to go on, are the tests for the orderings
+  written, from the plan, and then the code that passes them. A design
+  that has to change once code exists goes back to the plan: the plan is
+  revised and reviewed before the code follows it. The pull request's
+  body names the plan's last reviewed commit apart from the code's. The
+  plan stays as the change's design record, written as the pull request
+  is (neutral for a security fix). A milestone's plan says what to build;
+  each of its tasks that is such a change still gets a plan of its own,
+  reviewed so before the task's code. A small fix (one cause, one place,
+  no new state) needs no plan.
 - `--base` reviews the commits `origin/main...HEAD`, not the working tree:
-  commit everything first. A branch stacked on another unmerged branch is
-  reviewed against that branch (`--base origin/<branch>`). The pull
-  request's body names the commit reviewed; commits after it (the
-  review's own fixes included) get another review before the merge.
+  commit everything first. The pull request's body names the commit
+  reviewed; commits after it (the review's own fixes included) get another
+  review before the merge, within the limits below.
+- **The review is of what will merge.** The script fetches its base and
+  refuses a branch that is behind it: rebase onto the current
+  `origin/main` before each review, so the review sees the change on top
+  of everything merged since it began, not on the `main` it started from.
+  A branch stacked on another (see Parallel work) names its parent with
+  `--base origin/<branch>`; once the parent merges it is rebased onto
+  `main` and reviewed again before it merges. A base given as a commit (a
+  plan's review) is neither fetched nor checked, so the branch is rebased
+  onto the current `origin/main` by hand first.
+- **Review rounds are bounded.** Every round costs; the limits (the owner,
+  2026-10-14) are a budget, not a target. A docs or process change gets
+  one round; a plan, two (above). Code gets **three**: when the third
+  review still finds something, stop and sort its findings before going
+  on. A finding in the current stream of work (the change introduces it,
+  exposes it, needs it fixed or makes a test fail; see Issues and the
+  board) is fixed before the change merges, where One change per pull
+  request puts it: on the branch when the change introduces it or it is
+  in code the change touches, in a pull request of its own that merges
+  first when it is a defect already on `main` in code the change does not
+  otherwise touch. One that is independent of the change is split off (an
+  issue, or the private document for a security finding, and the owner's
+  call), not fixed on the branch. The pull request's body records the
+  checkpoint and how each finding was sorted. **Five** rounds is the stop:
+  a change still finding its own defects then goes back to its plan (or
+  gets one when it had none), the agent reports where it stands, and the
+  owner says whether more is spent on it. An agent never passes a limit on
+  its own: when its last round still finds something, it fixes what that
+  round found, reports those fixes as not yet reviewed, and the owner says
+  whether another round is spent.
 - The focus names the risks the change touches: what the guest can reach
   or alter, credentials in records, dumps and logs, the gate relaying
   bytes unchanged, a guest blocking the VMM, ring 1 blocking ring 0,
@@ -36,8 +90,9 @@ python3 scripts/codex_review.py "<focus: the risks this change touches>"
   reconciler scenario, a gated run) or traced in the code before it is
   fixed; one the code refutes is answered with the lines that refute it.
 - The pull request's body lists the findings and what became of each. One
-  outside the change's scope becomes an issue (below), never dropped
-  silently.
+  independent of the change becomes an issue (below), never dropped
+  silently, and the owner says whether it is fixed now, in a pull request
+  of its own, or waits.
 - A security finding (a way for the guest or anyone else to gain access,
   read what it should not, alter or escape the audit, or deny service)
   never goes into this repository, a pull request, a commit message or a
@@ -63,8 +118,42 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
 - An issue says what is wrong or wanted, how to see it, what is expected,
   and the cause as far as it is known. Write each paragraph on one line:
   GitHub shows every newline in an issue body as a break.
-- A bug found while working is fixed in that round, not parked. It still
-  gets an issue, In progress, closed by the fix's pull request.
+- **A bug in the current stream of work is fixed now; any other is the
+  owner's call.** A bug is in the current stream of work when the change
+  introduces it, exposes it (it was harmless until the change), needs it
+  fixed to reach its goal, or makes a test fail; this holds at every round
+  of review, whatever file the bug is in and whatever the plan left out of
+  scope. Such a bug is fixed in that round, with its tests, where the next
+  rule puts it, and gets an issue all the same, In progress, so the board
+  shows it until its fix merges. Any other bug, one independent of the
+  change (it behaves the same with or without it: a review's finding in
+  neighbouring code, a defect seen in passing, a test that flakes on
+  `main` as well), is not fixed on the spot: it becomes an issue in
+  Backlog, and the owner is asked whether it is fixed now (Ready, its own
+  pull request) or waits. An agent that cannot ask reports it to whoever
+  leads, who asks. A security finding, the change's or not, follows the
+  same ask but goes to the owner's private document instead of an issue,
+  and its fix waits for the owner's go-ahead (see Reviews).
+- **One change per pull request.** A bug the owner said to fix now, being
+  independent of the change, gets its own branch and pull request from
+  `main`, even in code the change touches; so does a defect already on
+  `main` that the change exposes or needs fixed in code the change does
+  not otherwise touch. Neither becomes more commits on the change's
+  branch, so each review stays on one thing. When the change depends on
+  such a fix (it exposes or needs it), that pull request merges first,
+  and the change, rebased on it, is tested and reviewed again before it
+  merges. Any other bug in the current stream of work (one the change
+  introduces, wherever it shows, or one in code the change touches) is
+  fixed on its branch.
+- **Parallel work only on separate files.** Two changes that touch the
+  same files (the same crate's module, the same device, the sensor) are
+  not worked at once in parallel worktrees: the second starts from `main`
+  once the first has merged. Each merge moves `main` under the other, and
+  every move means a rebase, the checks again and another review. Changes
+  to separate areas (a crate and the sensor, a doc) run side by side. When
+  a change must build on one not merged yet, it is stacked on that branch
+  and reviewed against it (`--base`), then rebased and reviewed again on
+  `main` once the first merges.
 - An issue's card goes through one order:
   1. In progress while the work is under way, from its branch's start. A
      pull request that does only part of it says `Part of #N` and closes
@@ -80,8 +169,6 @@ Backlog, Ready, In progress, In review, Done. There is no todo file.
   closed as not planned only when the owner drops it, its comment saying
   why. A pull request's own card goes In review when it opens and Done
   when it merges.
-- A review finding outside the change's scope becomes an issue (see
-  Reviews).
 - The exception is a security finding, as defined under Reviews: it never
   becomes an issue, a card, pull request text or a commit message until
   its fix has shipped. It stays in the owner's private security-findings
