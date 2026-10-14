@@ -57,9 +57,19 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// at once, however large the file. A runtime with OpenSSL linked in
 /// (Node's 120 MB binary) needs about 25 MiB.
 const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
-/// The most of a name read at once; a longer one is refused, as object's
-/// own cache does.
+/// The most of a name read; a longer one is refused, as object's own
+/// cache does.
 const MAX_NAME_READ: u64 = 4096;
+/// How much of a name is read at a time, so a short one costs a short
+/// read.
+const NAME_CHUNK: u64 = 256;
+/// The most bytes read from a file for its symbols, kept or not: what one
+/// candidate may cost the shares and the resolver's time, whatever its
+/// layout.
+const MAX_IO_BYTES: u64 = 256 * 1024 * 1024;
+/// The most names read from a file. A runtime's tables hold a couple of
+/// hundred thousand at most (Node's, about 180,000).
+const MAX_NAMES: u64 = 262_144;
 /// What every read costs past its bytes: the allocator's header for its
 /// buffer and its slot in the list of reads, that list's growth included.
 const ENTRY_COST: u64 = 96;
@@ -326,11 +336,8 @@ fn resolve_file(path: &Path) -> Result<(Offsets, File), String> {
         let data = Budgeted::new(&file, len);
         (symbols(&data), data.over.get())
     };
-    if over {
-        return Err(format!(
-            "its symbols take more than {} MiB to read",
-            MAX_READ_BYTES >> 20
-        ));
+    if let Some(over) = over {
+        return Err(over.to_string());
     }
     offsets.map(|offsets| (offsets, file))
 }
@@ -348,8 +355,40 @@ struct Budgeted<'f> {
     ranges: RefCell<BTreeMap<(u64, u64), *mut [u8]>>,
     /// Every name read, owned here until drop.
     names: RefCell<Vec<*mut [u8]>>,
+    /// Bytes it may still hold.
     left: Cell<u64>,
-    over: Cell<bool>,
+    /// Bytes it may still read, kept or not.
+    io_left: Cell<u64>,
+    /// Names it may still read.
+    names_left: Cell<u64>,
+    /// Which budget ran out, if one did.
+    over: Cell<Option<Over>>,
+}
+
+/// A budget a resolve ran out of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Over {
+    Memory,
+    Reads,
+    Names,
+}
+
+impl std::fmt::Display for Over {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Over::Memory => write!(
+                f,
+                "its symbols take more than {} MiB to read",
+                MAX_READ_BYTES >> 20
+            ),
+            Over::Reads => write!(
+                f,
+                "its symbols take more than {} MiB of reads",
+                MAX_IO_BYTES >> 20
+            ),
+            Over::Names => write!(f, "it has more than {MAX_NAMES} names to read"),
+        }
+    }
 }
 
 impl<'f> Budgeted<'f> {
@@ -360,18 +399,25 @@ impl<'f> Budgeted<'f> {
             ranges: RefCell::new(BTreeMap::new()),
             names: RefCell::new(Vec::new()),
             left: Cell::new(MAX_READ_BYTES),
-            over: Cell::new(false),
+            io_left: Cell::new(MAX_IO_BYTES),
+            names_left: Cell::new(MAX_NAMES),
+            over: Cell::new(None),
         }
     }
 
     fn charge(&self, bytes: u64) -> Result<(), ()> {
-        match self.left.get().checked_sub(bytes) {
+        self.spend(&self.left, bytes, Over::Memory)
+    }
+
+    /// Takes `amount` from `budget`, or marks it run out.
+    fn spend(&self, budget: &Cell<u64>, amount: u64, over: Over) -> Result<(), ()> {
+        match budget.get().checked_sub(amount) {
             Some(left) => {
-                self.left.set(left);
+                budget.set(left);
                 Ok(())
             }
             None => {
-                self.over.set(true);
+                self.over.set(Some(over));
                 Err(())
             }
         }
@@ -384,6 +430,7 @@ impl<'f> Budgeted<'f> {
     /// Reads up to `buf.len()` bytes at `offset`, fewer only at the end
     /// of the file.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, ()> {
+        self.spend(&self.io_left, buf.len() as u64, Over::Reads)?;
         let mut done = 0;
         while done < buf.len() {
             match self.file.read_at(&mut buf[done..], offset + done as u64) {
@@ -451,12 +498,25 @@ impl<'a> ReadRef<'a> for &'a Budgeted<'_> {
         if range.start > range.end || range.end > self.len {
             return Err(());
         }
+        self.spend(&self.names_left, 1, Over::Names)?;
         let most = (range.end - range.start).min(MAX_NAME_READ);
         self.charge(most + ENTRY_COST)?;
-        let mut bytes = vec![0; most as usize];
-        let read = self.read_at(&mut bytes, range.start)?;
-        let Some(end) = bytes[..read].iter().position(|&b| b == delimiter) else {
-            return Err(());
+        let mut bytes = Vec::new();
+        let end = loop {
+            let from = bytes.len();
+            let chunk = NAME_CHUNK.min(most - from as u64) as usize;
+            if chunk == 0 {
+                return Err(());
+            }
+            bytes.resize(from + chunk, 0);
+            let read = self.read_at(&mut bytes[from..], range.start + from as u64)?;
+            bytes.truncate(from + read);
+            if let Some(at) = bytes[from..].iter().position(|&b| b == delimiter) {
+                break from + at;
+            }
+            if read < chunk {
+                return Err(());
+            }
         };
         bytes.truncate(end);
         self.refund(most - end as u64);
@@ -495,6 +555,7 @@ fn symbols<'a, R: ReadRef<'a>>(data: R) -> Result<Offsets, String> {
             "{sections} sections: more than {MAX_SECTIONS} to parse for symbols"
         ));
     }
+    let file_len = data.len().unwrap_or(0);
     let obj = object::File::parse(data).map_err(|error| format!("not an object: {error}"))?;
     let mut found = [None; 4];
     for sym in obj.dynamic_symbols().chain(obj.symbols()) {
@@ -527,10 +588,16 @@ fn symbols<'a, R: ReadRef<'a>>(data: R) -> Result<Offsets, String> {
         let section = obj
             .section_by_index(index)
             .map_err(|error| format!("{name}: {error}"))?;
-        let (file_offset, _) = section
+        let (file_offset, size) = section
             .file_range()
             .ok_or_else(|| format!("{name}: its section has no bytes in the file"))?;
-        Ok(Some(address - section.address() + file_offset))
+        let offset = address
+            .checked_sub(section.address())
+            .filter(|within| *within < size)
+            .and_then(|within| file_offset.checked_add(within))
+            .filter(|offset| *offset < file_len)
+            .ok_or_else(|| format!("{name}: outside its section"))?;
+        Ok(Some(offset))
     };
     let write = offset(0)?.ok_or_else(|| "SSL_write: not exported".to_owned())?;
     let read = offset(1)?.ok_or_else(|| "SSL_read: not exported".to_owned())?;
@@ -973,8 +1040,48 @@ mod tests {
         fs::write(&path, &elf).unwrap();
         let (result, peak) = meter::peak(|| resolve(&path));
         let error = result.unwrap_err();
-        assert!(error.contains("more than 64 MiB"), "{error}");
+        assert_eq!(error, format!("it has more than {MAX_NAMES} names to read"));
         assert!(peak < MAX_READ_BYTES as usize, "{peak}");
+        // What it read, kept or not, is a part of the reads' budget: a
+        // short name is a short read.
+        let file = File::open(&path).unwrap();
+        let data = Budgeted::new(&file, elf.len() as u64);
+        assert!(super::symbols(&data).is_err());
+        let read = MAX_IO_BYTES - data.io_left.get();
+        assert!(read < 100 << 20, "{read}");
+    }
+
+    /// A symbol whose address lies outside its section (the library's
+    /// `SSL_write` moved below `.text`) is refused, never translated into
+    /// a wrapped offset or a panic.
+    #[test]
+    fn a_symbol_outside_its_section_is_refused() {
+        let Some(path) = host_libssl() else {
+            eprintln!("skipped: no libssl on this host");
+            return;
+        };
+        let mut elf = fs::read(fs::canonicalize(path).unwrap()).unwrap();
+        let at = {
+            let obj = object::File::parse(&*elf).unwrap();
+            let sym = obj
+                .dynamic_symbols()
+                .find(|s| s.name() == Ok("SSL_write"))
+                .unwrap();
+            let (table, _) = obj
+                .section_by_name(".dynsym")
+                .unwrap()
+                .file_range()
+                .unwrap();
+            table as usize + sym.index().0 * 24
+        };
+        elf[at + 8..at + 16].copy_from_slice(&1u64.to_le_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let moved = tmp.path().join("libssl.so.3");
+        fs::write(&moved, &elf).unwrap();
+        assert_eq!(
+            resolve(&moved).unwrap_err(),
+            "SSL_write: outside its section"
+        );
     }
 
     /// A range read twice gives the bytes of its first read: a header
@@ -1026,17 +1133,25 @@ mod tests {
         assert!(peak < 1 << 16, "{peak}");
     }
 
-    /// The host's OpenSSL resolves within a small part of the budget.
-    #[test]
-    fn a_library_resolves_within_a_small_part_of_the_budget() {
-        let candidates = [
+    /// The host's OpenSSL, 3 or 1.1, when it has one.
+    fn host_libssl() -> Option<&'static str> {
+        [
             "/lib/x86_64-linux-gnu/libssl.so.3",
             "/usr/lib/x86_64-linux-gnu/libssl.so.3",
             "/usr/lib64/libssl.so.3",
             "/lib/libssl.so.3",
-        ];
-        let Some(path) = candidates.iter().find(|p| Path::new(p).is_file()) else {
-            eprintln!("skipped: no libssl.so.3 on this host");
+            "/lib/x86_64-linux-gnu/libssl.so.1.1",
+            "/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+    }
+
+    /// The host's OpenSSL resolves within a small part of the budget.
+    #[test]
+    fn a_library_resolves_within_a_small_part_of_the_budget() {
+        let Some(path) = host_libssl() else {
+            eprintln!("skipped: no libssl on this host");
             return;
         };
         let (result, peak) = meter::peak(|| resolve(Path::new(path)));
