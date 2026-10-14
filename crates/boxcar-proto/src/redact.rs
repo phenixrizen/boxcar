@@ -140,14 +140,14 @@ fn scrub_arg(arg: &str) -> String {
 }
 
 /// The name of a word that gives a secret-looking name (`--cookie`,
-/// `-token`, `API_TOKEN`) a value after `=`; none when the value is
-/// empty.
+/// `-token`, `API_TOKEN`, a property's `-Ddb.password`) a value after
+/// `=`; none when the value is empty.
 fn attached_secret(word: &str) -> Option<&str> {
     let (name, value) = word.split_once('=')?;
     let bare = name.trim_start_matches('-');
     let secret = !value.is_empty()
         && !bare.is_empty()
-        && bare.chars().all(is_key_char)
+        && bare.chars().all(|c| is_key_char(c) || c == '.')
         && is_secret_key(bare);
     secret.then_some(name)
 }
@@ -862,6 +862,8 @@ mod tests {
             "-token='quoted' and, punctuated; too",
             "--api-key=",
             "API_TOKEN=a b",
+            "-Ddb.password=first second",
+            "-Dapp.cookie=a; b=c",
             "--output=two words",
             "LANG=C.UTF-8",
             "https://x.test/?a=b c",
@@ -875,6 +877,8 @@ mod tests {
             "-token=[redacted]",
             "--api-key=",
             "API_TOKEN=[redacted]",
+            "-Ddb.password=[redacted]",
+            "-Dapp.cookie=[redacted]",
             "--output=two words",
             "LANG=C.UTF-8",
             "https://x.test/?a=b c",
