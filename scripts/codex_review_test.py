@@ -143,6 +143,11 @@ class Behind(unittest.TestCase):
             with self.assertRaises(BaseRepeated):
                 base_of(argv)
 
+    def test_an_empty_base_is_refused_whatever_its_form(self):
+        for argv in (["--base", "", "focus"], ["--base=", "focus"], ["--base", " ", "focus"], ["focus", "--base"]):
+            with self.assertRaises(BaseUnknown):
+                base_of(argv)
+
     def test_the_remote_and_branch_come_from_the_base_s_full_ref(self):
         git = FakeGit({}, full={"origin/main": "refs/remotes/origin/main", "refs/remotes/origin/main": "refs/remotes/origin/main",
                                 "origin/feature/x": "refs/remotes/origin/feature/x", "main": "refs/heads/main", "parent": "refs/heads/parent"})
@@ -203,6 +208,14 @@ class MainChecksTheBase(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(main(["--base", "HEAD", "--base", "origin/main", "focus"]), 2)
         self.assertIn("more than once", err.getvalue())
+
+    def test_an_empty_base_is_refused_before_the_plugin_is_looked_for(self):
+        for argv in (["--base", "", "focus"], ["--base=", "focus"]):
+            with mock.patch.object(codex_review, "behind", side_effect=AssertionError("compared")), \
+                    mock.patch.object(codex_review, "registry_path", side_effect=AssertionError("looked for the plugin")), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(main(argv), 2)
+            self.assertIn("no ref", err.getvalue())
 
     def test_a_branch_on_its_base_goes_on_to_the_review(self):
         with mock.patch.object(codex_review, "behind", return_value=0), \

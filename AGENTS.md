@@ -44,10 +44,10 @@ python3 scripts/codex_review.py "<focus: the risks this change touches>"
   revised and reviewed before the code follows it. The pull request's
   body names the plan's last reviewed commit apart from the code's. The
   plan stays as the change's design record, written as the pull request
-  is (neutral for a security fix). A milestone's plan says what to build; each of its
-  tasks that is such a change still gets a plan of its own, reviewed so
-  before the task's code. A small fix (one cause, one place, no new state)
-  needs no plan.
+  is (neutral for a security fix). A milestone's plan says what to build;
+  each of its tasks that is such a change still gets a plan of its own,
+  reviewed so before the task's code. A small fix (one cause, one place,
+  no new state) needs no plan.
 - `--base` reviews the commits `origin/main...HEAD`, not the working tree:
   commit everything first. The pull request's body names the commit
   reviewed; commits after it (the review's own fixes included) get another
