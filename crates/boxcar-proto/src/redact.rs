@@ -123,10 +123,11 @@ impl Argv {
     /// `arg` as a record may keep it, after the arguments before it. A
     /// result a second scrub would still change goes whole, so an argv
     /// scrubs the same way twice (`docs/plans/argv-attached-values.md`,
-    /// I5).
+    /// I5); code keeps main's result as it is, so a script keeps its later
+    /// commands.
     fn next(&mut self, arg: &str) -> String {
         let mut out = self.one(arg);
-        if self.one(&out) != out {
+        if !self.code && self.one(&out) != out {
             out = REDACTED.to_owned();
         }
         // The flags are read from the result, as a second scrub reads
@@ -1137,6 +1138,22 @@ mod tests {
         }
     }
 
+    /// A script whose credential main's text rules redact (a quoted
+    /// `-u` value ending in `;`) keeps what main keeps, its later command
+    /// included: code gets main's result as it is.
+    #[test]
+    fn a_script_keeps_what_main_keeps() {
+        let script = "curl https://example.test -u 'alice:pw'; echo retained";
+        let argv: Vec<String> = ["sh", "-c", script].map(str::to_owned).to_vec();
+        let scrubbed = scrub_argv(&argv);
+        assert_eq!(scrubbed[2], scrub_text(script));
+        assert!(scrubbed[2].contains("echo retained"), "{scrubbed:?}");
+        assert!(!scrubbed[2].contains("pw"), "{scrubbed:?}");
+        let mut v = json!(argv);
+        scrub_deep(&mut v);
+        assert_eq!(v, json!(scrubbed));
+    }
+
     /// A long argument costs a long argument's time: one with no
     /// whitespace and a separator every other byte, one with a stem only
     /// near its end, and one of Kelvin signs (which lowercase to `k`).
@@ -1155,6 +1172,13 @@ mod tests {
             let took = started.elapsed();
             assert!(took < std::time::Duration::from_secs(5), "{took:?}");
         }
+    }
+
+    /// `twice` is `once` scrubbed again: equal outside code, which keeps
+    /// main's result and is only as stable as main's text rules.
+    fn stable_outside_code(once: &[String], twice: &[String]) -> bool {
+        once.len() == twice.len()
+            && (0..once.len()).all(|i| (i > 0 && is_code_flag(&once[i - 1])) || once[i] == twice[i])
     }
 
     /// Argvs built from the pieces flags and values are made of (user,
@@ -1195,7 +1219,7 @@ mod tests {
         let arg = prop::collection::vec(pieces, 1..10).prop_map(|p| p.concat());
         proptest!(ProptestConfig::with_cases(2000), |(argv in prop::collection::vec(arg, 0..6))| {
             let once = scrub_argv(&argv);
-            prop_assert_eq!(scrub_argv(&once), once.clone());
+            prop_assert!(stable_outside_code(&once, &scrub_argv(&once)), "{:?}", once);
             let mut v = json!(argv);
             scrub_deep(&mut v);
             prop_assert_eq!(v, json!(once));
@@ -1211,7 +1235,7 @@ mod tests {
         let arg = "[-a-zA-Z0-9=:;'\" _.\\[\\]\u{212a}\u{e9}\u{1f600}|&]{0,24}";
         proptest!(|(argv in prop::collection::vec(arg, 0..6))| {
             let once = scrub_argv(&argv);
-            prop_assert_eq!(scrub_argv(&once), once.clone());
+            prop_assert!(stable_outside_code(&once, &scrub_argv(&once)), "{:?}", once);
             let mut v = json!(argv);
             scrub_deep(&mut v);
             prop_assert_eq!(v.clone(), json!(once));
