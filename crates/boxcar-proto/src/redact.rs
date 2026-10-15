@@ -139,12 +139,16 @@ impl Argv {
                 cut(arg, main)
             }
         };
-        // A cut can make a bare secret flag of an argument that was not
-        // one (`--toKen:x=y` becomes `--toKen:[redacted]`): either counts,
-        // so the next argument goes now and not on a second scrub.
+        // The flags are read so a second scrub reads them the same. A cut
+        // can make a bare secret flag of an argument that was not one
+        // (`--toKen:x=y` becomes `--toKen:[redacted]`), so either counts
+        // and the next argument goes now; a user flag counts either way
+        // too, so main's `user_value` still applies; a code flag redacted
+        // as a secret flag's value is no code flag, so only its result
+        // counts (the exemption only ever gives main's result).
         self.flag = is_secret_flag(arg) || is_secret_flag(&out);
-        self.user = is_user_flag(arg);
-        self.code = is_code_flag(arg);
+        self.user = is_user_flag(arg) || is_user_flag(&out);
+        self.code = is_code_flag(&out);
         out
     }
 }
@@ -1014,6 +1018,31 @@ mod tests {
         assert_eq!(v, json!({"argv": want}));
         scrub_deep(&mut v);
         assert_eq!(v, json!({"argv": want}), "stable");
+        // Flags redacted as a secret flag's value shape the next argument
+        // the same way on every pass.
+        for (argv, want) in [
+            (
+                ["--token", "-c", "TOKEN=x; echo retained"],
+                ["--token", "[redacted]", "TOKEN=[redacted]"],
+            ),
+            (
+                ["--token", "-u", "alice:pw"],
+                ["--token", "[redacted]", "alice:[redacted]"],
+            ),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            assert_eq!(scrub_argv(&argv), want, "{argv:?}");
+            assert_eq!(
+                scrub_argv(&want.map(str::to_owned)),
+                want,
+                "{argv:?}: stable"
+            );
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(want), "{argv:?}");
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(want), "{argv:?}: stable");
+        }
         // A script given to a shell is text: only its values go, and the
         // commands after them stay.
         let script = scrub_argv(&["sh", "-c", "export TOKEN=x; rm -rf /tmp/y"].map(str::to_owned));
