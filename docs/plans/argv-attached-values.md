@@ -6,9 +6,9 @@ Five review rounds on rule-by-rule recognition (a whitelist of name characters, 
 
 ## The rule
 
-For an argument `A`, with `M` what main makes of it (main's `scrub_arg`: a user flag's value through `user_value`, anything else through `scrub_text`):
+For an argument `A`, with `M` what main makes of it in its place: after a separate user flag (`-u`, `--user`), `user_value` then `scrub_text`; otherwise main's `scrub_arg`, a user flag's attached value through `user_value` and anything else through `scrub_text`. After a secret flag the argument is redacted whole, as on main, and nothing below applies.
 
-1. **Code stays text.** When `A` follows `-c`, `-e`, `--command` or `--eval`, or a short-flag cluster ending in `c` or `e` (`-lc`, `-ec`), and holds a shell separator (`;`, `&&`, `||`, `|` or a newline), `A` is code: the result is `M`, and the script's later commands stay in the record. This covers `sh -c 'TOKEN=x; echo retained'` and `python3 -c "token='a'; run()"`.
+1. **Code stays text.** When `A` follows `-c`, `-e`, `--command` or `--eval`, or a short-flag cluster ending in `c` or `e` (`-lc`, `-ec`), `A` is code: the result is `M`, and the script's later commands stay in the record. This covers `sh -c 'TOKEN=x; echo retained'` and `python3 -c "token='a'; run()"`. The test is by position alone, which redaction never changes: a test on `A`'s content (a shell separator) would flip once redaction removed the separator, and a second scrub would cut what the first kept.
 2. **The cut, found in `A`.** The rule looks at `A`'s first word only (up to the first whitespace). The cut is the first `=` or `:` in that word that comes after a secret's stem (`SECRET_STEMS`, or `basic`) in the word lowercased as `is_secret_key` reads it (Unicode `to_lowercase`, so `toKen` with the Kelvin sign counts), with something after it in `A`. With no cut, the result is `M`.
 3. **The result, never less than `M`.** With the cut at byte `p` and `P = A[..=p]`: when `M` starts with `P`, main left all of `P` as it was, and the result is `P` followed by `[redacted]`. Otherwise main redacted something inside `P` (a long name taken for a credential, a `-u` user that is one), and the result is `[redacted]`, the whole argument.
 
@@ -28,8 +28,8 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
 ## Invariants
 
 - **I1. Never less than main.** The result is `M`, or `M` with everything after an untouched prefix replaced, or `[redacted]`. Whatever main redacts stays redacted. This holds by construction.
-- **I2.** A value attached by `=` or `:` to a first word holding a secret's stem never survives in part, outside step 1's code arguments.
-- **I3.** Code after a code flag that holds a shell separator keeps its later commands: the text rules apply to it as on main.
+- **I2.** A value attached by `=` or `:` to a first word holding a secret's stem never survives in part, outside step 1's code arguments, whether the argument stands alone or follows a user flag.
+- **I3.** Code after a code flag keeps its later commands: the text rules apply to it as on main, on every scrub.
 - **I4. Linear time** in the argument's length. Strings in arrays on the observer and dump paths can be megabytes, without whitespace and with many separators.
 - **I5. Stable**, for an argument and for an argv. Scrubbing a scrubbed argument changes nothing: the cut is found again in `P[redacted]`, main leaves `P[redacted]` alone, and `[redacted]` has no stem. Scrubbing a scrubbed argv changes nothing either: step 4 takes a flag from the argument as given or as emitted, so whatever a second pass would read as a flag already redacted the next argument in the first.
 - **I6. No panic** on any input. Slices are taken only at char boundaries of the same string, from `char_indices` or from ASCII separators found there.
@@ -40,7 +40,7 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
 - Values in an argument of their own after a flag whose name holds no stem, as on main.
 - Names holding no stem (`--pw=`, `--key=`): `is_secret_key`'s stems are the module's single list, and widening them is a change of its own.
 - Code given other than after a code flag (a remote command to `ssh`, an awk program). The cut can apply to it, and its text is lost from the argument's record. What it runs locally is still recorded by its own `proc.exec` and its effects.
-- A value after `-e` that holds a shell separator (`docker run -e 'TOKEN=a; b'`) is taken as code: the text rules redact `a` and keep `b`, as on main.
+- A value after `-e` or `-c` is taken as code, whatever it is: `docker run -e 'TOKEN=a b'` keeps `b`, as on main. Telling an environment value from code would need a program's own syntax.
 - Over-redaction is accepted, as `scrub`'s doc says: `--max_tokens=8` loses its value. The reconciler compares commands with the argv as run (`RawArgv`), so it is not affected.
 
 ## Tests
@@ -50,7 +50,8 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
   - `--toKen=alpha beta` with the Kelvin sign: Unicode recognition;
   - `--Secrets:ApiKey VALUE` and `--password:x next` (I7);
   - `--toKen:x=y` (the Kelvin sign) then `keep`: `keep` is redacted in the first pass, and a second pass changes nothing, through both entry points (step 4, I5).
-- `code_after_a_code_flag_stays_text` (new): `sh -c 'TOKEN=x; echo retained'`, `bash -lc …`, `python3 -c "token='a'; run()"` and `node -e …` keep their later commands, through both entry points (I3). `env 'TOKEN=a b'` and `--cookie=a; b=c`, which follow no code flag, are cut.
+- `code_after_a_code_flag_stays_text` (new): `sh -c 'TOKEN=x; echo retained'`, `bash -lc …`, `python3 -c "token='a'; run()"`, `node -e …` and `sh -c "TOKEN='a;b' env"` keep their later commands, through both entry points and on a second scrub (I3, I5). `env 'TOKEN=a b'` and `--cookie=a; b=c`, which follow no code flag, are cut.
+- A user flag's separate value: `curl -u 'token=alpha beta:pw'` and `--user 'password=a b:c'` lose the whole attached value, through both entry points (I2).
 - `a_long_argument_scrubs_in_linear_time` (new): a 2 MiB argument without whitespace, made of `a:` pairs, then one with a stem near its end, then one of Kelvin-sign letters. Each scrubs within a second; a quadratic scan takes minutes (I4).
 - `random_argvs_never_panic` (new): random arrays of random strings (separators, multi-byte characters, quotes) through `scrub_argv` and `scrub_deep` (I6). Each result is also scrubbed again to check I5.
 - I1 holds by construction; the review checks it. The existing redaction and audit tests pass unchanged.
