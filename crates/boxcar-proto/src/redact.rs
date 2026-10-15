@@ -127,7 +127,17 @@ impl Argv {
     /// commands.
     fn next(&mut self, arg: &str) -> String {
         let mut out = self.one(arg);
-        if !self.code && self.one(&out) != out {
+        if self.code {
+            // Code keeps main's result and main's reading of it for the
+            // next argument, from the argument as given: main's text rules
+            // need not be a fixed point on a script, so reading its result
+            // would let that reach the next argument on a second scrub.
+            self.flag = is_secret_flag(arg);
+            self.user = is_user_flag(arg);
+            self.code = is_code_flag(arg);
+            return out;
+        }
+        if self.one(&out) != out {
             out = REDACTED.to_owned();
         }
         // The flags are read from the result, as a second scrub reads
@@ -1152,6 +1162,24 @@ mod tests {
         let mut v = json!(argv);
         scrub_deep(&mut v);
         assert_eq!(v, json!(scrubbed));
+        // Main's text rules are not a fixed point on this script, and a
+        // second scrub drops its `=`; the argument after it is read from
+        // the script as given, as main reads it, and stays.
+        let argv: Vec<String> = ["python3", "-c", "-1 # token -u 'alice:pw'; x=y", "keep"]
+            .map(str::to_owned)
+            .to_vec();
+        let once = scrub_argv(&argv);
+        let twice = scrub_argv(&once);
+        assert_eq!(
+            (once[3].as_str(), twice[3].as_str()),
+            ("keep", "keep"),
+            "{once:?} {twice:?}"
+        );
+        let mut v = json!(argv);
+        scrub_deep(&mut v);
+        assert_eq!(v[3], "keep");
+        scrub_deep(&mut v);
+        assert_eq!(v[3], "keep");
     }
 
     /// A long argument costs a long argument's time: one with no
@@ -1175,10 +1203,12 @@ mod tests {
     }
 
     /// `twice` is `once` scrubbed again: equal outside code, which keeps
-    /// main's result and is only as stable as main's text rules.
+    /// main's result and is only as stable as main's text rules (as is
+    /// the argument after it, read from the code as main reads it).
     fn stable_outside_code(once: &[String], twice: &[String]) -> bool {
+        let after_code = |i: usize, back: usize| i >= back && is_code_flag(&once[i - back]);
         once.len() == twice.len()
-            && (0..once.len()).all(|i| (i > 0 && is_code_flag(&once[i - 1])) || once[i] == twice[i])
+            && (0..once.len()).all(|i| after_code(i, 1) || after_code(i, 2) || once[i] == twice[i])
     }
 
     /// Argvs built from the pieces flags and values are made of (user,
