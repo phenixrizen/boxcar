@@ -12,6 +12,8 @@ For an argument `A`, with `M` what main makes of it (main's `scrub_arg`: a user 
 2. **The cut, found in `A`.** The rule looks at `A`'s first word only (up to the first whitespace). The cut is the first `=` or `:` in that word that comes after a secret's stem (`SECRET_STEMS`, or `basic`) in the word lowercased as `is_secret_key` reads it (Unicode `to_lowercase`, so `toKen` with the Kelvin sign counts), with something after it in `A`. With no cut, the result is `M`.
 3. **The result, never less than `M`.** With the cut at byte `p` and `P = A[..=p]`: when `M` starts with `P`, main left all of `P` as it was, and the result is `P` followed by `[redacted]`. Otherwise main redacted something inside `P` (a long name taken for a credential, a `-u` user that is one), and the result is `[redacted]`, the whole argument.
 
+4. **The next argument.** Main redacts the argument after a bare secret flag (`is_secret_flag`: `--token`, `--Secrets:ApiKey`). A cut can make an argument a bare secret flag where it was not one: `--toKen:x=y` (the Kelvin sign) becomes `--toKen:[redacted]`, which has no `=`. So an argument counts as a secret flag for the next one when either it as given or its result is one, and the next argument goes in the first pass, not only on a second scrub.
+
 Recognition reads `A`, not `M`, so main's own redactions cannot hide the stem (`--password<32 digits>=alpha beta` loses `beta`). Applying it through `M` keeps every redaction main makes.
 
 The word before the separator is not parsed as a name, so every spelling holds: `--cookie=a; b=c`, `--password=a b`, `API_TOKEN=a b`, `+password=`, `/password=`, `'password'=`, `-Ddb.password=`, `-Ddb[0].password=`, `--Db:Password=`, `--Service:ApiKey=a;b`, `Authorization: Basic a b`, `Basic=a b`, `-user-password=a b:c`, `-u<credential>=x:pw`.
@@ -29,9 +31,9 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
 - **I2.** A value attached by `=` or `:` to a first word holding a secret's stem never survives in part, outside step 1's code arguments.
 - **I3.** Code after a code flag that holds a shell separator keeps its later commands: the text rules apply to it as on main.
 - **I4. Linear time** in the argument's length. Strings in arrays on the observer and dump paths can be megabytes, without whitespace and with many separators.
-- **I5. Stable.** Scrubbing a scrubbed argument changes nothing: the cut is found again in `P[redacted]`, main leaves `P[redacted]` alone, and `[redacted]` has no stem.
+- **I5. Stable**, for an argument and for an argv. Scrubbing a scrubbed argument changes nothing: the cut is found again in `P[redacted]`, main leaves `P[redacted]` alone, and `[redacted]` has no stem. Scrubbing a scrubbed argv changes nothing either: step 4 takes a flag from the argument as given or as emitted, so whatever a second pass would read as a flag already redacted the next argument in the first.
 - **I6. No panic** on any input. Slices are taken only at char boundaries of the same string, from `char_indices` or from ASCII separators found there.
-- **I7.** `is_secret_flag` is unchanged. A secret flag without `=` (`--token`, `--Secrets:ApiKey`) still redacts the next argument whole.
+- **I7.** `is_secret_flag` is unchanged, and an argument it takes as a flag on main still redacts the next argument whole (`--token`, `--Secrets:ApiKey`). Step 4 only adds flags, never removes one.
 
 ## Out of scope
 
@@ -46,7 +48,8 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
 - `a_value_attached_to_a_secret_name_is_taken_whole_in_an_argv`: every spelling above, through `scrub_argv` and `scrub_deep`, plus a second scrub (I2, I5). Also:
   - `--password<32 digits>=alpha beta` and `-u<credential>=x:pw`: step 3's whole-argument case;
   - `--toKen=alpha beta` with the Kelvin sign: Unicode recognition;
-  - `--Secrets:ApiKey VALUE` and `--password:x next` (I7).
+  - `--Secrets:ApiKey VALUE` and `--password:x next` (I7);
+  - `--toKen:x=y` (the Kelvin sign) then `keep`: `keep` is redacted in the first pass, and a second pass changes nothing, through both entry points (step 4, I5).
 - `code_after_a_code_flag_stays_text` (new): `sh -c 'TOKEN=x; echo retained'`, `bash -lc …`, `python3 -c "token='a'; run()"` and `node -e …` keep their later commands, through both entry points (I3). `env 'TOKEN=a b'` and `--cookie=a; b=c`, which follow no code flag, are cut.
 - `a_long_argument_scrubs_in_linear_time` (new): a 2 MiB argument without whitespace, made of `a:` pairs, then one with a stem near its end, then one of Kelvin-sign letters. Each scrubs within a second; a quadratic scan takes minutes (I4).
 - `random_argvs_never_panic` (new): random arrays of random strings (separators, multi-byte characters, quotes) through `scrub_argv` and `scrub_deep` (I6). Each result is also scrubbed again to check I5.
