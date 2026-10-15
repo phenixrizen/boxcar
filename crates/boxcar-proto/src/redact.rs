@@ -98,7 +98,8 @@ fn texts(v: &mut Value) {
     }
 }
 
-/// An argv as a record may keep it: each argument through `scrub_arg`,
+/// An argv as a record may keep it: each argument as main records it,
+/// the value after a secret word cut to the argument's end,
 /// and the argument after a secret-looking flag (`--token`, `--password`)
 /// redacted whole. The same argv always scrubs the same way, and a JSON
 /// array of the same strings scrubs as [`scrub_deep`] does it.
@@ -123,10 +124,20 @@ impl Argv {
     fn next(&mut self, arg: &str) -> String {
         let out = if self.flag {
             REDACTED.to_owned()
-        } else if self.user {
-            scrub_text(&user_value(arg))
         } else {
-            scrub_arg(arg, self.code)
+            // What main makes of it in its place, then the cut, unless it
+            // is code: an argument after a code flag is code by position,
+            // which no redaction changes.
+            let main = if self.user {
+                scrub_text(&user_value(arg))
+            } else {
+                main_arg(arg)
+            };
+            if self.code {
+                main
+            } else {
+                cut(arg, main)
+            }
         };
         // A cut can make a bare secret flag of an argument that was not
         // one (`--toKen:x=y` becomes `--toKen:[redacted]`): either counts,
@@ -138,26 +149,25 @@ impl Argv {
     }
 }
 
-/// One argument as a record may keep it (`docs/plans/argv-attached-values.md`):
-/// main's rules first (a user flag's value through [`user_value`], the
-/// rest through [`scrub_text`]); then, since in an argv a value runs to
-/// the argument's end, everything after the [`secret_cut`], never
-/// redacting less than main did. Code after a code flag (`sh -c 'TOKEN=x;
-/// echo kept'`) keeps main's rules alone, so its later commands stay.
-fn scrub_arg(arg: &str, after_code_flag: bool) -> String {
-    let main = match attached_user(arg) {
+/// One argument as main records it: a user flag's attached value
+/// (`--user=alice:pw`, `-ualice:pw`) through [`user_value`], the rest
+/// through [`scrub_text`].
+fn main_arg(arg: &str) -> String {
+    match attached_user(arg) {
         Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
         None => scrub_text(arg),
-    };
-    let separates = arg.contains([';', '|', '\n']) || arg.contains("&&");
-    if after_code_flag && separates {
-        return main;
     }
+}
+
+/// `main`, what main made of `arg`, with everything after `arg`'s
+/// [`secret_cut`] redacted too (`docs/plans/argv-attached-values.md`):
+/// in an argv a value runs to the argument's end. Never less than main:
+/// when main left everything up to the cut as it was, that prefix and
+/// `[redacted]`; when it redacted something inside it, all of it.
+fn cut(arg: &str, main: String) -> String {
     match secret_cut(arg) {
         None => main,
-        // Main left everything up to the cut as it was: the rest goes.
         Some(cut) if main.starts_with(&arg[..=cut]) => format!("{}{REDACTED}", &arg[..=cut]),
-        // Main redacted something before the cut: all of it goes.
         Some(_) => REDACTED.to_owned(),
     }
 }
@@ -1047,21 +1057,30 @@ mod tests {
                 "token='[redacted]'; run()",
             ),
             (["node", "-e", "token=1; run()"], "token=[redacted]; run()"),
+            (["sh", "-c", "TOKEN='a;b' env"], "TOKEN='[redacted]' env"),
         ] {
             let argv: Vec<String> = argv.map(str::to_owned).to_vec();
             let scrubbed = scrub_argv(&argv);
             assert_eq!(scrubbed[2], code, "{argv:?}");
+            assert_eq!(scrub_argv(&scrubbed), scrubbed, "{argv:?}: stable");
             let mut v = json!(argv);
             scrub_deep(&mut v);
             assert_eq!(v[2], code, "{argv:?}");
+            scrub_deep(&mut v);
+            assert_eq!(v[2], code, "{argv:?}: stable");
         }
         for (argv, cut) in [
             (["env", "TOKEN=a b", "cmd"], "TOKEN=[redacted]"),
             (["curl", "--cookie=a; b=c", "x"], "--cookie=[redacted]"),
-            (["sh", "-c", "TOKEN=a b"], "TOKEN=[redacted]"),
+            (["curl", "-u", "token=alpha beta:pw"], "token=[redacted]"),
+            (["curl", "--user", "password=a b:c"], "password=[redacted]"),
         ] {
             let argv: Vec<String> = argv.map(str::to_owned).to_vec();
-            assert!(scrub_argv(&argv)[1..].join(" ").contains(cut), "{argv:?}");
+            let scrubbed = scrub_argv(&argv);
+            assert!(scrubbed.iter().any(|a| a == cut), "{argv:?}: {scrubbed:?}");
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(scrubbed), "{argv:?}");
         }
     }
 
