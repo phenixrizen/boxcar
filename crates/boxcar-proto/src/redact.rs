@@ -83,81 +83,125 @@ fn texts(v: &mut Value) {
         Value::Array(items) => {
             // An array of strings may be an argv: a secret flag's value is
             // the next string.
-            let mut flag = false;
-            let mut user = false;
+            let mut argv = Argv::default();
             for item in items.iter_mut() {
-                let next_flag = item.as_str().is_some_and(is_secret_flag);
-                let next_user = item.as_str().is_some_and(is_user_flag);
                 match item {
-                    Value::String(_) if flag => *item = Value::String(REDACTED.to_owned()),
-                    Value::String(text) if user => *text = scrub_text(&user_value(text)),
-                    Value::String(text) => *text = scrub_arg(text),
-                    _ => texts(item),
+                    Value::String(text) => *text = argv.next(text),
+                    _ => {
+                        texts(item);
+                        argv = Argv::default();
+                    }
                 }
-                flag = next_flag;
-                user = next_user;
             }
         }
         _ => {}
     }
 }
 
-/// An argv as a record may keep it: each argument through [`scrub_text`],
+/// An argv as a record may keep it: each argument through `scrub_arg`,
 /// and the argument after a secret-looking flag (`--token`, `--password`)
 /// redacted whole. The same argv always scrubs the same way, and a JSON
 /// array of the same strings scrubs as [`scrub_deep`] does it.
 pub fn scrub_argv(argv: &[String]) -> Vec<String> {
-    let mut flag = false;
-    let mut user = false;
-    argv.iter()
-        .map(|arg| {
-            let out = if flag {
-                REDACTED.to_owned()
-            } else if user {
-                scrub_text(&user_value(arg))
-            } else {
-                scrub_arg(arg)
-            };
-            flag = is_secret_flag(arg);
-            user = is_user_flag(arg);
-            out
-        })
-        .collect()
+    let mut state = Argv::default();
+    argv.iter().map(|arg| state.next(arg)).collect()
 }
 
-/// One whole argument as a record may keep it: a user flag's value
-/// (`--user=alice:pw`, `-ualice:pw`) through [`user_value`], the rest
-/// through [`scrub_text`], as for any text; then, since in an argv a
-/// value runs to the argument's end (neither a space nor a `;` ends it),
-/// everything after a secret-looking name's `=` or `:` ([`secret_tail`]).
-fn scrub_arg(arg: &str) -> String {
-    let scrubbed = match attached_user(arg) {
+/// What scrubbing an argv carries from one argument to the next.
+#[derive(Default)]
+struct Argv {
+    /// The last argument was a secret flag: this one is its value.
+    flag: bool,
+    /// The last argument was a user flag: this one is `user:password`.
+    user: bool,
+    /// The last argument was a code flag: this one may be code.
+    code: bool,
+}
+
+impl Argv {
+    /// `arg` as a record may keep it, after the arguments before it.
+    fn next(&mut self, arg: &str) -> String {
+        let out = if self.flag {
+            REDACTED.to_owned()
+        } else if self.user {
+            scrub_text(&user_value(arg))
+        } else {
+            scrub_arg(arg, self.code)
+        };
+        // A cut can make a bare secret flag of an argument that was not
+        // one (`--toKen:x=y` becomes `--toKen:[redacted]`): either counts,
+        // so the next argument goes now and not on a second scrub.
+        self.flag = is_secret_flag(arg) || is_secret_flag(&out);
+        self.user = is_user_flag(arg);
+        self.code = is_code_flag(arg);
+        out
+    }
+}
+
+/// One argument as a record may keep it (`docs/plans/argv-attached-values.md`):
+/// main's rules first (a user flag's value through [`user_value`], the
+/// rest through [`scrub_text`]); then, since in an argv a value runs to
+/// the argument's end, everything after the [`secret_cut`], never
+/// redacting less than main did. Code after a code flag (`sh -c 'TOKEN=x;
+/// echo kept'`) keeps main's rules alone, so its later commands stay.
+fn scrub_arg(arg: &str, after_code_flag: bool) -> String {
+    let main = match attached_user(arg) {
         Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
         None => scrub_text(arg),
     };
-    secret_tail(&scrubbed).unwrap_or(scrubbed)
+    let separates = arg.contains([';', '|', '\n']) || arg.contains("&&");
+    if after_code_flag && separates {
+        return main;
+    }
+    match secret_cut(arg) {
+        None => main,
+        // Main left everything up to the cut as it was: the rest goes.
+        Some(cut) if main.starts_with(&arg[..=cut]) => format!("{}{REDACTED}", &arg[..=cut]),
+        // Main redacted something before the cut: all of it goes.
+        Some(_) => REDACTED.to_owned(),
+    }
 }
 
-/// `arg` redacted from the first `=` or `:` whose text before it is one
-/// word (no whitespace: a flag or an assignment, not a script given to
-/// `sh -c`, whose later commands stay [`scrub_text`]'s) holding a secret's
-/// stem (or `basic`, an auth scheme), to its end, when there is something
-/// after it to redact. The word is not read as a name, so any spelling
-/// holds: `--cookie=`, `+password=`, `'password'=`, `-Ddb[0].password=`,
-/// `--Db:Password=`, `Authorization: Basic …`. It over-matches as
-/// [`scrub`] does (`--max_tokens=8` loses its value).
-fn secret_tail(arg: &str) -> Option<String> {
-    let at = arg
-        .char_indices()
-        .filter(|&(_, c)| c == '=' || c == ':')
-        .map(|(at, _)| at)
-        .find(|&at| {
-            let name = &arg[..at];
-            !name.contains(char::is_whitespace)
-                && (is_secret_key(name) || name.to_lowercase().contains("basic"))
-        })?;
-    let value = &arg[at + 1..];
-    (!value.is_empty() && value != REDACTED).then(|| format!("{}{REDACTED}", &arg[..=at]))
+/// Where a value attached to a secret word starts in `arg`: the first `=`
+/// or `:` of `arg`'s first word that comes after a secret's stem (or
+/// `basic`, an auth scheme) in that word lowercased as [`is_secret_key`]
+/// reads it, when something follows it. The word is not read as a name,
+/// so any spelling holds: `--cookie=`, `+password=`, `'password'=`,
+/// `-Ddb[0].password=`, `--Db:Password=`, `Authorization: Basic …`. One
+/// pass, so a long argument costs a long argument's time.
+fn secret_cut(arg: &str) -> Option<usize> {
+    let word = &arg[..arg.find(char::is_whitespace).unwrap_or(arg.len())];
+    let lower: String = word.chars().flat_map(char::to_lowercase).collect();
+    let found = SECRET_STEMS
+        .iter()
+        .chain(&["basic"])
+        .filter_map(|stem| lower.find(stem).map(|at| at + stem.len()))
+        .min()?;
+    // Back from the lowercased word to the word: the end of the char whose
+    // lowercase ends the stem.
+    let mut lowered = 0;
+    let mut stem_end = word.len();
+    for (at, c) in word.char_indices() {
+        lowered += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if lowered >= found {
+            stem_end = at + c.len_utf8();
+            break;
+        }
+    }
+    let cut = stem_end + word[stem_end..].find(['=', ':'])?;
+    (cut + 1 < arg.len()).then_some(cut)
+}
+
+/// A flag whose next argument is code: `-c` (`sh`, `python3`), `-e`
+/// (`node`, `perl`), `--command`, `--eval`, or short flags run together
+/// ending in one (`-lc`, `-ec`).
+fn is_code_flag(arg: &str) -> bool {
+    matches!(arg, "--command" | "--eval")
+        || arg.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty()
+                && flags.bytes().all(|b| b.is_ascii_alphabetic())
+                && (flags.ends_with('c') || flags.ends_with('e'))
+        })
 }
 
 /// Flags whose value is `user:password` (curl's, wget's): `-u`,
@@ -931,6 +975,35 @@ mod tests {
             );
             assert!(scrubbed[0].ends_with(":[redacted]"), "{scrubbed:?}");
         }
+        // Main's own rules can redact the name the cut needs (a long run of
+        // letters and digits), or a `-u` user that is a credential: all of
+        // the argument goes.
+        for arg in [
+            format!("--password{}=alpha beta", "0123456789".repeat(4)),
+            format!("-u{key}=x:pw"),
+        ] {
+            let scrubbed = scrub_argv(std::slice::from_ref(&arg));
+            assert!(
+                !scrubbed[0].contains("beta") && !scrubbed[0].contains("a1B2c3"),
+                "{arg}: {scrubbed:?}"
+            );
+            assert_eq!(scrub_argv(&scrubbed), scrubbed, "{arg}: stable");
+        }
+        // A stem's letters are matched as `is_secret_key` matches them:
+        // the Kelvin sign is a `k`.
+        let kelvin = "--to\u{212a}en=alpha beta".to_owned();
+        assert_eq!(scrub_argv(&[kelvin]), ["--to\u{212a}en=[redacted]"]);
+        // A cut that leaves a bare secret flag takes the next argument in
+        // the first pass, so a second pass changes nothing.
+        let argv = ["--to\u{212a}en:x=y", "keep"].map(str::to_owned).to_vec();
+        let want = ["--to\u{212a}en:[redacted]", "[redacted]"];
+        assert_eq!(scrub_argv(&argv), want);
+        assert_eq!(scrub_argv(&want.map(str::to_owned)), want, "stable");
+        let mut v = json!({"argv": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}));
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}), "stable");
         // A script given to a shell is text: only its values go, and the
         // commands after them stay.
         let script = scrub_argv(&["sh", "-c", "export TOKEN=x; rm -rf /tmp/y"].map(str::to_owned));
@@ -953,6 +1026,79 @@ mod tests {
             scrub_deep(&mut v);
             assert_eq!(v, json!({"argv": want}));
         }
+    }
+
+    /// Code after a code flag keeps its later commands: the text rules
+    /// redact its values and leave the rest. An assignment that follows no
+    /// code flag loses its whole value.
+    #[test]
+    fn code_after_a_code_flag_stays_text() {
+        for (argv, code) in [
+            (
+                ["sh", "-c", "TOKEN=x; echo retained"],
+                "TOKEN=[redacted]; echo retained",
+            ),
+            (
+                ["bash", "-lc", "TOKEN=x && echo retained"],
+                "TOKEN=[redacted] && echo retained",
+            ),
+            (
+                ["python3", "-c", "token='a'; run()"],
+                "token='[redacted]'; run()",
+            ),
+            (["node", "-e", "token=1; run()"], "token=[redacted]; run()"),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            let scrubbed = scrub_argv(&argv);
+            assert_eq!(scrubbed[2], code, "{argv:?}");
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v[2], code, "{argv:?}");
+        }
+        for (argv, cut) in [
+            (["env", "TOKEN=a b", "cmd"], "TOKEN=[redacted]"),
+            (["curl", "--cookie=a; b=c", "x"], "--cookie=[redacted]"),
+            (["sh", "-c", "TOKEN=a b"], "TOKEN=[redacted]"),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            assert!(scrub_argv(&argv)[1..].join(" ").contains(cut), "{argv:?}");
+        }
+    }
+
+    /// A long argument costs a long argument's time: one with no
+    /// whitespace and a separator every other byte, one with a stem only
+    /// near its end, and one of Kelvin signs (which lowercase to `k`).
+    #[test]
+    fn a_long_argument_scrubs_in_linear_time() {
+        let pairs = "a:".repeat(128 * 1024);
+        for arg in [
+            pairs.clone(),
+            format!("{pairs}token=x"),
+            "\u{212a}".repeat(96 * 1024),
+        ] {
+            let started = std::time::Instant::now();
+            let _ = scrub_argv(std::slice::from_ref(&arg));
+            let mut v = json!([arg]);
+            scrub_deep(&mut v);
+            let took = started.elapsed();
+            assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        }
+    }
+
+    /// Random argvs (separators, quotes, whitespace, multi-byte and
+    /// case-folding characters) never panic, through either entry point,
+    /// and scrub the same way twice.
+    #[test]
+    fn random_argvs_never_panic_and_scrub_stably() {
+        use proptest::prelude::*;
+        let arg = "[-a-zA-Z0-9=:;'\" _.\\[\\]\u{212a}\u{e9}\u{1f600}|&]{0,24}";
+        proptest!(|(argv in prop::collection::vec(arg, 0..6))| {
+            let once = scrub_argv(&argv);
+            prop_assert_eq!(scrub_argv(&once), once.clone());
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            prop_assert_eq!(v.clone(), json!(once));
+        });
     }
 
     #[test]
