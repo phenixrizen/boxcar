@@ -120,36 +120,46 @@ struct Argv {
 }
 
 impl Argv {
-    /// `arg` as a record may keep it, after the arguments before it.
+    /// `arg` as a record may keep it, after the arguments before it. A
+    /// result a second scrub would still change goes whole, so an argv
+    /// scrubs the same way twice (`docs/plans/argv-attached-values.md`,
+    /// I5).
     fn next(&mut self, arg: &str) -> String {
-        let out = if self.flag {
-            REDACTED.to_owned()
-        } else {
-            // What main makes of it in its place, then the cut, unless it
-            // is code: an argument after a code flag is code by position,
-            // which no redaction changes.
-            let main = if self.user {
-                scrub_text(&user_value(arg))
-            } else {
-                main_arg(arg)
-            };
-            if self.code {
-                main
-            } else {
-                cut(arg, main)
-            }
-        };
-        // The flags are read so a second scrub reads them the same. A cut
-        // can make a bare secret flag of an argument that was not one
-        // (`--toKen:x=y` becomes `--toKen:[redacted]`), so either counts
-        // and the next argument goes now; a user flag counts either way
-        // too, so main's `user_value` still applies; a code flag redacted
-        // as a secret flag's value is no code flag, so only its result
-        // counts (the exemption only ever gives main's result).
-        self.flag = is_secret_flag(arg) || is_secret_flag(&out);
-        self.user = is_user_flag(arg) || is_user_flag(&out);
+        let mut out = self.one(arg);
+        if self.one(&out) != out {
+            out = REDACTED.to_owned();
+        }
+        // The flags are read from the result, as a second scrub reads
+        // them, never giving less than main: a secret flag counts as given
+        // too (a cut can make one, `--toKen:x=y` becomes
+        // `--toKen:[redacted]`, and the next argument then goes whole); a
+        // user flag that was itself redacted makes the next argument go
+        // whole, since main would still read it as `user:password`; a
+        // code flag redacted as a secret flag's value is no code flag.
+        let user_lost = is_user_flag(arg) && !is_user_flag(&out);
+        self.flag = is_secret_flag(arg) || is_secret_flag(&out) || user_lost;
+        self.user = is_user_flag(&out);
         self.code = is_code_flag(&out);
         out
+    }
+
+    /// `arg` in this place: whole after a secret flag; else what main
+    /// makes of it here, then the cut, unless it is code (an argument
+    /// after a code flag is code by position, which no redaction changes).
+    fn one(&self, arg: &str) -> String {
+        if self.flag {
+            return REDACTED.to_owned();
+        }
+        let main = if self.user {
+            scrub_text(&user_value(arg))
+        } else {
+            main_arg(arg)
+        };
+        if self.code {
+            main
+        } else {
+            cut(arg, main)
+        }
     }
 }
 
@@ -1018,6 +1028,20 @@ mod tests {
         assert_eq!(v, json!({"argv": want}));
         scrub_deep(&mut v);
         assert_eq!(v, json!({"argv": want}), "stable");
+        // An attached user flag whose colon the cut removes would read
+        // differently a second time: it goes whole the first time.
+        for arg in ["-usecret'x=alice:pw", "-Usecret'x=alice:pw"] {
+            let argv = vec!["curl".to_owned(), arg.to_owned()];
+            let once = scrub_argv(&argv);
+            assert_eq!(scrub_argv(&once), once, "{arg}: stable");
+            assert!(
+                !once[1].contains("pw") && !once[1].contains("alice"),
+                "{once:?}"
+            );
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(once), "{arg}");
+        }
         // Flags redacted as a secret flag's value shape the next argument
         // the same way on every pass.
         for (argv, want) in [
@@ -1027,7 +1051,7 @@ mod tests {
             ),
             (
                 ["--token", "-u", "alice:pw"],
-                ["--token", "[redacted]", "alice:[redacted]"],
+                ["--token", "[redacted]", "[redacted]"],
             ),
         ] {
             let argv: Vec<String> = argv.map(str::to_owned).to_vec();
@@ -1131,6 +1155,51 @@ mod tests {
             let took = started.elapsed();
             assert!(took < std::time::Duration::from_secs(5), "{took:?}");
         }
+    }
+
+    /// Argvs built from the pieces flags and values are made of (user,
+    /// secret and code flags, stems, separators, quotes, the redaction
+    /// mark) scrub the same way twice and alike through either entry point.
+    #[test]
+    fn argvs_of_flag_pieces_scrub_stably() {
+        use proptest::prelude::*;
+        let pieces = prop::sample::select(vec![
+            "-u",
+            "-U",
+            "--user",
+            "--proxy-user",
+            "-c",
+            "-e",
+            "-lc",
+            "--token",
+            "--Secrets",
+            "secret",
+            "token",
+            "Basic",
+            "password",
+            "=",
+            ":",
+            "'",
+            "\"",
+            " ",
+            ";",
+            "&&",
+            "a",
+            "x",
+            "alice",
+            "pw",
+            "\u{212a}",
+            "[redacted]",
+            "-",
+        ]);
+        let arg = prop::collection::vec(pieces, 1..10).prop_map(|p| p.concat());
+        proptest!(ProptestConfig::with_cases(2000), |(argv in prop::collection::vec(arg, 0..6))| {
+            let once = scrub_argv(&argv);
+            prop_assert_eq!(scrub_argv(&once), once.clone());
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            prop_assert_eq!(v, json!(once));
+        });
     }
 
     /// Random argvs (separators, quotes, whitespace, multi-byte and

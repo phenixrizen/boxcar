@@ -14,7 +14,9 @@ For an argument `A`, with `M` what main makes of it in its place: after a separa
 
 4. **The next argument.** Main redacts the argument after a bare secret flag (`is_secret_flag`: `--token`, `--Secrets:ApiKey`). A cut can make an argument a bare secret flag where it was not one: `--toKen:x=y` (the Kelvin sign) becomes `--toKen:[redacted]`, which has no `=`. So an argument counts as a secret flag for the next one when either it as given or its result is one, and the next argument goes in the first pass, not only on a second scrub.
 
-   The other flags that shape the next argument are read the same way, so a second scrub reads them as the first did. A user flag counts when the argument or its result is one: main's `user_value` still applies when `-u` itself was redacted as a secret flag's value, and the result is already redacted for the second pass. A code flag counts only when its result is one. A `-c` redacted as a secret flag's value (`--token -c 'TOKEN=x; echo'`) is no code flag, so the next argument gets the cut in the first pass too. The code exemption only ever gives main's result, so this cannot redact less than main.
+   The other flags that shape the next argument are read from the result, as a second scrub reads them. A user flag counts when its result is one. A `-u` that was itself redacted as a secret flag's value makes the next argument go whole: main would still read it as `user:password`, and whole is never less than that. A code flag counts only when its result is one. A `-c` redacted as a secret flag's value (`--token -c 'TOKEN=x; echo'`) is no code flag, so the next argument gets the cut in the first pass too. The code exemption only ever gives main's result, so this cannot redact less than main.
+
+5. **A fixed point.** The result is scrubbed again in the same place. If that would change it (a cut removed the colon an attached `-u` needs, so the second pass reads the argument differently), the argument goes whole. With step 4 the flags are read alike on both passes, so an argv scrubs the same way twice by construction, not case by case.
 
 Recognition reads `A`, not `M`, so main's own redactions cannot hide the stem (`--password<32 digits>=alpha beta` loses `beta`). Applying it through `M` keeps every redaction main makes.
 
@@ -33,7 +35,7 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
 - **I2.** A value attached by `=` or `:` to a first word holding a secret's stem never survives in part, outside step 1's code arguments, whether the argument stands alone or follows a user flag.
 - **I3.** Code after a code flag keeps its later commands: the text rules apply to it as on main, on every scrub.
 - **I4. Linear time** in the argument's length. Strings in arrays on the observer and dump paths can be megabytes, without whitespace and with many separators.
-- **I5. Stable**, for an argument and for an argv. Scrubbing a scrubbed argument changes nothing: the cut is found again in `P[redacted]`, main leaves `P[redacted]` alone, and `[redacted]` has no stem. Scrubbing a scrubbed argv changes nothing either: step 4 reads every flag so that a second pass reads it the same way (secret and user flags from the argument or its result, code flags from the result), so whatever a second pass would do to the next argument the first pass already did.
+- **I5. Stable**, for an argument and for an argv. Scrubbing a scrubbed argument changes nothing: the cut is found again in `P[redacted]`, main leaves `P[redacted]` alone, and `[redacted]` has no stem. Scrubbing a scrubbed argv changes nothing either. Step 4 reads every flag from the result, as the second pass does: a secret flag also from the argument, and that only redacts the next argument whole, a fixed point in any place. Step 5 makes each result a fixed point in its place.
 - **I6. No panic** on any input. Slices are taken only at char boundaries of the same string, from `char_indices` or from ASCII separators found there.
 - **I7.** `is_secret_flag` is unchanged, and an argument it takes as a flag on main still redacts the next argument whole (`--token`, `--Secrets:ApiKey`). Step 4 only adds flags, never removes one.
 
@@ -52,7 +54,9 @@ Stems hold neither `=` nor `:`, so this is the first separator whose text before
   - `--toKen=alpha beta` with the Kelvin sign: Unicode recognition;
   - `--Secrets:ApiKey VALUE` and `--password:x next` (I7);
   - `--toKen:x=y` (the Kelvin sign) then `keep`: `keep` is redacted in the first pass, and a second pass changes nothing, through both entry points (step 4, I5);
-  - flags redacted as a secret flag's value: `--token -c 'TOKEN=x; echo retained'` and `--token -u alice:pw`, stable over two passes, through both entry points (step 4, I1, I5).
+  - flags redacted as a secret flag's value: `--token -c 'TOKEN=x; echo retained'` and `--token -u alice:pw`, stable over two passes, through both entry points (step 4, I1, I5);
+  - `-usecret'x=alice:pw` and its `-U` form: the cut removes the colon, and the argument goes whole (step 5).
+- `argvs_of_flag_pieces_scrub_stably` (new): 2,000 argvs built from the pieces of flags and values (user, secret and code flags, stems, separators, quotes, the redaction mark) scrub the same way twice and alike through both entry points (I5).
 - `code_after_a_code_flag_stays_text` (new): `sh -c 'TOKEN=x; echo retained'`, `bash -lc …`, `python3 -c "token='a'; run()"`, `node -e …` and `sh -c "TOKEN='a;b' env"` keep their later commands, through both entry points and on a second scrub (I3, I5). `env 'TOKEN=a b'` and `--cookie=a; b=c`, which follow no code flag, are cut.
 - A user flag's separate value: `curl -u 'token=alpha beta:pw'` and `--user 'password=a b:c'` lose the whole attached value, through both entry points (I2).
 - `a_long_argument_scrubs_in_linear_time` (new): a 2 MiB argument without whitespace, made of `a:` pairs, then one with a stem near its end, then one of Kelvin-sign letters. Each scrubs within a second; a quadratic scan takes minutes (I4).
