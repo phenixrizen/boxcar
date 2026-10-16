@@ -2245,6 +2245,231 @@ fn the_flows_opener_is_the_executor() {
     assert_eq!(spans[0].procs, [300]);
 }
 
+/// The seq of a step's record.
+fn seq_of(step: &Step) -> u64 {
+    match step {
+        Step::Record(record) => record.seq,
+        Step::Tick(_) => panic!("a tick has no seq"),
+    }
+}
+
+/// The steps of a session where node (pid 200) opened flow 1 to the API;
+/// another process (pid 500) has flow 2 and python (pid 400) is about.
+fn node_opens_flow_1(log: &mut Log, steps: &mut Vec<Step>) {
+    attached(log, steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+}
+
+fn flow_1(log: &mut Log, steps: &mut Vec<Step>, at_ms: u64) {
+    let api = "203.0.113.5:443";
+    steps.push(log.tcp_connect(at_ms, 200, 41000, api));
+    steps.push(log.connect(at_ms + 10, 1, 41000, api, &["api.example"], Verdict::Allow));
+}
+
+/// The span of `toolu_01` was closed by the close whose seq is `seq`.
+fn closed_by(out: &[Out], seq: u64) -> bool {
+    spans_of(out)
+        .iter()
+        .any(|s| s.span_id == "toolu_01" && s.closed_seq == Some(seq))
+}
+
+/// The flow's opener has exited, well past the join window, before the
+/// request comes over the flow (a process that inherited the socket made
+/// it): the span's executor is still the opener, bound, so a close on the
+/// opener's flow closes it and another process's does not.
+#[test]
+fn a_bound_executor_is_the_flows_opener_after_it_exits() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    node_opens_flow_1(&mut log, &mut steps);
+    flow_1(&mut log, &mut steps, 1350);
+    steps.push(log.exit(1500, 200, 5));
+    steps.push(log.http_request(3000, 1, 1, 4800));
+    steps.push(log.tool_open(3100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.tcp_connect(3200, 400, 42000, "203.0.113.5:443"));
+    steps.push(log.connect(
+        3210,
+        2,
+        42000,
+        "203.0.113.5:443",
+        &["api.example"],
+        Verdict::Allow,
+    ));
+    steps.push(log.tool_close_on(3300, "toolu_01", "ok", 2));
+    let close = log.tool_close_on(3400, "toolu_01", "ok", 1);
+    let seq = seq_of(&close);
+    steps.push(close);
+    for at in [4000, 5000, 6000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(closed_by(&out, seq), "{out:?}");
+    assert_eq!(spans_of(&out)[0].executor_tgid, Some(200), "{out:?}");
+}
+
+/// As above, and a new process has the opener's pid when the request
+/// comes: the executor is the opener, not the pid's new process, whose
+/// close on a flow of its own does not close the span.
+#[test]
+fn a_bound_executor_is_the_flows_opener_not_its_pids_next_process() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    node_opens_flow_1(&mut log, &mut steps);
+    flow_1(&mut log, &mut steps, 1350);
+    steps.push(log.exit(1500, 200, 5));
+    steps.push(log.exec(2500, 200, 100, 20, &["python3", "next.py"]));
+    steps.push(log.http_request(3000, 1, 1, 4800));
+    steps.push(log.tool_open(3100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.tcp_connect(3200, 200, 42000, "203.0.113.5:443"));
+    steps.push(log.connect(
+        3210,
+        2,
+        42000,
+        "203.0.113.5:443",
+        &["api.example"],
+        Verdict::Allow,
+    ));
+    let theirs = log.tool_close_on(3300, "toolu_01", "ok", 2);
+    let theirs_seq = seq_of(&theirs);
+    steps.push(theirs);
+    let close = log.tool_close_on(3400, "toolu_01", "ok", 1);
+    let seq = seq_of(&close);
+    steps.push(close);
+    for at in [4000, 5000, 6000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(
+        !closed_by(&out, theirs_seq),
+        "closed by the pid's next process: {out:?}"
+    );
+    assert!(closed_by(&out, seq), "{out:?}");
+}
+
+/// The request comes before the sensor's connect, whose record is late,
+/// and the opener's pid has a new process by the time of the request:
+/// once the opener is known it is the executor, not that process.
+#[test]
+fn a_late_opener_binds_by_key_after_its_pid_is_reused() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    node_opens_flow_1(&mut log, &mut steps);
+    let api = "203.0.113.5:443";
+    steps.push(log.connect(1360, 1, 41000, api, &["api.example"], Verdict::Allow));
+    steps.push(log.exit(1500, 200, 5));
+    steps.push(log.exec(2500, 200, 100, 20, &["python3", "next.py"]));
+    steps.push(log.http_request(3000, 1, 1, 4800));
+    // The sensor's connect, of before the exit, arrives late.
+    steps.push(log.tcp_connect(1350, 200, 41000, api));
+    steps.push(log.tool_open(3100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.tcp_connect(3200, 200, 42000, api));
+    steps.push(log.connect(3210, 2, 42000, api, &["api.example"], Verdict::Allow));
+    let theirs = log.tool_close_on(3300, "toolu_01", "ok", 2);
+    let theirs_seq = seq_of(&theirs);
+    steps.push(theirs);
+    let close = log.tool_close_on(3400, "toolu_01", "ok", 1);
+    let seq = seq_of(&close);
+    steps.push(close);
+    for at in [4000, 5000, 6000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(
+        !closed_by(&out, theirs_seq),
+        "closed by the pid's next process: {out:?}"
+    );
+    assert!(closed_by(&out, seq), "{out:?}");
+}
+
+/// The request, the opener's connect and the span's open, in each order
+/// they can come in: the same executor and the same verdict on a close
+/// from another process's flow, then on the opener's.
+#[test]
+fn the_binding_is_the_same_whatever_comes_first() {
+    let api = "203.0.113.5:443";
+    for order in ["CRO", "RCO", "ROC"] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        node_opens_flow_1(&mut log, &mut steps);
+        let mut at = 1400;
+        for event in order.chars() {
+            match event {
+                'C' => flow_1(&mut log, &mut steps, at),
+                'R' => steps.push(log.http_request(at, 1, 1, 4800)),
+                _ => steps.push(log.tool_open(at, "toolu_01", "Bash", json!({"command": "ls"}))),
+            }
+            at += 100;
+        }
+        steps.push(log.tcp_connect(2000, 400, 42000, api));
+        steps.push(log.connect(2010, 2, 42000, api, &["api.example"], Verdict::Allow));
+        let theirs = log.tool_close_on(2100, "toolu_01", "ok", 2);
+        let theirs_seq = seq_of(&theirs);
+        steps.push(theirs);
+        let close = log.tool_close_on(2200, "toolu_01", "ok", 1);
+        let seq = seq_of(&close);
+        steps.push(close);
+        for at in [3000, 4000, 5000] {
+            steps.push(log.heartbeat(at));
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        assert!(!closed_by(&out, theirs_seq), "{order}: {out:?}");
+        assert!(closed_by(&out, seq), "{order}: {out:?}");
+        assert_eq!(
+            spans_of(&out)[0].executor_tgid,
+            Some(200),
+            "{order}: {out:?}"
+        );
+    }
+}
+
+/// A request bound by its flow's opener, its span open, then enough
+/// requests on another known flow to evict its executor entry, then a
+/// write by another process that fits it (and, the second time, a write
+/// by a third that fits too): the span keeps the opener as its executor,
+/// and a close on the opener's flow still closes it.
+#[test]
+fn a_bound_span_keeps_its_executor_after_the_cache_evicts_it() {
+    let api = "203.0.113.5:443";
+    for second_writer in [false, true] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        node_opens_flow_1(&mut log, &mut steps);
+        steps.push(log.exec(1220, 500, 100, 7, &["curl", "x"]));
+        steps.push(log.http_request(2000, 1, 1, 4800));
+        flow_1(&mut log, &mut steps, 2050);
+        steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+        steps.push(log.tcp_connect(2110, 500, 43000, api));
+        steps.push(log.connect(2120, 3, 43000, api, &["api.example"], Verdict::Allow));
+        for stream in 0..256u32 {
+            steps.push(log.http_request(2130, 3, stream + 1, 10));
+        }
+        steps.push(log.tls_io(2200, 400, "write", 4800));
+        if second_writer {
+            steps.push(log.tls_io(2210, 500, "write", 4800));
+        }
+        let close = log.tool_close_on(2300, "toolu_01", "ok", 1);
+        let seq = seq_of(&close);
+        steps.push(close);
+        for at in [3000, 4000, 5000] {
+            steps.push(log.heartbeat(at));
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        assert!(closed_by(&out, seq), "{second_writer}: {out:?}");
+        assert_eq!(
+            spans_of(&out)[0].executor_tgid,
+            Some(200),
+            "{second_writer}: {out:?}"
+        );
+    }
+}
+
 /// Two processes whose writes fit the request name no executor: the
 /// session root stands in.
 #[test]

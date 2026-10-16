@@ -669,17 +669,18 @@ impl Spans {
             .requests
             .iter()
             .filter(|r| {
-                !self
-                    .executors
-                    .get(&(r.flow, r.stream))
-                    .is_some_and(|(_, bound)| *bound)
+                !self.flow_owners.contains_key(&r.flow)
+                    && !self
+                        .executors
+                        .get(&(r.flow, r.stream))
+                        .is_some_and(|(_, bound)| *bound)
             })
             .map(|r| (*r, self.carrier(r)))
             .collect();
         for (request, carrier) in open {
             match carrier {
                 Some(tgid) => {
-                    self.name_executor(state, request.flow, request.stream, tgid, request.ts, false)
+                    self.name_executor(state, request.flow, request.stream, tgid, request.ts)
                 }
                 None => self.unname_executor(request.flow, request.stream),
             }
@@ -693,7 +694,7 @@ impl Spans {
     /// writes and the flow's opener to come.
     pub fn http_request(&mut self, state: &State, ts: u64, flow: u64, stream: u32, body: u64) {
         if let Some(owner) = self.flow_owners.get(&flow).copied() {
-            self.name_executor(state, flow, stream, owner.tgid, ts, true);
+            self.bind_executor(flow, stream, owner);
             return;
         }
         let request = Request {
@@ -703,7 +704,7 @@ impl Spans {
             body_bytes: body,
         };
         if let Some(tgid) = self.carrier(&request) {
-            self.name_executor(state, flow, stream, tgid, ts, false);
+            self.name_executor(state, flow, stream, tgid, ts);
         }
         self.requests.push_back(request);
         while self.requests.len() > MAX_EXECUTORS
@@ -744,22 +745,25 @@ impl Spans {
         }
     }
 
-    /// The process `tgid` made the request on (`flow`, `stream`): `bound`
-    /// when it opened the flow, provisionally when a TLS write said so. A
-    /// bound executor is never replaced by a provisional one. The open
-    /// spans that came from the request take it.
-    fn name_executor(
-        &mut self,
-        state: &State,
-        flow: u64,
-        stream: u32,
-        tgid: u32,
-        ts: u64,
-        bound: bool,
-    ) {
-        let Some(key) = state.attribute(tgid, ts) else {
-            return;
-        };
+    /// The process that opened `flow`, `key` as the sensor's connect named
+    /// it, made the request on (`flow`, `stream`): its bound executor,
+    /// whatever the pid names by now. The open spans that came from the
+    /// request take it.
+    fn bind_executor(&mut self, flow: u64, stream: u32, key: ProcKey) {
+        self.set_executor(flow, stream, key, true);
+    }
+
+    /// A TLS write of the process `tgid` carried the request on (`flow`,
+    /// `stream`): its executor, provisionally, the pid read at the
+    /// request's time `ts`. A bound executor is never replaced by a
+    /// provisional one.
+    fn name_executor(&mut self, state: &State, flow: u64, stream: u32, tgid: u32, ts: u64) {
+        if let Some(key) = state.attribute(tgid, ts) {
+            self.set_executor(flow, stream, key, false);
+        }
+    }
+
+    fn set_executor(&mut self, flow: u64, stream: u32, key: ProcKey, bound: bool) {
         match self.executors.get(&(flow, stream)) {
             Some((_, true)) if !bound => return,
             Some(&named) if named == (key, bound) => return,
@@ -784,13 +788,15 @@ impl Spans {
         }
     }
 
-    /// The open spans that came from `request` take `executor`.
+    /// The open spans that came from `request` take `executor`; a span
+    /// whose executor is bound keeps it unless `executor` is bound too.
     fn set_span_executors(&mut self, request: (u64, u32), executor: Option<(ProcKey, bool)>) {
+        let bound = executor.is_some_and(|(_, bound)| bound);
         for id in &self.open {
             if let Some(span) = self
                 .spans
                 .get_mut(id)
-                .filter(|span| span.request == request)
+                .filter(|span| span.request == request && (bound || !span.executor_bound))
             {
                 span.executor = executor.map(|(key, _)| key);
                 span.executor_bound = executor.is_some_and(|(_, bound)| bound);
@@ -1080,22 +1086,24 @@ impl Spans {
             }
         }
         // Requests on the flow already seen: their opener is their
-        // executor now, whatever a TLS write said.
-        let streams: Vec<(u32, u64)> = self
+        // executor now, whatever a TLS write said, and they wait for no
+        // more writes.
+        let streams: Vec<u32> = self
             .executors
             .keys()
             .filter(|(f, _)| *f == flow)
-            .map(|&(_, stream)| (stream, ts))
+            .map(|&(_, stream)| stream)
             .chain(
                 self.requests
                     .iter()
                     .filter(|r| r.flow == flow)
-                    .map(|r| (r.stream, r.ts)),
+                    .map(|r| r.stream),
             )
             .collect();
-        for (stream, at) in streams {
-            self.name_executor(state, flow, stream, key.tgid, at.max(ts), true);
+        for stream in streams {
+            self.bind_executor(flow, stream, key);
         }
+        self.requests.retain(|r| r.flow != flow);
         // Open spans whose request came over this flow and have no bound
         // executor: its opener is theirs.
         for id in &self.open {
