@@ -83,56 +83,160 @@ fn texts(v: &mut Value) {
         Value::Array(items) => {
             // An array of strings may be an argv: a secret flag's value is
             // the next string.
-            let mut flag = false;
-            let mut user = false;
+            let mut argv = Argv::default();
             for item in items.iter_mut() {
-                let next_flag = item.as_str().is_some_and(is_secret_flag);
-                let next_user = item.as_str().is_some_and(is_user_flag);
                 match item {
-                    Value::String(_) if flag => *item = Value::String(REDACTED.to_owned()),
-                    Value::String(text) if user => *text = scrub_text(&user_value(text)),
-                    Value::String(text) => *text = scrub_arg(text),
-                    _ => texts(item),
+                    Value::String(text) => *text = argv.next(text),
+                    _ => {
+                        texts(item);
+                        argv = Argv::default();
+                    }
                 }
-                flag = next_flag;
-                user = next_user;
             }
         }
         _ => {}
     }
 }
 
-/// An argv as a record may keep it: each argument through [`scrub_text`],
+/// An argv as a record may keep it: each argument as main records it,
+/// the value after a secret word cut to the argument's end,
 /// and the argument after a secret-looking flag (`--token`, `--password`)
 /// redacted whole. The same argv always scrubs the same way, and a JSON
 /// array of the same strings scrubs as [`scrub_deep`] does it.
 pub fn scrub_argv(argv: &[String]) -> Vec<String> {
-    let mut flag = false;
-    let mut user = false;
-    argv.iter()
-        .map(|arg| {
-            let out = if flag {
-                REDACTED.to_owned()
-            } else if user {
-                scrub_text(&user_value(arg))
-            } else {
-                scrub_arg(arg)
-            };
-            flag = is_secret_flag(arg);
-            user = is_user_flag(arg);
-            out
-        })
-        .collect()
+    let mut state = Argv::default();
+    argv.iter().map(|arg| state.next(arg)).collect()
 }
 
-/// One whole argument through [`scrub_text`], a user flag with its value
-/// attached (`--user=alice:pw`) taken whole first: in an argv a space
-/// does not end the value.
-fn scrub_arg(arg: &str) -> String {
+/// What scrubbing an argv carries from one argument to the next.
+#[derive(Default)]
+struct Argv {
+    /// The last argument was a secret flag: this one is its value.
+    flag: bool,
+    /// The last argument was a user flag: this one is `user:password`.
+    user: bool,
+    /// The last argument was a code flag: this one may be code.
+    code: bool,
+}
+
+impl Argv {
+    /// `arg` as a record may keep it, after the arguments before it. A
+    /// result a second scrub would still change goes whole, so an argv
+    /// scrubs the same way twice (`docs/plans/argv-attached-values.md`,
+    /// I5); code keeps main's result as it is, so a script keeps its later
+    /// commands.
+    fn next(&mut self, arg: &str) -> String {
+        let mut out = self.one(arg);
+        if self.code {
+            // Code keeps main's result and main's reading of it for the
+            // next argument, from the argument as given: main's text rules
+            // need not be a fixed point on a script, so reading its result
+            // would let that reach the next argument on a second scrub.
+            self.flag = is_secret_flag(arg);
+            self.user = is_user_flag(arg);
+            self.code = is_code_flag(arg);
+            return out;
+        }
+        if self.one(&out) != out {
+            out = REDACTED.to_owned();
+        }
+        // The flags are read from the result, as a second scrub reads
+        // them, never giving less than main: a secret flag counts as given
+        // too (a cut can make one, `--toKen:x=y` becomes
+        // `--toKen:[redacted]`, and the next argument then goes whole); a
+        // user flag that was itself redacted makes the next argument go
+        // whole, since main would still read it as `user:password`; a
+        // code flag redacted as a secret flag's value is no code flag.
+        let user_lost = is_user_flag(arg) && !is_user_flag(&out);
+        self.flag = is_secret_flag(arg) || is_secret_flag(&out) || user_lost;
+        self.user = is_user_flag(&out);
+        self.code = is_code_flag(&out);
+        out
+    }
+
+    /// `arg` in this place: whole after a secret flag; else what main
+    /// makes of it here, then the cut, unless it is code (an argument
+    /// after a code flag is code by position, which no redaction changes).
+    fn one(&self, arg: &str) -> String {
+        if self.flag {
+            return REDACTED.to_owned();
+        }
+        let main = if self.user {
+            scrub_text(&user_value(arg))
+        } else {
+            main_arg(arg)
+        };
+        if self.code {
+            main
+        } else {
+            cut(arg, main)
+        }
+    }
+}
+
+/// One argument as main records it: a user flag's attached value
+/// (`--user=alice:pw`, `-ualice:pw`) through [`user_value`], the rest
+/// through [`scrub_text`].
+fn main_arg(arg: &str) -> String {
     match attached_user(arg) {
         Some((flag, value)) => format!("{flag}{}", scrub_text(&user_value(value))),
         None => scrub_text(arg),
     }
+}
+
+/// `main`, what main made of `arg`, with everything after `arg`'s
+/// [`secret_cut`] redacted too (`docs/plans/argv-attached-values.md`):
+/// in an argv a value runs to the argument's end. Never less than main:
+/// when main left everything up to the cut as it was, that prefix and
+/// `[redacted]`; when it redacted something inside it, all of it.
+fn cut(arg: &str, main: String) -> String {
+    match secret_cut(arg) {
+        None => main,
+        Some(cut) if main.starts_with(&arg[..=cut]) => format!("{}{REDACTED}", &arg[..=cut]),
+        Some(_) => REDACTED.to_owned(),
+    }
+}
+
+/// Where a value attached to a secret word starts in `arg`: the first `=`
+/// or `:` of `arg`'s first word that comes after a secret's stem (or
+/// `basic`, an auth scheme) in that word lowercased as [`is_secret_key`]
+/// reads it, when something follows it. The word is not read as a name,
+/// so any spelling holds: `--cookie=`, `+password=`, `'password'=`,
+/// `-Ddb[0].password=`, `--Db:Password=`, `Authorization: Basic …`. One
+/// pass, so a long argument costs a long argument's time.
+fn secret_cut(arg: &str) -> Option<usize> {
+    let word = &arg[..arg.find(char::is_whitespace).unwrap_or(arg.len())];
+    let lower: String = word.chars().flat_map(char::to_lowercase).collect();
+    let found = SECRET_STEMS
+        .iter()
+        .chain(&["basic"])
+        .filter_map(|stem| lower.find(stem).map(|at| at + stem.len()))
+        .min()?;
+    // Back from the lowercased word to the word: the end of the char whose
+    // lowercase ends the stem.
+    let mut lowered = 0;
+    let mut stem_end = word.len();
+    for (at, c) in word.char_indices() {
+        lowered += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if lowered >= found {
+            stem_end = at + c.len_utf8();
+            break;
+        }
+    }
+    let cut = stem_end + word[stem_end..].find(['=', ':'])?;
+    (cut + 1 < arg.len()).then_some(cut)
+}
+
+/// A flag whose next argument is code: `-c` (`sh`, `python3`), `-e`
+/// (`node`, `perl`), `--command`, `--eval`, or short flags run together
+/// ending in one (`-lc`, `-ec`).
+fn is_code_flag(arg: &str) -> bool {
+    matches!(arg, "--command" | "--eval")
+        || arg.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty()
+                && flags.bytes().all(|b| b.is_ascii_alphabetic())
+                && (flags.ends_with('c') || flags.ends_with('e'))
+        })
 }
 
 /// Flags whose value is `user:password` (curl's, wget's): `-u`,
@@ -227,7 +331,9 @@ fn word_end(text: &str, start: usize) -> usize {
 }
 
 /// `--token`, `-password`: a flag, without a value of its own, whose name
-/// looks like a secret's.
+/// looks like a secret's. A `:` does not make a value its own: in
+/// `--Secrets:ApiKey VALUE` (.NET's configuration keys) it is part of the
+/// name, so the next argument is taken as the value all the same.
 fn is_secret_flag(arg: &str) -> bool {
     arg.starts_with('-')
         && !arg.contains('=')
@@ -740,7 +846,7 @@ mod tests {
         let mut v = json!({"command": argv});
         scrub_deep(&mut v);
         assert_eq!(v, json!({"command": want}));
-        // The flag with its value in one argument is the text rule's.
+        // The flag with its value in one argument loses the value too.
         assert_eq!(
             scrub_argv(&["--token=abc".to_owned(), "x".to_owned()]),
             ["--token=[redacted]", "x"]
@@ -834,6 +940,336 @@ mod tests {
             scrub_text("curl --user='alice:short pass' x"),
             "curl --user='alice:[redacted]' x"
         );
+    }
+
+    #[test]
+    fn a_value_attached_to_a_secret_name_is_taken_whole_in_an_argv() {
+        let argv: Vec<String> = [
+            "curl",
+            "--cookie=theme=light; session=demo",
+            "--password=two words",
+            "-token='quoted' and, punctuated; too",
+            "--api-key=",
+            "API_TOKEN=a b",
+            "-Ddb.password=first second",
+            "-Dapp.cookie=a; b=c",
+            "/password=alpha beta",
+            "+password=alpha beta",
+            "'password'=alpha beta",
+            "Basic=alpha beta",
+            "Authorization: Bearer alpha beta",
+            "-user-password=alpha beta:gamma",
+            "--Db:Password=alpha beta",
+            "--Service:ApiKey=alpha;beta",
+            "-Ddb[0].password=alpha beta",
+            "--output=two words",
+            "LANG=C.UTF-8",
+            "https://x.test/?a=b c",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let want = [
+            "curl",
+            "--cookie=[redacted]",
+            "--password=[redacted]",
+            "-token=[redacted]",
+            "--api-key=",
+            "API_TOKEN=[redacted]",
+            "-Ddb.password=[redacted]",
+            "-Dapp.cookie=[redacted]",
+            "/password=[redacted]",
+            "+password=[redacted]",
+            "'password'=[redacted]",
+            "Basic=[redacted]",
+            "Authorization:[redacted]",
+            "-user-password=[redacted]",
+            "--Db:Password=[redacted]",
+            "--Service:ApiKey=[redacted]",
+            "-Ddb[0].password=[redacted]",
+            "--output=two words",
+            "LANG=C.UTF-8",
+            "https://x.test/?a=b c",
+        ];
+        assert_eq!(scrub_argv(&argv), want);
+        let mut v = json!({"argv": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}));
+        let again: Vec<String> = want.map(str::to_owned).to_vec();
+        assert_eq!(scrub_argv(&again), want, "scrubbing is stable");
+        // A user that is itself a credential goes with the password.
+        let key = ["sk", "test", "a1B2c3D4e5F6g7H8i9J0k1L2"].join("_");
+        for scrubbed in [
+            scrub_argv(&[format!("-u{key}:x")]),
+            scrub_argv(&[format!("-u{key}x:x")]),
+            scrub_argv(&[format!("-u{key}=x:x")]),
+            scrub_argv(&[format!("-U{key}=x:x")]),
+        ] {
+            assert!(
+                !scrubbed[0].contains("a1B2c3D4e5F6g7H8i9J0k1L2"),
+                "{scrubbed:?}"
+            );
+            assert!(scrubbed[0].ends_with(":[redacted]"), "{scrubbed:?}");
+        }
+        // Main's own rules can redact the name the cut needs (a long run of
+        // letters and digits), or a `-u` user that is a credential: all of
+        // the argument goes.
+        for arg in [
+            format!("--password{}=alpha beta", "0123456789".repeat(4)),
+            format!("-u{key}=x:pw"),
+        ] {
+            let scrubbed = scrub_argv(std::slice::from_ref(&arg));
+            assert!(
+                !scrubbed[0].contains("beta") && !scrubbed[0].contains("a1B2c3"),
+                "{arg}: {scrubbed:?}"
+            );
+            assert_eq!(scrub_argv(&scrubbed), scrubbed, "{arg}: stable");
+        }
+        // A stem's letters are matched as `is_secret_key` matches them:
+        // the Kelvin sign is a `k`.
+        let kelvin = "--to\u{212a}en=alpha beta".to_owned();
+        assert_eq!(scrub_argv(&[kelvin]), ["--to\u{212a}en=[redacted]"]);
+        // A cut that leaves a bare secret flag takes the next argument in
+        // the first pass, so a second pass changes nothing.
+        let argv = ["--to\u{212a}en:x=y", "keep"].map(str::to_owned).to_vec();
+        let want = ["--to\u{212a}en:[redacted]", "[redacted]"];
+        assert_eq!(scrub_argv(&argv), want);
+        assert_eq!(scrub_argv(&want.map(str::to_owned)), want, "stable");
+        let mut v = json!({"argv": argv});
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}));
+        scrub_deep(&mut v);
+        assert_eq!(v, json!({"argv": want}), "stable");
+        // An attached user flag whose colon the cut removes would read
+        // differently a second time: it goes whole the first time.
+        for arg in ["-usecret'x=alice:pw", "-Usecret'x=alice:pw"] {
+            let argv = vec!["curl".to_owned(), arg.to_owned()];
+            let once = scrub_argv(&argv);
+            assert_eq!(scrub_argv(&once), once, "{arg}: stable");
+            assert!(
+                !once[1].contains("pw") && !once[1].contains("alice"),
+                "{once:?}"
+            );
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(once), "{arg}");
+        }
+        // Flags redacted as a secret flag's value shape the next argument
+        // the same way on every pass.
+        for (argv, want) in [
+            (
+                ["--token", "-c", "TOKEN=x; echo retained"],
+                ["--token", "[redacted]", "TOKEN=[redacted]"],
+            ),
+            (
+                ["--token", "-u", "alice:pw"],
+                ["--token", "[redacted]", "[redacted]"],
+            ),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            assert_eq!(scrub_argv(&argv), want, "{argv:?}");
+            assert_eq!(
+                scrub_argv(&want.map(str::to_owned)),
+                want,
+                "{argv:?}: stable"
+            );
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(want), "{argv:?}");
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(want), "{argv:?}: stable");
+        }
+        // A script given to a shell is text: only its values go, and the
+        // commands after them stay.
+        let script = scrub_argv(&["sh", "-c", "export TOKEN=x; rm -rf /tmp/y"].map(str::to_owned));
+        assert_eq!(script[2], "export TOKEN=[redacted]; rm -rf /tmp/y");
+        // A flag with a `:` in it may still take the next argument as its
+        // value: both go.
+        for (argv, want) in [
+            (
+                ["--Secrets:ApiKey", "alpha beta"],
+                ["--Secrets:[redacted]", "[redacted]"],
+            ),
+            (
+                ["--password:alpha'beta", "next"],
+                ["--password:[redacted]", "[redacted]"],
+            ),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            assert_eq!(scrub_argv(&argv), want);
+            let mut v = json!({"argv": argv});
+            scrub_deep(&mut v);
+            assert_eq!(v, json!({"argv": want}));
+        }
+    }
+
+    /// Code after a code flag keeps its later commands: the text rules
+    /// redact its values and leave the rest. An assignment that follows no
+    /// code flag loses its whole value.
+    #[test]
+    fn code_after_a_code_flag_stays_text() {
+        for (argv, code) in [
+            (
+                ["sh", "-c", "TOKEN=x; echo retained"],
+                "TOKEN=[redacted]; echo retained",
+            ),
+            (
+                ["bash", "-lc", "TOKEN=x && echo retained"],
+                "TOKEN=[redacted] && echo retained",
+            ),
+            (
+                ["python3", "-c", "token='a'; run()"],
+                "token='[redacted]'; run()",
+            ),
+            (["node", "-e", "token=1; run()"], "token=[redacted]; run()"),
+            (["sh", "-c", "TOKEN='a;b' env"], "TOKEN='[redacted]' env"),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            let scrubbed = scrub_argv(&argv);
+            assert_eq!(scrubbed[2], code, "{argv:?}");
+            assert_eq!(scrub_argv(&scrubbed), scrubbed, "{argv:?}: stable");
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v[2], code, "{argv:?}");
+            scrub_deep(&mut v);
+            assert_eq!(v[2], code, "{argv:?}: stable");
+        }
+        for (argv, cut) in [
+            (["env", "TOKEN=a b", "cmd"], "TOKEN=[redacted]"),
+            (["curl", "--cookie=a; b=c", "x"], "--cookie=[redacted]"),
+            (["curl", "-u", "token=alpha beta:pw"], "token=[redacted]"),
+            (["curl", "--user", "password=a b:c"], "password=[redacted]"),
+        ] {
+            let argv: Vec<String> = argv.map(str::to_owned).to_vec();
+            let scrubbed = scrub_argv(&argv);
+            assert!(scrubbed.iter().any(|a| a == cut), "{argv:?}: {scrubbed:?}");
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            assert_eq!(v, json!(scrubbed), "{argv:?}");
+        }
+    }
+
+    /// A script whose credential main's text rules redact (a quoted
+    /// `-u` value ending in `;`) keeps what main keeps, its later command
+    /// included: code gets main's result as it is.
+    #[test]
+    fn a_script_keeps_what_main_keeps() {
+        let script = "curl https://example.test -u 'alice:pw'; echo retained";
+        let argv: Vec<String> = ["sh", "-c", script].map(str::to_owned).to_vec();
+        let scrubbed = scrub_argv(&argv);
+        assert_eq!(scrubbed[2], scrub_text(script));
+        assert!(scrubbed[2].contains("echo retained"), "{scrubbed:?}");
+        assert!(!scrubbed[2].contains("pw"), "{scrubbed:?}");
+        let mut v = json!(argv);
+        scrub_deep(&mut v);
+        assert_eq!(v, json!(scrubbed));
+        // Main's text rules are not a fixed point on this script, and a
+        // second scrub drops its `=`; the argument after it is read from
+        // the script as given, as main reads it, and stays.
+        let argv: Vec<String> = ["python3", "-c", "-1 # token -u 'alice:pw'; x=y", "keep"]
+            .map(str::to_owned)
+            .to_vec();
+        let once = scrub_argv(&argv);
+        let twice = scrub_argv(&once);
+        assert_eq!(
+            (once[3].as_str(), twice[3].as_str()),
+            ("keep", "keep"),
+            "{once:?} {twice:?}"
+        );
+        let mut v = json!(argv);
+        scrub_deep(&mut v);
+        assert_eq!(v[3], "keep");
+        scrub_deep(&mut v);
+        assert_eq!(v[3], "keep");
+    }
+
+    /// A long argument costs a long argument's time: one with no
+    /// whitespace and a separator every other byte, one with a stem only
+    /// near its end, and one of Kelvin signs (which lowercase to `k`).
+    #[test]
+    fn a_long_argument_scrubs_in_linear_time() {
+        let pairs = "a:".repeat(128 * 1024);
+        for arg in [
+            pairs.clone(),
+            format!("{pairs}token=x"),
+            "\u{212a}".repeat(96 * 1024),
+        ] {
+            let started = std::time::Instant::now();
+            let _ = scrub_argv(std::slice::from_ref(&arg));
+            let mut v = json!([arg]);
+            scrub_deep(&mut v);
+            let took = started.elapsed();
+            assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        }
+    }
+
+    /// `twice` is `once` scrubbed again: equal outside code, which keeps
+    /// main's result and is only as stable as main's text rules (as is
+    /// the argument after it, read from the code as main reads it).
+    fn stable_outside_code(once: &[String], twice: &[String]) -> bool {
+        let after_code = |i: usize, back: usize| i >= back && is_code_flag(&once[i - back]);
+        once.len() == twice.len()
+            && (0..once.len()).all(|i| after_code(i, 1) || after_code(i, 2) || once[i] == twice[i])
+    }
+
+    /// Argvs built from the pieces flags and values are made of (user,
+    /// secret and code flags, stems, separators, quotes, the redaction
+    /// mark) scrub the same way twice and alike through either entry point.
+    #[test]
+    fn argvs_of_flag_pieces_scrub_stably() {
+        use proptest::prelude::*;
+        let pieces = prop::sample::select(vec![
+            "-u",
+            "-U",
+            "--user",
+            "--proxy-user",
+            "-c",
+            "-e",
+            "-lc",
+            "--token",
+            "--Secrets",
+            "secret",
+            "token",
+            "Basic",
+            "password",
+            "=",
+            ":",
+            "'",
+            "\"",
+            " ",
+            ";",
+            "&&",
+            "a",
+            "x",
+            "alice",
+            "pw",
+            "\u{212a}",
+            "[redacted]",
+            "-",
+        ]);
+        let arg = prop::collection::vec(pieces, 1..10).prop_map(|p| p.concat());
+        proptest!(ProptestConfig::with_cases(2000), |(argv in prop::collection::vec(arg, 0..6))| {
+            let once = scrub_argv(&argv);
+            prop_assert!(stable_outside_code(&once, &scrub_argv(&once)), "{:?}", once);
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            prop_assert_eq!(v, json!(once));
+        });
+    }
+
+    /// Random argvs (separators, quotes, whitespace, multi-byte and
+    /// case-folding characters) never panic, through either entry point,
+    /// and scrub the same way twice.
+    #[test]
+    fn random_argvs_never_panic_and_scrub_stably() {
+        use proptest::prelude::*;
+        let arg = "[-a-zA-Z0-9=:;'\" _.\\[\\]\u{212a}\u{e9}\u{1f600}|&]{0,24}";
+        proptest!(|(argv in prop::collection::vec(arg, 0..6))| {
+            let once = scrub_argv(&argv);
+            prop_assert!(stable_outside_code(&once, &scrub_argv(&once)), "{:?}", once);
+            let mut v = json!(argv);
+            scrub_deep(&mut v);
+            prop_assert_eq!(v.clone(), json!(once));
+        });
     }
 
     #[test]
