@@ -23,7 +23,7 @@ import security_guard
 
 MARK = "work-issue-checkpoint:v1"
 PR_MARK = "work-issue-pr:v1"
-MAX_CHECKPOINT_BYTES = 60000  # Below GitHub's comment limit, including all metadata.
+MAX_CHECKPOINT_BYTES = 65000  # Below GitHub's comment limit, including all metadata.
 
 
 Error = policy.Error
