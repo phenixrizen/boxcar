@@ -137,6 +137,15 @@ def checkpoint_body(state):
     body = "# Work issue checkpoint\n\n" + block(MARK, public)
     public_safe(body)
     if len(body.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
+        # Long-lived ledgers must not lose history merely to remove whitespace.
+        body = (
+            "# Work issue checkpoint\n\n<!-- "
+            + MARK
+            + " -->\n```json\n"
+            + json.dumps(public, separators=(",", ":"))
+            + "\n```"
+        )
+    if len(body.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
         raise Error(
             "checkpoint too large; shorten checkpoint/triage text, preserve review history"
         )

@@ -536,6 +536,18 @@ class PrivateWorkflowTest(unittest.TestCase):
                     a.API().request(path, data, "POST")
             run.assert_not_called()
 
+    def test_long_lived_ordinary_checkpoint_compacts_without_lost_history(self):
+        state = {
+            "reviews": [{"id": i, "detail": {"result": "test"}} for i in range(1000)]
+        }
+        self.assertGreater(
+            len(work_issue.block(work_issue.MARK, state)),
+            work_issue.MAX_CHECKPOINT_BYTES,
+        )
+        body = work_issue.checkpoint_body(state)
+        self.assertLess(len(body), work_issue.MAX_CHECKPOINT_BYTES)
+        self.assertEqual(work_issue.parse_block(work_issue.MARK, body), state)
+
     def test_cli_invalid_private_argument_never_echoes_it(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
