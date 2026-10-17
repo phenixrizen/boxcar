@@ -89,6 +89,13 @@ const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 /// The magics of skippable frames.
 const SKIPPABLE: std::ops::RangeInclusive<u32> = 0x184D_2A50..=0x184D_2A5F;
 
+/// ruzstd's decoder over the frame's magic, replayed, and the rest of the
+/// input.
+type InFrame<R> = ruzstd::decoding::StreamingDecoder<
+    io::Chain<io::Cursor<[u8; 4]>, R>,
+    ruzstd::decoding::FrameDecoder,
+>;
+
 /// A zstd stream of any number of frames, skippable frames among them.
 pub struct Zstd<R: Read> {
     state: ZstdState<R>,
@@ -97,13 +104,8 @@ pub struct Zstd<R: Read> {
 enum ZstdState<R: Read> {
     /// Between frames: the next four bytes say what comes.
     Between(R),
-    /// In a frame.
-    Frame(
-        ruzstd::decoding::StreamingDecoder<
-            io::Chain<io::Cursor<[u8; 4]>, R>,
-            ruzstd::decoding::FrameDecoder,
-        >,
-    ),
+    /// In a frame; boxed, being far larger than the reader between frames.
+    Frame(Box<InFrame<R>>),
     Done,
 }
 
@@ -138,7 +140,7 @@ impl<R: Read> Read for Zstd<R> {
                                 ));
                             }
                         }
-                        let (chain, _) = decoder.into_parts();
+                        let (chain, _) = (*decoder).into_parts();
                         let (_, input) = chain.into_inner();
                         self.state = ZstdState::Between(input);
                     }
@@ -174,7 +176,7 @@ impl<R: Read> Read for Zstd<R> {
                             MAX_ZSTD_WINDOW,
                         )
                         .map_err(|error| io::Error::other(format!("not a zstd frame: {error}")))?;
-                        self.state = ZstdState::Frame(decoder);
+                        self.state = ZstdState::Frame(Box::new(decoder));
                     } else if SKIPPABLE.contains(&word) {
                         let mut len = [0u8; 4];
                         input.read_exact(&mut len)?;

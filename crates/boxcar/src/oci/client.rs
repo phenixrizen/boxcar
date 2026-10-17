@@ -184,7 +184,7 @@ impl Client {
     }
 
     /// A client over plain HTTP to a loopback registry, for tests.
-    #[cfg(any(test, feature = "kvm-tests"))]
+    #[cfg(test)]
     pub fn insecure_loopback(
         reference: &Reference,
         config: Option<&DockerConfig>,
@@ -203,7 +203,7 @@ impl Client {
     }
 
     /// Shortens the body deadline's floor, so a test of a stall ends soon.
-    #[cfg(any(test, feature = "kvm-tests"))]
+    #[cfg(test)]
     pub fn with_timeout(mut self, timeout: Duration) -> Client {
         self.timeout = timeout;
         self
@@ -541,7 +541,12 @@ mod tests {
     fn image(registry: &Registry) -> (String, boxcar_testreg::Blob) {
         let layer = layer_tar(&tar_of(&[("hello", b"hi")]));
         let config = config(&[], &["/bin/sh"], &[], "/");
-        let digest = registry.put_image("library/app", "latest", &config, &[layer.clone()]);
+        let digest = registry.put_image(
+            "library/app",
+            "latest",
+            &config,
+            std::slice::from_ref(&layer),
+        );
         (digest, layer)
     }
 

@@ -495,7 +495,7 @@ mod tests {
         let shared = layer_tar(&testutil::layer(&[testutil::file("shared", 0o644, b"s")]));
         let only_b = layer_tar(&testutil::layer(&[testutil::file("b", 0o644, b"b")]));
         let cfg = config(&[], &[], &[], "/");
-        registry.put_image("team/a", "1", &cfg, &[shared.clone()]);
+        registry.put_image("team/a", "1", &cfg, std::slice::from_ref(&shared));
         registry.put_image("team/b", "1", &cfg, &[shared.clone(), only_b.clone()]);
         let (_tmp, store) = store();
         do_pull(&store, &registry, &reference(&registry, "team/a", "1")).unwrap();

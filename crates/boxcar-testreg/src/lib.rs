@@ -732,7 +732,12 @@ mod tests {
         let registry = Registry::start(Auth::None, Faults::default());
         let layer = layer_gzip(&tar_of(&[("hello", b"hi")]));
         let config = config(&["A=1"], &["/bin/sh"], &[], "/");
-        let digest = registry.put_image("library/app", "latest", &config, &[layer.clone()]);
+        let digest = registry.put_image(
+            "library/app",
+            "latest",
+            &config,
+            std::slice::from_ref(&layer),
+        );
         let (status, headers, body) =
             get(&registry.url(), "/v2/library/app/manifests/latest", None);
         assert_eq!(status, 200);

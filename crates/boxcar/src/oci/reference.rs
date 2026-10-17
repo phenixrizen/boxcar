@@ -153,6 +153,8 @@ impl Reference {
         self.tag.as_deref()
     }
 
+    // `vmm.start.image` (Task 3) records the digest a reference asked for.
+    #[allow(dead_code)]
     pub fn digest(&self) -> Option<&Digest> {
         self.digest.as_ref()
     }

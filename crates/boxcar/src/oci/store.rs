@@ -227,6 +227,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -393,6 +394,9 @@ impl Store {
         self.fs.fsync_dir(&dir)
     }
 
+    // `boxcar run --image --pull missing` (Task 3) reads the ref without asking
+    // the registry; until then only the tests read one.
+    #[allow(dead_code)]
     pub fn read_ref(&self, reference: &Reference) -> io::Result<Option<Digest>> {
         let path = self.ref_path(reference)?;
         let text = match fs::read_to_string(&path) {
@@ -955,7 +959,7 @@ mod tests {
         fs::create_dir_all(images.join(".bbbb.deleting.999999-2/rootfs/locked")).unwrap();
         fs::set_permissions(
             images.join(".bbbb.deleting.999999-2/rootfs/locked"),
-            fs::Permissions::from_mode(0),
+            fs::Permissions::from_mode(0o000),
         )
         .unwrap();
         fs::create_dir_all(images.join(".cccc.partial.999999-3/rootfs")).unwrap();
@@ -966,7 +970,7 @@ mod tests {
         fs::write(blobs.join(format!(".dddd.partial.{own}-1")), b"mine").unwrap();
         // Before the sweep, none of it is trusted.
         assert_eq!(store.image_dir(&Digest::of_hash(&[0xbb; 32])), None);
-        assert_eq!(store.list().unwrap().images, [m.clone()]);
+        assert_eq!(store.list().unwrap().images, std::slice::from_ref(&m));
         assert_eq!(store.list().unwrap().refs, []);
         assert_eq!(store.sweep().unwrap(), 4);
         assert_eq!(names(&blobs), [format!(".dddd.partial.{own}-1")]);
@@ -1036,7 +1040,7 @@ mod tests {
         fs::create_dir_all(locked.join("deeper")).unwrap();
         fs::write(locked.join("deeper/x"), b"x").unwrap();
         fs::set_permissions(locked.join("deeper"), fs::Permissions::from_mode(0o555)).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         staging.publish(&json(&m, &digest(2), &[])).unwrap();
         assert!(store.remove_image(&m).unwrap());
         assert_eq!(names(&store.dir().join("images")), Vec::<String>::new());
