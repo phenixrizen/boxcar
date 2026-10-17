@@ -260,3 +260,129 @@ Plan round 3 disposition: both independent reviewers identified the omitted
 follow-up eligibility above. Corrected before implementation without changing
 the intended bounded-fix policy. The initial → fix → follow-up readiness test
 and the amendment code review verify this correction; no extra plan round.
+
+
+## Advisory implementation and migration continuation (2026-10-17)
+
+The owner requested completing the remaining advisory implementation and private
+migration after the partial workflow PRs merged. This section authorizes that
+scope; it supersedes the earlier amendment's exclusion of advisory implementation.
+Use the existing task issues and ledgers, continuing from merged main without
+resetting attempts, counts, outcomes or scoped authorizations. New review spending
+requires the separately recorded bounded allowance. Real vulnerability remediation,
+publication, CVE requests and retirement of the original source remain separate
+owner decisions. Only synthetic records belong in this public change.
+
+### Record operations and privacy boundary
+
+Add one stdlib `scripts/security_advisory.py` entry point; reuse the existing
+`review_policy.py` and `codex_review.py`, without an orchestration service or tracker.
+Commands cover access, list/read/search, create/update/close/recover, authorization,
+work/checkpoint/release, review/review recovery, disposition and integration.
+Every session reads the current advisory. GHSA remains the stable identifier.
+
+Use authenticated `gh api` with argv arrays and structured stdin JSON. Restrict
+routes to this repository's advisory collection/items and its private-fork action;
+never expose arbitrary mutation routes, publication, CVE requests or collaborator
+changes. Creation omits publication fields; only explicit close can set closed.
+An unexpected public/native state fails closed. Read-only named access may use an
+advisory collaborator; full inventory and mutations conservatively require the
+owner's administrator identity. Check roles and endpoint access separately: a
+read preflight does not prove write-token capability. Sanitize API errors to
+status and permission guidance; never echo response bodies, CLI arguments or
+private records in public logs. Suppress GH_DEBUG and shell tracing in children.
+
+Read/search outputs, inputs, retry journals, raw review results and exported
+migration mappings use restricted files outside Git working trees (0700 parent,
+0600 files). Reject symlink destinations and files inside repositories. Public
+helpers reject confidential workspace markers before their GitHub operations;
+private clones have a pre-push guard that verifies the destination is their
+recorded private fork. Direct wrapper reviews of a confidential clone require
+the explicit private invocation path. These are accidental-routing guards, not
+semantic detection of every confidential sentence or a sandbox against an
+operator intentionally bypassing them.
+
+### Data, retries and ownership
+
+Preserve original technical prose. One `security-finding:v1` JSON section records
+schema/revision, creation key, original IDs, discovery metadata, confidence,
+internal status, append-only progress/history, authorization, session ownership,
+private workspace association and the policy-2 review ledger. Confidence is
+separate from severity. New/unverified claims do not automatically become confirmed.
+Historical source status remains verbatim during import; migration grants no new
+remediation authorization or claim that historical fixes were reverified.
+Required package ecosystem/name/ranges are taken from evidence; unknown nullable
+fields stay null. Insufficient metadata stays in its existing secure source with
+an explicit private migration gap, never an invented package or public issue.
+
+Before creation search all visible records for operation key/original IDs and
+related summaries. Exact matches are reused; related matches require inspection.
+Persist intent atomically before POST. A lost response is reconciled by the same
+key and read-back; if absent/ambiguous, stop instead of repeating POST. Definite
+rejection is distinguished from an unknown outcome. Updates require the current
+snapshot digest, preserve original identifiers and histories, reread before PATCH,
+and verify their operation revision afterward. Recover an applied-but-unacknowledged
+update without adding another event. Retain unresolved intents across process
+restarts; transfer them privately during a machine handoff. Never silently discard
+an unknown creation/fork outcome merely because a later list is empty.
+
+A local advisory-state flock serializes sessions sharing that state directory.
+The advisory carries an explicit active session/clone claim; resume reuses resources,
+release refuses pending review/publication and verifies the released state. Different
+machines must coordinate and hand off: REST has neither an atomic claim nor create
+idempotency nor a documented compare-and-swap PATCH. Digest checks detect observed
+conflicts; they cannot prevent every simultaneous remote writer. Do not claim a
+status read/update is a distributed lock.
+
+### Authorized private remediation and review
+
+An explicit owner-authorized scope is recorded separately from status. Generic
+progress updates cannot grant scope, reset the review ledger or rewrite receipts.
+Work retrieves and checks current scope/status, reuses an existing private fork,
+or journals one fork request before the asynchronous operation. Pending provisioning
+is polled by retrieval; never automatically POST another fork request. Verify
+private=true, remote identity and isolated clone before edits/push. No public PR
+or public branch is created for remediation. Creating drafts for migration does
+not authorize starting fixes or creating their private forks.
+
+Private review uses the same versioned budget and disposition functions as ordinary
+work: phase versus scope, immutable head/base/merge-base, prior original structured
+results, stable finding IDs, required investigation, scoped exceptions and explicit
+integration evidence. Store structured original results/receipts privately in the
+advisory so another authorized account can recover follow-up context; keep raw model
+transcripts local. Publish a pending attempt before spending; recover a structured
+result exactly once, and distinguish unavailable calls from completed reviews.
+Two failed attempts require a bound retry decision; pending calls prevent another
+round or release. Before invoking revalidate scope/ownership and current review
+allowances. Fresh checks and integration evidence bind actual revisions. Only the
+verified completion command may claim Fixed, awaiting disclosure; it leaves the
+native advisory draft. A close needs an explicit owner decision and private reason.
+Do not infer authorization from migration, a status label or reviewer confidence.
+
+Temporary private forks do not run normal public CI/status checks or enforce branch
+protections; integrations cannot access them. Run appropriate tests and independent
+review locally in the private workspace and retain evidence privately. Report those
+limits. No real security fix/fork is needed to test this workflow implementation.
+
+### Migration and validation
+
+Read current source bodies and all available comment threads, including resolved
+comments. Inventory every original finding privately; preserve original identifiers,
+claims, severity/confidence, evidence, remediation history and pending decisions.
+Map source blocks to records without inventing a claim. Carry administrative context
+as provenance where needed. Check existing advisories first; use deterministic source
+operation keys. Only actual owner-authorized findings are imported, never synthetic
+API-test records. Retrieve each created/updated draft and compare its original-ID
+mapping and content; rerun imports to demonstrate reuse. Keep a restricted mapping
+and a complete accounting of any unrepresentable/unretrieved records. Keep the
+original documents intact pending verified migration and explicit retirement approval.
+
+Focused tests use fake gh responses and temporary Git repositories: permission/auth
+failures and partial read access; pagination; invalid repo/GHSA; draft creation and
+forbidden publication/CVE payloads; duplicate/related detection; lost POST/PATCH/fork
+responses and recovery; stale updates; closed/published handling; owner scope and
+session conflicts; private-fork destinations and guards; private output/error handling;
+review recovery/counts/allowances across sessions; stale review and integration evidence;
+synthetic migration replay. Keep existing scripts regressions and trusted-main CI
+boundary. Tests establish mechanics, not model judgment, universal race exclusion or
+an actual KVM run. Run the complete scripts suite in both repositories.
