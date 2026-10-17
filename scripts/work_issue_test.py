@@ -607,6 +607,90 @@ class Workflow(unittest.TestCase):
         self.assertEqual(len(self.gh.pulls), 1)
         self.assertEqual(self.gh.pulls[0]["base"]["ref"], "main")
 
+    def test_colon_closing_forms_rejected_by_submit_and_ci(self):
+        self.ready()
+        original = w.run
+        for keyword in [
+            "close",
+            "closes",
+            "closed",
+            "fix",
+            "fixes",
+            "fixed",
+            "resolve",
+            "resolves",
+            "resolved",
+        ]:
+            body = "Part of #43\n\n" + keyword + ": #43"
+            self.assertIsNone(w.relation(body, 43))
+            with self.assertRaises(w.Error):
+                self.ctx.submit("one", "Partial", body, kind="part")
+        with mock.patch.object(
+            w,
+            "run",
+            side_effect=lambda a, **kw: (
+                "" if a[:2] == ["git", "push"] else original(a, **kw)
+            ),
+        ):
+            self.ctx.submit("one", "Partial", "Part of #43", kind="part")
+        self.gh.pulls[0]["body"] += "\nCloses: #43"
+        with self.assertRaisesRegex(w.Error, "relationship"):
+            w.validate_pr(88, self.gh)
+
+    def test_recover_reconciles_accepted_pending_publication_first(self):
+        self.start()
+        r = self.receipt()
+        r["status"] = "pending"
+        r["id"] = "not-launched"
+        self.ctx.state["reviews"] = [r]
+        self.ctx.save()
+        # Simulate the new revision accepted remotely without the local acknowledgement.
+        self.ctx.publish()
+        self.ctx.state["_remote_revision"] = "old-ack"
+        self.ctx.save()
+        later = w.Task(43, self.gh)
+        later.recover("one", failed=True)
+        self.assertEqual(later.state["reviews"][-1]["status"], "failed")
+        later.start("one", here=True)
+        later.release("one")
+        self.assertIsNone(w.remote_state(self.gh, 43)[0]["owner"])
+
+    def test_default_start_creates_exactly_one_worktree(self):
+        w.git("branch", "-m", "unrelated")
+        original = w.run
+        with mock.patch.object(
+            w,
+            "run",
+            side_effect=lambda a, **kw: (
+                "" if a[:2] == ["git", "fetch"] else original(a, **kw)
+            ),
+        ):
+            one = self.ctx.start("one")["_worktree"]
+            two = self.ctx.start("one")["_worktree"]
+        self.assertEqual(one, two)
+        self.assertTrue(Path(one).is_dir())
+        self.assertEqual(
+            w.git("worktree", "list", "--porcelain").count(
+                "branch refs/heads/issue-43"
+            ),
+            1,
+        )
+
+    def test_another_process_cannot_enter_the_clone_operation_lock(self):
+        import sys
+
+        program = "import sys;sys.path.insert(0,sys.argv[1]);import work_issue as w\nwith w.locked(): print('entered')"
+        with w.locked():
+            child = subprocess.run(
+                [sys.executable, "-c", program, str(Path(w.__file__).parent)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn("another workflow operation", child.stderr)
+        with w.locked():
+            pass
+
 
 if __name__ == "__main__":
     unittest.main()

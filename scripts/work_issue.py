@@ -213,7 +213,7 @@ def relation(body, number):
         return None
     kind = matches[0].lower()
     closing = re.findall(
-        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+(?:#[0-9]+|[\w.-]+/[\w.-]+#[0-9]+|https://github\.com/[\w.-]+/[\w.-]+/issues/[0-9]+)",
+        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\s+(?:#[0-9]+|[\w.-]+/[\w.-]+#[0-9]+|https://github\.com/[\w.-]+/[\w.-]+/issues/[0-9]+)",
         body or "",
         re.I,
     )
@@ -358,6 +358,8 @@ class Task:
             raise Error(
                 "task owned by another session/clone; explicit release/handoff required"
             )
+        # Every operation reconciles its predecessor before changing the saved intent.
+        self.publish()
 
     def clone(self):
         p = self.directory / "clone.json"
