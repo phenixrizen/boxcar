@@ -73,6 +73,20 @@ pub struct ShareRef {
     pub host_root: String,
 }
 
+/// The image a session booted from (`boxcar run --image`): the reference
+/// as given, normalized, and the manifest and config digests of the
+/// cached image whose tree was copied for the session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImageRef {
+    /// `registry/repository[:tag][@sha256:hex]`, at most 255 bytes.
+    pub reference: String,
+    /// `sha256:<hex>` of the manifest.
+    pub manifest_digest: String,
+    /// `sha256:<hex>` of the image config.
+    pub config_digest: String,
+}
+
 /// `vmm.start`: the VM was built and is about to run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -94,6 +108,11 @@ pub struct VmmStart {
     /// session has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspect_ca_sha256: Option<String>,
+    /// The image the session booted from (`--image`). Omitted when the
+    /// root share is a directory given with `--rootfs`, and read as none
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageRef>,
 }
 
 /// `vmm.stop`: the VM stopped.

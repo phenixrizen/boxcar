@@ -44,9 +44,9 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
     FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
-    HttpResponse, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop,
-    NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec, ProcExit,
-    ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
+    HttpResponse, ImageRef, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns,
+    NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec,
+    ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
     ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SensorPhase, SessionExit,
     SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop,
     VsockClose, VsockConnect,
@@ -779,6 +779,11 @@ mod tests {
                         },
                     ],
                     inspect_ca_sha256: Some("ab".repeat(32)),
+                    image: Some(ImageRef {
+                        reference: "docker.io/library/alpine:3.22".into(),
+                        manifest_digest: format!("sha256:{}", "cd".repeat(32)),
+                        config_digest: format!("sha256:{}", "ef".repeat(32)),
+                    }),
                 }),
                 json!({
                     "version": "0.1.0",
@@ -792,6 +797,11 @@ mod tests {
                         {"tag": "workspace", "host_root": "/tmp/ws"},
                     ],
                     "inspect_ca_sha256": "ab".repeat(32),
+                    "image": {
+                        "reference": "docker.io/library/alpine:3.22",
+                        "manifest_digest": format!("sha256:{}", "cd".repeat(32)),
+                        "config_digest": format!("sha256:{}", "ef".repeat(32)),
+                    },
                 }),
             ),
             (
@@ -1837,6 +1847,7 @@ mod tests {
                     mem_mib: 128,
                     shares: Vec::new(),
                     inspect_ca_sha256: None,
+                    image: None,
                 }),
                 json!({
                     "version": "0.1.0",
@@ -2123,9 +2134,49 @@ mod tests {
         });
         let rec = record("vmm.start", Source::Vmm, data);
         match Payload::from_record(&rec).unwrap() {
-            Payload::VmmStart(start) => assert!(start.shares.is_empty()),
+            Payload::VmmStart(start) => {
+                assert!(start.shares.is_empty());
+                assert_eq!(start.image, None, "no image either");
+            }
             other => panic!("not a vmm.start: {other:?}"),
         }
+    }
+
+    /// `image` came with M5: the largest reference (255 bytes) and both
+    /// digests round-trip, and a record carrying them fits its limit.
+    #[test]
+    fn a_vmm_start_carries_the_largest_image() {
+        let reference = format!(
+            "{}/{}@sha256:{}",
+            "r".repeat(60),
+            "p".repeat(122),
+            "0".repeat(64)
+        );
+        assert_eq!(reference.len(), 255);
+        let start = VmmStart {
+            version: "0.1.0".into(),
+            kernel: ArtifactRef {
+                path: "/k/vmlinux".into(),
+                blake3: Hash([0x11; 32]),
+            },
+            initramfs: None,
+            cmdline: String::new(),
+            vcpus: 1,
+            mem_mib: 128,
+            shares: Vec::new(),
+            inspect_ca_sha256: None,
+            image: Some(ImageRef {
+                reference,
+                manifest_digest: format!("sha256:{}", "1".repeat(64)),
+                config_digest: format!("sha256:{}", "2".repeat(64)),
+            }),
+        };
+        let payload = Payload::VmmStart(start.clone());
+        let tagged = serde_json::to_value(&payload).unwrap();
+        let data = tagged["data"].clone();
+        let back = Payload::from_record(&record("vmm.start", Source::Vmm, data.clone())).unwrap();
+        assert_eq!(back, payload);
+        assert!(serde_json::to_vec(&data).unwrap().len() < 2048);
     }
 
     #[test]

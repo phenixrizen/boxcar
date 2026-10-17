@@ -102,8 +102,6 @@ pub enum PullMode {
 pub struct Found {
     pub manifest: Digest,
     /// The image's directory, `rootfs` and `image.json` in it.
-    // Read by `run --image` when it copies the tree.
-    #[allow(dead_code)]
     pub dir: PathBuf,
     pub json: ImageJson,
     /// Whether anything was fetched.

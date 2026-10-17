@@ -59,6 +59,7 @@ const TRUST_STORE: &str = "/etc/ssl/certs/ca-certificates.crt";
 pub enum Reflink {
     Try,
     /// For tests of the copying path on a filesystem that reflinks.
+    #[cfg(test)]
     Never,
 }
 
@@ -310,6 +311,31 @@ fn copy_by_hand(src: &OwnedFd, dst: &OwnedFd) -> io::Result<()> {
         }
         writer.write_all(&buf[..n])?;
     }
+}
+
+/// Whether a file in `from` reflinks into `to`: a probe file under a
+/// dot name in each, cloned, both removed. For `boxcar doctor`, which
+/// says whether a session's copy of an image costs a copy.
+pub fn reflinks(from: &Path, to: &Path) -> io::Result<bool> {
+    let name = format!(".boxcar-reflink-probe.{}", std::process::id());
+    let src_path = from.join(&name);
+    let dst_path = to.join(&name);
+    let result = (|| {
+        let mut src = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(&src_path)?;
+        std::io::Write::write_all(&mut src, b"probe")?;
+        let dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dst_path)?;
+        Ok(unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) } == 0)
+    })();
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&dst_path);
+    result
 }
 
 /// Where the session's filesystems meet the host: the copy's root and the

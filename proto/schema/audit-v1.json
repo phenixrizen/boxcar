@@ -1066,6 +1066,29 @@
         }
       }
     },
+    "ImageRef": {
+      "description": "The image a session booted from (`boxcar run --image`): the reference as given, normalized, and the manifest and config digests of the cached image whose tree was copied for the session.",
+      "type": "object",
+      "required": [
+        "config_digest",
+        "manifest_digest",
+        "reference"
+      ],
+      "properties": {
+        "config_digest": {
+          "description": "`sha256:<hex>` of the image config.",
+          "type": "string"
+        },
+        "manifest_digest": {
+          "description": "`sha256:<hex>` of the manifest.",
+          "type": "string"
+        },
+        "reference": {
+          "description": "`registry/repository[:tag][@sha256:hex]`, at most 255 bytes.",
+          "type": "string"
+        }
+      }
+    },
     "LlmRequest": {
       "description": "`llm.request`: a request to a model API the gate knows, read from an inspected flow once its body ended.",
       "type": "object",
@@ -3707,6 +3730,17 @@
       "properties": {
         "cmdline": {
           "type": "string"
+        },
+        "image": {
+          "description": "The image the session booted from (`--image`). Omitted when the root share is a directory given with `--rootfs`, and read as none when absent.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ImageRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "initramfs": {
           "anyOf": [

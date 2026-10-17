@@ -62,6 +62,10 @@ enum Milestone {
     /// the model traffic gate, with inspected flows to example.com and to
     /// test upstreams on the loopback.
     M4,
+    /// M5: everything M4 runs, plus the M5 end-to-end tests (`kvm_m5`):
+    /// sessions booted from an image pulled from a test registry on the
+    /// loopback.
+    M5,
 }
 
 impl Milestone {
@@ -71,6 +75,7 @@ impl Milestone {
             Milestone::M2 => "m2",
             Milestone::M3 => "m3",
             Milestone::M4 => "m4",
+            Milestone::M5 => "m5",
         }
     }
 
@@ -79,7 +84,7 @@ impl Milestone {
     fn net_env(self) -> &'static str {
         match self {
             Milestone::M1 => "0",
-            Milestone::M2 | Milestone::M3 | Milestone::M4 => {
+            Milestone::M2 | Milestone::M3 | Milestone::M4 | Milestone::M5 => {
                 if example_com_resolves() {
                     "1"
                 } else {
@@ -130,7 +135,7 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
 /// The arguments after `cargo` that run `milestone`'s gated tests.
 fn cargo_test_args(milestone: Milestone) -> Vec<OsString> {
     let args: &[&str] = match milestone {
-        Milestone::M1 | Milestone::M2 | Milestone::M3 | Milestone::M4 => &[
+        Milestone::M1 | Milestone::M2 | Milestone::M3 | Milestone::M4 | Milestone::M5 => &[
             "test",
             "-p",
             "boxcar-vmm",
@@ -273,6 +278,7 @@ mod tests {
             strings(cargo_test_args(Milestone::M3))
         );
         assert_eq!(Milestone::M4.name(), "m4");
+        assert_eq!(Milestone::M5.name(), "m5");
         assert_eq!(Milestone::M4.net_env(), Milestone::M3.net_env());
         // M1 never reaches the network.
         assert_eq!(Milestone::M1.net_env(), "0");

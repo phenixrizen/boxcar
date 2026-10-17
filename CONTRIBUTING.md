@@ -30,6 +30,7 @@ cargo xtask test-kvm m1          # needs /dev/kvm and target/guest/*
 cargo xtask test-kvm m2          # the same, plus the tests that reach example.com
 cargo xtask test-kvm m3          # the same, with the sensor and the reconciler
 cargo xtask test-kvm m4          # the same, with the gate: the whole gated suite
+cargo xtask test-kvm m5          # the same, plus sessions booted from an image
 cargo xtask sensor               # the eBPF lane: builds the sensor's programs and checks the object
 ```
 

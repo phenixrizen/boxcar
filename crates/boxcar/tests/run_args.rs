@@ -650,3 +650,108 @@ fn no_sensor_is_taken_with_or_without_the_vsock_device() {
         );
     }
 }
+
+#[test]
+fn image_conflicts_with_rootfs_no_fs_and_no_vsock() {
+    for flags in [
+        &["--rootfs", "/tmp"][..],
+        &["--no-fs"][..],
+        &["--no-vsock"][..],
+    ] {
+        let mut args = vec!["run", "--kernel", "vmlinux", "--image", "alpine"];
+        args.extend_from_slice(flags);
+        let output = boxcar(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flags:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("cannot be used with"),
+            "{flags:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn pull_and_cache_dir_need_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let audit = tmp.path().join("audit");
+    for flags in [&["--pull", "always"][..], &["--cache-dir", "/tmp"][..]] {
+        let mut args = vec![
+            "run",
+            "--kernel",
+            "/nonexistent/vmlinux",
+            "--rootfs",
+            "/tmp",
+            "--audit-dir",
+            audit.to_str().unwrap(),
+        ];
+        args.extend_from_slice(flags);
+        let output = boxcar(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flags:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("--image"),
+            "{flags:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn a_bad_image_reference_is_refused_before_a_session_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let audit = tmp.path().join("audit");
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--image",
+        "Not A Ref",
+        "--audit-dir",
+        audit.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("error: --image"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+}
+
+#[test]
+fn pull_never_on_an_empty_cache_exits_1_before_a_session_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let audit = tmp.path().join("audit");
+    let cache = tmp.path().join("cache");
+    let output = boxcar(&[
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--image",
+        "127.0.0.1:1/library/app:latest",
+        "--pull",
+        "never",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("boxcar image pull"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!audit.exists(), "no session was started");
+    assert!(cache.join("images").is_dir(), "the cache was opened");
+    assert_eq!(std::fs::read_dir(cache.join("images")).unwrap().count(), 0);
+}

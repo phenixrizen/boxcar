@@ -4,7 +4,7 @@
 //! `boxcar image pull|ls|rm|prune`: the image cache from the command line.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
@@ -37,8 +37,13 @@ pub(crate) fn default_cache_dir(
 }
 
 fn open_store(args: &CacheArgs) -> Result<Store> {
-    let dir = match &args.cache_dir {
-        Some(dir) => dir.clone(),
+    open_cache(args.cache_dir.as_deref())
+}
+
+/// The cache at `dir`, or the default one, opened (and made when missing).
+pub(crate) fn open_cache(dir: Option<&Path>) -> Result<Store> {
+    let dir = match dir {
+        Some(dir) => dir.to_path_buf(),
         None => default_cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
             .context("no --cache-dir, and neither XDG_CACHE_HOME nor HOME is an absolute path")?,
     };
@@ -46,7 +51,7 @@ fn open_store(args: &CacheArgs) -> Result<Store> {
 }
 
 /// The host's trust store, for the registry's TLS.
-fn native_roots() -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
+pub(crate) fn native_roots() -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     let result = rustls_native_certs::load_native_certs();
     if result.certs.is_empty() {
         let why: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
@@ -59,7 +64,7 @@ fn native_roots() -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
 }
 
 /// `~/.docker/config.json`, when there is one.
-fn docker_config() -> Result<Option<DockerConfig>> {
+pub(crate) fn docker_config() -> Result<Option<DockerConfig>> {
     let Some(path) = DockerConfig::path() else {
         return Ok(None);
     };
@@ -85,22 +90,8 @@ fn pull(args: &ImagePullArgs) -> Result<ExitCode> {
     let roots = native_roots()?;
     let config = docker_config()?;
     let mut client = Client::new(&reference, roots, config.as_ref())?;
-    let pulled = pull::pull(
-        &store,
-        &mut client,
-        &reference,
-        &mut |progress: &Progress| {
-            super::tell(&format!(
-                "layer {}/{} {} {}{}",
-                progress.layer,
-                progress.layers,
-                progress.digest,
-                human(progress.size),
-                if progress.cached { " (cached)" } else { "" }
-            ));
-        },
-    )
-    .with_context(|| format!("pulling {reference}"))?;
+    let pulled = pull::pull(&store, &mut client, &reference, &mut report_progress)
+        .with_context(|| format!("pulling {reference}"))?;
     println!("{}", pulled.manifest);
     Ok(ExitCode::SUCCESS)
 }
@@ -166,6 +157,18 @@ fn prune(args: &CacheArgs) -> Result<ExitCode> {
         pruned.images, pruned.blobs
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line on stderr per layer, as the pull reaches it.
+pub(crate) fn report_progress(progress: &Progress) {
+    super::tell(&format!(
+        "layer {}/{} {} {}{}",
+        progress.layer,
+        progress.layers,
+        progress.digest,
+        human(progress.size),
+        if progress.cached { " (cached)" } else { "" }
+    ));
 }
 
 /// `size` in bytes, KiB, MiB or GiB.

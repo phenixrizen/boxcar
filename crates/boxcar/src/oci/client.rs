@@ -40,6 +40,11 @@ pub struct ManifestResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    /// The client could not be set up on this host (no trust store, an
+    /// unreadable Docker config): boxcar's own words, nothing a registry
+    /// sent.
+    #[error("{0}")]
+    Setup(String),
     #[error("{0}")]
     Transport(Transport),
     #[error("{registry}/{repository}: the {what} request answered {status}{}", describe(.codes))]
