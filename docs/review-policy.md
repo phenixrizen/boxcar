@@ -155,6 +155,9 @@ main. Existing live checkpoints stay schema 2 during bootstrap; legacy policy-2 
 use their cumulative grants. Policy 1 retains its original fourth/fifth-round
 rules; policy 2 retains docs one, plans two, code three autonomous with explicit
 permission for each later round. These historic rules do not change retroactively.
+Policy-2 receipts keep same-phase `prior` links for compatibility with main. During
+bootstrap, pass relevant plan reports as restricted supplementary focus context;
+cross-phase source links for carry-forward become available with policy 3.
 The migration preserves the existing comment envelope and history, records the
 explicit owner-scoped deliverable boundary, and uses recoverable publication.
 Pending attempts must recover first; an active or unpublished conflicting clone

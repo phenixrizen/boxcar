@@ -598,6 +598,26 @@ class PolicyWorkflow(unittest.TestCase):
             material=True,
         )
 
+    def test_policy_two_rejects_cross_phase_sources_before_invocation(self):
+        self.start()
+        plan = self.receipt("plan")
+        plan["outcome"] = "needs-attention"
+        self.ctx.state["reviews"].append(plan)
+        policy.register_result(
+            self.ctx.state,
+            plan,
+            {
+                "verdict": "needs-attention",
+                "findings": [{"title": "Synthetic plan claim", "severity": "medium"}],
+            },
+        )
+        self.ctx.save()
+        self.ctx.publish()
+        with self.assertRaisesRegex(policy.Error, "another phase"):
+            self.review("initial", [plan["id"]], plan["finding_ids"])
+        self.assertEqual(self.ctx.state["reviews"], [plan])
+        self.assertEqual(policy.count(self.ctx.state, "code"), 0)
+
     def test_pending_plan_prevents_readiness_of_earlier_code_receipt(self):
         self.ready()
         r = self.receipt("plan")

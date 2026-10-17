@@ -466,7 +466,9 @@ def validate_scope(state, r, check_auth=None):
         if ident not in [p["id"] for p in before]:
             raise Error("prior receipt must precede this review")
         p = receipt(state, ident)
-        if p["phase"] != r["phase"] and ident not in source_reports:
+        if p["phase"] != r["phase"] and (
+            r.get("policy_version") != POLICY_VERSION or ident not in source_reports
+        ):
             raise Error("prior receipt has another phase")
         if p["phase"] == r["phase"]:
             same_phase.append(p)
