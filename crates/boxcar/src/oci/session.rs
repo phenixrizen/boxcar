@@ -46,9 +46,8 @@ const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const MOUNTED: [&str; 4] = ["/run", "/dev", "/proc", "/sys"];
 /// Where the workspace share is mounted.
 const WORKSPACE: &str = "/workspace";
-/// Where the guest's view leaves the root share: `follow` looks up nothing
-/// at or beneath these, since what the image has there is hidden by a
-/// mount, and appends the rest of a path as written.
+/// Where the guest's view leaves the root share: the workspace share and
+/// the filesystems the guest mounts.
 const BOUNDARIES: [&str; 5] = [WORKSPACE, "/run", "/dev", "/proc", "/sys"];
 /// The mount points init moves or mounts onto; made when the image lacks
 /// them.
@@ -363,23 +362,35 @@ pub struct BootNeeds<'a> {
 /// the copy is still 0o700.
 pub fn prepare_boot_paths(layout: &Layout<'_>, needs: &BootNeeds<'_>) -> Result<(), SessionError> {
     let root = OwnedFd::from(File::open(layout.root).map_err(SessionError::Prepare)?);
+    let workspace = OwnedFd::from(File::open(layout.workspace).map_err(SessionError::Prepare)?);
+    let view = View {
+        root: &root,
+        workspace: &workspace,
+    };
     for point in MOUNT_POINTS {
         mkdir_missing(&root, Path::new(point), 0o755).map_err(SessionError::Prepare)?;
     }
-    make_working_dir(&root, layout, needs.cwd)?;
+    make_working_dir(&view, layout, needs.cwd)?;
     if needs.net {
-        touch_where_it_leads(&root, RESOLV_CONF).map_err(SessionError::Prepare)?;
+        touch_where_it_leads(&view, RESOLV_CONF).map_err(SessionError::Prepare)?;
     }
     if needs.inspect {
-        touch_where_it_leads(&root, TRUST_STORE).map_err(SessionError::Prepare)?;
+        touch_where_it_leads(&view, TRUST_STORE).map_err(SessionError::Prepare)?;
     }
     Ok(())
 }
 
+/// The guest's view of its filesystem, as the host can see it: the copy
+/// at `/`, the workspace's host directory at `/workspace`.
+pub struct View<'a> {
+    pub root: &'a OwnedFd,
+    pub workspace: &'a OwnedFd,
+}
+
 /// The working directory, where the guest will see it: judged by where the
 /// path leads once the copy's links are followed.
-fn make_working_dir(root: &OwnedFd, layout: &Layout<'_>, cwd: &str) -> Result<(), SessionError> {
-    let led = follow(root, cwd).map_err(|_| SessionError::WorkingDirUnresolvable)?;
+fn make_working_dir(view: &View<'_>, layout: &Layout<'_>, cwd: &str) -> Result<(), SessionError> {
+    let led = follow(view, cwd).map_err(|_| SessionError::WorkingDirUnresolvable)?;
     let leads = led.path.as_path();
     if MOUNTED.iter().any(|mounted| leads.starts_with(mounted)) {
         return Err(SessionError::WorkingDirMounted);
@@ -390,7 +401,7 @@ fn make_working_dir(root: &OwnedFd, layout: &Layout<'_>, cwd: &str) -> Result<()
         return Ok(());
     }
     let rel = leads.strip_prefix("/").unwrap_or(leads);
-    mkdir_missing(root, rel, 0o755).map_err(SessionError::Prepare)
+    mkdir_missing(view.root, rel, 0o755).map_err(SessionError::Prepare)
 }
 
 /// Creates the file `path` (as the guest sees it), empty and 0o644, where
@@ -398,10 +409,11 @@ fn make_working_dir(root: &OwnedFd, layout: &Layout<'_>, cwd: &str) -> Result<()
 /// directory is: as init's resolver and trust plan `Touch` it. A path
 /// leading under `/run` is init's tmpfs; a loop or an escape is left to
 /// init to refuse.
-fn touch_where_it_leads(root: &OwnedFd, path: &str) -> io::Result<()> {
-    let Ok(led) = follow(root, path) else {
+fn touch_where_it_leads(view: &View<'_>, path: &str) -> io::Result<()> {
+    let Ok(led) = follow(view, path) else {
         return Ok(());
     };
+    let root = view.root;
     // Beneath a mount the guest makes, the host's file would be hidden
     // (/run) or init writes to a writable share itself (/workspace).
     if led.exists || BOUNDARIES.iter().any(|b| led.path.starts_with(b)) {
@@ -530,15 +542,16 @@ fn kind_at(root: &OwnedFd, rel: &Path) -> io::Result<Kind> {
     })
 }
 
-/// Where the absolute `path` leads in the tree at `root`, as init's
+/// Where the absolute `path` leads in the guest's `view`, as init's
 /// resolver follows a path: each component in turn, a link's target
-/// (against the link's directory, or the root) put in its place, except
-/// at or beneath a mount the guest makes ([`BOUNDARIES`]), where the
-/// image's entries are hidden and the rest of the path is taken as
-/// written. Refused when it takes more than [`MAX_LINKS`] links, when a
-/// `..` would go above the root, or when a lookup fails other than for
-/// want of a file.
-pub fn follow(root: &OwnedFd, path: &str) -> Result<Followed, String> {
+/// (against the link's directory, or the root) put in its place. Beneath
+/// `/workspace` the workspace's host directory is what the guest sees,
+/// so its entries are looked up and its links followed there; beneath a
+/// filesystem the guest mounts ([`MOUNTED`]) nothing of the image is
+/// seen, so the rest is taken as written. Refused when it takes more than
+/// [`MAX_LINKS`] links, when a `..` would go above the root, or when a
+/// lookup fails other than for want of a file.
+pub fn follow(view: &View<'_>, path: &str) -> Result<Followed, String> {
     enum Part {
         Root,
         Parent,
@@ -566,18 +579,27 @@ pub fn follow(root: &OwnedFd, path: &str) -> Result<Followed, String> {
             }
             Part::Name(name) => {
                 let next = resolved.join(&name);
-                let rel = next.strip_prefix("/").unwrap_or(&next).to_path_buf();
-                // Beneath a mount the guest makes, the image's entries are
-                // hidden: not looked up, and not followed. That is not the
-                // same as a missing component: a `..` that leaves the mount
-                // resumes the lookups.
-                let hidden = BOUNDARIES.iter().any(|b| next.starts_with(b));
-                if hidden {
+                // Beneath a filesystem the guest mounts, the image's entries
+                // are hidden: not looked up, and not followed. That is not
+                // the same as a missing component: a `..` that leaves the
+                // mount resumes the lookups.
+                if MOUNTED.iter().any(|b| next.starts_with(b)) {
                     resolved = next;
                     continue;
                 }
+                // Beneath /workspace, the workspace's host directory is what
+                // the guest sees.
+                let (dir, rel) = match next.strip_prefix(WORKSPACE) {
+                    Ok(rest) if !rest.as_os_str().is_empty() => {
+                        (view.workspace, rest.to_path_buf())
+                    }
+                    _ => (
+                        view.root,
+                        next.strip_prefix("/").unwrap_or(&next).to_path_buf(),
+                    ),
+                };
                 let kind = if exists {
-                    kind_at(root, &rel).map_err(|error| format!("lstat: {error}"))?
+                    kind_at(dir, &rel).map_err(|error| format!("lstat: {error}"))?
                 } else {
                     Kind::Missing
                 };
@@ -587,7 +609,7 @@ pub fn follow(root: &OwnedFd, path: &str) -> Result<Followed, String> {
                         if links > MAX_LINKS {
                             return Err(format!("takes more than {MAX_LINKS} links"));
                         }
-                        let target = read_link_at(root, &rel)
+                        let target = read_link_at(dir, &rel)
                             .map_err(|error| format!("readlink: {error}"))?;
                         for part in parts(Path::new(&target)).rev() {
                             pending.push_front(part);
@@ -1239,6 +1261,40 @@ mod tests {
         assert_eq!(l["srv/resolv.conf"], "file 644 \"\"");
         assert!(!l.contains_key("app/build"));
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 0);
+        // Links inside the workspace are the guest's too: followed there,
+        // before a `..` decides where the path leaves the share.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("rootfs");
+        let finished = cached(
+            &src,
+            &[layer(&[dir("srv/", 0o755), symlink("app", "/srv")])],
+        );
+        let dst = tmp.path().join("copy");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("actual/nested")).unwrap();
+        std::os::unix::fs::symlink("actual/nested", workspace.join("alias")).unwrap();
+        let copied = copy_tree(&src, &dst, Reflink::Try).unwrap();
+        prepare_boot_paths(
+            &Layout {
+                root: &dst,
+                workspace: &workspace,
+            },
+            &BootNeeds {
+                cwd: "/workspace/alias/../../app/build",
+                net: false,
+                inspect: false,
+            },
+        )
+        .unwrap();
+        set_modes(&dst, &copied, &finished.modes).unwrap();
+        assert!(
+            workspace.join("app/build").is_dir(),
+            "where the guest arrives"
+        );
+        assert!(
+            !dst.join("srv/build").exists(),
+            "not through the image's /app"
+        );
         // A file whited out and its name reused for the working directory:
         // the directory gets no mode of the file's.
         let reused = vec![
