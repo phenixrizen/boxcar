@@ -112,6 +112,10 @@ pub enum Command {
     /// something that is not the protocol, and 128 plus the signal after
     /// SIGTERM, SIGHUP or SIGQUIT.
     Events(EventsArgs),
+    /// Images: pull one from a registry into the cache, list the cache,
+    /// remove an image or a tag, prune what nothing names.
+    #[command(subcommand)]
+    Image(ImageCommand),
     /// Show or change a running session's network policy.
     ///
     /// `show` prints the policy in force, as a table or with `--json` as
@@ -810,4 +814,47 @@ mod tests {
         let cli = Cli::try_parse_args(["boxcar", "audit", "verify", "--", "log.jsonl"]).unwrap();
         assert!(matches!(cli.command, Command::Audit(_)));
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ImageCommand {
+    /// Pull an image into the cache: its manifest, config and layers,
+    /// each verified against its digest, the layers unpacked into one
+    /// tree. Prints the manifest digest. Exits 1 when the pull fails, 2
+    /// for a reference that does not parse.
+    Pull(ImagePullArgs),
+    /// List the cache: every tag with its manifest digest, then the
+    /// images no tag names.
+    Ls(CacheArgs),
+    /// Remove an image by digest (and every tag naming it), or one tag by
+    /// reference. Exits 1 when there is no such thing.
+    Rm(ImageRmArgs),
+    /// Remove the images no tag names and the blobs no image names.
+    Prune(CacheArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CacheArgs {
+    /// The image cache. $XDG_CACHE_HOME/boxcar, or ~/.cache/boxcar.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ImagePullArgs {
+    /// The image: `[registry/]repository[:tag][@sha256:digest]`, as
+    /// Docker reads it (`alpine` is `docker.io/library/alpine:latest`).
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    #[command(flatten)]
+    pub cache: CacheArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct ImageRmArgs {
+    /// A manifest digest (`sha256:…`) or a reference with a tag.
+    #[arg(value_name = "DIGEST|REF")]
+    pub target: String,
+    #[command(flatten)]
+    pub cache: CacheArgs,
 }
