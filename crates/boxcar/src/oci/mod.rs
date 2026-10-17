@@ -5,8 +5,12 @@
 //! and unpacked trees, and the unpacking itself. The plan is
 //! `docs/plans/oci-image-cache.md`.
 
+pub mod auth;
+pub mod client;
 pub mod decode;
 pub mod framer;
+pub mod manifest;
+pub mod pull;
 pub mod reference;
 pub mod store;
 pub mod unpack;
