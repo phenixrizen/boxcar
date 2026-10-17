@@ -15,6 +15,7 @@
 //! ```
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -266,6 +267,10 @@ impl Store {
         let mut dirs = vec![self.dir.join("blobs/sha256"), self.dir.join("images")];
         collect_dirs(&self.dir.join("refs"), &mut dirs)?;
         for dir in dirs {
+            // The directory first: an interrupted rm may have renamed an
+            // image to its deleting name without syncing the rename, and
+            // the tree must not be half deleted under its final name.
+            let mut synced = false;
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
                 let name = entry.file_name();
@@ -277,6 +282,10 @@ impl Store {
                 };
                 if alive(pid) {
                     continue;
+                }
+                if !synced {
+                    self.fs.fsync_dir(&dir)?;
+                    synced = true;
                 }
                 if entry.file_type()?.is_dir() {
                     delete_tree(&dir, name)?;
@@ -511,9 +520,10 @@ impl Store {
         let Some(final_dir) = self.image_dir(digest) else {
             return Ok(false);
         };
-        // The refs first: every one unlinked, then each changed directory
-        // synced, before the image goes.
-        let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
+        // The refs first: every one unlinked, then every tags directory
+        // synced, before the image goes. Every one, not only those changed
+        // now: an rm interrupted after an unlink and before the sync left
+        // one with an unsynced unlink and nothing to show for it.
         let refs = self.dir.join("refs");
         for entry in self.list()?.refs {
             if entry.digest != *digest {
@@ -524,9 +534,14 @@ impl Store {
                 .join(&entry.repository)
                 .join(TAGS);
             self.fs.unlink(&dir.join(&entry.tag))?;
-            changed.insert(dir);
         }
-        for dir in &changed {
+        let mut dirs = Vec::new();
+        collect_dirs(&refs, &mut dirs)?;
+        dirs.sort();
+        for dir in dirs
+            .iter()
+            .filter(|dir| dir.file_name() == Some(OsStr::new(TAGS)))
+        {
             self.fs.fsync_dir(dir)?;
         }
         let deleting = staging_name(digest.hex(), "deleting");
@@ -1213,22 +1228,45 @@ mod tests {
                 format!("fsync-dir refs/host.example/x/{TAGS}"),
             ]
         );
-        // A second tag in the same directory: both unlinks come before the
-        // one sync of their directory, and that before the image goes.
+        // A second tag in the same directory and another repository's tag
+        // for another image: both unlinks come first, then every tags
+        // directory is synced, changed or not, and then the image goes.
         let r2 = Reference::parse("host.example/x:v2").unwrap();
         store.write_ref(&r2, &m).unwrap();
+        let other = put_blob(&store, b"other manifest");
+        put_image(&store, &json(&other, &digest(3), &[]));
+        store
+            .write_ref(&Reference::parse("host.example/y:v1").unwrap(), &other)
+            .unwrap();
         calls.lock().unwrap().clear();
         assert!(store.remove_image(&m).unwrap());
         let got = calls.lock().unwrap().clone();
         assert_eq!(
-            got[..5],
+            got[..6],
             [
                 format!("unlink refs/host.example/x/{TAGS}/v1"),
                 format!("unlink refs/host.example/x/{TAGS}/v2"),
                 format!("fsync-dir refs/host.example/x/{TAGS}"),
+                format!("fsync-dir refs/host.example/y/{TAGS}"),
                 format!("rename images/{hex} -> images/.{hex}.deleting"),
                 "fsync-dir images".to_owned(),
             ]
+        );
+        // The sweep syncs a directory before deleting what a dead process
+        // left in it.
+        fs::create_dir_all(store.dir().join("images/.zzzz.deleting.999999-9/rootfs")).unwrap();
+        fs::write(
+            store.dir().join("blobs/sha256/.qqqq.partial.999999-9"),
+            b"q",
+        )
+        .unwrap();
+        calls.lock().unwrap().clear();
+        assert_eq!(store.sweep().unwrap(), 2);
+        let got = calls.lock().unwrap().clone();
+        assert!(got.contains(&"fsync-dir images".to_owned()), "{got:?}");
+        assert!(
+            got.contains(&"fsync-dir blobs/sha256".to_owned()),
+            "{got:?}"
         );
         // An existing image is made durable before anyone builds on it,
         // and a losing publisher syncs the directory it found it in.

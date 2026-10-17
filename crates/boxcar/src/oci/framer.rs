@@ -44,6 +44,8 @@ pub struct Entry {
 pub struct Framer<'a, R: Read> {
     input: R,
     entries_left: &'a Cell<u64>,
+    /// Headers read so far, so an error can say which entry.
+    seen: u64,
     /// Data of the current entry not yet read, and its padding.
     remaining: u64,
     padding: u64,
@@ -99,6 +101,7 @@ impl<'a, R: Read> Framer<'a, R> {
         Framer {
             input,
             entries_left,
+            seen: 0,
             remaining: 0,
             padding: 0,
             ended: false,
@@ -107,8 +110,19 @@ impl<'a, R: Read> Framer<'a, R> {
 
     /// The next ordinary entry, extension records applied, or `None` at
     /// the end-of-archive blocks. Whatever of the previous entry's data
-    /// was not read is skipped first.
+    /// was not read is skipped first. An error says which entry by
+    /// number and nothing the archive says.
     pub fn next(&mut self) -> io::Result<Option<Entry>> {
+        self.next_entry().map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                malformed(format!("entry {}: {error}", self.seen))
+            } else {
+                error
+            }
+        })
+    }
+
+    fn next_entry(&mut self) -> io::Result<Option<Entry>> {
         if self.ended {
             return Ok(None);
         }
@@ -139,7 +153,7 @@ impl<'a, R: Read> Framer<'a, R> {
             check_checksum(header, &block)?;
             let size = header
                 .entry_size()
-                .map_err(|error| malformed(format!("a header's size does not parse: {error}")))?;
+                .map_err(|_| malformed("a header's size does not parse"))?;
             let kind = match header.entry_type().as_byte() {
                 b'x' => {
                     let record = self.read_extension(size)?;
@@ -167,17 +181,12 @@ impl<'a, R: Read> Framer<'a, R> {
                 b'4' => Kind::BlockDevice,
                 b'5' => Kind::Dir,
                 b'6' => Kind::Fifo,
-                other => {
-                    return Err(malformed(format!(
-                        "an entry of kind `{}` is not supported",
-                        other as char
-                    )))
-                }
+                _ => return Err(malformed("an entry of a kind that is not supported")),
             };
             let size = over.size.unwrap_or(size);
             let mode = header
                 .mode()
-                .map_err(|error| malformed(format!("a header's mode does not parse: {error}")))?
+                .map_err(|_| malformed("a header's mode does not parse"))?
                 & 0o7777;
             let path = over
                 .path
@@ -205,10 +214,11 @@ impl<'a, R: Read> Framer<'a, R> {
         Data { framer: self }
     }
 
-    fn count_header(&self) -> io::Result<()> {
+    fn count_header(&mut self) -> io::Result<()> {
         match self.entries_left.get().checked_sub(1) {
             Some(left) => {
                 self.entries_left.set(left);
+                self.seen += 1;
                 Ok(())
             }
             None => Err(io::Error::other(
@@ -248,9 +258,7 @@ impl<'a, R: Read> Framer<'a, R> {
     /// An extension record of `size` bytes, with its padding consumed.
     fn read_extension(&mut self, size: u64) -> io::Result<Vec<u8>> {
         if size > MAX_EXTENSION {
-            return Err(malformed(format!(
-                "an extension record of {size} bytes: larger than 64 KiB"
-            )));
+            return Err(malformed("an extension record larger than 64 KiB"));
         }
         let mut record = vec![0u8; size as usize];
         self.read_block(&mut record, "inside an extension record")?;
@@ -295,8 +303,7 @@ fn check_checksum(header: &tar::Header, block: &[u8; 512]) -> io::Result<()> {
 /// set what names or sizes an entry; a sparse key fails either.
 fn parse_pax(record: &[u8], over: &mut Overrides, overrides: bool) -> io::Result<()> {
     for extension in tar::PaxExtensions::new(record) {
-        let extension = extension
-            .map_err(|error| malformed(format!("a PAX record does not parse: {error}")))?;
+        let extension = extension.map_err(|_| malformed("a PAX record does not parse"))?;
         let key = extension
             .key()
             .map_err(|_| malformed("a PAX key is not UTF-8"))?;
@@ -305,9 +312,7 @@ fn parse_pax(record: &[u8], over: &mut Overrides, overrides: bool) -> io::Result
         }
         let names = matches!(key, "size" | "path" | "linkpath");
         if names && !overrides {
-            return Err(malformed(format!(
-                "a global PAX header sets `{key}`, which is an entry's own"
-            )));
+            return Err(malformed("a global PAX header sets what is an entry's own"));
         }
         match key {
             "size" => {
@@ -316,7 +321,7 @@ fn parse_pax(record: &[u8], over: &mut Overrides, overrides: bool) -> io::Result
                     .map_err(|_| malformed("a PAX size is not UTF-8"))?;
                 over.size = Some(
                     text.parse()
-                        .map_err(|_| malformed(format!("a PAX size does not parse: `{text}`")))?,
+                        .map_err(|_| malformed("a PAX size does not parse"))?,
                 );
             }
             "path" => over.path = Some(extension.value_bytes().to_vec()),

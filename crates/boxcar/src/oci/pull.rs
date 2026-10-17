@@ -842,7 +842,37 @@ mod tests {
             data: serde_json::to_vec(&bad_digest).unwrap(),
         };
         registry.put_manifest("library/app", "digest", &m);
-        for tag in ["echo", "digest"] {
+        // Layers that fail to unpack with the header in a PAX record, in a
+        // hardlink's target, and in a path whose parent is a file.
+        let pax = layer_tar(&testutil::layer(&[
+            testutil::extension(
+                tar::EntryType::XHeader,
+                &testutil::pax_record("size", format!("Basic {auth}").as_bytes()),
+            ),
+            testutil::file("a", 0o644, b"a"),
+        ]));
+        let link = layer_tar(&testutil::layer(&[testutil::hardlink(
+            "x",
+            &format!("Basic {auth}"),
+        )]));
+        let parent = layer_tar(&testutil::layer(&[
+            testutil::file("f", 0o644, b"f"),
+            testutil::file(&format!("f/Basic {auth}"), 0o644, b"g"),
+        ]));
+        for (tag, layer) in [("pax", &pax), ("link", &link), ("parent", &parent)] {
+            registry.put_blob(layer);
+            let m = serde_json::json!({
+                "schemaVersion": 2, "mediaType": boxcar_testreg::OCI_MANIFEST,
+                "config": cfg.descriptor(),
+                "layers": [layer.descriptor()],
+            });
+            let m = Blob {
+                media_type: boxcar_testreg::OCI_MANIFEST.into(),
+                data: serde_json::to_vec(&m).unwrap(),
+            };
+            registry.put_manifest("library/app", tag, &m);
+        }
+        for tag in ["echo", "digest", "pax", "link", "parent"] {
             let reference = reference(&registry, "library/app", tag);
             let mut client = Client::insecure_loopback(&reference, Some(&config)).unwrap();
             let err = pull(&store, &mut client, &reference, &mut |_| {}).unwrap_err();

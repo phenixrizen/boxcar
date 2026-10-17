@@ -44,8 +44,9 @@ const BUILDING_DIR_MODE: libc::mode_t = 0o700;
 /// whose modes wait for the end, and the paths of skipped entries. A
 /// layer may declare any number of either, with names of any length.
 pub const MAX_METADATA: u64 = 64 * 1024 * 1024;
-/// What one kept path costs past its bytes.
-const ENTRY_COST: u64 = 32;
+/// What one kept path costs past its bytes: its vector's header and the
+/// map's or list's slot.
+const ENTRY_COST: u64 = 64;
 
 const WHITEOUT: &[u8] = b".wh.";
 const OPAQUE: &[u8] = b".wh..wh..opq";
@@ -53,9 +54,15 @@ const OPAQUE: &[u8] = b".wh..wh..opq";
 /// A tree being built from layers.
 pub struct Unpacker {
     root: OwnedFd,
-    /// Directory modes, applied once every layer is in; a later entry for
-    /// the same directory wins, and a directory that goes is forgotten.
-    dir_modes: BTreeMap<Vec<Vec<u8>>, u32>,
+    /// The root's path as the kernel gives it, which a directory's starts
+    /// with.
+    root_path: Vec<u8>,
+    /// Directory modes, applied once every layer is in, by the directory's
+    /// own path from the root: the one the kernel gives, through no link,
+    /// so a layer's path that reached it through a link names the same
+    /// directory. A later entry for a directory wins, and a directory
+    /// that goes is forgotten.
+    dir_modes: BTreeMap<Vec<u8>, u32>,
     skipped: Vec<String>,
     /// What may still be kept in memory, against [`MAX_METADATA`].
     metadata_left: u64,
@@ -72,8 +79,11 @@ impl Unpacker {
         if !file.metadata()?.is_dir() {
             return Err(malformed(format!("{} is not a directory", root.display())));
         }
+        let root = OwnedFd::from(file);
+        let root_path = fd_path(&root)?;
         Ok(Unpacker {
-            root: OwnedFd::from(file),
+            root,
+            root_path,
             dir_modes: BTreeMap::new(),
             skipped: Vec::new(),
             metadata_left: MAX_METADATA,
@@ -101,24 +111,67 @@ impl Unpacker {
         }
     }
 
-    /// Records the mode `comps` will get at the end.
-    fn remember_mode(&mut self, comps: Vec<Vec<u8>>, mode: u32) -> io::Result<()> {
-        if !self.dir_modes.contains_key(&comps) {
-            self.keep(comps.iter().map(Vec::len).sum())?;
+    /// Records the mode the directory at `path` will get at the end.
+    fn remember_mode(&mut self, path: Vec<u8>, mode: u32) -> io::Result<()> {
+        if !self.dir_modes.contains_key(&path) {
+            self.keep(path.len())?;
         }
-        self.dir_modes.insert(comps, mode);
+        self.dir_modes.insert(path, mode);
         Ok(())
     }
 
-    /// Forgets the modes of everything beneath `comps`, and of `comps`
+    /// Records the implied mode for a directory a path implied, unless
+    /// an entry gave it one.
+    fn remember_implied(&mut self, path: Vec<u8>) -> io::Result<()> {
+        if !self.dir_modes.contains_key(&path) {
+            self.remember_mode(path, IMPLIED_DIR_MODE)?;
+        }
+        Ok(())
+    }
+
+    /// Forgets the modes of everything beneath `path`, and of `path`
     /// itself when `itself`: what stood there is gone, and whatever takes
-    /// the name (a link, say) must not inherit the mode.
-    fn forget_modes(&mut self, comps: &[Vec<u8>], itself: bool) {
-        self.dir_modes.retain(|path, _| {
-            let beneath = path.len() > comps.len() && path[..comps.len()] == *comps;
-            let same = path.as_slice() == comps;
-            !(beneath || (itself && same))
-        });
+    /// the name (a link, say) must not inherit the mode. The work is in
+    /// what is forgotten, not in what is kept.
+    fn forget_modes(&mut self, path: &[u8], itself: bool) {
+        let mut gone = Vec::new();
+        if itself && !path.is_empty() {
+            gone.extend(self.dir_modes.remove_entry(path));
+        }
+        if path.is_empty() {
+            gone.extend(std::mem::take(&mut self.dir_modes));
+        } else {
+            let mut from = path.to_vec();
+            from.push(b'/');
+            let mut to = path.to_vec();
+            to.push(b'/' + 1);
+            let keys: Vec<Vec<u8>> = self
+                .dir_modes
+                .range(from..to)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys {
+                gone.extend(self.dir_modes.remove_entry(&key));
+            }
+        }
+        for (key, _) in gone {
+            self.metadata_left += key.len() as u64 + ENTRY_COST;
+        }
+    }
+
+    /// The path of the directory `fd` is, from the root and through no
+    /// link, as the kernel gives it: empty for the root itself.
+    fn canonical(&self, fd: &OwnedFd) -> io::Result<Vec<u8>> {
+        let path = fd_path(fd)?;
+        let rest = path
+            .strip_prefix(self.root_path.as_slice())
+            .ok_or_else(|| io::Error::other("a directory of the tree is not beneath its root"))?;
+        Ok(rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
+    }
+
+    /// The path of `name` in the directory `dir` is.
+    fn canonical_in(&self, dir: &OwnedFd, name: &CStr) -> io::Result<Vec<u8>> {
+        Ok(beneath(&self.canonical(dir)?, name.to_bytes()))
     }
 
     /// The first pass over a layer: its whiteouts, applied to the tree as
@@ -131,17 +184,11 @@ impl Unpacker {
             };
             if name.as_slice() == OPAQUE {
                 self.make_opaque(parent)?;
-                self.forget_modes(parent, false);
             } else if let Some(target) = name.strip_prefix(WHITEOUT) {
                 match target {
                     b"" | b"." => {}
                     b".." => return Err(malformed("a whiteout of `..`")),
-                    target => {
-                        self.remove_in(parent, target)?;
-                        let mut gone = parent.to_vec();
-                        gone.push(target.to_vec());
-                        self.forget_modes(&gone, true);
-                    }
+                    target => self.remove_in(parent, target)?,
                 }
             }
         }
@@ -162,15 +209,17 @@ impl Unpacker {
             match entry.kind {
                 Kind::Dir => {
                     let parent_fd = self.parent_fd(parent)?;
+                    let path = self.canonical_in(&parent_fd, &name)?;
                     if make_dir(&parent_fd, &name)? {
-                        self.forget_modes(&comps, true);
+                        self.forget_modes(&path, true);
                     }
-                    self.remember_mode(comps.clone(), entry.mode)?;
+                    self.remember_mode(path, entry.mode)?;
                 }
                 Kind::File => {
                     let parent_fd = self.parent_fd(parent)?;
                     if replace_slot(&parent_fd, &name)? {
-                        self.forget_modes(&comps, true);
+                        let path = self.canonical_in(&parent_fd, &name)?;
+                        self.forget_modes(&path, true);
                     }
                     let fd = openat(
                         &parent_fd,
@@ -190,7 +239,8 @@ impl Unpacker {
                     let target = cstr(&entry.link)?;
                     let parent_fd = self.parent_fd(parent)?;
                     if replace_slot(&parent_fd, &name)? {
-                        self.forget_modes(&comps, true);
+                        let path = self.canonical_in(&parent_fd, &name)?;
+                        self.forget_modes(&path, true);
                     }
                     check(unsafe {
                         libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), name.as_ptr())
@@ -210,12 +260,12 @@ impl Unpacker {
                                 io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                             ) =>
                         {
-                            return Err(missing_target(&entry.link))
+                            return Err(missing_target())
                         }
                         Err(error) => return Err(error),
                     };
                     match stat_at(&target_parent_fd, &target_name)? {
-                        None => return Err(missing_target(&entry.link)),
+                        None => return Err(missing_target()),
                         Some(mode) if mode & libc::S_IFMT == libc::S_IFDIR => {
                             return Err(malformed("a hardlink to a directory"))
                         }
@@ -223,7 +273,8 @@ impl Unpacker {
                     }
                     let parent_fd = self.parent_fd(parent)?;
                     if replace_slot(&parent_fd, &name)? {
-                        self.forget_modes(&comps, true);
+                        let path = self.canonical_in(&parent_fd, &name)?;
+                        self.forget_modes(&path, true);
                     }
                     check(unsafe {
                         libc::linkat(
@@ -254,19 +305,20 @@ impl Unpacker {
                 check(unsafe {
                     libc::mkdirat(self.root.as_raw_fd(), cname.as_ptr(), BUILDING_DIR_MODE)
                 })?;
-                self.remember_mode(vec![name.as_bytes().to_vec()], mode)?;
+                self.remember_mode(name.as_bytes().to_vec(), mode)?;
             }
         }
-        let mut dirs: Vec<(Vec<Vec<u8>>, u32)> =
+        let mut dirs: Vec<(Vec<u8>, u32)> =
             std::mem::take(&mut self.dir_modes).into_iter().collect();
-        dirs.sort_by_key(|(comps, _)| std::cmp::Reverse(comps.len()));
-        for (comps, mode) in dirs {
+        dirs.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
+        for (path, mode) in dirs {
             // The parent resolved in the root, then the name itself with
             // nothing followed: a later layer may have put a link there.
-            let Some((name, parent)) = comps.split_last() else {
-                continue;
+            let (parent, name) = match path.iter().rposition(|b| *b == b'/') {
+                Some(at) => (&path[..at], &path[at + 1..]),
+                None => (&path[..0], &path[..]),
             };
-            let parent_fd = match self.open_dir(parent) {
+            let parent_fd = match self.open_path(parent) {
                 Ok(fd) => fd,
                 Err(error)
                     if matches!(
@@ -303,10 +355,16 @@ impl Unpacker {
 
     /// The directory `comps` names, resolved in the root; `O_PATH`.
     fn open_dir(&self, comps: &[Vec<u8>]) -> io::Result<OwnedFd> {
-        let path = if comps.is_empty() {
+        self.open_path(&comps.join(&b'/'))
+    }
+
+    /// The directory at `path` (components joined by `/`, empty for the
+    /// root), resolved in the root; `O_PATH`.
+    fn open_path(&self, path: &[u8]) -> io::Result<OwnedFd> {
+        let path = if path.is_empty() {
             CString::new(".").expect("no NUL")
         } else {
-            cstr(&comps.join(&b'/'))?
+            cstr(path)?
         };
         openat2(
             &self.root,
@@ -320,7 +378,7 @@ impl Unpacker {
     fn open_parent(&self, comps: &[Vec<u8>]) -> io::Result<OwnedFd> {
         self.open_dir(comps).map_err(|error| {
             if error.kind() == io::ErrorKind::NotADirectory {
-                malformed(format!("{} is not a directory", display(comps)))
+                malformed("a path's parent is not a directory")
             } else {
                 error
             }
@@ -349,9 +407,8 @@ impl Unpacker {
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
                 Err(error) => return Err(error),
             }
-            if !self.dir_modes.contains_key(&parent[..depth]) {
-                self.remember_mode(parent[..depth].to_vec(), IMPLIED_DIR_MODE)?;
-            }
+            let path = self.canonical_in(&above, &name)?;
+            self.remember_implied(path)?;
         }
         self.open_parent(parent)
     }
@@ -376,10 +433,12 @@ impl Unpacker {
             &self_path(parent)?,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )?;
+        let path = self.canonical(&dir)?;
         drop(dir);
         for child in children(readable)? {
             remove_at(&self.open_dir(parent)?, &child)?;
         }
+        self.forget_modes(&path, false);
         Ok(())
     }
 
@@ -397,7 +456,11 @@ impl Unpacker {
             }
             Err(error) => return Err(error),
         };
-        remove_at(&dir, &cstr(target)?)?;
+        let target = cstr(target)?;
+        if remove_at(&dir, &target)? {
+            let path = self.canonical_in(&dir, &target)?;
+            self.forget_modes(&path, true);
+        }
         Ok(())
     }
 }
@@ -617,11 +680,46 @@ fn display(comps: &[Vec<u8>]) -> String {
     String::from_utf8_lossy(&comps.join(&b'/')).into_owned()
 }
 
-fn missing_target(link: &[u8]) -> io::Error {
-    malformed(format!(
-        "a hardlink to a missing target `{}`",
-        String::from_utf8_lossy(link)
-    ))
+fn missing_target() -> io::Error {
+    malformed("a hardlink to a missing target")
+}
+
+/// `name` beneath the directory at `dir` (empty for the root).
+fn beneath(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut path = Vec::with_capacity(dir.len() + 1 + name.len());
+    if !dir.is_empty() {
+        path.extend_from_slice(dir);
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path
+}
+
+/// How deep `path` is: components, the root 0.
+fn depth(path: &[u8]) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        path.iter().filter(|b| **b == b'/').count() + 1
+    }
+}
+
+/// The path of what `fd` is, as the kernel gives it.
+fn fd_path(fd: &OwnedFd) -> io::Result<Vec<u8>> {
+    let link = cstr(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: a NUL-terminated path and a buffer of the length given.
+    let n = unsafe { libc::readlink(link.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n as usize >= buf.len() {
+        return Err(io::Error::other(
+            "a directory's path is longer than PATH_MAX",
+        ));
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
 }
 
 fn malformed(what: impl Into<String>) -> io::Error {
@@ -961,6 +1059,120 @@ mod tests {
         let l = without_defaults(&tmp.path().join("rootfs"));
         assert_eq!(l.len(), 1);
         assert_eq!(l["e"], "file 644 \"f\"");
+    }
+
+    #[test]
+    fn a_mode_given_through_a_link_belongs_to_the_directory_it_reached() {
+        // Layer 1 gives `z/sub` its mode while `z` points at `a`; layer 2
+        // points `z` at `b`. The mode is `a/sub`'s, and `b/sub` keeps its own.
+        let lower = layer(&[
+            dir("a/", 0o755),
+            dir("b/", 0o755),
+            dir("b/sub/", 0o700),
+            symlink("z", "a"),
+            dir("z/sub/", 0o777),
+        ]);
+        let upper = layer(&[symlink("z", "b")]);
+        let (tmp, _) = unpack(&[lower, upper]);
+        let root = tmp.path().join("rootfs");
+        let mode = |p: &str| fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("a/sub"), 0o777);
+        assert_eq!(mode("b/sub"), 0o700);
+        assert_eq!(fs::read_link(root.join("z")).unwrap(), Path::new("b"));
+        // A whiteout through the link removes what the link reaches, and
+        // its mode record with it; the other directory keeps its mode.
+        let lower = layer(&[
+            dir("a/", 0o755),
+            dir("a/sub/", 0o707),
+            dir("b/", 0o755),
+            dir("b/sub/", 0o700),
+            symlink("z", "a"),
+        ]);
+        let upper = layer(&[file(".wh.z", 0o644, b""), symlink("z", "b")]);
+        let (tmp, _) = unpack(&[lower, upper]);
+        let root = tmp.path().join("rootfs");
+        let mode = |p: &str| fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("a/sub"), 0o707);
+        assert_eq!(mode("b/sub"), 0o700);
+        let lower = layer(&[dir("a/", 0o755), dir("a/sub/", 0o707), symlink("z", "a")]);
+        let upper = layer(&[file("z/.wh.sub", 0o644, b"")]);
+        let (tmp, _) = unpack(&[lower, upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l.keys().collect::<Vec<_>>(), ["a", "z"]);
+    }
+
+    #[test]
+    fn forgetting_what_is_not_there_costs_nothing_much() {
+        // Many directories remembered, then as many whiteouts of names that
+        // never existed: the work is in what is forgotten, not in what is
+        // kept, so this is quick; a scan of every record for every whiteout
+        // would not be.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rootfs");
+        fs::create_dir(&root).unwrap();
+        let mut unpacker = Unpacker::new(&root).unwrap();
+        let count = 200_000;
+        for i in 0..count {
+            unpacker
+                .remember_mode(format!("d{i}").into_bytes(), 0o755)
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        for i in 0..count {
+            unpacker.forget_modes(format!("n{i}").as_bytes(), true);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(unpacker.dir_modes.len(), count);
+        // Forgetting a subtree takes only its records, and gives their
+        // budget back; the root's whole clears everything.
+        unpacker.remember_mode(b"d1/x".to_vec(), 0o755).unwrap();
+        unpacker.remember_mode(b"d1/x/y".to_vec(), 0o755).unwrap();
+        unpacker.remember_mode(b"d10".to_vec(), 0o700).unwrap();
+        unpacker.forget_modes(b"d1", true);
+        assert_eq!(unpacker.dir_modes.len(), count - 1);
+        assert_eq!(unpacker.dir_modes.get(&b"d10"[..]), Some(&0o700));
+        unpacker.forget_modes(b"", false);
+        assert_eq!(unpacker.dir_modes.len(), 0);
+        assert_eq!(unpacker.metadata_left, MAX_METADATA);
+    }
+
+    #[test]
+    fn the_metadata_budget_charges_whole_paths() {
+        // Two thousand directories beneath a path a thousand deep: each
+        // record is the whole path, not its last component.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rootfs");
+        fs::create_dir(&root).unwrap();
+        let deep = (0..1000).map(|_| "d").collect::<Vec<_>>().join("/");
+        let entries: Vec<Vec<u8>> = (0..2000)
+            .map(|i| pax_file(format!("{deep}/{i}/f").as_bytes(), b""))
+            .collect();
+        let deep_layer = layer(&entries);
+        let entries_left = Cell::new(u64::MAX);
+        let mut unpacker = Unpacker::with_metadata_budget(&root, 1024 * 1024).unwrap();
+        let mut framer = Framer::new(&deep_layer[..], &entries_left);
+        let err = unpacker.entries(&mut framer).unwrap_err();
+        assert!(err.to_string().contains("64 MiB to record"), "{err}");
+        // Forgetting gives the budget back: a tree made and whited out
+        // again and again stays within it.
+        let root2 = tmp.path().join("rootfs2");
+        fs::create_dir(&root2).unwrap();
+        let mut unpacker = Unpacker::with_metadata_budget(&root2, 64 * 1024).unwrap();
+        for round in 0..20 {
+            let make: Vec<Vec<u8>> = (0..200)
+                .map(|i| dir(&format!("r{round}/{i}/"), 0o755))
+                .collect();
+            let made = layer(&make);
+            let mut framer = Framer::new(&made[..], &entries_left);
+            unpacker.entries(&mut framer).unwrap();
+            let gone = layer(&[file(&format!(".wh.r{round}"), 0o644, b"")]);
+            let mut framer = Framer::new(&gone[..], &entries_left);
+            unpacker.whiteouts(&mut framer).unwrap();
+        }
     }
 
     #[test]
