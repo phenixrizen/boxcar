@@ -46,6 +46,10 @@ const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const MOUNTED: [&str; 4] = ["/run", "/dev", "/proc", "/sys"];
 /// Where the workspace share is mounted.
 const WORKSPACE: &str = "/workspace";
+/// Where the guest's view leaves the root share: `follow` looks up nothing
+/// at or beneath these, since what the image has there is hidden by a
+/// mount, and appends the rest of a path as written.
+const BOUNDARIES: [&str; 5] = [WORKSPACE, "/run", "/dev", "/proc", "/sys"];
 /// The mount points init moves or mounts onto; made when the image lacks
 /// them.
 const MOUNT_POINTS: [&str; 4] = ["dev", "proc", "sys", "run"];
@@ -398,7 +402,9 @@ fn touch_where_it_leads(root: &OwnedFd, path: &str) -> io::Result<()> {
     let Ok(led) = follow(root, path) else {
         return Ok(());
     };
-    if led.exists || led.path.starts_with("/run") {
+    // Beneath a mount the guest makes, the host's file would be hidden
+    // (/run) or init writes to a writable share itself (/workspace).
+    if led.exists || BOUNDARIES.iter().any(|b| led.path.starts_with(b)) {
         return Ok(());
     }
     let (Some(parent), Some(name)) = (led.path.parent(), led.path.file_name()) else {
@@ -526,9 +532,12 @@ fn kind_at(root: &OwnedFd, rel: &Path) -> io::Result<Kind> {
 
 /// Where the absolute `path` leads in the tree at `root`, as init's
 /// resolver follows a path: each component in turn, a link's target
-/// (against the link's directory, or the root) put in its place. Refused
-/// when it takes more than [`MAX_LINKS`] links, when a `..` would go above
-/// the root, or when a lookup fails other than for want of a file.
+/// (against the link's directory, or the root) put in its place, except
+/// at or beneath a mount the guest makes ([`BOUNDARIES`]), where the
+/// image's entries are hidden and the rest of the path is taken as
+/// written. Refused when it takes more than [`MAX_LINKS`] links, when a
+/// `..` would go above the root, or when a lookup fails other than for
+/// want of a file.
 pub fn follow(root: &OwnedFd, path: &str) -> Result<Followed, String> {
     enum Part {
         Root,
@@ -558,7 +567,8 @@ pub fn follow(root: &OwnedFd, path: &str) -> Result<Followed, String> {
             Part::Name(name) => {
                 let next = resolved.join(&name);
                 let rel = next.strip_prefix("/").unwrap_or(&next).to_path_buf();
-                let kind = if exists {
+                let hidden = BOUNDARIES.iter().any(|b| next.starts_with(b));
+                let kind = if exists && !hidden {
                     kind_at(root, &rel).map_err(|error| format!("lstat: {error}"))?
                 } else {
                     Kind::Missing
@@ -1193,6 +1203,25 @@ mod tests {
         // /workspace itself, the default: nothing to make.
         let (_tmp, _, workspace) = prepared(&image(), "/workspace", false, false).unwrap();
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 0);
+        // What the image has beneath /workspace is hidden by the mount: a
+        // link there is not followed, and the directory goes where the
+        // guest will see it.
+        let hidden = vec![layer(&[
+            dir("opt/app/", 0o755),
+            symlink("workspace/app", "/opt/app"),
+        ])];
+        let (_tmp, dst, workspace) =
+            prepared(&hidden, "/workspace/app/build", false, false).unwrap();
+        assert!(workspace.join("app/build").is_dir());
+        assert!(!dst.join("opt/app/build").exists());
+        // A file whited out and its name reused for the working directory:
+        // the directory gets no mode of the file's.
+        let reused = vec![
+            layer(&[file("a", 0o000, b"x")]),
+            layer(&[file(".wh.a", 0o644, b"")]),
+        ];
+        let (_tmp, dst, _) = prepared(&reused, "/a", false, false).unwrap();
+        assert_eq!(listing(&dst)["a"], "dir 755");
     }
 
     #[test]

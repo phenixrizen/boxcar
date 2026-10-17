@@ -252,7 +252,9 @@ impl Unpacker {
                 Kind::Dir => {
                     let parent_fd = self.parent_fd(parent)?;
                     let path = self.canonical_in(&parent_fd, &name)?;
-                    if make_dir(&parent_fd, &name)? || !self.file_modes.is_empty() {
+                    // Something else stood there and went: its records go.
+                    // A directory that was there keeps its children's.
+                    if make_dir(&parent_fd, &name)? {
                         self.forget_modes(&path, true);
                     }
                     self.remember_mode(path, entry.mode)?;
@@ -339,6 +341,16 @@ impl Unpacker {
                             0,
                         )
                     })?;
+                    // The inode's image mode is the target's record; the
+                    // new name gets one too, so it survives the target's
+                    // replacement.
+                    if !self.file_modes.is_empty() {
+                        let target_path = self.canonical_in(&target_parent_fd, &target_name)?;
+                        if let Some(mode) = self.file_modes.get(&target_path).copied() {
+                            let path = self.canonical_in(&parent_fd, &name)?;
+                            self.remember_file_mode(path, mode)?;
+                        }
+                    }
                 }
                 Kind::CharDevice | Kind::BlockDevice | Kind::Fifo => {
                     let path = display(&comps);
@@ -503,7 +515,7 @@ impl Unpacker {
         let path = self.canonical(&dir)?;
         drop(dir);
         for child in children(readable)? {
-            remove_at(&self.open_dir(parent)?, &child)?;
+            let _ = remove_at(&self.open_dir(parent)?, &child)?;
         }
         self.forget_modes(&path, false);
         Ok(())
@@ -524,9 +536,13 @@ impl Unpacker {
             Err(error) => return Err(error),
         };
         let target = cstr(target)?;
-        if remove_at(&dir, &target)? {
-            let path = self.canonical_in(&dir, &target)?;
-            self.forget_modes(&path, true);
+        match remove_at(&dir, &target)? {
+            Removed::Nothing => {}
+            Removed::Dir => {
+                let path = self.canonical_in(&dir, &target)?;
+                self.forget_modes(&path, true);
+            }
+            Removed::File => self.forget_file_mode(&dir, &target)?,
         }
         Ok(())
     }
@@ -626,24 +642,33 @@ fn reopen(dir: &OwnedFd) -> io::Result<OwnedFd> {
 
 /// Removes `name` in `parent`: a directory whole, anything else unlinked,
 /// nothing when it is not there. Answers whether a directory went.
-fn remove_at(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
+fn remove_at(parent: &OwnedFd, name: &CStr) -> io::Result<Removed> {
     match stat_at(parent, name)? {
-        None => Ok(false),
+        None => Ok(Removed::Nothing),
         Some(mode) if mode & libc::S_IFMT == libc::S_IFDIR => {
             delete_tree_at(parent, name)?;
-            Ok(true)
+            Ok(Removed::Dir)
         }
         Some(_) => {
             check(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) })?;
-            Ok(false)
+            Ok(Removed::File)
         }
     }
+}
+
+/// What `remove_at` took away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removed {
+    Nothing,
+    /// A regular file, a link, or another non-directory.
+    File,
+    Dir,
 }
 
 /// Makes room for a new entry at `name`: whatever is there goes. Answers
 /// whether a directory went.
 fn replace_slot(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
-    remove_at(parent, name)
+    Ok(remove_at(parent, name)? == Removed::Dir)
 }
 
 /// A directory at `name`: made, or kept when one is there; anything else
@@ -1160,6 +1185,44 @@ mod tests {
         );
         delete_tree(tmp.path(), "rootfs").unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn mode_records_survive_a_repeated_directory_and_follow_hardlinks_and_whiteouts() {
+        // A layer that repeats a directory keeps the children's records.
+        let lower = layer(&[
+            dir("d/", 0o755),
+            dir("d/sub/", 0o555),
+            file("d/f", 0o000, b"f"),
+        ]);
+        let upper = layer(&[dir("d/", 0o755)]);
+        let (tmp, finished) = unpack(&[lower, upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l["d/sub"], "dir 755");
+        assert_eq!(l["d/f"], "file 400 \"f\"");
+        assert_eq!(
+            finished.modes,
+            [("d/f".to_owned(), 0o000), ("d/sub".to_owned(), 0o555)]
+        );
+        // A hardlink to an unreadable file carries its record, so the mode
+        // survives the target's replacement.
+        let lower = layer(&[file("a", 0o000, b"x"), hardlink("b", "a")]);
+        let upper = layer(&[file("a", 0o644, b"y")]);
+        let (tmp, finished) = unpack(&[lower, upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l["a"], "file 644 \"y\"");
+        assert_eq!(l["b"], "file 400 \"x\"");
+        assert_eq!(finished.modes, [("b".to_owned(), 0o000)]);
+        // A whiteout of an unreadable file forgets its record, so a later
+        // directory of that name is not given the file's mode.
+        let lower = layer(&[file("a", 0o000, b"x")]);
+        let middle = layer(&[file(".wh.a", 0o644, b"")]);
+        let upper = layer(&[dir("a/", 0o755)]);
+        let (_tmp, finished) = unpack(&[lower.clone(), middle.clone()]);
+        assert_eq!(finished.modes, []);
+        let (tmp, finished) = unpack(&[lower, middle, upper]);
+        assert_eq!(finished.modes, []);
+        assert_eq!(without_defaults(&tmp.path().join("rootfs"))["a"], "dir 755");
     }
 
     #[test]
