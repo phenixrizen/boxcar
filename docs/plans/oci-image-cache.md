@@ -124,7 +124,7 @@ The pull is a sequence of steps; what interacts with it is another process on th
 - **I7.** Concurrent pulls, and a pull with a prune, leave the cache consistent (I2–I4) in every order of P1, P2, P9.
 - **I8.** Only HTTPS, with the host's roots, outside test builds; loopback plain `http` exists only under `cfg(any(test, feature = "kvm-tests"))`.
 - **I9.** The result of unpacking is a function of the layers alone: no time, pid or host path in `rootfs/` or `image.json`.
-- **I10.** Unpacking a layer gives the same tree whatever the order of its entries: whiteouts act on the layers below before the layer's own entries are applied.
+- **I10.** Unpacking a layer gives the same tree whatever the order of its entries relative to its whiteouts: whiteouts act on the layers below before the layer's own entries are applied. Among themselves, whiteouts apply in archive order (see the decisions).
 
 ## 5. Out of scope
 
@@ -155,7 +155,7 @@ Gated (`test-kvm m5`) tests begin in Task 3, where a pulled image boots.
 - **Blobs are kept and shared across images;** the tree is unpacked per image. Disk holds both; `prune` reclaims.
 - **One framer of our own** over `tar`'s header and PAX parsers, as the M5 plan's round 3 and 4 reviews settled.
 - **`--cache-dir`** is added so tests and the test box can point the cache anywhere; the default is the XDG path.
-- **Whiteouts in a first pass.** Reading each layer twice costs one more decompression per layer and makes the result independent of entry order by construction; tracking provenance through a single pass would have to follow it into every subdirectory.
+- **Whiteouts in a first pass.** Reading each layer twice costs one more decompression per layer and makes the result independent of entry order by construction; tracking provenance through a single pass would have to follow it into every subdirectory. Within the pass, whiteouts apply in archive order against the tree as it stands, as Docker's applier does: a whiteout that removes a link and another that reaches through that link depend on their order in both; builders that diff an overlay record a whiteout at the real path, through no link, so the case does not arise in their layers.
 - **`syncfs` once, not `fsync` per file.** A tree of ten thousand files is made durable by one call before `image.json` and the rename; blobs and refs, single files, get `fsync` and their directory's.
 - **`_tags` in the ref path**, a name no repository component can have, so a repository and a deeper repository's tag never claim the same path.
 - **Staging and deleting names** start with `.`, carry pid and a counter, and only the three final names are ever read, so a half-built or half-deleted entry is never trusted and never collides with a tag.

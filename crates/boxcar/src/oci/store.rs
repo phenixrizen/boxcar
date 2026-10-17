@@ -419,7 +419,18 @@ impl Store {
         }
         drop(file);
         self.fs.rename(&staging, &path)?;
-        self.fs.fsync_dir(&dir)
+        // The tags directory, then every directory above it up to `refs`:
+        // the first ref of a repository made them, and a crash must not
+        // take the chain, and the tag with it, from under a published
+        // image.
+        let refs = self.dir.join("refs");
+        for ancestor in dir.ancestors() {
+            self.fs.fsync_dir(ancestor)?;
+            if ancestor == refs {
+                break;
+            }
+        }
+        Ok(())
     }
 
     // `boxcar run --image --pull missing` (Task 3) reads the ref without asking
@@ -1226,6 +1237,9 @@ mod tests {
                 format!("fsync refs/host.example/x/{TAGS}/.v1.partial"),
                 format!("rename refs/host.example/x/{TAGS}/.v1.partial -> refs/host.example/x/{TAGS}/v1"),
                 format!("fsync-dir refs/host.example/x/{TAGS}"),
+                "fsync-dir refs/host.example/x".to_owned(),
+                "fsync-dir refs/host.example".to_owned(),
+                "fsync-dir refs".to_owned(),
             ]
         );
         // A second tag in the same directory and another repository's tag

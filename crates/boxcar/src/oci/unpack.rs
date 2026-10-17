@@ -473,33 +473,88 @@ pub fn delete_tree(parent: &Path, name: &str) -> io::Result<()> {
     delete_tree_at(&parent, &cstr(name.as_bytes())?)
 }
 
+/// Deletes the directory `name` in `parent` and everything beneath it,
+/// holding three descriptors at a time whatever the depth: each directory
+/// is entered by name and left through `..`, which from a directory
+/// reached through no link is its parent. A tree deeper than the
+/// descriptor limit, or than PATH_MAX, goes like any other.
 fn delete_tree_at(parent: &OwnedFd, name: &CStr) -> io::Result<()> {
+    let mut current = enter(parent, name)?;
+    // Each level: the directory's name in its parent, and the children
+    // not yet removed.
+    let mut levels: Vec<(CString, Vec<CString>)> =
+        vec![(name.to_owned(), children(reopen(&current)?)?)];
+    loop {
+        let Some((_, pending)) = levels.last_mut() else {
+            return Ok(());
+        };
+        match pending.pop() {
+            Some(child) => match stat_at(&current, &child)? {
+                None => {}
+                Some(mode) if mode & libc::S_IFMT == libc::S_IFDIR => {
+                    let next = enter(&current, &child)?;
+                    let kids = children(reopen(&next)?)?;
+                    current = next;
+                    levels.push((child, kids));
+                }
+                Some(_) => {
+                    check(unsafe { libc::unlinkat(current.as_raw_fd(), child.as_ptr(), 0) })?
+                }
+            },
+            None => {
+                let (dir_name, _) = levels.pop().expect("a level");
+                let above = if levels.is_empty() {
+                    None
+                } else {
+                    Some(openat(
+                        &current,
+                        c"..",
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                        0,
+                    )?)
+                };
+                drop(current);
+                let up = above.as_ref().unwrap_or(parent);
+                check(unsafe {
+                    libc::unlinkat(up.as_raw_fd(), dir_name.as_ptr(), libc::AT_REMOVEDIR)
+                })?;
+                match above {
+                    Some(up) => current = up,
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// Opens the directory `name` in `parent` for listing, made ours to
+/// delete first (0o700) whatever mode a layer gave it.
+fn enter(parent: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
     let opath = openat(
         parent,
         name,
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
     )?;
-    // Ours to delete, whatever mode a layer gave it.
     chmod_fd(&opath, 0o700)?;
     drop(opath);
-    let dir = openat(
+    openat(
         parent,
         name,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
-    )?;
-    let dir_fd = openat(
-        parent,
-        name,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+}
+
+/// A second descriptor for the directory `dir`, for a listing, which
+/// consumes one.
+fn reopen(dir: &OwnedFd) -> io::Result<OwnedFd> {
+    openat(
+        dir,
+        c".",
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         0,
-    )?;
-    for child in children(dir)? {
-        remove_at(&dir_fd, &child)?;
-    }
-    drop(dir_fd);
-    check(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) })
+    )
 }
 
 /// Removes `name` in `parent`: a directory whole, anything else unlinked,
@@ -1209,6 +1264,63 @@ mod tests {
         let mut unpacker = Unpacker::with_metadata_budget(&root, MAX_METADATA).unwrap();
         let mut framer = Framer::new(&fifos[..], &entries_left);
         unpacker.entries(&mut framer).unwrap();
+    }
+
+    #[test]
+    fn a_tree_deeper_than_path_max_is_deleted_with_few_descriptors() {
+        // Built with *at calls, a tree can be deeper than any path; it is
+        // deleted level by level, with no descriptor kept per level.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = OwnedFd::from(File::open(tmp.path()).unwrap());
+        let depth = 2500;
+        let name = cstr(b"d").unwrap();
+        check(unsafe { libc::mkdirat(root.as_raw_fd(), c"deep".as_ptr(), 0o700) }).unwrap();
+        let mut cur = openat(&root, c"deep", libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
+        for level in 0..depth {
+            check(unsafe { libc::mkdirat(cur.as_raw_fd(), name.as_ptr(), 0o700) }).unwrap();
+            // A locked directory and a file at every tenth level.
+            if level % 10 == 0 {
+                let file = openat(
+                    &cur,
+                    c"f",
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )
+                .unwrap();
+                drop(file);
+                check(unsafe { libc::mkdirat(cur.as_raw_fd(), c"locked".as_ptr(), 0o000) })
+                    .unwrap();
+            }
+            cur = openat(&cur, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
+        }
+        drop(cur);
+        // The descriptor bound itself is checked by the binary-level test
+        // that prunes such a tree under `ulimit -n 64`; counting this
+        // process's descriptors here would race other tests' files.
+        delete_tree(tmp.path(), "deep").unwrap();
+        assert!(!tmp.path().join("deep").exists());
+    }
+
+    #[test]
+    fn whiteouts_apply_in_archive_order_against_the_tree_as_it_stands() {
+        // As Docker's applier does: a whiteout that removes a link and one
+        // that reaches through it depend on their order, and the order is
+        // the archive's.
+        let lower = || {
+            layer(&[
+                dir("b/", 0o755),
+                file("b/file", 0o644, b"x"),
+                symlink("a", "b"),
+            ])
+        };
+        let upper = layer(&[file(".wh.a", 0o644, b""), file("a/.wh.file", 0o644, b"")]);
+        let (tmp, _) = unpack(&[lower(), upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l.keys().collect::<Vec<_>>(), ["b", "b/file"]);
+        let upper = layer(&[file("a/.wh.file", 0o644, b""), file(".wh.a", 0o644, b"")]);
+        let (tmp, _) = unpack(&[lower(), upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l.keys().collect::<Vec<_>>(), ["b"]);
     }
 
     #[test]

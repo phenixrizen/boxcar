@@ -102,3 +102,27 @@ fn help_names_the_image_commands() {
         assert!(help.contains(word), "{help}");
     }
 }
+
+#[test]
+fn prune_sweeps_a_deep_abandoned_tree_within_a_small_descriptor_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    let out = boxcar(&cache, &["ls"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    // What an rm that died (pid 999999 is nobody) left: an image renamed
+    // to its deleting name, with a tree 1,200 directories deep.
+    let deleting = cache.join("images/.abcd.deleting.999999-1");
+    let deep: String = (0..1200).map(|_| "d/").collect();
+    std::fs::create_dir_all(deleting.join("rootfs").join(&deep)).unwrap();
+    std::fs::write(deleting.join("rootfs").join(&deep).join("f"), b"x").unwrap();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(r#"ulimit -n 64 && exec "$0" image prune --cache-dir "$1""#)
+        .arg(env!("CARGO_BIN_EXE_boxcar"))
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let images: Vec<_> = std::fs::read_dir(cache.join("images")).unwrap().collect();
+    assert!(images.is_empty(), "{images:?}");
+}

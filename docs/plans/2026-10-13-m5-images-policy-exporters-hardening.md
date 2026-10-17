@@ -184,7 +184,7 @@ Made after the plan's Codex review, 2026-10-14:
 Made by Task 2 (`docs/plans/oci-image-cache.md`), 2026-10-16:
 
 - **`RESOLVE_IN_ROOT`, not `RESOLVE_BENEATH`, for unpacking.** `RESOLVE_BENEATH` fails on an absolute symlink in a parent component, and images are full of them (`/etc/alternatives/x -> /usr/bin/y`). `RESOLVE_IN_ROOT` resolves them against the tree's root, as a chroot would, and still confines every resolution to the tree.
-- **Whiteouts in a first pass over each layer**, applied as the pass streams them, then the layer's entries in a second: the result does not depend on the order of the archive, and the pass holds one entry at a time.
+- **Whiteouts in a first pass over each layer**, applied as the pass streams them, then the layer's entries in a second: the result does not depend on the order of entries relative to whiteouts, and the pass holds one entry at a time. Among themselves, whiteouts apply in archive order against the tree as it stands, as Docker's applier does.
 - **A body deadline from the size, not a stall timeout.** ureq 3 times out a whole body, not one read; the deadline is 30 s plus the size at 64 KiB/s.
 - **Only the three final names are ever read.** Everything half-built or half-deleted has a `.`-name with a pid and a counter, which no tag, digest or repository component can have; a sweep removes those of dead pids. Tags live under `_tags`, a component no repository path can have.
 - **`syncfs` once for a tree**, then `image.json`, the image directory, the rename and its parent; blobs and refs get `fsync` and their directory's. Refs are unlinked and their directories synced before an image is renamed away.
