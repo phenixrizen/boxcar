@@ -62,7 +62,8 @@ Plan-only review can use `--comparison COMMIT_BEFORE_PLAN`.
 Before readiness, fetch and incorporate the current target, run affected checks,
 checkpoint actual results, and use `integrate` with an applicable receipt.
 Integration evidence binds the actual head/target/merge base, rationale and
-review receipt. The current target must be an ancestor of that head. A bounded
+review receipt. The selected receipt must be the applicable code/docs review;
+a plan receipt never substitutes for implementation coverage. The current target must be an ancestor of that head. A bounded
 fix against an unchanged target accepts an exact-head follow-up linked to the
 prior review. Target changes need integration or renewed initial scope; material
 changes need initial scope. Unchanged patch identity alone is not evidence of
@@ -73,7 +74,8 @@ Retargeting/rebasing preserves historical receipts rather than rewriting SHAs.
 
 Keep original structured results in restricted reports. A public checkpoint
 contains opaque IDs and sanitized evidence, never undisclosed technical claims
-or reproductions. Severity and confidence are separate. Classify with evidence
+or reproductions. Severity and confidence are separate and retained per source claim. Repeated
+claims preserve earlier observations and enforce any later severity escalation. Classify with evidence
 and consequences, not confidence alone:
 
 - `blocking`: demonstrated incorrect behavior, violated requirement/invariant,
@@ -120,7 +122,7 @@ blockers, authorize merging/disclosure or reset previous rounds.
 
 Only completed structured invocations consume rounds. Pending attempts block
 another invocation until recovered exactly once. Two consecutive failures require
-repairing the cause and an exact owner `retry` authorization; that authorization
+repairing the cause and an exact owner `retry` authorization naming the failed-attempt digest printed by the helper; that authorization
 covers only the failed attempt IDs recorded then, not unlimited retries.
 
 Schema 2 retains the stable `work-issue-checkpoint:v1` envelope marker so old

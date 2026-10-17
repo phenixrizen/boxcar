@@ -462,6 +462,262 @@ class PolicyWorkflow(unittest.TestCase):
             with self.assertRaises(codex_review.BaseUnknown):
                 w.fresh_base("origin/main")
 
+    def test_repeated_claim_escalation_preserves_observations_and_blocks_deferral(self):
+        self.start()
+        first, fid = self.finding()
+        self.dispose(fid, "nonblocking", "deferred")
+        original = dict(self.ctx.state["findings"][fid]["history"][0])
+        second, _ = self.review(
+            "follow-up",
+            [first["id"]],
+            [fid],
+            {
+                "verdict": "needs-attention",
+                "findings": [
+                    {
+                        "title": fid + " escalated synthetic concern",
+                        "severity": "high",
+                        "confidence": 0.7,
+                    }
+                ],
+            },
+        )
+        f = self.ctx.state["findings"][fid]
+        self.assertEqual([o["severity"] for o in f["observations"]], ["medium", "high"])
+        self.assertEqual([o["confidence"] for o in f["observations"]], [0.4, 0.7])
+        self.assertEqual(f["history"][0], original)
+        with self.assertRaisesRegex(w.Error, "reclassification"):
+            self.dispose(fid, "nonblocking", "deferred")
+        self.assertFalse(
+            w.approved(self.ctx.state, second["commit"], second["base_sha"])
+        )
+        self.dispose(fid, "concern", "refuted")
+        self.assertTrue(
+            w.approved(self.ctx.state, second["commit"], second["base_sha"])
+        )
+
+    def test_retry_grant_cannot_be_rebound_to_additional_failures(self):
+        self.start()
+        for i in range(2):
+            r = self.receipt(number=i + 1)
+            r.update(id="failure" + str(i), status="failed", outcome="unavailable")
+            self.ctx.state["reviews"].append(r)
+        self.ctx.save()
+        self.ctx.publish()
+        ids, _ = policy.failed_attempts(self.ctx.state, "code")
+        binding = policy.digest(ids)
+        self.gh.notes.append(
+            {
+                "id": 99,
+                "body": f"work-issue retry {w.board.REPO}#43 code 1 {binding}",
+                "user": {"login": w.board.OWNER},
+                "editor": w.board.OWNER,
+            }
+        )
+        self.ctx.authorize("one", "code", 1, 99, "retry")
+        first_grant = dict(self.ctx.state["retry_authorizations"]["code"])
+        self.ctx.authorize("one", "code", 1, 99, "retry")
+        self.assertEqual(len(self.ctx.state["retry_history"]), 1)
+        r = self.receipt()
+        r.update(
+            id="failure2", status="failed", outcome="unavailable", retry=first_grant
+        )
+        self.ctx.state["reviews"].append(r)
+        self.ctx.save()
+        self.ctx.publish()
+        with self.assertRaisesRegex(w.Error, "authorization"):
+            self.ctx.authorize("one", "code", 1, 99, "retry")
+        with self.assertRaisesRegex(w.Error, "failed attempts"):
+            policy.budget(self.ctx.state, "code")
+        # The old invocation was authorized; a fourth one cannot reuse its grant.
+        check = lambda ph, rd, c, kind, binding=None: w.authorize_check(
+            self.gh, 43, ph, rd, c, kind, binding
+        )
+        policy.check_ledger(self.ctx.state, check)
+        fourth = self.receipt()
+        fourth.update(id="fourth", retry=first_grant)
+        self.ctx.state["reviews"].append(fourth)
+        with self.assertRaisesRegex(w.Error, "reused"):
+            policy.check_ledger(self.ctx.state, check)
+        fourth["retry"] = {
+            **first_grant,
+            "failed_ids": ids + ["failure2"],
+            "binding": policy.digest(ids + ["failure2"]),
+        }
+        with self.assertRaisesRegex(w.Error, "authorization"):
+            policy.check_ledger(self.ctx.state, check)
+
+    def test_retry_invocation_and_ci_use_the_exact_bound_grant(self):
+        self.start()
+        for i in range(2):
+            r = self.receipt()
+            r.update(id="failed" + str(i), status="failed", outcome="unavailable")
+            self.ctx.state["reviews"].append(r)
+        self.ctx.save()
+        self.ctx.publish()
+        ids, _ = policy.failed_attempts(self.ctx.state, "code")
+        self.gh.notes.append(
+            {
+                "id": 99,
+                "body": f"work-issue retry {w.board.REPO}#43 code 1 {policy.digest(ids)}",
+                "user": {"login": w.board.OWNER},
+                "editor": w.board.OWNER,
+            }
+        )
+        self.ctx.authorize("one", "code", 1, 99, "retry")
+        r, _ = self.review()
+        self.assertEqual(r["retry"]["failed_ids"], ids)
+        self.checkpoint()
+        self.ctx.integrate("one", r["id"], "Successful bounded retry checked.")
+        w.readiness(self.ctx.state, r["commit"], r["base_sha"], self.gh, 43)
+
+    def test_initial_plan_cannot_replace_material_initial_code_review(self):
+        self.start()
+        first, _ = self.review()
+        self.commit()
+        second, _ = self.review("follow-up", [first["id"]])
+        plan = self.receipt("plan")
+        plan["id"] = "plan-current"
+        self.ctx.state["reviews"].append(plan)
+        self.checkpoint()
+        with self.assertRaisesRegex(w.Error, "implementation"):
+            self.ctx.integrate(
+                "one", plan["id"], "Material behavior changed.", material=True
+            )
+        with self.assertRaisesRegex(w.Error, "initial"):
+            self.ctx.integrate(
+                "one", second["id"], "Material behavior changed.", material=True
+            )
+        third, _ = self.review(material=True)
+        self.checkpoint()
+        self.ctx.integrate(
+            "one",
+            third["id"],
+            "Renewed initial code review covers material change.",
+            material=True,
+        )
+
+    def test_pending_plan_prevents_readiness_of_earlier_code_receipt(self):
+        self.ready()
+        r = self.receipt("plan")
+        r.update(id="pending-plan", status="pending")
+        self.ctx.state["reviews"].append(r)
+        self.assertFalse(w.approved(self.ctx.state, r["commit"], r["base_sha"]))
+
+    def test_invalid_assembled_relationship_never_pushes_or_creates_pr(self):
+        self.start()
+        original = w.run
+        for body in [
+            "Fix #43",
+            "This step fixes #999.",
+            "Closed: #43",
+            "Resolve #43",
+            "Part of #43\nFixes #44",
+        ]:
+            with (
+                mock.patch.object(
+                    w,
+                    "run",
+                    side_effect=lambda a, **kw: (
+                        "" if a[:2] == ["git", "push"] else original(a, **kw)
+                    ),
+                ) as command,
+                mock.patch.object(self.gh, "pr_write") as write,
+            ):
+                with self.assertRaisesRegex(w.Error, "relationship"):
+                    self.ctx.submit("one", "Partial", body, kind="part", pending=True)
+                self.assertFalse(
+                    any(
+                        c.args[0][:2] == ["git", "push"] for c in command.call_args_list
+                    )
+                )
+                write.assert_not_called()
+        self.assertEqual(self.gh.pulls, [])
+
+    def test_final_stacked_pr_can_finish_each_carried_issue(self):
+        self.ready()
+        original = w.run
+        with mock.patch.object(
+            w,
+            "run",
+            side_effect=lambda a, **kw: (
+                "" if a[:2] == ["git", "push"] else original(a, **kw)
+            ),
+        ):
+            self.ctx.submit("one", "Final stack", "Fixes #43\nFixes #44")
+        p = self.gh.pulls[0]
+        p["merged_at"] = "today"
+        p["merge_commit_sha"] = w.git("rev-parse", "HEAD")
+        api = self.gh.api
+        with mock.patch.object(
+            self.gh,
+            "api",
+            side_effect=lambda path, *a, **kw: (
+                {**self.gh.issue, "number": 44}
+                if path.endswith("/issues/44")
+                else api(path, *a, **kw)
+            ),
+        ):
+            self.assertEqual(w.finish(43, self.gh), 88)
+            self.assertEqual(w.finish(44, self.gh), 88)
+        self.assertEqual(
+            w.validate_pr(88, self.gh), "issue and review contract verified"
+        )
+        self.assertIsNone(w.relation("Fixes #43\nFixed #43\nFixes #44", 43))
+
+    def test_released_v1_returning_clone_adopts_remote_migration(self):
+        self.start()
+        self.ctx.state["version"] = 1
+        self.ctx.save()
+        self.ctx.publish()
+        self.ctx.release("one")
+        old_state = json.loads(self.ctx.path.read_text())
+        # Another authorized session migrates the released remote checkpoint.
+        later = w.Task(43, self.gh)
+        later.start("two", here=True)
+        later.release("two")
+        w.atomic(self.ctx.path, old_state)
+        returning = w.Task(43, self.gh)
+        returning.start("three", here=True)
+        self.assertEqual(returning.state["version"], 2)
+        self.assertEqual(returning.state["reviews"], old_state["reviews"])
+
+    def test_ci_rejects_docs_phase_for_executable_changes(self):
+        self.ready()
+        self.ctx.state["reviews"][-1]["phase"] = "docs"
+        self.ctx.save()
+        self.ctx.publish()
+        r = self.ctx.state["reviews"][-1]
+        token = {
+            "repo": w.board.REPO,
+            "issue": 43,
+            "relation": "fixes",
+            "head": r["commit"],
+            "base": r["base_sha"],
+            "checkpoint": self.ctx.state["_comment"],
+            "pending": False,
+        }
+        self.gh.pr_write(
+            None,
+            "Change",
+            "Fixes #43\n\n" + w.block(w.PR_MARK, token),
+            "issue-43",
+            "main",
+            False,
+        )
+        api = self.gh.api
+        with mock.patch.object(
+            self.gh,
+            "api",
+            side_effect=lambda path, *a, **kw: (
+                [{"filename": "scripts/helper.py"}]
+                if "/files?" in path
+                else api(path, *a, **kw)
+            ),
+        ):
+            with self.assertRaisesRegex(w.Error, "executable"):
+                w.validate_pr(88, self.gh)
+
 
 if __name__ == "__main__":
     unittest.main()

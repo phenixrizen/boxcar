@@ -166,9 +166,11 @@ instruction; an existing generic budget never expands a narrower allowance.
 Interrupted attempts block spending. `recover` reads a completed result once;
 `recover --failed` is only for a confirmed stopped invocation lacking a result.
 Failures approve nothing and consume no completed rounds. After two consecutive
-failures, repair the cause and obtain `work-issue retry REFERENCE PHASE ROUND`;
+failures, repair the cause and obtain `work-issue retry REFERENCE PHASE ROUND FAILED_ATTEMPT_DIGEST`;
 record with `retry` (same arguments as authorize). It covers only failures already
-recorded, not unlimited retries.
+recorded, not unlimited retries. Repeating the same command cannot extend the
+grant: new failures require a newly authorized digest. Keep old grant lines for
+CI to validate historical invocations.
 
 `start` migrates released/reconciled v1 checkpoints to schema 2, preserving all
 attempt IDs, original outcomes, counts and authorizations. It records legacy
@@ -188,6 +190,8 @@ resolved blocking findings, applicable review, and exact integration evidence.
 Use `--relation part` for `Part of #N`; only `--relation fixes` emits `Fixes #N`
 and moves the issue In review. An open finishing PR is not Done. A PR merged
 into a parent branch is not Done: its final main PR must repeat `Fixes #N`.
+A final stack PR may repeat `Fixes #N` for each carried issue; relationships
+are checked per issue. Partial submissions must contain no closing declarations.
 `complete` finds merged finishing PRs and verifies their merge commit is on
 main. Board commands independently check review/completion evidence; `Done`
 is not an arbitrary assignment. Duplicate and not-planned closures keep the

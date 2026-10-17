@@ -100,25 +100,31 @@ def budget(state, phase):
         raise Error(
             f"{phase} budget exhausted; scoped owner authorization required for round {round_}"
         )
-    # A stopped/failed attempt is not a review, but unattended retries still cost.
-    failed = 0
-    for r in reversed(state.get("reviews", [])):
-        if r["phase"] != phase:
-            continue
-        if r["status"] == "completed":
-            break
-        failed += r["status"] == "failed"
+    failed_ids, consecutive = failed_attempts(state, phase)
     retry = state.get("retry_authorizations", {}).get(phase, {})
-    failed_ids = [
-        r["id"]
-        for r in state.get("reviews", [])
-        if r["phase"] == phase and r["status"] == "failed"
-    ]
-    if failed >= 2 and retry.get("failed_ids") != failed_ids:
+    if consecutive >= 2 and (
+        retry.get("failed_ids") != failed_ids
+        or retry.get("binding") != digest(failed_ids)
+        or retry.get("round") != round_
+    ):
         raise Error(
-            "two failed attempts; repair access/output and record owner retry authorization"
+            "two failed attempts; repair access/output and record owner retry authorization for failed-attempt digest "
+            + digest(failed_ids)
         )
     return round_
+
+
+def failed_attempts(state, phase):
+    failed_ids, consecutive = [], 0
+    for r in state.get("reviews", []):
+        if r["phase"] != phase:
+            continue
+        if r["status"] == "failed":
+            failed_ids.append(r["id"])
+            consecutive += 1
+        elif r["status"] == "completed":
+            consecutive = 0
+    return failed_ids, consecutive
 
 
 def check_ledger(state, check_auth):
@@ -169,14 +175,27 @@ def check_ledger(state, check_auth):
                 check_auth(phase, r["round"], a["comment"], "authorize")
             if policy == VERSION:
                 validate_receipt(state, r)
-        retry = state.get("retry_authorizations", {}).get(phase)
-        if retry:
-            check_auth(phase, retry["round"], retry["comment"], "retry")
         ceiling = state.get("ceilings", {}).get(phase)
         if ceiling:
             check_auth(phase, ceiling["round"], ceiling["comment"], "ceiling")
             if len(done) > ceiling["round"]:
                 raise Error("scoped review allowance exceeded")
+    # A retry grant names the exact failures preceding an invocation. Reusing
+    # a comment cannot silently expand it to cover a newly failed attempt.
+    prefix = []
+    for r in state["reviews"]:
+        failed_ids, consecutive = failed_attempts({"reviews": prefix}, r["phase"])
+        if r.get("policy_version") == VERSION and consecutive >= 2:
+            grant = r.get("retry", {})
+            round_ = count({"reviews": prefix}, r["phase"]) + 1
+            if (
+                grant.get("failed_ids") != failed_ids
+                or grant.get("binding") != digest(failed_ids)
+                or grant.get("round") != round_
+            ):
+                raise Error("review retry grant missing or reused for other failures")
+            check_auth(r["phase"], round_, grant["comment"], "retry", grant["binding"])
+        prefix.append(r)
     # Preserve policy 1's actual checkpoint requirement, without retroactive v2 permission.
     old_code = [
         r
@@ -238,6 +257,13 @@ def validate_receipt(state, r):
         raise Error("material change requires initial review")
 
 
+def high_impact(f):
+    return f.get("severity") in ("critical", "high") or any(
+        o.get("severity") in ("critical", "high") and o["source"] in f["sources"]
+        for o in f.get("observations", [])
+    )
+
+
 def register_result(state, r, result):
     """Preserve raw result separately; never put its prose in public checkpoints."""
     findings = state.setdefault("findings", {})
@@ -262,16 +288,26 @@ def register_result(state, r, result):
                 "confidence": claim.get("confidence"),
             },
         )
+        for event in f["history"]:
+            event.setdefault("sources_seen", len(f["sources"]))
         source = [r["id"], i]
         if source not in f["sources"]:
             f["sources"].append(source)
+        observation = {
+            "source": source,
+            "severity": claim.get("severity", "unknown"),
+            "confidence": claim.get("confidence"),
+        }
+        if observation not in f.setdefault("observations", []):
+            f["observations"].append(observation)
         # A repeated finding must be investigated again. Earlier resolution is history.
         if f["history"]:
             previous = f["history"][-1]
             f["history"].append(
                 {
-                    "category": previous["category"],
+                    "category": "concern" if high_impact(f) else previous["category"],
                     "status": "investigate",
+                    "sources_seen": len(f["sources"]),
                     "evidence": "Reviewer raised this finding again.",
                     "consequence": "Reconcile the new claim before readiness.",
                     "head": r["commit"],
@@ -300,7 +336,7 @@ def disposition(state, fid, data, head, base):
     ):
         raise Error("disposition needs evidence and consequences, not confidence alone")
     category, status = data["category"], data["status"]
-    dangerous = f.get("severity") in ("critical", "high") or any(
+    dangerous = high_impact(f) or any(
         e["category"] in ("blocking", "concern") for e in f["history"]
     )
     if dangerous and category not in ("blocking", "concern"):
@@ -317,7 +353,7 @@ def disposition(state, fid, data, head, base):
         raise Error("classify legacy/unknown finding with evidence first")
     if status == "excepted" and not isinstance(data.get("comment"), int):
         raise Error("specific owner finding exception required")
-    event = {**data, "head": head, "base": base}
+    event = {**data, "head": head, "base": base, "sources_seen": len(f["sources"])}
     f["history"].append(event)
     return event
 
@@ -327,10 +363,18 @@ def findings_ready(state, head, base, check_exception=None):
         # Reapply the same transition rules in CI; labels in JSON are not enough.
         scratch = {"findings": {f["id"]: {**f, "history": []}}}
         for event in f["history"]:
+            seen = event.get("sources_seen", len(f["sources"]))
+            if not isinstance(seen, int) or not 0 <= seen <= len(f["sources"]):
+                raise Error("invalid finding observation history")
+            scratch["findings"][f["id"]]["sources"] = f["sources"][:seen]
             disposition(
                 scratch,
                 f["id"],
-                {k: v for k, v in event.items() if k not in ("head", "base")},
+                {
+                    k: v
+                    for k, v in event.items()
+                    if k not in ("head", "base", "sources_seen")
+                },
                 event["head"],
                 event["base"],
             )
@@ -364,6 +408,8 @@ def findings_ready(state, head, base, check_exception=None):
 
 
 def approved(state, head, base):
+    if any(r["status"] == "pending" for r in state.get("reviews", [])):
+        return False
     if state.get("version") == 1:
         reviews = [
             r for r in state.get("reviews", []) if r["phase"] in ("code", "docs")
@@ -400,13 +446,22 @@ def integration_current(state, head, base):
     ):
         raise Error("integration evidence missing or stale for current head/target")
     r = receipt(state, evidence.get("receipt"))
+    implementation = [x for x in state["reviews"] if x["phase"] in ("code", "docs")]
+    if (
+        not implementation
+        or r["id"] != implementation[-1]["id"]
+        or r["phase"] not in ("code", "docs")
+    ):
+        raise Error(
+            "integration must reference the applicable implementation review, not a plan"
+        )
     if (
         r["commit"] != head
         or r["base_sha"] != base
         or not evidence.get("rationale", "").strip()
     ):
         raise Error("integration continuity does not cover these revisions")
-    if evidence.get("material_change") and r.get("scope") != "initial":
+    if evidence.get("material_change") and (r.get("scope") != "initial"):
         raise Error("material integration needs renewed initial review")
     if not approved(state, head, base):
         raise Error("integration lacks applicable review and finding dispositions")

@@ -280,12 +280,35 @@ def relation(body, number):
         return None
     kind = matches[0].lower()
     closing = re.findall(
-        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\s+(?:#[0-9]+|[\w.-]+/[\w.-]+#[0-9]+|https://github\.com/[\w.-]+/[\w.-]+/issues/[0-9]+)",
+        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\s+(#[0-9]+|[\w.-]+/[\w.-]+#[0-9]+|https://github\.com/[\w.-]+/[\w.-]+/issues/[0-9]+)",
         body or "",
         re.I,
     )
-    if len(closing) != (1 if kind == "fixes" else 0):
-        return None
+    if kind == "part of":
+        if closing:
+            return None
+    else:
+        canonical = re.findall(
+            r"^Fixes (#[0-9]+|[\w.-]+/[\w.-]+#[0-9]+|https://github\.com/[\w.-]+/[\w.-]+/issues/[0-9]+)\s*$",
+            body or "",
+            re.M | re.I,
+        )
+
+        def key(value):
+            value = (
+                value.lower()
+                .removeprefix("https://github.com/")
+                .replace("/issues/", "#")
+            )
+            return board.REPO.lower() + value if value.startswith("#") else value
+
+        closing_keys = [key(value) for value in closing]
+        if len(closing_keys) != len(set(closing_keys)) or set(closing_keys) != {
+            key(value) for value in canonical
+        }:
+            return None
+        if sum(bool(re.fullmatch(ref, value, re.I)) for value in closing) != 1:
+            return None
     return kind
 
 
@@ -614,18 +637,25 @@ class Task:
 
     def authorize(self, session, phase, round_, comment, kind="authorize"):
         self.own(session)
-        authorize_check(self.gh, self.number, phase, round_, comment, kind)
+        failed_ids = [
+            r["id"]
+            for r in self.state["reviews"]
+            if r["phase"] == phase and r["status"] == "failed"
+        ]
+        binding = policy.digest(failed_ids) if kind == "retry" else None
+        authorize_check(self.gh, self.number, phase, round_, comment, kind, binding)
         a = {"phase": phase, "round": round_, "comment": comment}
         if kind == "ceiling":
             if round_ < completed(self.state, phase):
                 raise Error("ceiling cannot erase completed reviews")
             self.state.setdefault("ceilings", {})[phase] = a
         elif kind == "retry":
-            a["failed_ids"] = [
-                r["id"]
-                for r in self.state["reviews"]
-                if r["phase"] == phase and r["status"] == "failed"
-            ]
+            if round_ != completed(self.state, phase) + 1:
+                raise Error("retry authorization must name the next completed round")
+            a.update(failed_ids=failed_ids, binding=binding)
+            history = self.state.setdefault("retry_history", [])
+            if a not in history:
+                history.append(a)
             self.state.setdefault("retry_authorizations", {})[phase] = a
         elif a not in self.state["authorizations"]:
             self.state["authorizations"].append(a)
@@ -707,8 +737,8 @@ class Task:
         # Validate all previous counts before spending, including historical exceptions.
         policy.check_ledger(
             self.state,
-            lambda ph, rd, c, kind: authorize_check(
-                self.gh, self.number, ph, rd, c, kind
+            lambda ph, rd, c, kind, binding=None: authorize_check(
+                self.gh, self.number, ph, rd, c, kind, binding
             ),
         )
         if phase == "docs" and any(
@@ -743,6 +773,8 @@ class Task:
             "rationale": rationale,
             "material_change": material,
         }
+        if policy.failed_attempts(self.state, phase)[1] >= 2:
+            r["retry"] = dict(self.state["retry_authorizations"][phase])
         public_safe(json.dumps(r))
         if scope not in policy.SCOPES or (material and scope != "initial"):
             raise Error("material changes require initial scope; unknown scope refused")
@@ -872,12 +904,6 @@ class Task:
         expected = "fixes" if kind == "fixes" else "part of"
         if relation(body, self.number) not in (None, expected):
             raise Error("PR issue relationship contradicts --relation")
-        # Avoid quietly accepting contradictory completion declarations elsewhere.
-        if (
-            re.search(r"^\s*(?:fixes|closes|resolves|part of)\b", body, re.M | re.I)
-            and relation(body, self.number) != expected
-        ):
-            raise Error("supply only the selected task relationship")
         self.publish()
         token = {
             "repo": board.REPO,
@@ -894,6 +920,10 @@ class Task:
                 + f" #{self.number}\n\n"
                 + body
             )
+        # Validate the assembled body before push/PR mutation, including inline
+        # and noncanonical GitHub closing keywords in the caller's prose.
+        if relation(body, self.number) != expected:
+            raise Error("assembled PR body has an invalid issue relationship")
         body += "\n\n" + block(PR_MARK, token)
         if pending:
             body += "\n\nReview decision pending; this draft has unreviewed or unresolved work.\n"
@@ -967,6 +997,13 @@ def validate_pr(number, gh):
         raise Error("checkpoint missing or replaced")
     if evidence.get("pending") or not approved(s, head, base):
         raise Error("review missing, stale, failed or unresolved")
+    implementation = [r for r in s["reviews"] if r["phase"] in ("code", "docs")]
+    if implementation and implementation[-1]["phase"] == "docs":
+        files = gh.api(
+            f"repos/{board.REPO}/pulls/{number}/files?per_page=100", pages=True
+        )
+        if any(Path(f["filename"]).suffix not in (".md", ".txt") for f in files):
+            raise Error("executable PR changes require code review, not docs")
     readiness(s, head, base, gh, n)
     if s.get("version") == 2:
         comparison = gh.api(f"repos/{board.REPO}/compare/{base}...{head}")
@@ -978,11 +1015,14 @@ def validate_pr(number, gh):
     return "issue and review contract verified"
 
 
-def authorize_check(gh, n, phase, round_, comment, kind="authorize"):
+def authorize_check(gh, n, phase, round_, comment, kind="authorize", binding=None):
     c = next((c for c in comments(gh, n) if c["id"] == comment), None)
     if (
         not c
-        or f"work-issue {kind} {board.REPO}#{n} {phase} {round_}"
+        or (
+            f"work-issue {kind} {board.REPO}#{n} {phase} {round_}"
+            + (f" {binding}" if kind == "retry" else "")
+        )
         not in gh.trusted(c)["body"].splitlines()
     ):
         raise Error("missing exact owner authorization")
@@ -998,7 +1038,10 @@ def finding_exception(gh, n, fid, comment, head, base):
 def readiness(state, head, base, gh, number):
     verification_current(state, head, base)
     policy.check_ledger(
-        state, lambda ph, rd, c, kind: authorize_check(gh, number, ph, rd, c, kind)
+        state,
+        lambda ph, rd, c, kind, binding=None: authorize_check(
+            gh, number, ph, rd, c, kind, binding
+        ),
     )
     if not approved(state, head, base):
         raise Error("review missing, stale, failed, unclassified or blocking")
