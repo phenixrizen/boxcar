@@ -662,7 +662,7 @@ fn make_dir(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
 }
 
 /// The names in the directory `dir` (consumed), `.` and `..` left out.
-fn children(dir: OwnedFd) -> io::Result<Vec<CString>> {
+pub(super) fn children(dir: OwnedFd) -> io::Result<Vec<CString>> {
     // SAFETY: fdopendir takes the descriptor over; closedir releases it.
     let stream = unsafe { libc::fdopendir(dir.into_raw_fd()) };
     if stream.is_null() {
