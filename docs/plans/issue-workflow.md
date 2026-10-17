@@ -386,3 +386,29 @@ review recovery/counts/allowances across sessions; stale review and integration 
 synthetic migration replay. Keep existing scripts regressions and trusted-main CI
 boundary. Tests establish mechanics, not model judgment, universal race exclusion or
 an actual KVM run. Run the complete scripts suite in both repositories.
+
+### Design-review resolutions before implementation
+
+Advisory descriptions have no REST equivalent of the issue-comment latest-editor
+check. Owner-only helper writes therefore do not authenticate an out-of-band
+collaborator edit. Persist an execution trust anchor outside Git containing the
+last exact advisory digest acknowledged by this owner's helper. Scope, allowances,
+exceptions, ownership and review recovery require that anchor to match a fresh
+GitHub read. Helper mutations advance it only after verified read-back. A fresh
+machine/session handoff without a trusted anchor, or any out-of-band edit, requires
+an explicit current owner reconfirmation through a restricted decision file after
+reviewing the current description and ledger. Reconfirmation names the exact
+snapshot digest, approved scope and source of the owner's instruction; it does
+not discard history or grant unknown future rounds. Merely copying remote
+`author=phenixrizen` or a status/authorization field is never provenance. Ordinary
+reads and migration do not grant remediation trust. This is an owner attestation
+boundary, not cryptographic protection against an operator forging the owner's
+instructions. Test out-of-band scope/budget edits and fresh-clone recovery.
+
+Extend the shared disposition/readiness validators with an explicit confidential
+tracking mode. Independent findings in that mode require a repository-qualified
+GHSA identifier whose private record has been retrieved; public issue numbers are
+refused. The ordinary validator retains issue-number-only tracking and rejects
+advisory references. Both transition validation and history replay receive the
+same mode; test private disposition through handoff and readiness. Preserve all
+previous policy-2 receipts and ordinary checkpoint schemas.

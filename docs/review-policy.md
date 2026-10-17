@@ -115,10 +115,13 @@ permission. Exhaustion is neither proof of safety nor an order to redesign.
 
 The existing `authorize` command validates an owner-authored/latest-edited exact
 phase/round comment before invocation and again in CI. `ceiling` records a
-narrower task allowance, also checked in both paths. These amendments authorize
-one additional plan round and at most two additional code rounds in each
-repository, with the second code round focused if needed. They do not waive
-blockers, authorize merging/disclosure or reset previous rounds.
+narrower task allowance, also checked in both paths. Task-specific allowances
+belong in the issue's owner authorization and durable ledger, not in this general
+policy. When the owner extends a task into a new implementation phase, record the
+whole bounded allowance before starting its reviews. Continue cumulative counts;
+do not apply a completed amendment's historical allowance as a permanent ceiling
+or infer permission beyond the current grant. A spending grant never waives
+blockers, authorizes disclosure or resets previous rounds.
 
 Only completed structured invocations consume rounds. Pending attempts block
 another invocation until recovered exactly once. Two consecutive failures require
