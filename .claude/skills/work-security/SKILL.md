@@ -6,10 +6,10 @@ argument-hint: "[owner/repo] [GHSA-xxxx-yyyy-zzzz]"
 
 # Work security
 
-The advisory helper remains unimplemented under the broader task; this review-policy amendment does not implement it.
-If `scripts/security_advisory.py` is absent, stop and report that limitation;
-do not record findings elsewhere or claim these operations ran.
-
+Use the implemented `scripts/security_advisory.py` operations below. This is a
+repository skill, not a Claude built-in. Read the guide's exact JSON schemas and
+restricted output requirements before invoking it. Never claim an operation
+succeeded until its verified read-back completes.
 
 This is separate from `/work-issue`. Read `docs/security-workflow.md` and
 `docs/review-policy.md`. Retrieve the advisory using `security_advisory.py read`
@@ -17,7 +17,9 @@ and inspect its restricted output file. No public issue, Project card or PR.
 
 - Verify native draft state, internal status, owner authorization and its
   approved scope. No security fix starts without that authorization. If absent
-  or changed, ask the owner privately; never infer permission from discovery,
+  or changed, ask the owner privately; a new machine or out-of-band advisory edit
+  also requires explicit current owner reconfirmation of the exact record and
+  ledger via `authorize`. A stored author field is not proof. Never infer permission from discovery,
   a Confirmed status, passing tests or authorization for ordinary development.
 - Read the original claim, technical evidence, plan, dependencies, previous
   attempts and decisions. A review claim is not a proven vulnerability.
@@ -43,7 +45,8 @@ and inspect its restricted output file. No public issue, Project card or PR.
 - Record findings from that review in the same advisory when related, or search
   and create a separate draft for an independent credible finding. Preserve
   the owner decision for unrelated work. Keep verification and dispositions.
-- When fixed and verified, update internal status to Fixed, awaiting disclosure;
+- When fixed and verified, use `verified` to validate integration evidence and
+  set internal status to Fixed, awaiting disclosure;
   leave native state draft. Never open a public PR automatically. The owner
   explicitly decides when and how to disclose and move the patch into public
   history. Publication and CVE requests are deliberately outside these helpers.

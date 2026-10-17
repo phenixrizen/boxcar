@@ -256,10 +256,11 @@ existing checks the owner chooses. Protect workflow/helper changes with owner
 review. Do not replace unrelated settings or imply these were configured.
 
 The contract workflow uses `pull_request_target` with read-only permissions and
-checks out only main; it never executes PR files. The new bootstrap workflow
-cannot run from main before this PR merges. Validate these initial PRs with
-`python3 scripts/work_issue.py ci --pr PR_NUMBER` locally. Separate ordinary PR
-CI runs helper tests. Once installed, comment edits alone do not trigger it.
+checks out only main; it never executes PR files. The initial workflow PR has
+merged and installed the schema-2 validator on main. Local validation remains
+available through `python3 scripts/work_issue.py ci --pr PR_NUMBER`; it is not
+a substitute for the actual PR check. Separate ordinary PR CI runs helper tests.
+Comment edits alone do not trigger the trusted-main contract workflow.
 Find the existing run through the PR's Checks tab or `gh pr checks PR_NUMBER
 --repo phenixrizen/boxcar --json name,link`. Rerun that run with `gh run rerun
 RUN_ID --repo phenixrizen/boxcar --failed`, wait with `gh run watch RUN_ID
@@ -268,9 +269,19 @@ with `gh pr checks`. A separate manually dispatched run is not a replacement
 for the PR's failed check. If no PR-associated check appears, leave this check
 out of branch requirements and resolve that association before enabling it.
 
-Schema rollout: the candidate validator accepts v1 and v2 evidence, but a v1
-validator installed on main rejects schema 2. This is intentional fail-closed
-compatibility. Local candidate validation is not an enforced GitHub check. Deploy
-the trusted validator through the owner's normal merge process before requiring
-schema-2 checks; no branch protection or checks are waived by this amendment.
-Both partial task PRs remain drafts while broader advisory work is incomplete.
+Schema rollout: main now accepts v1 and v2 evidence. Returning clones using the
+old v1 validator still reject schema 2; update their helper without resetting
+history. Repository-file workflows do not make a required merge check. Branch
+protection/ruleset configuration remains a separate owner setting; no protection
+or check is waived here. The merged ordinary-workflow PRs were partial task work;
+private advisory implementation and migration continue under the same issues.
+
+### Confidential workspace routing
+
+The advisory helper is implemented separately in `scripts/security_advisory.py`.
+Use `/security-finding` and `/work-security` and read `docs/security-workflow.md`.
+Issue, Project and PR API helpers refuse confidential clone markers before network
+operations. Private independent findings use advisory tracking through a distinct
+policy-validator mode; ordinary CI retains issue-only references. No raw review
+transcripts belong in public artifacts. The privileged validator continues to load
+trusted main only; public CI does not validate confidential-fork remediation.

@@ -16,6 +16,8 @@ import json
 import subprocess
 import sys
 
+import security_guard
+
 OWNER = "phenixrizen"
 REPO = "phenixrizen/boxcar"
 BOARD = 2  # https://github.com/users/phenixrizen/projects/2
@@ -37,6 +39,10 @@ class BoardError(Exception):
 
 def gh(args: list[str], run=subprocess.run) -> dict:
     """Runs gh with args and answers its JSON output."""
+    try:
+        security_guard.public_only()
+    except ValueError as e:
+        raise BoardError(str(e)) from None
     r = run(["gh", *args], capture_output=True, text=True)
     if r.returncode != 0:
         raise BoardError(r.stderr.strip() or f"gh {args[0]} failed")

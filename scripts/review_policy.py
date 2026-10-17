@@ -319,7 +319,7 @@ def register_result(state, r, result):
     r["result_digest"] = digest(result)
 
 
-def disposition(state, fid, data, head, base):
+def disposition(state, fid, data, head, base, confidential=False):
     f = state.get("findings", {}).get(fid)
     if not f:
         raise Error("unknown finding ID")
@@ -345,10 +345,19 @@ def disposition(state, fid, data, head, base):
         )
     if status == "deferred" and category not in ("nonblocking", "independent"):
         raise Error("only nonblocking/independent work may be deferred")
+    tracking = (
+        r"[\w.-]+/[\w.-]+#GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}"
+        if confidential
+        else r"(?:[\w.-]+/[\w.-]+)?#[1-9][0-9]*"
+    )
     if category == "independent" and not re.fullmatch(
-        r"(?:[\w.-]+/[\w.-]+)?#[1-9][0-9]*", data.get("tracking", "")
+        tracking, data.get("tracking", "")
     ):
-        raise Error("independent defect requires separate issue tracking")
+        raise Error(
+            "independent defect requires separate private advisory tracking"
+            if confidential
+            else "independent defect requires separate issue tracking"
+        )
     if category == "unclassified" and status not in ("investigate", "fixed-unverified"):
         raise Error("classify legacy/unknown finding with evidence first")
     if status == "excepted" and not isinstance(data.get("comment"), int):
@@ -358,7 +367,7 @@ def disposition(state, fid, data, head, base):
     return event
 
 
-def findings_ready(state, head, base, check_exception=None):
+def findings_ready(state, head, base, check_exception=None, confidential=False):
     for f in state.get("findings", {}).values():
         # Reapply the same transition rules in CI; labels in JSON are not enough.
         scratch = {"findings": {f["id"]: {**f, "history": []}}}
@@ -377,6 +386,7 @@ def findings_ready(state, head, base, check_exception=None):
                 },
                 event["head"],
                 event["base"],
+                confidential=confidential,
             )
         if not f["history"]:
             return False
@@ -407,7 +417,7 @@ def findings_ready(state, head, base, check_exception=None):
     return True
 
 
-def approved(state, head, base):
+def approved(state, head, base, confidential=False):
     if any(r["status"] == "pending" for r in state.get("reviews", [])):
         return False
     if state.get("version") == 1:
@@ -434,10 +444,10 @@ def approved(state, head, base):
     ):
         return False
     validate_receipt(state, r)
-    return findings_ready(state, head, base)
+    return findings_ready(state, head, base, confidential=confidential)
 
 
-def integration_current(state, head, base):
+def integration_current(state, head, base, confidential=False):
     evidence = state.get("integration", {})
     if (evidence.get("head"), evidence.get("base"), evidence.get("merge_base")) != (
         head,
@@ -463,5 +473,5 @@ def integration_current(state, head, base):
         raise Error("integration continuity does not cover these revisions")
     if evidence.get("material_change") and (r.get("scope") != "initial"):
         raise Error("material integration needs renewed initial review")
-    if not approved(state, head, base):
+    if not approved(state, head, base, confidential=confidential):
         raise Error("integration lacks applicable review and finding dispositions")

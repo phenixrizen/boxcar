@@ -19,6 +19,7 @@ import uuid
 import board
 import codex_review
 import review_policy as policy
+import security_guard
 
 MARK = "work-issue-checkpoint:v1"
 PR_MARK = "work-issue-pr:v1"
@@ -146,6 +147,10 @@ def checkpoint_body(state):
 
 class GitHub:
     def api(self, path, data=None, method=None, pages=False):
+        try:
+            security_guard.public_only()
+        except ValueError as e:
+            raise Error(str(e)) from None
         args = ["gh", "api", path]
         if pages:
             args += ["--paginate", "--slurp"]
@@ -193,6 +198,10 @@ class GitHub:
             raise Error(str(e)) from None
 
     def pr_write(self, number, title, body, branch, base, draft):
+        try:
+            security_guard.public_only()
+        except ValueError as e:
+            raise Error(str(e)) from None
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md") as f:
             f.write(body)
             f.flush()

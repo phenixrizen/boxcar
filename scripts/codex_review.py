@@ -36,6 +36,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import stat
+
+import security_guard
 
 PLUGIN = "codex@openai-codex"
 SCRIPT = "scripts/codex-companion.mjs"
@@ -236,6 +239,36 @@ def install_root(registry: dict, project: Path, repo=repository) -> Path:
 
 
 def main(argv: list[str]) -> int:
+    private = "--private" in argv
+    argv = [a for a in argv if a != "--private"]
+    try:
+        if private:
+            security_guard.verify()
+            output = os.fstat(sys.stdout.fileno())
+            if (
+                "--json" not in argv
+                or not stat.S_ISREG(output.st_mode)
+                or output.st_mode & 0o077
+            ):
+                raise ValueError(
+                    "private review needs restricted regular-file JSON output"
+                )
+            # Linux private execution path: prohibit a report redirected into Git.
+            from security_advisory import secure_path, Error as PrivateError
+
+            try:
+                secure_path(os.readlink("/proc/self/fd/1"))
+            except PrivateError:
+                raise ValueError("private output must remain outside Git") from None
+            if value_of(argv, "--scope", "branch") != "branch":
+                raise ValueError("private review requires immutable branch scope")
+        else:
+            security_guard.public_only()
+    except (ValueError, OSError, KeyError):
+        sys.stderr.write(
+            "codex_review: confidential workspace requires the private advisory review path and restricted output\n"
+        )
+        return 2
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__.strip() if __doc__ else "")
         return 0 if argv else 2

@@ -145,5 +145,6 @@ Security Advisories. Search related drafts, preserve unconfirmed claims and
 verification, and fail closed on unavailable access. No fix without owner
 remediation authorization; no disclosure or publication without explicit owner
 approval. Revealing patches/tests and review reports stay private. The advisory
-helper remains unimplemented; consult `docs/security-workflow.md` for the limits.
+helper records private results and reuses this policy; consult
+`docs/security-workflow.md` for permissions, owner-provenance handoff and fork limits.
 Never upload raw reports as public CI artifacts or paste them into checkpoints.
