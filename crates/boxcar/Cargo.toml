@@ -25,10 +25,23 @@ boxcar-net = { workspace = true }
 rustls-pki-types = { workspace = true }
 boxcar-vsock = { workspace = true }
 arc-swap = { workspace = true }
+# OCI images (`boxcar image`, M5): the registry client, the store and the
+# unpacker.
+ureq = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+ring = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+ruzstd = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }
 tempfile = { workspace = true }
 # The M4 gated tests run a TLS stub on the loopback for the gate to reach.
-rustls = { workspace = true }
 rcgen = { workspace = true }
+# The in-process registry the image tests pull from.
+boxcar-testreg = { workspace = true }

@@ -51,13 +51,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 uuid = { version = "1", features = ["v7", "serde"] }
 hex = "0.4"
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 libc = "0.2"
 thiserror = "2"
 anyhow = "1"   # binaries and xtask only
 nix = "0.31"   # guest only
 cpio = "0.4"   # xtask only
 tempfile = "3" # dev only
+
+# OCI images (M5): the registry client on ureq over the same rustls and ring
+# as the gate, tar's header and PAX parsers (no xattr) for a framer of our
+# own, ruzstd (pure Rust) for zstd layers; gzip is flate2's.
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider"] }
+tar = { version = "0.4", default-features = false }
+ruzstd = "0.9"
+boxcar-testreg = { path = "crates/boxcar-testreg" }
 
 # The user-mode network stack (boxcar-net).
 # The guest sensor (M3): aya loads the eBPF programs in the guest, aya-build
