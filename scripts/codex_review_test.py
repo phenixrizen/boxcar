@@ -231,5 +231,18 @@ class MainChecksTheBase(unittest.TestCase):
             self.assertEqual(main(["focus"]), 2)
         self.assertIn("could not fetch", err.getvalue())
 
+class StructuredOutput(unittest.TestCase):
+    def test_json_flag_is_allowed_for_workflow_receipts(self):
+        self.assertEqual(refused_flag(['--json','--base=origin/parent','focus']), '')
+
+    def test_equals_base_is_not_overridden_when_invoking_plugin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'scripts').mkdir();(root/'scripts/codex-companion.mjs').touch()
+            with mock.patch.object(codex_review,'behind',return_value=0), mock.patch.object(codex_review,'install_root',return_value=root), mock.patch.object(codex_review.subprocess,'run',return_value=subprocess.CompletedProcess([],0)) as call:
+                self.assertEqual(main(['--json','--base=origin/parent','focus']),0)
+            argv=call.call_args.args[0]
+            self.assertNotIn('origin/main',argv)
+            self.assertIn('--base=origin/parent',argv)
+
 if __name__ == "__main__":
     unittest.main()

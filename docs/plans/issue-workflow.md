@@ -103,3 +103,68 @@ service. The implementation will enforce these boundaries:
   failure, review saved but unpublished followed by release, duplicate attempt
   recovery, unauthorized markers/exceptions, mismatched and stale receipts,
   and the workflow's trusted checkout. No handoff can silently drop a round.
+
+## Draft advisory extension requested 2026-10-17
+
+GitHub Draft Repository Security Advisories replace the private document as
+source of truth. Add a narrow `security_advisory.py` helper and two skills:
+`security-finding` for records, `work-security` for authorized remediation.
+This is confidential state on GitHub, never an issue or Project card.
+
+- Read fresh draft/closed records each session, with paginated authenticated
+  REST calls. Check repository role and token access. Read access does not
+  imply write access. Mutations require explicit repository administration
+  and the owner identity in this initial helper; collaborator reads remain
+  supported. Credentials are independently authorized, never copied between
+  Claude accounts. API errors are redacted to status/permission guidance.
+- Create requires real package ecosystem metadata, summary and description;
+  unknown versions/name remain null where GitHub permits. Search drafts and
+  closed records first. A stable caller operation key and legacy IDs in a
+  machine-readable description block provide exact duplicate/retry detection.
+  Similarity matches require human comparison. No automatic repeat POST after
+  an ambiguous timeout: list/read to reconcile, and require owner resolution
+  if visibility cannot prove the outcome. GitHub has no distributed creation
+  lock; coordinate simultaneous creation across machines explicitly.
+- Update fetches current content and requires its version/digest. Re-read
+  before PATCH and read back afterward. Keep native state draft while internal
+  status moves New, Investigating, Confirmed, Approved for remediation, Fixing,
+  Awaiting verification, Fixed awaiting disclosure, Closed. Closing is an
+  explicit operation with a private reason; fixed does not publish. Refuse
+  published/native triage records for mutation, state=published payloads,
+  CVE requests, arbitrary endpoints and extra fields. Preserve prose and
+  original claim/evidence/history, including disproven findings.
+- Remediation requires durable owner authorization in the advisory and checks
+  the current owner GitHub identity. Reuse or request its temporary private
+  security fork; handle asynchronous creation without another POST. Validate
+  `private: true` through GitHub and clone into an isolated private workspace,
+  with push origin restricted to that fork and a local guard against public
+  issue/board/PR entry points. Keep technical patches/tests only in that fork.
+  No automatic public PR, publication, CVE request or disclosure operation.
+- Review budgets use the same policy functions, with receipts/pending attempts
+  stored in the advisory, raw logs restricted locally. Rebase invalidates
+  evidence; counts survive machine handoff. The private workflow retrieves
+  current metadata before spending, requires review recovery before another
+  attempt or handoff, and uses the existing base-fresh review helper.
+- Public helpers reject advisory references and confidential-workspace markers;
+  raw review logs are never CI artifacts. These guards prevent accidental
+  routing, not semantic detection of every sensitive sentence; the skills
+  require confidentiality review and explicit owner disclosure before anything
+  goes to public Git history. Main-only contract CI accepts only neutral,
+  exact-revision owner exceptions and authenticates current comment editors.
+- Existing artifacts are not deleted. If securely accessible, inventory,
+  deduplicate, preserve original IDs and record the original→GHSA mapping only
+  inside advisories, verifying retrieval. Otherwise provide a private import
+  procedure; do not reconstruct claims from public references. Credible claims
+  without honest package metadata stay in the original secure source (or an
+  owner-selected encrypted intake) pending schema completion; this is explicitly
+  temporary triage, never a new authoritative local backlog. If no secure source
+  is available, stop and report only the access/metadata limitation.
+
+Tests use synthetic advisories only: listing/reading, exact and related matches,
+creation with lost acknowledgement, update conflicts and recovery, permissions,
+invalid IDs, private-fork checks, owner authorization, closed/published states,
+publication/CVE rejection, persisted budgets and public-routing guards. No real
+advisories are created as tests. Initial read-only access checks found no drafts;
+the prior artifact has no location in the repository instructions and remains
+untouched. API reference: GitHub REST repository security advisories, consulted
+2026-10-17; draft creation is distinct from private vulnerability reporting.

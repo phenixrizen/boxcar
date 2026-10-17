@@ -499,6 +499,114 @@ class Workflow(unittest.TestCase):
         self.start()
         self.assertEqual(self.gh.moves[-1], "In review")
 
+    def test_numeric_prefix_review_log_is_not_an_issue(self):
+        self.start()
+        w.atomic(
+            self.ctx.directory / "1c000000-0000-4000-8000-000000000000.json",
+            {"result": {}},
+        )
+        self.start()
+
+    def test_release_lost_ack_and_readback_recovers(self):
+        self.start()
+        original = self.ctx.publish
+        calls = 0
+
+        def publish():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                # Remote accepted the released revision, local acknowledgement was lost.
+                original()
+                self.ctx.state["_remote_revision"] = "old-ack"
+                self.ctx.save()
+                raise w.Error("readback offline")
+            original()
+
+        with mock.patch.object(self.ctx, "publish", side_effect=publish):
+            with self.assertRaises(w.Error):
+                self.ctx.release("one")
+        later = w.Task(43, self.gh)
+        later.release("one")
+        later.start("two", here=True)
+        self.assertEqual(later.state["owner"]["session"], "two")
+
+    def test_partial_rejects_all_github_closing_keywords(self):
+        for closing in [
+            "Closes #43",
+            "Resolved #43",
+            "Fix #43",
+            f"fixes {board.REPO}#43",
+            "Fixes #999",
+        ]:
+            self.assertIsNone(w.relation("Part of #43\n\n" + closing, 43), closing)
+        self.assertIsNone(w.relation("Fixes #43\n\nCloses #999", 43))
+
+    def test_verification_binding_is_not_refreshed_by_resume(self):
+        self.ready()
+        old = self.ctx.state["verification_commit"]
+        (self.root / "file").write_text("changed")
+        w.git("add", "file")
+        w.git("commit", "-qm", "change")
+        self.start()
+        self.assertEqual(self.ctx.state["verification_commit"], old)
+        self.ctx.state["reviews"] = [self.receipt()]
+        with self.assertRaisesRegex(w.Error, "verification"):
+            self.ctx.submit("one", "Change", "Implemented")
+
+    def test_explicit_base_transition_keeps_counts_and_invalidates_evidence(self):
+        self.ready()
+        self.ctx.state["base"] = "origin/parent"
+        self.ctx.save()
+        self.ctx.set_base("one", "origin/main")
+        self.assertEqual(self.ctx.state["base"], "origin/main")
+        self.assertEqual(w.completed(self.ctx.state, "code"), 1)
+        self.assertFalse(
+            w.approved(
+                self.ctx.state,
+                w.git("rev-parse", "HEAD"),
+                w.git("rev-parse", "origin/main"),
+            )
+        )
+
+    def test_handoff_recovers_from_a_separate_clone(self):
+        self.ready()
+        self.ctx.release("one")
+        clone = Path(self.tmp.name) / "other-machine"
+        w.run(["git", "clone", "-q", str(self.root), str(clone)])
+        os.chdir(clone)
+        w.git(
+            "remote", "set-url", "origin", "https://github.com/" + board.REPO + ".git"
+        )
+        later = w.Task(43, self.gh)
+        later.start("new-session", here=True)
+        self.assertNotEqual(later.clone(), self.ctx.clone())
+        self.assertEqual(w.completed(later.state, "code"), 1)
+        self.assertEqual(later.state["checkpoint"]["verification"], "44 tests passed")
+
+    def test_retarget_updates_existing_pr_instead_of_creating_another(self):
+        self.ready()
+        original = w.run
+        with mock.patch.object(
+            w,
+            "run",
+            side_effect=lambda a, **kw: (
+                "" if a[:2] == ["git", "push"] else original(a, **kw)
+            ),
+        ):
+            self.ctx.submit("one", "Change", "Implemented")
+            self.gh.pulls[0]["base"]["ref"] = "parent"
+            write = self.gh.pr_write
+
+            def retarget(number, title, body, branch, base, draft):
+                write(number, title, body, branch, base, draft)
+                self.gh.pulls[0]["base"]["ref"] = base
+
+            with mock.patch.object(self.gh, "pr_write", side_effect=retarget):
+                self.ctx.submit("one", "Change", "Implemented")
+        self.assertEqual(len(self.gh.pulls), 1)
+        self.assertEqual(self.gh.pulls[0]["base"]["ref"], "main")
+
 
 if __name__ == "__main__":
     unittest.main()

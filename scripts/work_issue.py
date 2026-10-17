@@ -172,7 +172,7 @@ class GitHub:
             f.write(body)
             f.flush()
             args = (
-                ["gh", "pr", "edit", str(number)]
+                ["gh", "pr", "edit", str(number), "--base", base]
                 if number
                 else ["gh", "pr", "create", "--head", branch, "--base", base]
             )
@@ -209,7 +209,17 @@ def pulls(gh):
 def relation(body, number):
     ref = rf"(?:#{number}|{re.escape(board.REPO)}#{number}|https://github.com/{re.escape(board.REPO)}/issues/{number})"
     matches = re.findall(rf"^(Fixes|Part of) {ref}\s*$", body or "", re.M | re.I)
-    return matches[0].lower() if len(matches) == 1 else None
+    if len(matches) != 1:
+        return None
+    kind = matches[0].lower()
+    closing = re.findall(
+        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+(?:#[0-9]+|[\w.-]+/[\w.-]+#[0-9]+|https://github\.com/[\w.-]+/[\w.-]+/issues/[0-9]+)",
+        body or "",
+        re.I,
+    )
+    if len(closing) != (1 if kind == "fixes" else 0):
+        return None
+    return kind
 
 
 def fresh_base(base):
@@ -253,6 +263,7 @@ def approved(state, head, base):
     reviews = [r for r in state.get("reviews", []) if r["phase"] in ("code", "docs")]
     return bool(
         reviews
+        and reviews[-1].get("valid", True)
         and reviews[-1]["status"] == "completed"
         and reviews[-1]["outcome"] == "approve"
         and reviews[-1]["unresolved"] == 0
@@ -354,7 +365,7 @@ class Task:
             atomic(p, {"id": str(uuid.uuid4())})
         return json.loads(p.read_text())["id"]
 
-    def start(self, session, here=False, base="origin/main"):
+    def start(self, session, here=False, base=None):
         url = git("remote", "get-url", "origin")
         expected = [f"https://github.com/{board.REPO}", f"git@github.com:{board.REPO}"]
         if url.removesuffix(".git") not in expected:
@@ -379,6 +390,9 @@ class Task:
                 self.state["revision"],
             ):
                 raise Error("remote checkpoint changed; reconcile local history")
+            # Reconcile a mutation accepted remotely before changing its saved intent.
+            if remote_revision == self.state["revision"]:
+                self.publish()
         elif remote:
             self.state = remote
             self.state["_remote_revision"] = remote["revision"]
@@ -409,7 +423,7 @@ class Task:
                 "issue": self.number,
                 "revision": str(uuid.uuid4()),
                 "branch": branch,
-                "base": base,
+                "base": base or "origin/main",
                 "owner": None,
                 "reviews": [],
                 "authorizations": [],
@@ -422,10 +436,16 @@ class Task:
             }
         if self.state.get("owner"):
             self.own(session)
+        if base is not None and base != self.state["base"]:
+            raise Error(
+                "existing task has a different base; use the base command in its worktree"
+            )
         branch = self.state["branch"]
         if not branch or branch == "main":
             raise Error("use a task branch, not main or detached HEAD")
         for p in self.directory.glob("[0-9]*.json"):
+            if not p.stem.isdecimal():
+                continue
             other = json.loads(p.read_text())
             if (
                 other["issue"] != self.number
@@ -446,7 +466,11 @@ class Task:
             if not existing:
                 run(["git", "fetch", "origin"])
                 remote_branch = git("branch", "-r", "--list", f"origin/{branch}")
-                git("branch", branch, f"origin/{branch}" if remote_branch else base)
+                git(
+                    "branch",
+                    branch,
+                    f"origin/{branch}" if remote_branch else self.state["base"],
+                )
             git("worktree", "add", target, branch)
         self.state["_worktree"] = target
         self.state["commit"] = run(["git", "-C", target, "rev-parse", "HEAD"])
@@ -475,14 +499,39 @@ class Task:
         public_safe(json.dumps(data))
         self.state["checkpoint"] = data
         self.state["commit"] = git("rev-parse", "HEAD")
+        self.state["verification_commit"] = self.state["commit"]
+        self.state["verification_base"] = git("rev-parse", self.state["base"])
+        self.state["verification_dirty"] = bool(git("status", "--porcelain"))
         self.save()
         self.publish()
 
+    def set_base(self, session, base):
+        self.check_tree(session)
+        if any(r["status"] == "pending" for r in self.state["reviews"]):
+            raise Error("recover pending review before changing base")
+        fresh_base(base)
+        if base != self.state["base"]:
+            self.state["base"] = base
+            for receipt in self.state["reviews"]:
+                receipt["valid"] = False
+            self.state["verification_base"] = None
+            self.save()
+            self.publish()
+
     def release(self, session):
+        if (
+            self.state
+            and self.state.get("owner") is None
+            and self.state.get("_released_by")
+            == {"session": session, "clone": self.clone()}
+        ):
+            self.publish()
+            return
         self.own(session)
         if any(r["status"] == "pending" for r in self.state["reviews"]):
             raise Error("recover pending review before release")
         self.publish()  # durable handoff barrier before releasing ownership
+        self.state["_released_by"] = self.state["owner"]
         self.state["owner"] = None
         self.save()
         self.publish()
@@ -577,8 +626,7 @@ class Task:
         public_safe(title + "\n" + body)
         head = git("rev-parse", "HEAD")
         base_sha = fresh_base(self.state["base"])
-        if not self.state["checkpoint"]["verification"].strip():
-            raise Error("record actual verification before submit")
+        verification_current(self.state, head, base_sha)
         if not approved(self.state, head, base_sha) and not pending:
             raise Error(
                 "current head/base lacks approval; review or submit --pending for an owner decision"
@@ -621,13 +669,17 @@ class Task:
                 for p in pulls(self.gh)
                 if p["head"]["ref"] == branch
                 and p["head"]["repo"]["full_name"] == board.REPO
-                and p["base"]["ref"] == base
                 and p["state"] == "open"
             ]
 
         existing = candidates()
         if len(existing) > 1:
             raise Error("ambiguous existing PRs")
+        if existing and relation(existing[0]["body"], self.number) not in (
+            "fixes",
+            "part of",
+        ):
+            raise Error("existing branch PR has a different issue relationship")
         number = existing[0]["number"] if existing else None
         try:
             self.gh.pr_write(number, title, body, branch, base, pending)
@@ -636,10 +688,26 @@ class Task:
             if len(observed) != 1 or observed[0]["body"] != body:
                 raise
         observed = candidates()
-        if len(observed) != 1 or observed[0]["body"] != body:
+        if (
+            len(observed) != 1
+            or observed[0]["body"] != body
+            or observed[0]["base"]["ref"] != base
+        ):
             raise Error("PR write not verified")
         self.gh.move(self.number, "In review" if kind == "fixes" else "In progress")
         return observed[0]["html_url"]
+
+
+def verification_current(state, head, base):
+    if (
+        not state.get("checkpoint", {}).get("verification", "").strip()
+        or state.get("verification_commit") != head
+        or state.get("verification_base") != base
+        or state.get("verification_dirty")
+    ):
+        raise Error(
+            "verification is missing or stale; checkpoint actual results after committing and rebasing"
+        )
 
 
 def validate_pr(number, gh):
@@ -671,8 +739,7 @@ def validate_pr(number, gh):
         raise Error("checkpoint missing or replaced")
     if evidence.get("pending") or not approved(s, head, base):
         raise Error("review missing, stale, failed or unresolved")
-    if not s.get("checkpoint", {}).get("verification", "").strip():
-        raise Error("verification evidence missing")
+    verification_current(s, head, base)
     for phase, limit in [("docs", 1), ("plan", 2), ("code", 5)]:
         done = [
             r
@@ -716,6 +783,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest="action", required=True)
     for name in [
         "start",
+        "base",
         "checkpoint",
         "release",
         "review",
@@ -731,7 +799,9 @@ def main(argv=None):
             s.add_argument("--session", required=True)
         if name == "start":
             s.add_argument("--here", action="store_true")
-            s.add_argument("--base", default="origin/main")
+            s.add_argument("--base")
+        if name == "base":
+            s.add_argument("--base", required=True)
         if name in ("checkpoint", "triage"):
             s.add_argument("--file", type=Path, required=True)
         if name == "review":
@@ -777,6 +847,8 @@ def main(argv=None):
                         indent=2,
                     )
                 )
+            elif a.action == "base":
+                t.set_base(a.session, a.base)
             elif a.action == "checkpoint":
                 t.checkpoint(a.session, json.loads(a.file.read_text()))
             elif a.action == "release":
