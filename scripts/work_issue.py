@@ -21,6 +21,7 @@ import codex_review
 
 MARK = "work-issue-checkpoint:v1"
 PR_MARK = "work-issue-pr:v1"
+MAX_CHECKPOINT_BYTES = 60000  # Below GitHub's comment limit, including all metadata.
 
 
 class Error(Exception):
@@ -130,6 +131,19 @@ def parse_block(marker, body):
         raise Error("invalid workflow evidence JSON") from None
 
 
+def checkpoint_body(state):
+    public = {k: v for k, v in state.items() if not k.startswith("_")}
+    body = "# Work issue checkpoint\n\n" + block(MARK, public)
+    public_safe(body)
+    if len(body.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
+        raise Error(
+            "checkpoint too large; shorten checkpoint/triage text, preserve review history"
+        )
+    if parse_block(MARK, body) != public:
+        raise Error("checkpoint serialization did not round trip")
+    return body
+
+
 class GitHub:
     def api(self, path, data=None, method=None, pages=False):
         args = ["gh", "api", path]
@@ -190,6 +204,33 @@ class GitHub:
             if draft and not number:
                 args += ["--draft"]
             run([*args, "--repo", board.REPO, "--title", title, "--body-file", f.name])
+        if number:
+            current = json.loads(
+                run(
+                    [
+                        "gh",
+                        "pr",
+                        "view",
+                        str(number),
+                        "--repo",
+                        board.REPO,
+                        "--json",
+                        "isDraft",
+                    ]
+                )
+            )["isDraft"]
+            if current != draft:
+                run(
+                    [
+                        "gh",
+                        "pr",
+                        "ready",
+                        str(number),
+                        "--repo",
+                        board.REPO,
+                        *(["--undo"] if draft else []),
+                    ]
+                )
 
 
 def comments(gh, number):
@@ -323,6 +364,8 @@ class Task:
         self.state = json.loads(self.path.read_text()) if self.path.exists() else None
 
     def save(self):
+        # Reject invalid publication intents before they can wedge later recovery.
+        checkpoint_body(self.state)
         atomic(self.path, self.state)
 
     def public_state(self):
@@ -349,10 +392,7 @@ class Task:
         self.state["revision"] = str(uuid.uuid4())
         self.save()
         public = self.public_state()
-        body = "# Work issue checkpoint\n\n" + block(MARK, public)
-        public_safe(body)
-        if parse_block(MARK, body) != public:
-            raise Error("checkpoint serialization did not round trip")
+        body = checkpoint_body(self.state)
         path = (
             f"repos/{board.REPO}/issues/comments/{c['id']}"
             if c
@@ -533,11 +573,17 @@ class Task:
                 "checkpoint needs completed, verification, blockers, next strings"
             )
         public_safe(json.dumps(data))
-        self.state["checkpoint"] = data
-        self.state["commit"] = git("rev-parse", "HEAD")
-        self.state["verification_commit"] = self.state["commit"]
-        self.state["verification_base"] = git("rev-parse", self.state["base"])
-        self.state["verification_dirty"] = bool(git("status", "--porcelain"))
+        head = git("rev-parse", "HEAD")
+        candidate = {
+            **self.state,
+            "checkpoint": data,
+            "commit": head,
+            "verification_commit": head,
+            "verification_base": git("rev-parse", self.state["base"]),
+            "verification_dirty": bool(git("status", "--porcelain")),
+        }
+        checkpoint_body(candidate)
+        self.state = candidate
         self.save()
         self.publish()
 
@@ -728,6 +774,8 @@ class Task:
             len(observed) != 1
             or observed[0]["body"] != body
             or observed[0]["base"]["ref"] != base
+            or observed[0]["draft"] != pending
+            or observed[0]["head"]["sha"] != head
         ):
             raise Error("PR write not verified")
         self.gh.move(self.number, "In review" if kind == "fixes" else "In progress")

@@ -96,6 +96,7 @@ class FakeGitHub:
     def pr_write(self, number, title, body, branch, base, draft):
         if number:
             self.pulls[0]["body"] = body
+            self.pulls[0]["draft"] = draft
         else:
             self.pulls.append(
                 {
@@ -396,6 +397,88 @@ class Workflow(unittest.TestCase):
             self.ctx.submit("one", "Partial", "Implemented one piece", kind="part")
         self.assertEqual(self.gh.moves[-1], "In progress")
         self.assertIn("Part of #43", self.gh.pulls[0]["body"])
+
+    def test_real_pr_adapter_reconciles_draft_transitions(self):
+        for current, requested in [(True, False), (False, True), (True, True)]:
+
+            def command(args, **kwargs):
+                if args[:3] == ["gh", "pr", "view"]:
+                    return json.dumps({"isDraft": current})
+                return ""
+
+            with mock.patch.object(w, "run", side_effect=command) as run:
+                w.GitHub().pr_write(88, "Change", "Body", "issue-43", "main", requested)
+                transitions = [
+                    call.args[0]
+                    for call in run.call_args_list
+                    if call.args[0][:3] == ["gh", "pr", "ready"]
+                ]
+                self.assertEqual(len(transitions), int(current != requested))
+                if transitions:
+                    self.assertEqual("--undo" in transitions[0], requested)
+
+    def test_pending_and_approved_resubmissions_reuse_pr_and_check_draft(self):
+        self.ready()
+        original = w.run
+        with mock.patch.object(
+            w,
+            "run",
+            side_effect=lambda a, **kw: (
+                "" if a[:2] == ["git", "push"] else original(a, **kw)
+            ),
+        ):
+            for pending in [True, False, True]:
+                self.gh.lose_pr = True  # State change accepted, acknowledgement lost.
+                self.ctx.submit("one", "Change", "Implemented", pending=pending)
+                self.assertEqual(self.gh.pulls[0]["draft"], pending)
+                self.assertEqual(len(self.gh.pulls), 1)
+            write = self.gh.pr_write
+
+            def wrong_draft(*args):
+                write(*args)
+                self.gh.pulls[0]["draft"] = True
+
+            with mock.patch.object(self.gh, "pr_write", side_effect=wrong_draft):
+                with self.assertRaisesRegex(w.Error, "verified"):
+                    self.ctx.submit("one", "Change", "Implemented", pending=False)
+
+    def test_oversized_checkpoint_rejected_before_save_and_can_be_corrected(self):
+        self.start()
+        before = self.ctx.path.read_text()
+        with self.assertRaisesRegex(w.Error, "too large"):
+            self.ctx.checkpoint(
+                "one",
+                {
+                    "completed": "",
+                    "verification": "a" * 70000,
+                    "blockers": "",
+                    "next": "",
+                },
+            )
+        self.assertEqual(before, self.ctx.path.read_text())
+        later = w.Task(43, self.gh)
+        later.checkpoint(
+            "one",
+            {
+                "completed": "",
+                "verification": "short results",
+                "blockers": "",
+                "next": "review",
+            },
+        )
+        later.release("one")
+        self.assertIsNone(w.remote_state(self.gh, 43)[0]["owner"])
+
+    def test_total_checkpoint_limit_includes_triage_and_review_history(self):
+        self.ready()
+        before = self.ctx.path.read_text()
+        self.ctx.state["triage"] = "a" * 70000
+        with self.assertRaisesRegex(w.Error, "too large"):
+            self.ctx.save()
+        self.assertEqual(before, self.ctx.path.read_text())
+        later = w.Task(43, self.gh)
+        later.release("one")
+        self.assertEqual(w.completed(later.state, "code"), 1)
 
     def test_completed_review_recovery_is_counted_once(self):
         self.start()

@@ -41,6 +41,10 @@ python3 scripts/work_issue.py complete phenixrizen/boxcar#43
 ```
 
 A checkpoint file contains these four strings (actual results, not planned tests).
+The complete public checkpoint, including review history and triage, is limited
+to 60,000 UTF-8 bytes before anything is saved. Summarize lengthy test output;
+do not trim review history to fit. A rejected oversized edit leaves the previous
+checkpoint intact, so a shorter correction can be submitted normally.
 For submission, record results after the implementation is committed; verification
 is bound to that clean commit and base and does not become fresh merely on resume:
 

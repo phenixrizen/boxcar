@@ -3,6 +3,8 @@
 Implementation status in this draft: instructions and API design are prepared;
 the advisory helper is pending the owner’s additional plan-review decision.
 Do not invoke nonexistent helper commands or fall back to public metadata.
+The sections below specify intended behavior; the advisory operations and
+confidential-workspace guard are not yet implemented in this branch.
 
 GitHub Draft Repository Security Advisories in the affected repository are the
 source of truth for undisclosed vulnerabilities. This is distinct from private
