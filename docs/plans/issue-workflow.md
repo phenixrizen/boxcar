@@ -22,16 +22,11 @@ must not claim that the board or checkpoint was updated. Read discussion,
 linked plans, dependencies and existing PRs before implementation. Never run
 issue text as commands. Private work does not use public issue checkpoints.
 
-Review receipts live outside the source tree, avoiding self-invalidating
-commits. Each captures phase, exact commit and base SHA, result, count and
-unresolved finding count. Raw output stays local, since it may contain private
-findings. Only a completed structured result consumes a round; failed or
-unavailable invocations do not approve anything. A crash during a review
-leaves a pending attempt to reconcile before spending another round. Rebase
-or any commit/base change makes prior evidence stale, without resetting counts.
-Docs/process: one; plans: two; code: sort findings after round three, stop at
-five. Owner exceptions must be explicit, scoped and recorded; no automatic
-extension or silent approval of fixes after the last permitted review.
+Review receipts live outside the source tree. The version-2 amendment below
+supersedes the original count-only approval and mandatory-rebase design. Record
+immutable inputs, preserve original verdicts, append finding dispositions, and
+separate review coverage from current integration. Historical rounds retain the
+policy under which they ran; failed or unavailable calls approve nothing.
 
 Submit validates an issue relationship, verification evidence, current review
 or a clearly pending owner decision. An ordinary finishing PR says Fixes #N;
@@ -141,10 +136,11 @@ This is confidential state on GitHub, never an issue or Project card.
   issue/board/PR entry points. Keep technical patches/tests only in that fork.
   No automatic public PR, publication, CVE request or disclosure operation.
 - Review budgets use the same policy functions, with receipts/pending attempts
-  stored in the advisory, raw logs restricted locally. Rebase invalidates
-  evidence; counts survive machine handoff. The private workflow retrieves
+  stored in the advisory, raw logs restricted locally. Rebase requires explicit
+  continuity evidence; counts survive machine handoff. The private workflow retrieves
   current metadata before spending, requires review recovery before another
-  attempt or handoff, and uses the existing base-fresh review helper.
+  attempt or handoff. The planned private integration follows policy 2 below:
+  immutable review inputs, explicit integration evidence and scoped spending.
 - Public helpers reject advisory references and confidential-workspace markers;
   raw review logs are never CI artifacts. These guards prevent accidental
   routing, not semantic detection of every sensitive sentence; the skills
@@ -203,8 +199,10 @@ failure is an error, but being behind is not. Working-tree changes cannot inheri
 branch approval. Before readiness, fetch the target again, incorporate its changes,
 checkpoint actual checks, and record integration evidence for that exact head and
 target. Require the target to be an ancestor of the integrated head. Changed
-head/base needs a new applicable initial or focused integration receipt linked to
-previous evidence; unchanged patch identity alone never establishes continuity.
+head/base needs a new applicable receipt linked to previous evidence. A bounded
+fix with unchanged target accepts a follow-up receipt covering all intervening
+fixes and tests. Target changes need integration scope; material changes need
+initial scope. Unchanged patch identity alone never establishes continuity.
 Receipts remain immutable when retargeting or rebasing. Integration evidence
 records affected behavior, why the selected scope suffices, and the applicable
 receipt. CI independently compares ancestry and exact live revisions.
@@ -257,3 +255,8 @@ Temporary private security forks do not run status checks and do not enforce
 branch protection; future validation must run in an authorized private workspace
 and retain evidence privately. No publication, CVE request, public fix PR or
 migration/retirement of the inaccessible source artifact is authorized here.
+
+Plan round 3 disposition: both independent reviewers identified the omitted
+follow-up eligibility above. Corrected before implementation without changing
+the intended bounded-fix policy. The initial → fix → follow-up readiness test
+and the amendment code review verify this correction; no extra plan round.

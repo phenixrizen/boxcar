@@ -6,7 +6,7 @@ argument-hint: "[owner/repo] [GHSA-xxxx-yyyy-zzzz]"
 
 # Work security
 
-This draft's helper implementation is pending an owner plan-budget decision.
+The advisory helper remains unimplemented under the broader task; this review-policy amendment does not implement it.
 If `scripts/security_advisory.py` is absent, stop and report that limitation;
 do not record findings elsewhere or claim these operations ran.
 
@@ -36,8 +36,9 @@ and inspect its restricted output file. No public issue, Project card or PR.
   and do not upload transcripts or raw reviews to public Actions artifacts.
 - Use the advisory helper's private `review` operation: it invokes the existing
   Codex review helper and records phase/head/base/count/outcome privately.
-  Docs/process one, plans two, code triage after three and stop at five still
-  apply. Failed/unavailable reviews are never passes. Recover interrupted
+  Follow policy 2: docs one, plans two, code three autonomous; each later
+  code round requires scoped owner authorization. Phase and review scope are
+  separate; findings need evidence-backed dispositions and current integration. Failed/unavailable reviews are never passes. Recover interrupted
   attempts before another round; a session change does not reset the budget.
 - Record findings from that review in the same advisory when related, or search
   and create a separate draft for an independent credible finding. Preserve

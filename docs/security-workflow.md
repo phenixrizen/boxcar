@@ -1,7 +1,8 @@
 # Private security advisory workflow
 
 Implementation status in this draft: instructions and API design are prepared;
-the advisory helper is pending the owner’s additional plan-review decision.
+the advisory helper remains unimplemented under the broader task. The review-policy
+amendment does not implement or authorize claiming those operations.
 Do not invoke nonexistent helper commands or fall back to public metadata.
 The sections below specify intended behavior; the advisory operations and
 confidential-workspace guard are not yet implemented in this branch.
@@ -28,8 +29,8 @@ In a private Claude session with independently authorized GitHub credentials:
 
 Ordinary work remains `/work-issue phenixrizen/boxcar#N`. Never put a draft advisory
 reference or contents into its issue, checkpoint, Project card or PR body.
-The helpers reject advisory markers and confidential workspaces on the ordinary
-path. This is accidental-disclosure protection, not semantic classification of
+The ordinary helper rejects advisory references; the planned confidential
+workspace guard is not implemented. This is accidental-disclosure protection, not semantic classification of
 arbitrary prose. Inspect every public change for confidential details.
 
 ## Permissions and account independence
@@ -116,12 +117,24 @@ fork as its push remote; a public worktree is not suitable for a revealing
 patch. Keep reproduction fixtures, branch names, test names, review text and
 implementation details private. No automatic public PR is created.
 
-Use the existing Codex adversarial reviewer with its base-freshness checks.
-Store receipts privately against exact commit and base: phase, completed count,
-outcome, unresolved findings, pending exception and owner-authorized scope.
-Docs/process one round, plan two, code third-round triage and five-round stop
-apply here too. A rebase invalidates approval but not the ledger. Pending or
-failed invocations are never passes; reconcile before another round or handoff.
+The planned private review integration uses policy 2 in docs/review-policy.md:
+independent review; phase separate from initial/follow-up/integration scope;
+immutable reviewed head/comparison/merge base; explicit current integration
+and verification; stable findings and evidence-backed dispositions. Docs one,
+plans two, code three autonomous; each later code round requires scoped owner
+authorization. Historical attempts keep their policy and counts. Raw reports,
+receipts, findings, pending attempts and authorizations must remain private.
+This advisory integration has not been implemented or validated.
+
+GitHub temporary private security forks have important limits: integrations
+cannot access them, status checks do not run, and branch protections are not
+enforced. Run appropriate checks locally in an authorized private workspace,
+record actual results privately, and obtain the owner's review/disclosure decision.
+Normal public Actions and branch-protection enforcement are not a validation path
+for these forks. GitHub also merges their open PRs through the advisory rather
+than individually; only one PR may target the fork's default branch at that step.
+See [GitHub's private-fork documentation](https://docs.github.com/en/code-security/tutorials/fix-reported-vulnerabilities/collaborate-in-a-fork).
+No fork creation, merging or publication is performed by this amendment.
 
 When verification succeeds, record Fixed, awaiting disclosure while leaving
 native state draft. Closing an invalid/resolved draft is explicit and retains

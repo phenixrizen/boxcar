@@ -1,97 +1,144 @@
-# Review policy
+# Review policy (version 2)
 
+A merge-ready change has no unresolved blocking findings, completed required
+verification, and applicable independent review/owner approvals. Optional
+suggestions are not a reason to spend another review. Ordinary draft PRs may
+open before review or verification; they remain explicitly pending.
 
-Every pull request gets a Codex adversarial review before it is opened: a
-second model questioning the design, not only the lines. It comes from the
-Codex plugin for Claude Code (`openai/codex-plugin-cc`; `/plugin marketplace
-add openai/codex-plugin-cc`, `/plugin install codex@openai-codex`,
-`/codex:setup`, a Codex login). A person types
-`/codex:adversarial-review --base origin/main <focus>`; an agent cannot
-invoke that command and runs the same review through the plugin's script,
-which `scripts/codex_review.py` finds (the installation Claude Code's
-registry names for this repository, else the user's; never the newest
-cached copy, and an ambiguous registry is refused):
+Use the existing Codex plugin (`codex@openai-codex`) through
+`scripts/work_issue.py review`. It calls `scripts/codex_review.py`, which resolves
+the installed registry entry for this repository/user and refuses ambiguity.
+A Codex implementation session needs a separate reviewer session: its own
+self-review does not count. The plugin starts a separate read-only review thread.
+Unavailable services, authentication failures and missing output approve nothing.
 
-```bash
-python3 scripts/work_issue.py review phenixrizen/boxcar#N --session SESSION --phase code --focus "<risks>"
-```
+## Planning and logical boundaries
 
-- **The plan is reviewed before the code** when a change touches a state
-  machine (a flow in the relay or the gate, the reconciler's spans, a
-  device's queues, a session's start and stop), a protocol, concurrency
-  or a security behaviour. The change's first commit is
-  `docs/plans/<branch>.md`: the events that can interact and every order
-  they can come in, the invariants that must hold in all of them (say,
-  "the gate relays every byte unchanged, however the flow's ends close"),
-  what is out of scope, and the tests that will pin each ordering. Codex
-  reviews the plan alone (`codex_review.py --base <the commit before the
-  plan> "review this plan: <focus>"`, so the review sees only the plan's
-  commits) before any code is written; its findings change the plan, and
-  the revision is reviewed once more. A plan still blocked after its
-  second review is not revised again on the agent's own: the agent
-  reports it, and the owner decides. Only once a review finds nothing that
-  blocks, or the owner says to go on, are the tests for the orderings
-  written, from the plan, and then the code that passes them. A design
-  that has to change once code exists goes back to the plan: the plan is
-  revised and reviewed before the code follows it. The pull request's
-  body names the plan's last reviewed commit apart from the code's. The
-  plan stays as the change's design record, written as the pull request
-  is (neutral for a security fix). A milestone's plan says what to build;
-  each of its tasks that is such a change still gets a plan of its own,
-  reviewed so before the task's code. A small fix (one cause, one place,
-  no new state) needs no plan.
-- `--base` reviews the commits `origin/main...HEAD`, not the working tree:
-  commit everything first. The pull request's body names the commit
-  reviewed; commits after it (the review's own fixes included) get another
-  review before the merge, within the limits below.
-- **The review is of what will merge.** The script fetches its base and
-  refuses a branch that is behind it: rebase onto the current
-  `origin/main` before each review, so the review sees the change on top
-  of everything merged since it began, not on the `main` it started from.
-  A branch stacked on another (see Parallel work) names its parent with
-  `--base origin/<branch>`; once the parent merges it is rebased onto
-  `main` and reviewed again before it merges. A base given as a commit (a
-  plan's review) is neither fetched nor checked, so the branch is rebased
-  onto the current `origin/main` by hand first.
-- **Review rounds are bounded.** Every round costs; the limits (the owner,
-  2026-10-14) are a budget, not a target. A docs or process change gets
-  one round; a plan, two (above). Code gets **three**: when the third
-  review still finds something, stop and sort its findings before going
-  on. A finding in the current stream of work (the change introduces it,
-  exposes it, needs it fixed or makes a test fail; see the Task contract in AGENTS.md) is fixed before the change merges, where One change per pull
-  request puts it: on the branch when the change introduces it or it is
-  in code the change touches, in a pull request of its own that merges
-  first when it is a defect already on `main` in code the change does not
-  otherwise touch. One that is independent of the change is split off (an
-  issue, or a GitHub draft advisory for a security finding, and the owner's
-  call), not fixed on the branch. The pull request's body records the
-  checkpoint and how each finding was sorted. **Five** rounds is the stop:
-  a change still finding its own defects then goes back to its plan (or
-  gets one when it had none), the agent reports where it stands, and the
-  owner says whether more is spent on it. An agent never passes a limit on
-  its own: when its last round still finds something, it fixes what that
-  round found, reports those fixes as not yet reviewed, and the owner says
-  whether another round is spent.
-- The focus names the risks the change touches: what the guest can reach
-  or alter, credentials in records, dumps and logs, the gate relaying
-  bytes unchanged, a guest blocking the VMM, ring 1 blocking ring 0,
-  races and ownership across the VMM's threads, recovery and cleanup at
-  stop.
-- Its findings are claims, not facts. Each is reproduced (a test, a
-  reconciler scenario, a gated run) or traced in the code before it is
-  fixed; one the code refutes is answered with the lines that refute it.
-- The pull request's body lists the findings and what became of each. One
-  independent of the change becomes an issue (below), never dropped
-  silently, and the owner says whether it is fixed now, in a pull request
-  of its own, or waits.
-- A security finding (a way for the guest or anyone else to gain access,
-  read what it should not, alter or escape the audit, or deny service)
-  never goes into this repository, a pull request, a commit message or a
-  plan until the owner explicitly authorizes disclosure: it goes to the affected repository's GitHub Draft Security Advisories. The fix's pull request describes the
-  change, not the attack, and its regression tests have neutral names.
-  No security fix starts without the owner's go-ahead.
-- When the review cannot run (no login, no network), the pull request says
-  so: a limitation, not a pass.
+Review a design before code when behavior or guarantees materially change:
+architecture, protocols, trust boundaries, ownership, concurrency or assumptions
+underlying an earlier approval. Merely touching a file with a state machine does
+not require a design document. A bounded correction restoring an invariant can
+use the issue, regression test and PR explanation. Plans cover relevant events,
+failure paths, interleavings, invariants, tests and coverage limits; do not claim
+exhaustive ordering coverage without a method establishing it. A clean first
+plan review does not require a second. Resolve material plan blockers before code.
 
+Keep changes together when they implement and verify one coherent outcome.
+Split independently useful, risky or revertible work. A necessary correction in
+another file may belong; unrelated cleanup in the same file usually does not.
+Parallel work must account for shared contracts/state, not just file overlap.
+Test the affected surfaces as specified in AGENTS.md; Python-only workflow
+changes do not require unrelated application runtime suites.
 
-The workflow helper invokes `scripts/codex_review.py` and records structured results outside the commit tree. Use it for issue work so counts and receipts survive resume. See `docs/issue-workflow.md` for exceptions and recovery.
+## Phase, scope and inputs
+
+Phase is `docs`, `plan` or `code`. Independently select review scope:
+
+- `initial`: complete logical change, requirements, important invariants and
+  relevant surrounding code. Renew this scope after material design changes.
+- `follow-up`: previous findings, bounded fixes, tests and affected behavior,
+  including surrounding code and callers. It may discover serious new defects;
+  it does not restart unrestricted architectural review after each correction.
+- `integration`: target changes, conflict resolution or stack retargeting,
+  including callers, dependencies, configuration and shared assumptions.
+
+The helper's `--scope` is a workflow option. The installed plugin supports only
+`--scope branch|working-tree|auto`; it receives `branch`, an immutable base SHA,
+and the selected workflow scope/instructions in its focus text. Prior receipts
+and restricted reports are supplied as private context. Focused scopes require
+prior completed receipts in the same phase and a continuity rationale. Transfer
+missing reports privately or choose initial scope; never invent their contents.
+Use `--verifies F-ID` for each prior finding being verified. A reviewer can retain
+its stable ID in the finding title; otherwise a new claim receives a new opaque
+ID and earlier findings remain in the ledger.
+
+Branch review runs in a detached snapshot of the exact commit. Receipts record
+head, comparison base and merge base; uncommitted files are excluded. Remote
+bases are fetched; fetch/comparison failures stop the operation. Being behind
+is permitted and does not assert current integration. Direct wrapper users can
+pin `--head SHA`; this is consumed by the wrapper, not forwarded to the plugin.
+Plan-only review can use `--comparison COMMIT_BEFORE_PLAN`.
+
+Before readiness, fetch and incorporate the current target, run affected checks,
+checkpoint actual results, and use `integrate` with an applicable receipt.
+Integration evidence binds the actual head/target/merge base, rationale and
+review receipt. The current target must be an ancestor of that head. A bounded
+fix against an unchanged target accepts an exact-head follow-up linked to the
+prior review. Target changes need integration or renewed initial scope; material
+changes need initial scope. Unchanged patch identity alone is not evidence of
+unchanged behavior. A new head/base never silently inherits old approval.
+Retargeting/rebasing preserves historical receipts rather than rewriting SHAs.
+
+## Finding dispositions
+
+Keep original structured results in restricted reports. A public checkpoint
+contains opaque IDs and sanitized evidence, never undisclosed technical claims
+or reproductions. Severity and confidence are separate. Classify with evidence
+and consequences, not confidence alone:
+
+- `blocking`: demonstrated incorrect behavior, violated requirement/invariant,
+  material security risk, or missing verification of critical behavior.
+- `nonblocking`: optional refinement; requirements are met without it.
+- `concern`: unverified claim needing investigation. High-impact concerns hold
+  readiness until investigated; a high/critical reviewer claim cannot simply
+  be labelled nonblocking.
+- `independent`: existing defect tracked separately unless this change worsens,
+  exposes or depends on it. Requires a separate issue reference; preserve the
+  owner's decision on whether/when to pursue unrelated work.
+- `unclassified`: missing detail, including legacy findings. Never an approval.
+
+`dispose` appends a history event: `investigate`, `fixed-unverified`, `verified`,
+`refuted`, `deferred`, or `excepted`, plus evidence and consequence. Blocking
+findings/concerns cannot disappear by reclassification. Resolve them with
+verification, refuting evidence or a specific owner exception. Only nonblocking
+or independent findings may be deferred. Resolution applies to its recorded
+head/base; explicitly reconcile it after further changes. A repeated reviewer
+claim reopens investigation. Original verdicts are immutable: a needs-attention
+review can support readiness after evidence shows all findings are resolved or
+nonblocking. Missing review output can never support readiness.
+
+These are attestations, not proofs of model judgment or semantic equivalence.
+The helper cannot decide whether prose establishes a real defect or whether an
+unreported architecture change is material. The agent must investigate and
+choose scope honestly; CI checks evidence consistency and trusted provenance.
+
+## Spending and migration
+
+Version 2 ceilings: docs/process one when required; plans two; code three
+autonomously. Code rounds four and five each require explicit scoped owner
+authorization; beyond five requires another explicit exception. Initial,
+follow-up and integration code reviews all count. Stop once criteria are met.
+Round three is a spending/triage checkpoint; a nonempty triage note is not
+permission. Exhaustion is neither proof of safety nor an order to redesign.
+
+The existing `authorize` command validates an owner-authored/latest-edited exact
+phase/round comment before invocation and again in CI. `ceiling` records a
+narrower task allowance, also checked in both paths. These amendments authorize
+one additional plan round and at most two additional code rounds in each
+repository, with the second code round focused if needed. They do not waive
+blockers, authorize merging/disclosure or reset previous rounds.
+
+Only completed structured invocations consume rounds. Pending attempts block
+another invocation until recovered exactly once. Two consecutive failures require
+repairing the cause and an exact owner `retry` authorization; that authorization
+covers only the failed attempt IDs recorded then, not unlimited retries.
+
+Schema 2 retains the stable `work-issue-checkpoint:v1` envelope marker so old
+clients find the existing comment and fail closed on its version. Migration
+preserves all attempts/outcomes/counts/authorizations, stores historical receipt
+digests and a local v1 backup, and creates unclassified legacy findings. Recover
+pending v1 attempts before migration. Historic rounds retain policy 1 (including
+its old fourth/fifth-round rules); no retrospective permission is fabricated.
+New rounds use policy 2. Migration publishes through the same recoverable atomic
+protocol. Released returning clones adopt migrated remote history; active or
+unpublished conflicting state still requires explicit reconciliation.
+
+## Confidential reviews
+
+Undisclosed vulnerabilities belong in the affected repository's GitHub Draft
+Security Advisories. Search related drafts, preserve unconfirmed claims and
+verification, and fail closed on unavailable access. No fix without owner
+remediation authorization; no disclosure or publication without explicit owner
+approval. Revealing patches/tests and review reports stay private. The advisory
+helper remains unimplemented; consult `docs/security-workflow.md` for the limits.
+Never upload raw reports as public CI artifacts or paste them into checkpoints.

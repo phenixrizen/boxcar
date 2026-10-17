@@ -28,7 +28,8 @@ If the task is an undisclosed vulnerability or names a draft GHSA, route to
 3. Read the affected-surface checks in AGENTS.md and its linked docs. If the
    change needs a plan, read `docs/review-policy.md`, commit the plan alone,
    then use the helper's `review --phase plan`. Trace or reproduce findings;
-   revise and review the plan before code. Do not advance a blocked plan.
+   resolve material plan blockers before code. A clean first review needs no
+   second round; bounded invariant corrections can use issue/test/PR evidence.
 4. Implement and verify the issue. Fix introduced defects in this PR and
    record them here; independent fixes/follow-ups get separate issues/PRs and
    retain the owner's decision point. Do not publish security findings: use
@@ -40,18 +41,24 @@ If the task is an undisclosed vulnerability or names a draft GHSA, route to
    This updates one comment, not a stream of status comments. Commit and
    push before a machine handoff, then `release`; the next session starts
    with its own ID. Uncommitted files and local review logs do not travel.
-6. Commit all changes, rebase on the fresh base, and use `review --phase code`
-   (or `docs` for prose-only process/docs). Review budgets survive sessions.
-   Read the local report; findings are claims to verify. Record their
-   dispositions via checkpoint. Use `triage --file` after code round three
-   if it has findings. At a budget stop, fix that round's findings, identify
-   the resulting revision as unreviewed and ask the owner about another
-   round. Only an explicit scoped owner comment permits `authorize`.
+6. Commit changes and use `review --phase code --scope initial` (or `docs` for
+   prose-only changes). Behind-base review is permitted against immutable inputs.
+   Read the restricted report; append sanitized finding dispositions with
+   `dispose --finding F-ID --file FILE`. Unknowns and blockers cannot be silently
+   relabelled. Use `--scope follow-up --prior ID --verifies F-ID --rationale TEXT`
+   for bounded fixes, `integration` for target changes, renewed `initial` for
+   material changes. Read docs/review-policy.md for scope and evidence rules.
+   Before readiness incorporate the current target, run affected checks,
+   checkpoint actual results and `integrate --receipt ID --rationale TEXT`.
+   Budgets survive handoff/rebase: docs one, plans two, code three autonomous;
+   every later code round needs exact scoped authorization. Stop when ready,
+   not when all optional suggestions disappear. Never exceed a narrower task
+   ceiling. Pending/failed invocations approve nothing; recover before retry.
 7. Use `submit --body-file ... --title ...` with `--relation fixes` for a
    finishing PR or `part` for partial work. Supply what changed and actual
    validation; the helper appends machine evidence. Current approval opens
    a normal PR; `--pending` opens a draft with a failing contract check and
-   an explicit owner decision. Never claim pending/unavailable as approved.
+   explicit pending evidence. Never claim pending/unavailable as approved.
    A partial PR leaves the issue In progress. Do not merge without instruction.
 8. After an authorized merge, `complete` checks GitHub and main ancestry.
    A partial or intermediate merge does not finish the issue. The final PR

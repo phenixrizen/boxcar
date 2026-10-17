@@ -10,6 +10,6 @@
 
 ## Review
 
-<!-- work_issue.py submit appends exact revision/base receipts. Record findings and dispositions, the third-round checkpoint where applicable, and any unreviewed final-round fixes. Never publish private findings. -->
+<!-- work_issue.py submit appends exact revision/base receipts. Identify review phase/scope, receipt IDs and actual head/comparison/merge base; record sanitized finding dispositions, verification and current integration evidence. State pending work and scoped authorizations. Never publish private findings. -->
 
 ## Limitations or pending decisions

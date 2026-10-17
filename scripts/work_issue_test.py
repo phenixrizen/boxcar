@@ -76,7 +76,12 @@ class FakeGitHub:
                 )
             )
         if "/compare/" in path:
-            return {"status": "ahead"}
+            return {
+                "status": "ahead",
+                "merge_base_commit": {
+                    "sha": path.split("/compare/")[1].split("...")[0]
+                },
+            }
         raise AssertionError((path, data))
 
     def trusted(self, c):
@@ -211,7 +216,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(w.completed(later.state, "code"), 1)
 
     def receipt(self, phase="code", number=1, outcome="approve"):
-        return {
+        r = {
             "id": str(number),
             "phase": phase,
             "commit": w.git("rev-parse", "HEAD"),
@@ -221,7 +226,23 @@ class Workflow(unittest.TestCase):
             "outcome": outcome,
             "unresolved": 0 if outcome == "approve" else 1,
             "round": number,
+            "policy_version": 2,
+            "receipt_version": 2,
+            "scope": "initial",
+            "prior": [],
+            "verifies": [],
+            "rationale": "",
+            "merge_base": w.git("merge-base", "HEAD", "origin/main"),
         }
+        r["inputs"] = {
+            "head": r["commit"],
+            "base": r["base_sha"],
+            "merge_base": r["merge_base"],
+        }
+        w.policy.register_result(
+            self.ctx.state, r, {"verdict": outcome, "findings": []}
+        )
+        return r
 
     def test_changed_revision_or_base_invalidates_review_not_count(self):
         self.start()
@@ -241,7 +262,7 @@ class Workflow(unittest.TestCase):
         )
         self.assertEqual(w.completed(self.ctx.state, "code"), 1)
 
-    def test_phase_budgets_and_third_round_checkpoint(self):
+    def test_phase_budgets_require_permission_after_three(self):
         self.start()
         for phase, limit in [("docs", 1), ("plan", 2), ("code", 5)]:
             self.ctx.state["reviews"] = [
@@ -252,9 +273,12 @@ class Workflow(unittest.TestCase):
         self.ctx.state["reviews"] = [
             self.receipt("code", n, "needs-attention") for n in range(1, 4)
         ]
-        with self.assertRaisesRegex(w.Error, "triage"):
+        with self.assertRaisesRegex(w.Error, "authorization"):
             w.budget(self.ctx.state, "code")
         self.ctx.state["triage"] = "Findings sorted with tests and follow-up issues"
+        with self.assertRaisesRegex(w.Error, "authorization"):
+            w.budget(self.ctx.state, "code")
+        self.ctx.state["authorizations"] = [{"phase": "code", "round": 4, "comment": 9}]
         w.budget(self.ctx.state, "code")
 
     def test_failed_review_is_not_completed_or_approved(self):
@@ -362,6 +386,10 @@ class Workflow(unittest.TestCase):
                 "blockers": "none",
                 "next": "submit",
             },
+        )
+
+        self.ctx.integrate(
+            "one", "1", "Current target incorporated; affected unit checks passed."
         )
 
     def test_lost_pr_response_and_repeat_submit_reuse_one_pr(self):
@@ -527,7 +555,11 @@ class Workflow(unittest.TestCase):
         self.ctx.state["reviews"] = [r]
         w.atomic(
             self.ctx.directory / "attempt.json",
-            {"codex": {"status": 0}, "result": {"verdict": "approve", "findings": []}},
+            {
+                "codex": {"status": 0},
+                "inputs": r["inputs"],
+                "result": {"verdict": "approve", "findings": []},
+            },
         )
         self.ctx.recover("one")
         self.assertEqual(w.completed(self.ctx.state, "code"), 1)
@@ -683,13 +715,21 @@ class Workflow(unittest.TestCase):
         self.ctx.set_base("one", "origin/main")
         self.assertEqual(self.ctx.state["base"], "origin/main")
         self.assertEqual(w.completed(self.ctx.state, "code"), 1)
-        self.assertFalse(
+        # Identical immutable inputs retain review evidence; retargeting still
+        # clears verification and requires a new integration checkpoint.
+        self.assertTrue(
             w.approved(
                 self.ctx.state,
                 w.git("rev-parse", "HEAD"),
                 w.git("rev-parse", "origin/main"),
             )
         )
+        with self.assertRaisesRegex(w.Error, "verification"):
+            w.verification_current(
+                self.ctx.state,
+                w.git("rev-parse", "HEAD"),
+                w.git("rev-parse", "origin/main"),
+            )
 
     def test_handoff_recovers_from_a_separate_clone(self):
         self.ready()

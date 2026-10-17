@@ -18,14 +18,14 @@ import uuid
 
 import board
 import codex_review
+import review_policy as policy
 
 MARK = "work-issue-checkpoint:v1"
 PR_MARK = "work-issue-pr:v1"
 MAX_CHECKPOINT_BYTES = 60000  # Below GitHub's comment limit, including all metadata.
 
 
-class Error(Exception):
-    pass
+Error = policy.Error
 
 
 def run(args, **kwargs):
@@ -248,7 +248,7 @@ def remote_state(gh, number):
     if (
         state.get("repo") != board.REPO
         or state.get("issue") != number
-        or state.get("version") != 1
+        or state.get("version") not in (1, 2)
     ):
         raise Error("checkpoint belongs to another task or schema")
     return state, c
@@ -292,51 +292,13 @@ def relation(body, number):
 def fresh_base(base):
     if not re.fullmatch(r"origin/[A-Za-z0-9_./-]+", base) or ".." in base:
         raise Error("base must be an origin branch")
-    if codex_review.behind(base, env=codex_review.clean_env(dict(os.environ))):
-        raise Error("branch is behind its current base; rebase and verify first")
+    codex_review.behind(base, env=codex_review.clean_env(dict(os.environ)))
     return git("rev-parse", base)
 
 
-def completed(state, phase):
-    return sum(
-        r["status"] == "completed" and r["phase"] == phase
-        for r in state.get("reviews", [])
-    )
-
-
-def budget(state, phase):
-    if any(r["status"] == "pending" for r in state.get("reviews", [])):
-        raise Error("pending review: recover it before another invocation")
-    count = completed(state, phase)
-    if phase == "code" and count >= 3 and not state.get("triage"):
-        third = [
-            r
-            for r in state["reviews"]
-            if r["phase"] == "code" and r["status"] == "completed"
-        ][2]
-        if third["outcome"] != "approve":
-            raise Error("third code review requires triage checkpoint")
-    limit = {"docs": 1, "plan": 2, "code": 5}[phase]
-    if count >= limit and not any(
-        a["phase"] == phase and a["round"] == count + 1
-        for a in state.get("authorizations", [])
-    ):
-        raise Error(
-            f"{phase} budget exhausted; owner decision required for round {count + 1}"
-        )
-
-
-def approved(state, head, base):
-    reviews = [r for r in state.get("reviews", []) if r["phase"] in ("code", "docs")]
-    return bool(
-        reviews
-        and reviews[-1].get("valid", True)
-        and reviews[-1]["status"] == "completed"
-        and reviews[-1]["outcome"] == "approve"
-        and reviews[-1]["unresolved"] == 0
-        and reviews[-1]["commit"] == head
-        and reviews[-1]["base_sha"] == base
-    )
+completed = policy.count
+budget = policy.budget
+approved = policy.approved
 
 
 def exception(gh, number, head, base):
@@ -509,7 +471,10 @@ class Task:
                     raise Error("existing PR uses another branch; resume its worktree")
                 branch = current
             self.state = {
-                "version": 1,
+                "version": 2,
+                "policy_version": 2,
+                "findings": {},
+                "migration": {"from": None, "history": {}},
                 "repo": board.REPO,
                 "issue": self.number,
                 "revision": str(uuid.uuid4()),
@@ -574,6 +539,8 @@ class Task:
             for p in pulls(self.gh)
         )
         self.gh.move(self.number, "In review" if finishing else "In progress")
+        if not any(r["status"] == "pending" for r in self.state["reviews"]):
+            self.migrate(session)
         return self.state
 
     def check_tree(self, session):
@@ -596,7 +563,7 @@ class Task:
             "checkpoint": data,
             "commit": head,
             "verification_commit": head,
-            "verification_base": git("rev-parse", self.state["base"]),
+            "verification_base": fresh_base(self.state["base"]),
             "verification_dirty": bool(git("status", "--porcelain")),
         }
         checkpoint_body(candidate)
@@ -611,8 +578,6 @@ class Task:
         fresh_base(base)
         if base != self.state["base"]:
             self.state["base"] = base
-            for receipt in self.state["reviews"]:
-                receipt["valid"] = False
             self.state["verification_base"] = None
             self.save()
             self.publish()
@@ -635,11 +600,117 @@ class Task:
         self.save()
         self.publish()
 
-    def review(self, session, phase, focus):
+    def migrate(self, session):
+        self.own(session)
+        if self.state["version"] == 2:
+            return
+        candidate = policy.migrate(self.state)
+        backup = self.directory / f"{self.number}.v1-backup.json"
+        if not backup.exists():
+            atomic(backup, self.state)
+        self.state = candidate
+        self.save()
+        self.publish()
+
+    def authorize(self, session, phase, round_, comment, kind="authorize"):
+        self.own(session)
+        authorize_check(self.gh, self.number, phase, round_, comment, kind)
+        a = {"phase": phase, "round": round_, "comment": comment}
+        if kind == "ceiling":
+            if round_ < completed(self.state, phase):
+                raise Error("ceiling cannot erase completed reviews")
+            self.state.setdefault("ceilings", {})[phase] = a
+        elif kind == "retry":
+            a["failed_ids"] = [
+                r["id"]
+                for r in self.state["reviews"]
+                if r["phase"] == phase and r["status"] == "failed"
+            ]
+            self.state.setdefault("retry_authorizations", {})[phase] = a
+        elif a not in self.state["authorizations"]:
+            self.state["authorizations"].append(a)
+        self.save()
+        self.publish()
+
+    def dispose(self, session, fid, data):
+        self.check_tree(session)
+        self.migrate(session)
+        public_safe(json.dumps(data))
+        head, base = git("rev-parse", "HEAD"), fresh_base(self.state["base"])
+        candidate = json.loads(json.dumps(self.state))
+        event = policy.disposition(candidate, fid, data, head, base)
+        if event["status"] == "excepted":
+            finding_exception(self.gh, self.number, fid, event["comment"], head, base)
+        checkpoint_body(candidate)
+        self.state = candidate
+        self.save()
+        self.publish()
+
+    def integrate(self, session, receipt_id, rationale, material=False):
         self.check_tree(session)
         if git("status", "--porcelain"):
+            raise Error("commit all changes before integration validation")
+        public_safe(rationale)
+        head, base = git("rev-parse", "HEAD"), fresh_base(self.state["base"])
+        merge_base = git("merge-base", head, base)
+        if merge_base != base:
+            raise Error(
+                "current target is not incorporated; integrate it, verify affected behavior and review the result"
+            )
+        verification_current(self.state, head, base)
+        candidate = {
+            **self.state,
+            "integration": {
+                "head": head,
+                "base": base,
+                "merge_base": merge_base,
+                "receipt": receipt_id,
+                "rationale": rationale,
+                "material_change": material,
+            },
+        }
+        readiness(candidate, head, base, self.gh, self.number)
+        self.state = candidate
+        self.save()
+        self.publish()
+
+    def review(
+        self,
+        session,
+        phase,
+        focus,
+        scope="initial",
+        prior=None,
+        verifies=None,
+        rationale="",
+        material=False,
+        comparison=None,
+    ):
+        self.check_tree(session)
+        self.migrate(session)
+        if git("status", "--porcelain"):
             raise Error("commit all changes before review")
-        budget(self.state, phase)
+        round_ = budget(self.state, phase)
+        auth = policy.authorization(self.state, phase, round_)
+        if auth:
+            authorize_check(self.gh, self.number, phase, round_, auth["comment"])
+        ceiling = self.state.get("ceilings", {}).get(phase)
+        if ceiling:
+            authorize_check(
+                self.gh,
+                self.number,
+                phase,
+                ceiling["round"],
+                ceiling["comment"],
+                "ceiling",
+            )
+        # Validate all previous counts before spending, including historical exceptions.
+        policy.check_ledger(
+            self.state,
+            lambda ph, rd, c, kind: authorize_check(
+                self.gh, self.number, ph, rd, c, kind
+            ),
+        )
         if phase == "docs" and any(
             Path(p).suffix not in (".md", ".txt")
             for p in git(
@@ -647,22 +718,75 @@ class Task:
             ).splitlines()
         ):
             raise Error("executable changes require the code phase, not docs")
-        base = self.state["base"]
-        base_sha = fresh_base(base)
+        if comparison and phase != "plan":
+            raise Error(
+                "a custom comparison commit is only supported for plan-only review"
+            )
+        base_sha = fresh_base(self.state["base"])
+        if comparison:
+            base_sha = git("rev-parse", "--verify", comparison + "^{commit}")
+        head = git("rev-parse", "HEAD")
         r = {
             "id": str(uuid.uuid4()),
             "phase": phase,
-            "commit": git("rev-parse", "HEAD"),
-            "base": base,
+            "commit": head,
+            "base": comparison or self.state["base"],
             "base_sha": base_sha,
+            "merge_base": git("merge-base", head, base_sha),
             "status": "pending",
             "outcome": "pending",
-            "unresolved": 0,
+            "policy_version": 2,
+            "receipt_version": 2,
+            "scope": scope,
+            "prior": prior or [],
+            "verifies": verifies or [],
+            "rationale": rationale,
+            "material_change": material,
         }
+        public_safe(json.dumps(r))
+        if scope not in policy.SCOPES or (material and scope != "initial"):
+            raise Error("material changes require initial scope; unknown scope refused")
+        if scope != "initial" and (not r["prior"] or not rationale.strip()):
+            raise Error(
+                "focused review needs prior receipts and a continuity rationale"
+            )
+        for ident in r["prior"]:
+            previous = policy.receipt(self.state, ident)
+            if previous["phase"] != phase:
+                raise Error("prior receipt has another phase")
+            if scope == "follow-up" and previous["base_sha"] != base_sha:
+                raise Error("target changed; use integration or renewed initial scope")
+        if any(fid not in self.state["findings"] for fid in r["verifies"]):
+            raise Error("unknown finding to verify")
+        report = self.directory / (r["id"] + ".json")
+        context = self.directory / (r["id"] + ".context.json")
+        # Restricted context is not copied into the public checkpoint or PR.
+        previous_context = []
+        for ident in r["prior"]:
+            path = self.directory / (ident + ".json")
+            if scope != "initial" and not path.exists():
+                raise Error(
+                    "prior raw report unavailable; recover it privately or use initial scope"
+                )
+            previous_context.append(
+                {
+                    "receipt": policy.receipt(self.state, ident),
+                    "report": json.loads(path.read_text())
+                    if path.exists()
+                    else "unavailable; recover privately or broaden review",
+                }
+            )
+        atomic(
+            context,
+            {
+                "prior": previous_context,
+                "findings": {fid: self.state["findings"][fid] for fid in r["verifies"]},
+            },
+        )
         self.state["reviews"].append(r)
         self.save()
         self.publish()
-        report = self.directory / (r["id"] + ".json")
+        instruction = review_focus(r, focus, context)
         with report.open("w") as f:
             os.chmod(report, 0o600)
             p = subprocess.run(
@@ -670,15 +794,18 @@ class Task:
                     sys.executable,
                     str(Path(__file__).with_name("codex_review.py")),
                     "--json",
+                    "--head",
+                    head,
                     "--base",
-                    base,
+                    base_sha,
                     "--scope",
                     "branch",
-                    focus,
+                    instruction,
                 ],
                 stdout=f,
                 stderr=subprocess.DEVNULL,
                 env=codex_review.clean_env(dict(os.environ)),
+                umask=0o077,
             )
             f.flush()
             os.fsync(f.fileno())
@@ -701,14 +828,29 @@ class Task:
             payload.get("codex", {}).get("status") == 0
             and result.get("verdict") in ("approve", "needs-attention")
             and isinstance(result.get("findings"), list)
+            and all(isinstance(f, dict) for f in result.get("findings", []))
             and not payload.get("parseError")
+            and (
+                r.get("policy_version", 1) == 1
+                or payload.get("inputs")
+                == {
+                    "head": r["commit"],
+                    "base": r["base_sha"],
+                    "merge_base": r["merge_base"],
+                }
+            )
         ):
             r.update(
                 status="completed",
                 outcome=result["verdict"],
-                unresolved=len(result["findings"]),
                 round=completed(self.state, r["phase"]) + 1,
             )
+            if r.get("policy_version") == 2:
+                r["finding_count"] = len(result["findings"])
+                r["inputs"] = payload["inputs"]
+                policy.register_result(self.state, r, result)
+            else:
+                r["unresolved"] = len(result["findings"])
         elif failed:
             r.update(status="failed", outcome="unavailable")
         else:
@@ -725,11 +867,8 @@ class Task:
         public_safe(title + "\n" + body)
         head = git("rev-parse", "HEAD")
         base_sha = fresh_base(self.state["base"])
-        verification_current(self.state, head, base_sha)
-        if not approved(self.state, head, base_sha) and not pending:
-            raise Error(
-                "current head/base lacks approval; review or submit --pending for an owner decision"
-            )
+        if not pending:
+            readiness(self.state, head, base_sha, self.gh, self.number)
         expected = "fixes" if kind == "fixes" else "part of"
         if relation(body, self.number) not in (None, expected):
             raise Error("PR issue relationship contradicts --relation")
@@ -795,7 +934,7 @@ def verification_current(state, head, base):
         or state.get("verification_dirty")
     ):
         raise Error(
-            "verification is missing or stale; checkpoint actual results after committing and rebasing"
+            "verification is missing or stale; checkpoint actual results for the exact committed revision and fetched target"
         )
 
 
@@ -828,43 +967,66 @@ def validate_pr(number, gh):
         raise Error("checkpoint missing or replaced")
     if evidence.get("pending") or not approved(s, head, base):
         raise Error("review missing, stale, failed or unresolved")
-    verification_current(s, head, base)
-    for phase, limit in [("docs", 1), ("plan", 2), ("code", 5)]:
-        done = [
-            r
-            for r in s["reviews"]
-            if r["phase"] == phase and r["status"] == "completed"
-        ]
-        if [r["round"] for r in done] != list(range(1, len(done) + 1)):
-            raise Error("inconsistent review counts")
-        for round_ in range(limit + 1, len(done) + 1):
-            auth = [
-                a
-                for a in s.get("authorizations", [])
-                if a["phase"] == phase and a["round"] == round_
-            ]
-            if not auth:
-                raise Error("review budget exceeded without owner authorization")
-            authorize_check(gh, n, phase, round_, auth[0]["comment"])
-    if completed(s, "code") > 3 and not s.get("triage"):
-        third = [
-            r
-            for r in s["reviews"]
-            if r["phase"] == "code" and r["status"] == "completed"
-        ][2]
-        if third["outcome"] != "approve":
-            raise Error("third-round triage missing")
+    readiness(s, head, base, gh, n)
+    if s.get("version") == 2:
+        comparison = gh.api(f"repos/{board.REPO}/compare/{base}...{head}")
+        if (
+            comparison.get("status") not in ("ahead", "identical")
+            or comparison.get("merge_base_commit", {}).get("sha") != base
+        ):
+            raise Error("live target is not incorporated into the reviewed head")
     return "issue and review contract verified"
 
 
-def authorize_check(gh, n, phase, round_, comment):
+def authorize_check(gh, n, phase, round_, comment, kind="authorize"):
     c = next((c for c in comments(gh, n) if c["id"] == comment), None)
     if (
         not c
-        or f"work-issue authorize {board.REPO}#{n} {phase} {round_}"
+        or f"work-issue {kind} {board.REPO}#{n} {phase} {round_}"
         not in gh.trusted(c)["body"].splitlines()
     ):
         raise Error("missing exact owner authorization")
+
+
+def finding_exception(gh, n, fid, comment, head, base):
+    c = next((c for c in comments(gh, n) if c["id"] == comment), None)
+    expected = f"work-issue finding-exception {board.REPO}#{n} {fid} {head} {base}"
+    if not c or expected not in gh.trusted(c)["body"].splitlines():
+        raise Error("missing exact owner finding exception")
+
+
+def readiness(state, head, base, gh, number):
+    verification_current(state, head, base)
+    policy.check_ledger(
+        state, lambda ph, rd, c, kind: authorize_check(gh, number, ph, rd, c, kind)
+    )
+    if not approved(state, head, base):
+        raise Error("review missing, stale, failed, unclassified or blocking")
+    if state.get("version") == 2:
+        policy.integration_current(state, head, base)
+        if not policy.findings_ready(
+            state,
+            head,
+            base,
+            lambda fid, c, h, b: finding_exception(gh, number, fid, c, h, b),
+        ):
+            raise Error("finding disposition is unresolved")
+
+
+def review_focus(r, focus, context):
+    scopes = {
+        "initial": "Review the complete logical change, requirements, surrounding code and important invariants.",
+        "follow-up": "Focused follow-up: verify prior findings, intervening fixes, their tests and affected behavior/callers. Do not restart an unrestricted architectural review. Identify any new serious defect you discover.",
+        "integration": "Integration review: examine target-branch changes, conflict resolutions, callers, dependencies, configuration and shared invariants since the referenced receipts. Unchanged patches alone do not prove equivalent behavior.",
+    }
+    return (
+        f"Phase: {r['phase']}. Scope: {r['scope']}. {scopes[r['scope']]} "
+        f"Immutable inputs: head={r['commit']} comparison={r['base_sha']} merge-base={r['merge_base']}. "
+        f"Read restricted prior context at {context}. Prior receipts: {r['prior']}; finding IDs: {r['verifies']}. "
+        "Preserve a repeated finding's opaque F- ID in its title. Distinguish blocking defects from optional improvements; provide evidence, consequences, severity and confidence separately. "
+        "Report missing critical context rather than inventing an approval. This branch review does not assert current integration readiness. "
+        f"Continuity rationale: {r['rationale']}. Focus: {focus}"
+    )
 
 
 def main(argv=None):
@@ -879,6 +1041,11 @@ def main(argv=None):
         "recover",
         "triage",
         "authorize",
+        "ceiling",
+        "retry",
+        "migrate",
+        "dispose",
+        "integrate",
         "submit",
         "complete",
     ]:
@@ -891,14 +1058,28 @@ def main(argv=None):
             s.add_argument("--base")
         if name == "base":
             s.add_argument("--base", required=True)
-        if name in ("checkpoint", "triage"):
+        if name in ("checkpoint", "triage", "dispose"):
             s.add_argument("--file", type=Path, required=True)
         if name == "review":
             s.add_argument("--phase", choices=["docs", "plan", "code"], required=True)
             s.add_argument("--focus", required=True)
+            s.add_argument("--scope", choices=policy.SCOPES, default="initial")
+            s.add_argument("--prior", action="append", default=[])
+            s.add_argument("--verifies", action="append", default=[])
+            s.add_argument("--rationale", default="")
+            s.add_argument("--material-change", action="store_true")
+            s.add_argument(
+                "--comparison", help="immutable comparison commit for plan-only review"
+            )
+        if name == "dispose":
+            s.add_argument("--finding", required=True)
+        if name == "integrate":
+            s.add_argument("--receipt", required=True)
+            s.add_argument("--rationale", required=True)
+            s.add_argument("--material-change", action="store_true")
         if name == "recover":
             s.add_argument("--failed", action="store_true")
-        if name == "authorize":
+        if name in ("authorize", "ceiling", "retry"):
             s.add_argument("--phase", choices=["docs", "plan", "code"], required=True)
             s.add_argument("--round", type=int, required=True)
             s.add_argument("--comment", type=int, required=True)
@@ -943,7 +1124,20 @@ def main(argv=None):
             elif a.action == "release":
                 t.release(a.session)
             elif a.action == "review":
-                print("Private local report:", t.review(a.session, a.phase, a.focus))
+                print(
+                    "Private local report:",
+                    t.review(
+                        a.session,
+                        a.phase,
+                        a.focus,
+                        a.scope,
+                        a.prior,
+                        a.verifies,
+                        a.rationale,
+                        a.material_change,
+                        a.comparison,
+                    ),
+                )
             elif a.action == "recover":
                 t.recover(a.session, a.failed)
             elif a.action == "submit":
@@ -965,14 +1159,14 @@ def main(argv=None):
                 t.state["triage"] = note
                 t.save()
                 t.publish()
-            elif a.action == "authorize":
-                t.own(a.session)
-                authorize_check(t.gh, n, a.phase, a.round, a.comment)
-                t.state["authorizations"].append(
-                    {"phase": a.phase, "round": a.round, "comment": a.comment}
-                )
-                t.save()
-                t.publish()
+            elif a.action in ("authorize", "ceiling", "retry"):
+                t.authorize(a.session, a.phase, a.round, a.comment, a.action)
+            elif a.action == "migrate":
+                t.migrate(a.session)
+            elif a.action == "dispose":
+                t.dispose(a.session, a.finding, json.loads(a.file.read_text()))
+            elif a.action == "integrate":
+                t.integrate(a.session, a.receipt, a.rationale, a.material_change)
         return 0
     except (
         Error,

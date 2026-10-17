@@ -21,23 +21,25 @@ as a scoped issue before implementation; do not ask again for selection.
 - Every independently deliverable task has an issue. Fix defects introduced
   by the current task on its branch and record them in its PR, without extra
   issues. Independent fixes and follow-ups get separate issues/PRs. Ask the
-  owner before doing unrelated work or expanding scope. A pre-existing defect
-  required by the task in otherwise untouched code gets its own prerequisite
-  PR; merge that first, then rebase, retest and review the dependent change.
-- One change per PR. Parallel work touches separate files/areas; overlapping
-  changes wait. Stacks name their parent base, then rebase and review on main.
+  owner before doing unrelated work or expanding scope.
+- Keep one coherent outcome and its verification together. Split independently
+  useful, risky or revertible work. Parallel work considers shared contracts
+  and state as well as files. Retargeted stacks need integration evidence.
 - `Part of #N` is partial work; `Fixes #N` is finishing work. In review needs a
   finishing PR; Done needs that fix on main. An open PR or intermediate merge
   is not Done. Duplicates name their original; not-planned closures record the
   owner's decision and reason. Neither claims a delivered implementation.
 - Use the helper's persistent session claim and checkpoint; never silently
   take over active work. Locks coordinate linked worktrees in one clone only.
-- Every PR gets an adversarial Codex review. State/protocol/concurrency/security
-  changes have a reviewed plan before code. Read `docs/review-policy.md` at
-  that point. Docs/process: one round; plan: two; code: sort findings after
-  round three, stop at five. Owner exceptions are explicit and durable.
-  Failed/unavailable reviews are limitations. Commit/base changes invalidate
-  approval without resetting budgets; preserve base freshness checks.
+- Merge readiness requires independent adversarial review, resolved blockers,
+  actual affected-surface verification and current integration evidence. Drafts
+  may precede review. Design review is required for materially changed behavior
+  or guarantees. Read `docs/review-policy.md` on demand: phase and scope differ;
+  docs one, plans two, code three autonomous; later code rounds need scoped
+  owner authorization. Historical budgets and outcomes survive migration.
+  Behind-base review is permitted against immutable inputs; changed revisions
+  require explicit continuity/integration evidence. Optional suggestions alone
+  do not require another round. Failed/unavailable reviews approve nothing.
 - Security findings stay in the affected repository's GitHub Draft Security Advisories until the owner explicitly authorizes disclosure,
   never public issues, cards or checkpoints. A neutral, owner-authorized
   exception supports issue-free private fixes; see `docs/issue-workflow.md`.

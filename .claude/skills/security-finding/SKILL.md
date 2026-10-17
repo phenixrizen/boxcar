@@ -6,7 +6,7 @@ argument-hint: "[list|read|search|create|update|close] [GHSA identifier]"
 
 # Security finding
 
-This draft's helper implementation is pending an owner plan-budget decision.
+The advisory helper remains unimplemented under the broader task; this review-policy amendment does not implement it.
 If `scripts/security_advisory.py` is absent, stop and report that limitation;
 do not record findings elsewhere or claim these operations ran.
 
