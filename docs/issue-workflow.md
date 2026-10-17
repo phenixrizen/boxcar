@@ -2,7 +2,7 @@
 
 ## Claude entry point
 
-From this repository in Claude:
+From the selected task worktree in Claude:
 
 ```text
 /memory
@@ -18,7 +18,10 @@ The repository skill is distinct from bundled commands. Both repositories use
 some configurations; absence of CLAUDE.md alone does not prove instructions
 are missing. In `/memory`, inspect loaded files and confirm this worktree's
 CLAUDE.md and imported AGENTS.md; inspect exclusions and Project instructions
-if absent. Restart after adding a skill if it does not appear in `/` completion.
+if absent. Establish the task worktree before implementation; an old detached
+checkout or unrelated feature branch can still load obsolete instructions. Do not
+reset unrelated work to update its instructions. Re-enter the selected worktree
+and inspect its current contract. Restart after adding a skill if it does not appear in `/` completion.
 See [Claude memory](https://code.claude.com/docs/en/memory) and
 [skills](https://code.claude.com/docs/en/skills). Architecture/check catalogs
 are links, not imports, so they do not all load at startup.
@@ -42,7 +45,7 @@ python3 scripts/work_issue.py complete phenixrizen/boxcar#43
 
 A checkpoint file contains these four strings (actual results, not planned tests).
 The complete public checkpoint, including review history and triage, is limited
-to 60,000 UTF-8 bytes before anything is saved. Summarize lengthy test output;
+to 65,000 UTF-8 bytes before anything is saved. Summarize lengthy test output;
 do not trim review history to fit. A rejected oversized edit leaves the previous
 checkpoint intact, so a shorter correction can be submitted normally.
 For submission, record results after the implementation is committed; verification
@@ -63,7 +66,10 @@ ledger, and base. It updates one owner-authored comment marked
 read linked plans and dependency issues explicitly. Owner-authorized selection
 and acceptance criteria require judgment; a script cannot infer them from a
 Ready card. Search before creating an issue for a direct feature request.
-Use `gh issue create --body-file` and the task template. No backlog polling.
+Use `gh issue create --body-file` and the task template for owner-selected outcomes
+or demonstrated independent actionable defects. Necessary fixes stay in the task;
+optional suggestions stay dispositions. Do not create issues for every review claim.
+No backlog polling.
 
 ## Durability and coordination
 
@@ -107,7 +113,9 @@ submit retargets the existing PR rather than opening another.
 ## Review evidence, dispositions and integration
 
 Read [review-policy.md](review-policy.md) when reviewing. Phase and scope are
-separate; the helper records policy/schema 2 without resetting historical rounds.
+separate. Existing checkpoints retain their recorded policy and cumulative history.
+Policy/schema 3 is an explicit deliverable migration after the validator rollout
+below; `start`, a branch change or a new session never resets spending.
 Initial, follow-up and integration scopes use the installed plugin's supported
 focus text, not invented plugin arguments. Branch review uses an immutable detached
 snapshot and records actual head, comparison base and merge base. Behind-base
@@ -143,25 +151,69 @@ append a sanitized disposition with `dispose --finding F-ID --file FILE`:
 ```
 
 Categories/statuses and downgrade restrictions are in review-policy.md.
-Independent work adds `tracking: "owner/repo#N"`. Never put private technical
+A demonstrated independent actionable defect adds `tracking: "owner/repo#N"`
+after searching for an existing issue. Optional suggestions need no issue and
+remain `nonblocking` with a reason; unverified claims remain concerns. Never put private technical
 claims in this file: its fields are published. A specific exception uses status
 `excepted`, its comment ID, and an owner-authored/latest-edited exact issue line:
 `work-issue finding-exception REPO#N F-ID HEAD_SHA BASE_SHA`.
 Original reviewer verdicts remain unchanged; optional findings need no new round.
 
-Docs/process allow one review; plans two; code three autonomously. Round four,
-five and each later round need scoped permission. A triage note is not permission.
-The owner posts an exact line, then the agent records it through `authorize`:
+Spending limits and new-deliverable boundaries are defined only in
+[review-policy.md](review-policy.md). Existing policy-2 ledgers use cumulative
+round grants; preserve those grants during this bootstrap. An actual owner instruction
+authorizes the agent, using the authenticated owner's identity, to record its source
+and exact grant lines in one comment with `gh issue comment --body-file`, then record
+them through `authorize`. Do not request the same approval again or require the
+owner to type machine syntax. Other actors cannot self-issue an owner grant:
 
 ```text
-work-issue authorize phenixrizen/boxcar#43 PHASE ROUND
+work-issue authorize REFERENCE PHASE ROUND
 ```
 
 `authorize REFERENCE --session SESSION --phase PHASE --round ROUND --comment ID`
-checks current author/editor and exact scope. A narrower allowance uses an exact
-`work-issue ceiling REFERENCE PHASE LAST_ROUND` line and the `ceiling` command
-with the same arguments. Changing that ceiling requires another explicit owner
-instruction; an existing generic budget never expands a narrower allowance.
+checks current author/editor and exact scope. A narrower allowance uses
+`work-issue ceiling REFERENCE PHASE LAST_ROUND` and the `ceiling` command with the
+same arguments. Record every round in one bounded owner instruction upfront when
+an extension is authorized. A generic policy cannot expand a narrower allowance.
+A triage note, new branch or session does not grant spending.
+For schema 3, append the active deliverable's `binding` to both authorization and
+ceiling lines. The helper verifies that exact scope; unused older grants cannot
+fund another outcome. Legacy lines remain valid only for their historical scope.
+
+After trusted main supports schema 3, prepare a deliverable JSON file containing
+`id`, `outcome` and `acceptance`. A direct owner request or approved plan for that
+outcome authorizes the default bounded grant. Preview its exact line, record it
+with the real source instruction using the authenticated owner's identity and a
+body file, then activate using that owner-authored/latest-edited comment:
+
+```bash
+python3 scripts/work_issue.py deliverable REFERENCE --session SESSION --file /tmp/deliverable.json --preview
+# Record the actual owner instruction and: work-issue deliverable REFERENCE ORDINAL BINDING
+python3 scripts/work_issue.py deliverable REFERENCE --session SESSION --file /tmp/deliverable.json --comment COMMENT_ID
+```
+
+The binding covers the scope and preceding attempt IDs. It establishes only the
+explicit owner-scoped outcome; it cannot silently restart an exhausted deliverable.
+Lifetime receipts/counts remain intact. Reusing the same boundary cannot replenish
+its allowance. Existing issues can hold successive authorized outcomes without
+creating another task just for bookkeeping.
+
+A focused review can reconcile earlier dispositions as a batch. Supply JSON
+`{"findings": ["F-ID"], "rationale": "What changed and why this review covers it"}`
+to `carry REFERENCE --session SESSION --receipt ID --file FILE`. It verifies the
+identified batch against the current reviewed inputs, retaining original events.
+The review captures disposition/source digests before invocation. Later resolutions
+cannot be attributed to that earlier review. Transferred source reports must match
+their receipt's result digest and immutable inputs; unverifiable legacy reports
+require reconciliation through a new initial review, not automatic carry-forward.
+It cannot carry unresolved findings or fabricate evidence. For strictly allowed
+license-header-only changes at an unchanged target, use
+`continuity REFERENCE --session SESSION --receipt ID`. This accepts only insertion
+of the two fixed header lines in existing regular `.py` files with every other
+byte, path and mode unchanged; it refuses encoding cookies/BOMs and docs/instruction
+changes. Checkpoint current test results first. Behavior-changing or unexplained
+changes need applicable independent review. Both operations preserve prior receipts.
 
 Interrupted attempts block spending. `recover` reads a completed result once;
 `recover --failed` is only for a confirmed stopped invocation lacking a result.
@@ -176,8 +228,10 @@ CI to validate historical invocations.
 attempt IDs, original outcomes, counts and authorizations. It records legacy
 receipt digests and unclassified findings, with a local `N.v1-backup.json`.
 Pending legacy attempts must recover first; `migrate` can then run explicitly.
-Historic policy-1 rounds stay under their original rules; new reviews use policy 2.
-Neither handoff nor rebase resets counts. Old clients detect schema 2 and stop.
+Historic policy-1 rounds stay under their original rules. Existing schema-2 tasks
+continue under policy 2 until explicitly migrated; schema-3 deliverables use their
+recorded boundary. Neither handoff nor rebase resets lifetime counts. Older clients
+stop on unsupported schemas instead of replacing remote history.
 Restricted raw reports do not travel via public checkpoints; transfer them
 privately when focused review needs them, or use an authorized initial review.
 
@@ -217,9 +271,9 @@ work-issue exception HEAD_SHA BASE_SHA
 ```
 
 CI accepts that exact owner-authored attestation for that revision/base without
-publishing the reason or linking a private document. It is also the explicit
-mechanism for an owner decision to merge final-round fixes without another
-review. Do not publish sensitive descriptions, logs, IDs, or private URLs in
+publishing the reason or linking a private document. It requires a specific
+owner decision; spending exhaustion or a general merge instruction is not such
+an exception. Do not publish sensitive descriptions, logs, IDs, or private URLs in
 exception metadata. Ordinary agents cannot self-authorize an exception.
 
 ## GitHub setup and observed settings (2026-10-17)
@@ -256,10 +310,11 @@ existing checks the owner chooses. Protect workflow/helper changes with owner
 review. Do not replace unrelated settings or imply these were configured.
 
 The contract workflow uses `pull_request_target` with read-only permissions and
-checks out only main; it never executes PR files. The new bootstrap workflow
-cannot run from main before this PR merges. Validate these initial PRs with
-`python3 scripts/work_issue.py ci --pr PR_NUMBER` locally. Separate ordinary PR
-CI runs helper tests. Once installed, comment edits alone do not trigger it.
+checks out only main; it never executes PR files. The initial workflow PR has
+merged and installed the schema-2 validator on main. Local validation remains
+available through `python3 scripts/work_issue.py ci --pr PR_NUMBER`; it is not
+a substitute for the actual PR check. Separate ordinary PR CI runs helper tests.
+Comment edits alone do not trigger the trusted-main contract workflow.
 Find the existing run through the PR's Checks tab or `gh pr checks PR_NUMBER
 --repo phenixrizen/boxcar --json name,link`. Rerun that run with `gh run rerun
 RUN_ID --repo phenixrizen/boxcar --failed`, wait with `gh run watch RUN_ID
@@ -268,9 +323,23 @@ with `gh pr checks`. A separate manually dispatched run is not a replacement
 for the PR's failed check. If no PR-associated check appears, leave this check
 out of branch requirements and resolve that association before enabling it.
 
-Schema rollout: the candidate validator accepts v1 and v2 evidence, but a v1
-validator installed on main rejects schema 2. This is intentional fail-closed
-compatibility. Local candidate validation is not an enforced GitHub check. Deploy
-the trusted validator through the owner's normal merge process before requiring
-schema-2 checks; no branch protection or checks are waived by this amendment.
-Both partial task PRs remain drafts while broader advisory work is incomplete.
+Schema rollout: the installed main validator accepts v1/v2 evidence. This amendment
+adds schema-3 support while retaining both. Keep this amendment's live checkpoints
+schema 2 and use its recorded bounded cumulative allowance. Merge the compatible
+validator first, verify its actual PR check, then explicitly activate schema-3
+deliverables and update returning clones. Candidate local validation alone cannot
+make schema 3 acceptable to the older trusted-main check. Do not execute PR helpers
+in that privileged workflow or erase history to bypass compatibility. Repository-file
+workflows do not make a required merge check; branch protections remain an owner
+setting. Finish the software deliverable when ready and authorized; remaining
+private disclosure/source-retirement decisions stay in their existing records.
+
+### Confidential workspace routing
+
+The advisory helper is implemented separately in `scripts/security_advisory.py`.
+Use `/security-finding` and `/work-security` and read `docs/security-workflow.md`.
+Issue, Project and PR API helpers refuse confidential clone markers before network
+operations. Private independent findings use advisory tracking through a distinct
+policy-validator mode; ordinary CI retains issue-only references. No raw review
+transcripts belong in public artifacts. The privileged validator continues to load
+trusted main only; public CI does not validate confidential-fork remediation.

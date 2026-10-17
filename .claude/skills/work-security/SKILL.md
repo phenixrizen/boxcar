@@ -6,10 +6,10 @@ argument-hint: "[owner/repo] [GHSA-xxxx-yyyy-zzzz]"
 
 # Work security
 
-The advisory helper remains unimplemented under the broader task; this review-policy amendment does not implement it.
-If `scripts/security_advisory.py` is absent, stop and report that limitation;
-do not record findings elsewhere or claim these operations ran.
-
+Use the implemented `scripts/security_advisory.py` operations below. This is a
+repository skill, not a Claude built-in. Read the guide's exact JSON schemas and
+restricted output requirements before invoking it. Never claim an operation
+succeeded until its verified read-back completes.
 
 This is separate from `/work-issue`. Read `docs/security-workflow.md` and
 `docs/review-policy.md`. Retrieve the advisory using `security_advisory.py read`
@@ -17,7 +17,11 @@ and inspect its restricted output file. No public issue, Project card or PR.
 
 - Verify native draft state, internal status, owner authorization and its
   approved scope. No security fix starts without that authorization. If absent
-  or changed, ask the owner privately; never infer permission from discovery,
+  or changed, ask the owner privately; a new machine or out-of-band advisory edit
+  also requires explicit current owner reconfirmation of the exact record and
+  ledger via `authorize` for a released handoff. If an active record changes,
+  use the documented exact-snapshot owner `reconcile` path; retain pending attempts
+  and confirm stopped invocations before recovery. A stored author field is not proof. Never infer permission from discovery,
   a Confirmed status, passing tests or authorization for ordinary development.
 - Read the original claim, technical evidence, plan, dependencies, previous
   attempts and decisions. A review claim is not a proven vulnerability.
@@ -36,14 +40,22 @@ and inspect its restricted output file. No public issue, Project card or PR.
   and do not upload transcripts or raw reviews to public Actions artifacts.
 - Use the advisory helper's private `review` operation: it invokes the existing
   Codex review helper and records phase/head/base/count/outcome privately.
-  Follow policy 2: docs one, plans two, code three autonomous; each later
-  code round requires scoped owner authorization. Phase and review scope are
-  separate; findings need evidence-backed dispositions and current integration. Failed/unavailable reviews are never passes. Recover interrupted
-  attempts before another round; a session change does not reset the budget.
-- Record findings from that review in the same advisory when related, or search
-  and create a separate draft for an independent credible finding. Preserve
-  the owner decision for unrelated work. Keep verification and dispositions.
-- When fixed and verified, update internal status to Fixed, awaiting disclosure;
+  Follow `docs/review-policy.md`; the guide identifies the private helper's supported
+  ledger version and migration limits. Existing authorization/resume never creates
+  a fresh allowance: explicit `deliverable` records an already owner-authorized
+  outcome using a trusted private input file. Use `carry` for a reviewed batch of
+  resolved findings; exact schemas are in the guide. Phase and scope are separate. Persist
+  evidence-backed dispositions and current integration; optional suggestions need
+  no extra round. Recover interrupted attempts before spending again. Record the
+  owner's bounded allowance upfront; sessions and branches never reset it. Stop at
+  readiness or present one consolidated spending decision. Unavailable reviews
+  approve nothing.
+- Keep related claims, necessary fixes and their tests in the same remediation.
+  Search existing drafts before recording a separate credible security finding;
+  optional suggestions remain dispositions. Preserve unconfirmed claims and the
+  owner's decision on unrelated work; never convert them into public issues.
+- When fixed and verified, use `verified` to validate integration evidence and
+  set internal status to Fixed, awaiting disclosure;
   leave native state draft. Never open a public PR automatically. The owner
   explicitly decides when and how to disclose and move the patch into public
   history. Publication and CVE requests are deliberately outside these helpers.

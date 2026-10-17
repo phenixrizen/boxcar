@@ -1,21 +1,16 @@
 # Private security advisory workflow
 
-Implementation status in this draft: instructions and API design are prepared;
-the advisory helper remains unimplemented under the broader task. The review-policy
-amendment does not implement or authorize claiming those operations.
-Do not invoke nonexistent helper commands or fall back to public metadata.
-The sections below specify intended behavior; the advisory operations and
-confidential-workspace guard are not yet implemented in this branch.
-
 GitHub Draft Repository Security Advisories in the affected repository are the
-source of truth for undisclosed vulnerabilities. This is distinct from private
-vulnerability reporting: administrators can create drafts directly without
-turning on submissions from the public. The workflows never publish or request
-a CVE. The owner explicitly authorizes remediation and later disclosure.
+source of truth for undisclosed vulnerabilities. `scripts/security_advisory.py`
+implements the private operations below using authenticated `gh api`. It has no
+publication, CVE-request or public-PR operation. Creating records does not approve
+remediation; passing tests does not approve disclosure. Private vulnerability
+reporting is separate: administrators can create drafts without enabling public
+submission of reports.
 
-## Entry points
+## Claude and CLI entry points
 
-In a private Claude session with independently authorized GitHub credentials:
+Use a private session, with independently authorized GitHub credentials:
 
 ```text
 /security-finding list
@@ -23,146 +18,261 @@ In a private Claude session with independently authorized GitHub credentials:
 /security-finding read GHSA-xxxx-yyyy-zzzz
 /security-finding create
 /security-finding update GHSA-xxxx-yyyy-zzzz
-/security-finding close GHSA-xxxx-yyyy-zzzz
 /work-security phenixrizen/boxcar GHSA-xxxx-yyyy-zzzz
 ```
 
-Ordinary work remains `/work-issue phenixrizen/boxcar#N`. Never put a draft advisory
-reference or contents into its issue, checkpoint, Project card or PR body.
-The ordinary helper rejects advisory references; the planned confidential
-workspace guard is not implemented. This is accidental-disclosure protection, not semantic classification of
-arbitrary prose. Inspect every public change for confidential details.
+These are repository skills, not Claude built-ins. Ordinary work remains
+`/work-issue phenixrizen/boxcar#N`; never put private references or details in
+its issues, checkpoints, cards or PRs. Use `/memory` to check instruction loading.
 
-## Permissions and account independence
+The Python helper runs on Linux (Python 3.9+, `gh`, Git; private review also uses
+`/proc` to verify its output destination). Prepare a private directory outside
+**every** Git checkout, mode 0700, and JSON inputs mode 0600. No finding details
+belong in command arguments. Example paths below are placeholders for that directory:
 
-The helper uses authenticated `gh api`, not Claude account memory. Every new
-session retrieves current GitHub records. Each account/session must have its
-own authorized GitHub login or integration; never copy credentials.
+```bash
+python3 scripts/security_advisory.py --out /private/output.json access
+python3 scripts/security_advisory.py --out /private/output.json list
+python3 scripts/security_advisory.py --out /private/output.json read GHSA-xxxx-yyyy-zzzz
+python3 scripts/security_advisory.py --out /private/output.json search --input /private/query.json
+python3 scripts/security_advisory.py --out /private/output.json create --input /private/finding.json
+python3 scripts/security_advisory.py --out /private/output.json update GHSA-xxxx-yyyy-zzzz --input /private/progress.json
+python3 scripts/security_advisory.py --out /private/output.json recover
+```
 
-According to [GitHub's repository advisories REST API](https://docs.github.com/en/rest/security-advisories/repository-advisories):
+Output is `{"snapshot": "digest", "record": ...}` in a restricted file; stdout
+reports only success. List/search return arrays in `record`. Search input is
+`{"query":"private search phrase"}`. Read current records on every session.
+API errors omit response bodies and private text. Do not copy raw private output
+into a public transcript, CI artifact, issue, PR, commit or documentation.
 
-- Unpublished read: repository administrator/security manager, or collaborator
-  on the advisory. A fine-grained PAT/App needs Repository security advisories:
-  read. Public-code access alone is insufficient; an empty list is not proof
-  of permission to see all drafts.
-- Create: administrator/security manager, plus Repository security advisories:
-  write for a fine-grained PAT/App. Update can also be granted to an advisory
-  collaborator. This initial helper conservatively restricts mutations to the
-  repository owner authenticated as `phenixrizen` with administration rights;
-  other authorized advisory collaborators can read using GitHub's UI/API.
-- A classic/OAuth token uses `repo` or the corresponding documented
-  `repository_advisories:read` / `repository_advisories:write` scope. Do not
-  assume token scope replaces repository role. Fine-grained token capabilities
-  are not fully introspectable; the endpoint remains authoritative.
-- Temporary private fork creation additionally needs Administration: write
-  and Repository security advisories: read for fine-grained tokens. Clone/push
-  requires access to the resulting private fork and Contents: write.
+Creation input has `key` (stable 8–100-character operation identifier), `summary`,
+`description` (original technical prose), `legacy_ids`, `confidence`, `discovery`
+(source/date), optional `severity`, and `vulnerabilities`. Each vulnerability uses
+GitHub's `package: {ecosystem, name}`, optional `vulnerable_version_range`,
+`patched_versions`, and `vulnerable_functions`. Use an evidenced ecosystem/package;
+unknown names/ranges may be null. Do not substitute invented metadata. Retain the
+original claim, components, impact, preconditions, evidence, affected commits,
+verification attempted and historical disposition in the description. New records
+start New, Investigating or Confirmed; uncertainty is not confirmation.
 
-Read-only preflight checks roles and draft endpoint access; it cannot prove a
-write will succeed without making one. A failed mutation reports only status
-and permission guidance, never response bodies. Missing access fails closed.
-No fallback to public issues, PRs, logs or an invented package/version.
+Before creation the helper lists all visible records, reuses an exact key, rejects
+reused original IDs requiring reconciliation, and reports similar summaries in
+restricted `related.json`. Read those records and acknowledge inspected IDs in
+`reviewed_related` only after deciding they are distinct. Similarity is a prompt
+for human inspection, not semantic duplicate detection. Also search by component,
+claim and original ID. Reusing a key with changed content requires update.
 
-## Private record schema
+Progress input is `{"expected":"snapshot digest","note":"private evidence and next
+step","status":"Investigating"}`; status is optional. Generic updates append
+history and cannot rewrite original prose, authorizations, ownership or receipts.
+An actively owned remediation uses `checkpoint`. Unsupported external advisory
+metadata requires private manual reconciliation; the helper never overwrites it.
 
-The description preserves the original technical prose and contains exactly
-one `security-finding:v1` JSON block. Native GitHub state stays `draft` during
-remediation; the block's `status` is separate:
+## Access and authorization
 
-New → Investigating → Confirmed → Approved for remediation → Fixing →
-Awaiting verification → Fixed, awaiting disclosure → Closed.
+The authenticated GitHub identity, not a Claude account, determines access.
+Never copy credentials between Claude accounts. Independently authorize `gh` or
+an equivalent integration. The endpoint, not a successful public repository read,
+is authoritative about advisory access.
 
-Keep GHSA as the stable identifier. Record `legacy_ids`, discovery date/source,
-confidence, original claim, components/paths, impact/preconditions, evidence
-and verification attempts, root cause and affected commits when known. Keep
-remediation scope/authorization, private fork/patch reference, branch/session,
-implementation commit, verification results, last reviewed commit, pending
-decisions and next action. A review suspicion remains unconfirmed until verified;
-a disproven claim retains its original statement and private disposition.
+[GitHub's REST requirements](https://docs.github.com/en/rest/security-advisories/repository-advisories):
 
-Use the API's required summary, description and vulnerabilities array. Each
-vulnerability needs a real package ecosystem; package name and affected/patched
-ranges can be null where GitHub permits. Do not guess a version or substitute
-`other` merely to pass validation. An unrepresentable claim remains in its
-original secure source pending accurate metadata; if none exists, ask the
-owner privately to designate encrypted intake. That is a temporary secure
-triage path, not a second authoritative backlog. If secure access is absent,
-report only the limitation and stop that recording operation.
+- Unpublished read: repository administrator/security manager or an advisory
+  collaborator; fine-grained Repository security advisories: **read**.
+- Create: administrator/security manager; fine-grained Repository security
+  advisories: **write**. Updating also supports authorized advisory collaborators.
+- Classic/OAuth: `repo` or the documented `repository_advisories:read` / `write`
+  scope for the applicable endpoint. Token permission does not replace role.
+- Private fork creation: fine-grained **Administration: write** plus **Repository
+  security advisories: read**. Clone/push additionally needs access to that private
+  fork and **Contents: write**. Integration access has limits described below.
 
-## Concurrency and retries
+This helper conservatively restricts full inventory and mutations to authenticated
+`phenixrizen` with repository admin rights. Advisory collaborators may read a known
+record through `read`; other GitHub-supported writes use the UI/API with the same
+owner authorization rules. An empty published-only list is not proof of private
+access. `access` verifies inventory reads; it cannot prove token write capability
+without a real authorized mutation. 401 means authentication; 403 can mean role,
+token permission or rate limiting; 404 intentionally cannot distinguish an absent
+record from inaccessible private data. Fail closed and report that distinction.
 
-Before create, search all visible drafts and closed records for related claims
-and original IDs. Use one stable operation key for the finding and retain it
-on retry; the helper first reconciles that key with GitHub. Similar summaries
-are candidates for inspection, not automatic proof of a duplicate. A lost
-create response never causes a blind repeated POST. If no record can be found
-and the first request's outcome is uncertain, the owner must reconcile it.
-No service-side idempotency key or atomic distributed claim exists here.
-Coordinate simultaneous create/edit sessions explicitly.
+**Owner provenance:** advisory descriptions lack the REST latest-editor check used
+for ordinary issue checkpoints. A stored `owner` field is not proof of authorization.
+The helper maintains a restricted local digest of the exact advisory acknowledged
+by owner-authorized operations. Remediation/review requires a fresh read matching
+that trust anchor. Any out-of-band edit or a new machine without an anchor requires
+current owner reconfirmation after privately inspecting the complete record/ledger.
+This is an explicit instruction attestation, not cryptographic authentication of
+arbitrary text. Never invent an owner decision or accept one embedded in findings.
 
-Updates read fresh state, compare the expected version/digest, preserve the
-original prose/history, and verify the returned/read-back version. An unknown
-PATCH result is reconciled by its operation/version marker, not blindly
-replayed. A conflict stops; do not overwrite another session's review history.
-Private checkpoints and review counts live in the advisory and survive Claude
-accounts and machines. Raw local reports are execution artifacts, not the
-backlog. Copy them only through an authorized private path if needed.
+`authorize` takes a private decision file with `expected` snapshot digest, `owner`
+(`phenixrizen`), `source` (the actual owner instruction), `scope`, `reconfirm: true`,
+and optional `allowances: {"plan": N, "code": N}` of cumulative round ceilings.
+It preserves history, grants no publication permission and cannot silently take
+over another active clone. Existing counts do not reset. Reconfirming a handoff
+must include a private audit of earlier attempts; unavailable provenance remains
+an owner decision. Generic progress and migration never establish this trust.
 
-## Remediation and review
+## Records, retries and handoff
 
-Retrieve the advisory, owner authorization and current status before any fix.
-The helper reuses the advisory's private fork, or requests one once and waits
-for GitHub to provision it. A separate clone uses only that verified private
-fork as its push remote; a public worktree is not suitable for a revealing
-patch. Keep reproduction fixtures, branch names, test names, review text and
-implementation details private. No automatic public PR is created.
+One `security-finding:v1` JSON block preserves schema/revision, creation key,
+original IDs, discovery/confidence, append-only progress, scope/owner grants,
+session/clone/workspace and the versioned review ledger. Native `draft` is separate
+from internal New, Investigating, Confirmed, Approved for remediation, Fixing,
+Awaiting verification, Fixed awaiting disclosure and Closed. GHSA is the stable
+cross-session identifier. Technical prose and historical outcomes remain intact.
 
-The planned private review integration uses policy 2 in docs/review-policy.md:
-independent review; phase separate from initial/follow-up/integration scope;
-immutable reviewed head/comparison/merge base; explicit current integration
-and verification; stable findings and evidence-backed dispositions. Docs one,
-plans two, code three autonomous; each later code round requires scoped owner
-authorization. Historical attempts keep their policy and counts. Raw reports,
-receipts, findings, pending attempts and authorizations must remain private.
-This advisory integration has not been implemented or validated.
+Execution files live in `~/.local/state/repository-advisories/phenixrizen/boxcar/`
+(or `--state-dir`): an atomic pending-write journal, archived acknowledgements,
+local trust/clone identity, restricted contexts and raw reports. GitHub holds the
+recoverable record, structured original review results, counts and dispositions.
+The local files are execution metadata, not a Markdown vulnerability backlog.
+Each trusted acknowledgement also retains its exact snapshot for owner recovery.
+For an out-of-band edit during active work, `reconcile` accepts expected/owner/source,
+private reason, and `stopped_attempts` listing every pending invocation the owner
+has confirmed stopped. It restores known trusted ownership/grants/attempts/history,
+retains the observed untrusted metadata as private evidence, and requires the
+same active claim in both the saved and current record. A released clone cannot
+restore its stale ledger over a successor's completed/pending attempts. Changed
+ownership needs a coordinated released handoff, not restoration by another clone. Recover the retained pending review afterward. A pending
+publication journal must be reconciled first; restore its exact recorded control
+snapshot privately if a fork provisioned while an unauthorized edit occurred.
+Missing trusted snapshots or an unresolved remote write remain explicit private
+reconciliation limits; never discard history or retry creation under a new key.
 
-GitHub temporary private security forks have important limits: integrations
-cannot access them, status checks do not run, and branch protections are not
-enforced. Run appropriate checks locally in an authorized private workspace,
-record actual results privately, and obtain the owner's review/disclosure decision.
-Normal public Actions and branch-protection enforcement are not a validation path
-for these forks. GitHub also merges their open PRs through the advisory rather
-than individually; only one PR may target the fork's default branch at that step.
-See [GitHub's private-fork documentation](https://docs.github.com/en/code-security/tutorials/fix-reported-vulnerabilities/collaborate-in-a-fork).
-No fork creation, merging or publication is performed by this amendment.
+A local flock coordinates only sessions sharing that state directory. The advisory
+claim detects observed session/clone conflicts, but REST PATCH is not an atomic
+distributed claim. Coordinate machines explicitly. Do not overlap remote writers.
+Release the old session after verifying its checkpoint; transfer unresolved journals
+and raw reports only through an authorized private channel. A new machine reads
+GitHub and obtains the required current owner reconfirmation. Copying a digest
+without establishing provenance is not a handoff. Rebase changes no historical
+receipt: test/review the new immutable inputs and record explicit continuity.
 
-When verification succeeds, record Fixed, awaiting disclosure while leaving
-native state draft. Closing an invalid/resolved draft is explicit and retains
-its private reason; it is not publication. Published records are read-only to
-these helpers. Publication/CVE requests and transferring patches to public
-history remain separate, explicit owner decisions through GitHub.
+Before any POST/PATCH, an atomic journal records intent. An unknown write outcome
+blocks new writes until `recover` verifies exact read-back. A missing result never
+causes an automatic repeated POST. A rejected validation/auth request differs from
+an unknown outcome. If recovery cannot prove the exact revision (including other
+changed advisory fields), retain the journal and reconcile privately. No automatic
+journal reset/force takeover exists. State-directory loss before resolving a write
+requires private reconciliation, not a new operation key. Description size is
+bounded; history is never silently trimmed to fit GitHub's limit.
+
+## Private remediation and review
+
+After explicit owner authorization, use:
+
+```bash
+python3 scripts/security_advisory.py --out /private/output.json authorize GHSA-xxxx-yyyy-zzzz --input /private/decision.json
+python3 scripts/security_advisory.py --out /private/output.json work GHSA-xxxx-yyyy-zzzz --session SESSION --workspace /private/workspace
+# Run the remaining commands from that verified private clone.
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json checkpoint GHSA-xxxx-yyyy-zzzz --session SESSION --input /private/checkpoint.json
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json review GHSA-xxxx-yyyy-zzzz --session SESSION --input /private/review.json
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json recover-review GHSA-xxxx-yyyy-zzzz --session SESSION
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json verified GHSA-xxxx-yyyy-zzzz --session SESSION --input /private/integration.json
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json release GHSA-xxxx-yyyy-zzzz --session SESSION
+```
+
+`work` reuses the advisory's verified temporary private fork or journals one
+asynchronous fork request. Pending provisioning polls retrieval; never POST again.
+It uses an isolated clone with only private `origin`, a confidential common-directory
+marker and a pre-push destination guard. It refuses conflicting hooks/remotes and
+session ownership. The claim binds its path before asynchronous provisioning.
+Preparation is acknowledged for the exact active session/clone, not merely a
+pathname. A released handoff restores the checkpoint's private branch and verifies
+its commit even when both machines use the same path or provisioning is retried.
+Remediation/review remains blocked until preparation succeeds. Unpublished work must be pushed there
+before another machine can resume. A new workspace starts on `remediation`, while
+an existing explicitly selected private clone retains its branch. Existing public
+issue/board/PR helpers reject marked clones
+before their GitHub calls. Direct review needs `--private`, immutable branch scope
+and restricted regular-file output outside Git; the advisory helper supplies these.
+These guards prevent accidental routing, not bypass with raw Git/gh or semantic
+leaks from arbitrary prose. Inspect every proposed public artifact yourself.
+
+Checkpoint JSON records `completed`, `verification` actually performed/results,
+`blockers` and `next`, with optional `status` of Fixing or Awaiting verification.
+It cannot set approval or verified completion. The helper adds current
+branch/head/base/session and updates the associated branch. It fetches
+current public main for comparison without adding a public push remote. Review
+JSON records `phase` (plan/code/docs), `scope` (initial/follow-up/integration), private
+`focus`, and for focused scopes `prior` receipt IDs, `verifies` finding IDs and
+`rationale`; `material_change: true` requires initial scope. It invokes the installed
+Codex plugin through the existing wrapper, passing scope instructions through focus,
+not invented plugin flags. Raw private focus and continuity rationale stay in the restricted context file;
+subprocess arguments contain only fixed instructions and opaque review inputs.
+
+Use the canonical [review policy](review-policy.md). Existing private policy-2
+ledgers and cumulative grants remain unchanged until an explicit `deliverable`
+operation; `authorize`, resume, branch changes and ordinary issue migration never
+reset them. After installing the compatible helper, an already-authorized remediation
+scope and current trusted owner snapshot can establish a policy-3 deliverable:
+
+```bash
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json deliverable GHSA-xxxx-yyyy-zzzz --input /private/deliverable.json
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json carry GHSA-xxxx-yyyy-zzzz --session SESSION --input /private/carry.json
+```
+
+The deliverable input is `expected`, `owner`, `source`, `id`, `outcome` and
+`acceptance`. Record the actual private owner instruction and existing remediation
+scope; creating a spending boundary does not authorize a new fix or disclosure.
+It preserves historical attempts/counts and binds the new scoped outcome. Carry input
+is `receipt`, `findings` (IDs) and `rationale`; it connects already-resolved findings
+to the current independently reviewed inputs without rewriting original results.
+The private helper does not offer the ordinary license-header continuity shortcut.
+Public CI and branch protection do not enforce this private ledger; use the compatible
+helper and preserve the advisory's owner-provenance checks.
+
+Record the owner's entire bounded extension upfront, preserve exhausted allowances,
+and present one consolidated decision if it is spent. Optional suggestions need no
+extra review; stop at verified readiness. Failed/unavailable output counts zero and
+approves nothing. Recover pending attempts exactly once; `recover-review --failed`
+requires first confirming the invocation stopped. After two failures, `retry`
+requires an owner decision file naming `phase` and the exact failed-attempt `binding`
+digest, plus expected snapshot/owner/source. It grants no additional completed round.
+
+`dispose` takes `finding`, `category`, `status`, `evidence`, `consequence` and optional
+`tracking`/`comment` as specified in review-policy.md. Independent private tracking
+must be this repository's `owner/repo#GHSA-...`, retrieved as draft/closed; public
+issue references are rejected, including during history replay. A specific finding
+exception uses `exception` with expected/owner/source, finding/head/base and reason;
+then its private grant ID is the disposition's `comment`. Exceptions do not expand
+spending or authorize disclosure. Original reviewer results remain unchanged.
+
+`verified` takes `receipt`, `rationale` and optional `material_change`; it requires
+current committed head/main integration, current actual verification, applicable
+independent review and resolved blocking findings. It records **Fixed, awaiting
+disclosure** and keeps native state **draft**. `close` is separate: expected/owner/
+source plus private `reason`, no active/pending work; it preserves an invalid/resolved
+claim and sets native closed. Published/closed records are otherwise read-only.
+Finishing this workflow software is separate from a finding's disclosure or source
+retirement; keep those pending private decisions in their existing records.
+
+Temporary private forks have no normal public status checks or enforced branch
+protections, and integrations cannot access them. Validate locally/private; public
+CI is not proof that a private fix passed. GitHub merges their PRs through the
+advisory UI, with only one PR targeting the fork's default branch at that step.
+See [GitHub's private-fork limitations](https://docs.github.com/en/code-security/tutorials/fix-reported-vulnerabilities/collaborate-in-a-fork).
+Publication, CVE requests and moving a revealing patch into public history remain
+explicit owner decisions outside this helper. No real fork or fix is needed to test
+these workflow mechanics; tests use synthetic records and temporary Git repositories.
 
 ## Migration
 
-No original artifact location is recorded in the repository instructions.
-Initial read-only checks on 2026-10-17 found zero drafts in each repository;
-no real advisory was created as a test and no original artifact was changed.
+Keep original private artifacts until every entry is accounted for, read-back is
+verified and the owner explicitly approves retirement. Inventory source bodies and
+comment histories privately; never reconstruct findings from public fragments.
+For each actual finding, search related drafts/closed records, retain original IDs,
+claim, confidence, severity, evidence, history and pending decisions, and use a stable
+source operation key. Import historical statements without granting new remediation
+scope or claiming historical fixes were independently reverified. Read each advisory
+back, compare preserved fields and rerun with the same key to verify reuse. Export
+original-ID→GHSA mapping only to a restricted file; identifiers also live in advisory
+metadata for later authorized sessions. Reconcile aliases before creating records.
 
-When the owner provides authorized access in a private session:
-
-1. Inventory the source privately, including stable old IDs and unresolved
-   decisions. Do not copy it into this repository or a public transcript.
-2. Retrieve all existing drafts/closed records and inspect related claims.
-3. For each real finding, create or update the matching advisory with honest
-   package metadata; retain severity, confidence, original claim, evidence,
-   remediation history and decisions. Put old IDs in `legacy_ids`.
-4. Read each GHSA back and compare those fields. The old-ID→GHSA mapping stays
-   in advisory metadata; if exporting a mapping, use an access-restricted file
-   outside the checkout and transfer it only privately.
-5. Re-run using the same original IDs/operation keys to confirm idempotence.
-   Account for every source entry, including disproven and incomplete claims.
-6. Ask the owner to approve retirement only after all entries and mapping are
-   verified. Keep the original artifact until that explicit approval.
-
-An inaccessible artifact or incomplete public reference is not evidence from
-which to reconstruct a vulnerability. Report migration as blocked, not complete.
+An unrepresentable/unconfirmed claim stays in its existing secure source with an
+explicit private triage reason; if no secure source exists, ask the owner privately
+to designate encrypted intake. Do not invent a package/version or create a public
+issue. Record disproven findings and evidence privately instead of dropping them.
+An access failure stops that operation and reports only access, never the finding.

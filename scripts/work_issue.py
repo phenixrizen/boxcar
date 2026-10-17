@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 import argparse
+import base64
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,10 +21,11 @@ import uuid
 import board
 import codex_review
 import review_policy as policy
+import security_guard
 
 MARK = "work-issue-checkpoint:v1"
 PR_MARK = "work-issue-pr:v1"
-MAX_CHECKPOINT_BYTES = 60000  # Below GitHub's comment limit, including all metadata.
+MAX_CHECKPOINT_BYTES = 65000  # Below GitHub's comment limit, including all metadata.
 
 
 Error = policy.Error
@@ -136,6 +139,15 @@ def checkpoint_body(state):
     body = "# Work issue checkpoint\n\n" + block(MARK, public)
     public_safe(body)
     if len(body.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
+        # Long-lived ledgers must not lose history merely to remove whitespace.
+        body = (
+            "# Work issue checkpoint\n\n<!-- "
+            + MARK
+            + " -->\n```json\n"
+            + json.dumps(public, separators=(",", ":"))
+            + "\n```"
+        )
+    if len(body.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
         raise Error(
             "checkpoint too large; shorten checkpoint/triage text, preserve review history"
         )
@@ -146,6 +158,10 @@ def checkpoint_body(state):
 
 class GitHub:
     def api(self, path, data=None, method=None, pages=False):
+        try:
+            security_guard.public_only()
+        except ValueError as e:
+            raise Error(str(e)) from None
         args = ["gh", "api", path]
         if pages:
             args += ["--paginate", "--slurp"]
@@ -193,6 +209,10 @@ class GitHub:
             raise Error(str(e)) from None
 
     def pr_write(self, number, title, body, branch, base, draft):
+        try:
+            security_guard.public_only()
+        except ValueError as e:
+            raise Error(str(e)) from None
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md") as f:
             f.write(body)
             f.flush()
@@ -248,7 +268,7 @@ def remote_state(gh, number):
     if (
         state.get("repo") != board.REPO
         or state.get("issue") != number
-        or state.get("version") not in (1, 2)
+        or state.get("version") not in (1, 2, 3)
     ):
         raise Error("checkpoint belongs to another task or schema")
     return state, c
@@ -317,6 +337,169 @@ def fresh_base(base):
         raise Error("base must be an origin branch")
     codex_review.behind(base, env=codex_review.clean_env(dict(os.environ)))
     return git("rev-parse", base)
+
+
+LICENSE_HEADER = (
+    b"# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 The boxcar Authors\n"
+)
+
+
+def license_continuity(before, head, base, gh=None):
+    """Recompute the narrow content proof; never execute candidate files.
+
+    CI uses GitHub Git objects, not its trusted-main checkout's working tree.
+    Exact bytes, modes and paths matter; this is not a semantic diff heuristic.
+    """
+    if not all(re.fullmatch(r"[0-9a-f]{40,64}", s or "") for s in (before, head, base)):
+        raise Error("continuity requires immutable revisions")
+    if before == head:
+        raise Error("unchanged head needs no continuity record")
+    if gh:
+        comparison = gh.api(f"repos/{board.REPO}/compare/{before}...{head}")
+        if (
+            comparison.get("status") != "ahead"
+            or comparison.get("merge_base_commit", {}).get("sha") != before
+        ):
+            raise Error("reviewed head must be an ancestor of continuity head")
+    elif git("merge-base", before, head) != before:
+        raise Error("reviewed head must be an ancestor of continuity head")
+
+    def tree(sha):
+        if gh:
+            value = gh.api(f"repos/{board.REPO}/git/trees/{sha}?recursive=1")
+            if value.get("truncated") is not False or not isinstance(
+                value.get("tree"), list
+            ):
+                raise Error("complete Git tree unavailable for continuity")
+            entries = value["tree"]
+        else:
+            entries = []
+            for row in git("ls-tree", "-rz", "--full-tree", sha).split("\0"):
+                if row:
+                    fields, path = row.split("\t", 1)
+                    mode, kind, oid = fields.split()
+                    entries.append(
+                        {"path": path, "mode": mode, "type": kind, "sha": oid}
+                    )
+        selected = [e for e in entries if e["type"] != "tree"]
+        result = {e["path"]: [e["mode"], e["type"], e["sha"]] for e in selected}
+        if len(result) != len(selected):
+            raise Error("ambiguous Git tree")
+        return result
+
+    def blob(sha):
+        if gh:
+            value = gh.api(f"repos/{board.REPO}/git/blobs/{sha}")
+            if value.get("encoding") != "base64" or value.get("sha") != sha:
+                raise Error("Git blob unavailable for continuity")
+            try:
+                content = base64.b64decode(
+                    "".join(value["content"].split()), validate=True
+                )
+            except (ValueError, KeyError):
+                raise Error("invalid Git blob encoding") from None
+        else:
+            p = subprocess.run(
+                ["git", "cat-file", "blob", sha],
+                capture_output=True,
+                env=codex_review.clean_env(dict(os.environ)),
+            )
+            if p.returncode:
+                raise Error("Git blob unavailable for continuity")
+            content = p.stdout
+        if len(content) > 1024 * 1024:
+            raise Error("continuity blob exceeds bounded inspection size")
+        hashed = (hashlib.sha1 if len(sha) == 40 else hashlib.sha256)(
+            b"blob " + str(len(content)).encode() + b"\0" + content
+        ).hexdigest()
+        if hashed != sha:
+            raise Error("Git blob content does not match its object ID")
+        return content
+
+    old, new = tree(before), tree(head)
+    if old.keys() != new.keys():
+        raise Error("continuity cannot add, delete or rename files")
+    changed = sorted(path for path in old if old[path] != new[path])
+    if not changed or len(changed) > 100:
+        raise Error("continuity needs a bounded license-header delta")
+    for path in changed:
+        a, b = old[path], new[path]
+        if (
+            not path.endswith(".py")
+            or a[:2] != b[:2]
+            or a[0] not in ("100644", "100755")
+            or a[1] != "blob"
+        ):
+            raise Error("continuity only permits unchanged regular Python paths/modes")
+        source, target = blob(a[2]), blob(b[2])
+        if (
+            source.startswith(b"\xef\xbb\xbf")
+            or b"\0" in source
+            or re.search(
+                rb"coding[:=][ \t]*[-\w.]+", b"\n".join(source.splitlines()[:2])
+            )
+        ):
+            raise Error("encoding cookies/BOMs/binary files cannot use continuity")
+        try:
+            source.decode("utf-8")
+        except UnicodeError:
+            raise Error("continuity requires ordinary UTF-8 Python source") from None
+        offset = 0
+        if source.startswith(b"#!"):
+            offset = source.find(b"\n") + 1
+            if not offset:
+                raise Error("unterminated shebang cannot use continuity")
+        if target != source[:offset] + LICENSE_HEADER + source[offset:]:
+            raise Error("continuity delta is not exactly the approved license header")
+    return {
+        "kind": "license-headers",
+        "from_head": before,
+        "head": head,
+        "base": base,
+        "before_tree": policy.digest(old),
+        "after_tree": policy.digest(new),
+        "files": changed,
+    }
+
+
+def verify_continuity(state, head, base, gh=None, confidential=False):
+    reviews = [r for r in state["reviews"] if r["phase"] in ("code", "docs")]
+    if state.get("version") == 3 and reviews and reviews[-1]["commit"] != head:
+        c = policy.validate_continuity(state, head, base, confidential=confidential)
+        if c["proof"] != license_continuity(c["reviewed_head"], head, base, gh):
+            raise Error("continuity proof does not match the actual Git objects")
+
+
+def review_source(receipt, path):
+    """Only receipt-bound structured claims may be transferred into review context."""
+    try:
+        payload = json.loads(path.read_text())
+    except (ValueError, OSError):
+        raise Error("prior source report is missing or incomplete") from None
+    result = payload.get("result") if isinstance(payload, dict) else None
+    expected = {
+        "head": receipt["commit"],
+        "base": receipt["base_sha"],
+        "merge_base": receipt.get("merge_base"),
+    }
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("findings"), list)
+        or not all(isinstance(f, dict) for f in result["findings"])
+        or not isinstance(payload.get("codex"), dict)
+        or payload.get("codex", {}).get("status") != 0
+        or payload.get("parseError")
+        or result.get("verdict") != receipt["outcome"]
+        or not receipt.get("result_digest")
+        or policy.digest(result) != receipt["result_digest"]
+        or receipt.get("inputs") != expected
+        or payload.get("inputs") != expected
+    ):
+        raise Error(
+            "prior source result/inputs do not match its receipt; recover the original report or reconcile through a new initial review"
+        )
+    # Unbound transcript/metadata fields must not masquerade as authenticated claims.
+    return {"result": result, "inputs": expected}
 
 
 completed = policy.count
@@ -625,12 +808,104 @@ class Task:
 
     def migrate(self, session):
         self.own(session)
-        if self.state["version"] == 2:
+        if self.state["version"] in (2, 3):
             return
         candidate = policy.migrate(self.state)
         backup = self.directory / f"{self.number}.v1-backup.json"
         if not backup.exists():
             atomic(backup, self.state)
+        self.state = candidate
+        self.save()
+        self.publish()
+
+    def deliverable(self, session, data, comment=None, preview=False):
+        if set(data) != {"id", "outcome", "acceptance"}:
+            raise Error("deliverable needs id, outcome and acceptance")
+        public_safe(json.dumps(data))
+        if preview:
+            if (
+                not self.state
+                or self.state.get("owner")
+                != {
+                    "session": session,
+                    "clone": self.clone(),
+                }
+                or git("branch", "--show-current") != self.state["branch"]
+            ):
+                raise Error("preview requires the owned task worktree")
+            remote, _ = remote_state(self.gh, self.number)
+            if remote != self.public_state():
+                raise Error("reconcile unpublished or remote state before preview")
+        else:
+            self.check_tree(session)
+        existing = next(
+            (d for d in self.state.get("deliverables", []) if d["id"] == data["id"]),
+            None,
+        )
+        candidate = policy.begin_deliverable(
+            self.state,
+            data["id"],
+            data["outcome"],
+            data["acceptance"],
+            comment or (existing["comment"] if existing else 1),
+        )
+        d = candidate["deliverables"][-1]
+        ordinal = len(candidate["deliverables"])
+        line = f"work-issue deliverable {board.REPO}#{self.number} {ordinal} {d['binding']}"
+        if preview:
+            return line
+        if comment is None:
+            raise Error(
+                "record the real owner instruction and exact preview line, then supply --comment"
+            )
+        check = lambda ph, rd, c, kind, binding=None: authorize_check(
+            self.gh, self.number, ph, rd, c, kind, binding
+        )
+        policy.check_ledger(self.state, check)
+        authorize_check(
+            self.gh,
+            self.number,
+            "deliverable",
+            ordinal,
+            comment,
+            "deliverable",
+            d["binding"],
+        )
+        policy.check_ledger(candidate, check)
+        checkpoint_body(candidate)
+        self.state = candidate
+        self.save()
+        self.publish()
+        return line
+
+    def carry(self, session, receipt_id, data):
+        self.check_tree(session)
+        if set(data) != {"findings", "rationale"}:
+            raise Error("carry needs findings and rationale")
+        public_safe(json.dumps(data))
+        head, base = git("rev-parse", "HEAD"), fresh_base(self.state["base"])
+        r = policy.receipt(self.state, receipt_id)
+        if git("status", "--porcelain") or (r["commit"], r["base_sha"]) != (head, base):
+            raise Error("carry requires the actual clean reviewed head and target")
+        candidate = json.loads(json.dumps(self.state))
+        policy.carry_forward(candidate, receipt_id, data["findings"], data["rationale"])
+        checkpoint_body(candidate)
+        self.state = candidate
+        self.save()
+        self.publish()
+
+    def continuity(self, session, receipt_id):
+        self.check_tree(session)
+        if git("status", "--porcelain"):
+            raise Error("commit all changes before continuity validation")
+        head, base = git("rev-parse", "HEAD"), fresh_base(self.state["base"])
+        r = policy.receipt(self.state, receipt_id)
+        if r["base_sha"] != base:
+            raise Error("changed target requires integration review")
+        proof = license_continuity(r["commit"], head, base)
+        candidate = json.loads(json.dumps(self.state))
+        policy.record_continuity(candidate, receipt_id, head, base, proof)
+        checkpoint_body(candidate)
         self.state = candidate
         self.save()
         self.publish()
@@ -643,12 +918,20 @@ class Task:
             if r["phase"] == phase and r["status"] == "failed"
         ]
         binding = policy.digest(failed_ids) if kind == "retry" else None
+        deliverable = policy.active_deliverable(self.state)
+        if deliverable and kind in ("authorize", "ceiling"):
+            binding = deliverable["binding"]
         authorize_check(self.gh, self.number, phase, round_, comment, kind, binding)
         a = {"phase": phase, "round": round_, "comment": comment}
+        if deliverable and kind in ("authorize", "ceiling"):
+            a.update(deliverable=deliverable["id"], binding=binding)
         if kind == "ceiling":
             if round_ < completed(self.state, phase):
                 raise Error("ceiling cannot erase completed reviews")
-            self.state.setdefault("ceilings", {})[phase] = a
+            target = policy.active_deliverable(self.state)
+            if target is None:
+                target = self.state
+            target.setdefault("ceilings", {})[phase] = a
         elif kind == "retry":
             if round_ != completed(self.state, phase) + 1:
                 raise Error("retry authorization must name the next completed round")
@@ -723,8 +1006,20 @@ class Task:
         round_ = budget(self.state, phase)
         auth = policy.authorization(self.state, phase, round_)
         if auth:
-            authorize_check(self.gh, self.number, phase, round_, auth["comment"])
-        ceiling = self.state.get("ceilings", {}).get(phase)
+            authorize_check(
+                self.gh,
+                self.number,
+                phase,
+                round_,
+                auth["comment"],
+                binding=auth.get("binding"),
+            )
+        scope_state = policy.active_deliverable(self.state)
+        ceiling = (
+            (scope_state if scope_state is not None else self.state)
+            .get("ceilings", {})
+            .get(phase)
+        )
         if ceiling:
             authorize_check(
                 self.gh,
@@ -733,6 +1028,7 @@ class Task:
                 ceiling["round"],
                 ceiling["comment"],
                 "ceiling",
+                ceiling.get("binding"),
             )
         # Validate all previous counts before spending, including historical exceptions.
         policy.check_ledger(
@@ -765,14 +1061,15 @@ class Task:
             "merge_base": git("merge-base", head, base_sha),
             "status": "pending",
             "outcome": "pending",
-            "policy_version": 2,
-            "receipt_version": 2,
+            **policy.review_fields(self.state, phase),
             "scope": scope,
             "prior": prior or [],
             "verifies": verifies or [],
             "rationale": rationale,
             "material_change": material,
         }
+        if r["policy_version"] == 3:
+            r["finding_context"] = policy.capture_findings(self.state, r["verifies"])
         if policy.failed_attempts(self.state, phase)[1] >= 2:
             grant = self.state["retry_authorizations"][phase]
             # A cached grant is not current permission. Validate the selected
@@ -788,34 +1085,44 @@ class Task:
             )
             r["retry"] = dict(grant)
         public_safe(json.dumps(r))
+        policy.validate_scope(
+            self.state,
+            r,
+            lambda ph, rd, c, kind, binding=None: authorize_check(
+                self.gh, self.number, ph, rd, c, kind, binding
+            ),
+        )
         if scope not in policy.SCOPES or (material and scope != "initial"):
             raise Error("material changes require initial scope; unknown scope refused")
         if scope != "initial" and (not r["prior"] or not rationale.strip()):
             raise Error(
                 "focused review needs prior receipts and a continuity rationale"
             )
-        for ident in r["prior"]:
-            previous = policy.receipt(self.state, ident)
-            if previous["phase"] != phase:
-                raise Error("prior receipt has another phase")
-            if scope == "follow-up" and previous["base_sha"] != base_sha:
-                raise Error("target changed; use integration or renewed initial scope")
         if any(fid not in self.state["findings"] for fid in r["verifies"]):
             raise Error("unknown finding to verify")
         report = self.directory / (r["id"] + ".json")
         context = self.directory / (r["id"] + ".context.json")
         # Restricted context is not copied into the public checkpoint or PR.
         previous_context = []
+        required_sources = {
+            source[0]
+            for fid in r["verifies"]
+            for source in self.state["findings"][fid]["sources"]
+        }
+        if r["policy_version"] == 3 and not required_sources.issubset(r["prior"]):
+            raise Error(
+                "include every source receipt before verifying carried findings"
+            )
         for ident in r["prior"]:
             path = self.directory / (ident + ".json")
-            if scope != "initial" and not path.exists():
+            if (scope != "initial" or ident in required_sources) and not path.exists():
                 raise Error(
-                    "prior raw report unavailable; recover it privately or use initial scope"
+                    "prior raw report unavailable; recover it privately before verifying its findings"
                 )
             previous_context.append(
                 {
                     "receipt": policy.receipt(self.state, ident),
-                    "report": json.loads(path.read_text())
+                    "report": review_source(policy.receipt(self.state, ident), path)
                     if path.exists()
                     else "unavailable; recover privately or broaden review",
                 }
@@ -889,7 +1196,7 @@ class Task:
                 outcome=result["verdict"],
                 round=completed(self.state, r["phase"]) + 1,
             )
-            if r.get("policy_version") == 2:
+            if r.get("policy_version") in (2, 3):
                 r["finding_count"] = len(result["findings"])
                 r["inputs"] = payload["inputs"]
                 policy.register_result(self.state, r, result)
@@ -1021,8 +1328,8 @@ def validate_pr(number, gh):
             if name in f
         ):
             raise Error("executable PR changes require code review, not docs")
-    readiness(s, head, base, gh, n)
-    if s.get("version") == 2:
+    readiness(s, head, base, gh, n, remote=True)
+    if s.get("version") in (2, 3):
         comparison = gh.api(f"repos/{board.REPO}/compare/{base}...{head}")
         if (
             comparison.get("status") not in ("ahead", "identical")
@@ -1034,14 +1341,13 @@ def validate_pr(number, gh):
 
 def authorize_check(gh, n, phase, round_, comment, kind="authorize", binding=None):
     c = next((c for c in comments(gh, n) if c["id"] == comment), None)
-    if (
-        not c
-        or (
-            f"work-issue {kind} {board.REPO}#{n} {phase} {round_}"
-            + (f" {binding}" if kind == "retry" else "")
-        )
-        not in gh.trusted(c)["body"].splitlines()
-    ):
+    expected = (
+        f"work-issue deliverable {board.REPO}#{n} {round_} {binding}"
+        if kind == "deliverable"
+        else f"work-issue {kind} {board.REPO}#{n} {phase} {round_}"
+        + (f" {binding}" if binding else "")
+    )
+    if not c or expected not in gh.trusted(c)["body"].splitlines():
         raise Error("missing exact owner authorization")
 
 
@@ -1052,7 +1358,7 @@ def finding_exception(gh, n, fid, comment, head, base):
         raise Error("missing exact owner finding exception")
 
 
-def readiness(state, head, base, gh, number):
+def readiness(state, head, base, gh, number, remote=False):
     verification_current(state, head, base)
     policy.check_ledger(
         state,
@@ -1062,7 +1368,8 @@ def readiness(state, head, base, gh, number):
     )
     if not approved(state, head, base):
         raise Error("review missing, stale, failed, unclassified or blocking")
-    if state.get("version") == 2:
+    verify_continuity(state, head, base, gh if remote else None)
+    if state.get("version") in (2, 3):
         policy.integration_current(state, head, base)
         if not policy.findings_ready(
             state,
@@ -1104,6 +1411,9 @@ def main(argv=None):
         "ceiling",
         "retry",
         "migrate",
+        "deliverable",
+        "carry",
+        "continuity",
         "dispose",
         "integrate",
         "submit",
@@ -1118,8 +1428,14 @@ def main(argv=None):
             s.add_argument("--base")
         if name == "base":
             s.add_argument("--base", required=True)
-        if name in ("checkpoint", "triage", "dispose"):
+        if name in ("checkpoint", "triage", "dispose", "deliverable", "carry"):
             s.add_argument("--file", type=Path, required=True)
+        if name == "deliverable":
+            group = s.add_mutually_exclusive_group(required=True)
+            group.add_argument("--comment", type=int)
+            group.add_argument("--preview", action="store_true")
+        if name in ("carry", "continuity"):
+            s.add_argument("--receipt", required=True)
         if name == "review":
             s.add_argument("--phase", choices=["docs", "plan", "code"], required=True)
             s.add_argument("--focus", required=True)
@@ -1223,6 +1539,16 @@ def main(argv=None):
                 t.authorize(a.session, a.phase, a.round, a.comment, a.action)
             elif a.action == "migrate":
                 t.migrate(a.session)
+            elif a.action == "deliverable":
+                print(
+                    t.deliverable(
+                        a.session, json.loads(a.file.read_text()), a.comment, a.preview
+                    )
+                )
+            elif a.action == "carry":
+                t.carry(a.session, a.receipt, json.loads(a.file.read_text()))
+            elif a.action == "continuity":
+                t.continuity(a.session, a.receipt)
             elif a.action == "dispose":
                 t.dispose(a.session, a.finding, json.loads(a.file.read_text()))
             elif a.action == "integrate":

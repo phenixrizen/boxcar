@@ -11,4 +11,4 @@ about: A deliverable change, defect or follow-up
 
 ## Context, constraints and dependencies
 
-<!-- Link a relevant plan. Do not report security findings here; use the owner’s private channel. -->
+<!-- Reuse an existing issue for the same outcome. Link a plan only when the changed guarantees need one. Optional review suggestions do not require issues. Undisclosed security findings belong in private draft advisories, never here. -->
