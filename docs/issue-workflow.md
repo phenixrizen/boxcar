@@ -84,8 +84,11 @@ python3 scripts/work_issue.py release phenixrizen/boxcar#43 --session my-session
 ```
 
 Release refuses pending reviews and publishes/verifies all history before
-publishing the released claim. The next session uses its own ID with `start`;
-a fresh clone fetches the branch and recovers the ledger from the issue comment.
+publishing the released claim. The next session uses its own ID with `start`.
+Returning to an earlier clone also imports a newer released checkpoint when
+that clone has no unpublished metadata. Review history is retained. An active
+claim, unpublished local changes, or missing review history remains a conflict.
+A fresh clone fetches the branch and recovers the ledger from the issue comment.
 Unsaved files and private raw reports do not travel: transfer those privately
 if needed. If the former process died with an active claim, confirm it has
 stopped, synchronize its local metadata, and explicitly release using its old
@@ -192,7 +195,10 @@ At https://github.com/users/phenixrizen/projects/2/workflows inspect:
 
 Both repositories had no rulesets and main protection returned 'Branch not
 protected'. The file alone is NOT a required merge check. After merging this
-bootstrap and observing a successful run, Settings → Rules → Rulesets: create
+bootstrap, verify that `issue-contract` appears on an actual PR's Checks tab
+and that a failed check becomes successful after correcting its evidence and
+rerunning that same run. Required-check association has not been validated
+live before this bootstrap reaches main. Only after that check, Settings → Rules → Rulesets: create
 (or narrowly extend) a branch ruleset targeting `main`; require PRs, require
 branches up to date, and require the check `issue-contract` alongside the
 existing checks the owner chooses. Protect workflow/helper changes with owner
@@ -202,6 +208,11 @@ The contract workflow uses `pull_request_target` with read-only permissions and
 checks out only main; it never executes PR files. The new bootstrap workflow
 cannot run from main before this PR merges. Validate these initial PRs with
 `python3 scripts/work_issue.py ci --pr PR_43` locally. Separate ordinary PR
-CI runs helper tests. Once installed, recheck changed checkpoint/exception
-comments with `gh workflow run issue-contract.yml -f pr=PR_43`, or rerun
-its check; comment edits alone do not automatically trigger it.
+CI runs helper tests. Once installed, comment edits alone do not trigger it.
+Find the existing run through the PR's Checks tab or `gh pr checks PR_NUMBER
+--repo phenixrizen/boxcar --json name,link`. Rerun that run with `gh run rerun
+RUN_ID --repo phenixrizen/boxcar --failed`, wait with `gh run watch RUN_ID
+--repo phenixrizen/boxcar --exit-status`, then confirm the result on the PR
+with `gh pr checks`. A separate manually dispatched run is not a replacement
+for the PR's failed check. If no PR-associated check appears, leave this check
+out of branch requirements and resolve that association before enabling it.

@@ -63,7 +63,7 @@ python3 scripts/work_issue.py review phenixrizen/boxcar#N --session SESSION --ph
   in code the change touches, in a pull request of its own that merges
   first when it is a defect already on `main` in code the change does not
   otherwise touch. One that is independent of the change is split off (an
-  issue, or the private document for a security finding, and the owner's
+  issue, or a GitHub draft advisory for a security finding, and the owner's
   call), not fixed on the branch. The pull request's body records the
   checkpoint and how each finding was sorted. **Five** rounds is the stop:
   a change still finding its own defects then goes back to its plan (or

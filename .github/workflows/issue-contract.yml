@@ -2,12 +2,6 @@ name: issue contract
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review]
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: Pull request number to recheck after evidence changes
-        required: true
-        type: string
 permissions:
   contents: read
   issues: read
@@ -24,5 +18,5 @@ jobs:
       - name: Validate current GitHub evidence
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: python3 scripts/work_issue.py ci --pr "$PR_NUMBER"

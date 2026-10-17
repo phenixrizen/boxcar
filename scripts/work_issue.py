@@ -108,13 +108,24 @@ def block(marker, data):
 
 
 def parse_block(marker, body):
-    found = re.findall(
-        r"<!-- " + re.escape(marker) + r" -->\s*```json\s*(.*?)\s*```", body or "", re.S
+    found = list(
+        re.finditer(
+            r"^<!-- " + re.escape(marker) + r" -->[ \t]*\r?\n```json[ \t]*\r?\n",
+            body or "",
+            re.M,
+        )
     )
     if len(found) != 1:
         raise Error("missing or ambiguous workflow evidence")
     try:
-        return json.loads(found[0])
+        # Markdown fences inside JSON strings are data, not the closing fence.
+        remaining = body[found[0].end() :].lstrip()
+        value, end = json.JSONDecoder().raw_decode(remaining)
+        if not isinstance(value, dict) or not re.match(
+            r"[ \t]*(?:\r?\n[ \t]*)+```[ \t]*(?:\r?\n|$)", remaining[end:]
+        ):
+            raise ValueError("missing closing fence or object")
+        return value
     except (ValueError, TypeError):
         raise Error("invalid workflow evidence JSON") from None
 
@@ -314,14 +325,22 @@ class Task:
     def save(self):
         atomic(self.path, self.state)
 
+    def public_state(self):
+        return {k: v for k, v in self.state.items() if not k.startswith("_")}
+
+    def acknowledge(self, public, comment):
+        self.state["_remote_revision"] = public["revision"]
+        self.state["_comment"] = comment["html_url"]
+        # A separate snapshot detects unpublished edits on a returning machine.
+        self.state["_published"] = json.loads(json.dumps(public))
+        self.save()
+
     def publish(self):
         remote, c = remote_state(self.gh, self.number)
         revision = remote["revision"] if remote else None
-        public = {k: v for k, v in self.state.items() if not k.startswith("_")}
+        public = self.public_state()
         if remote == public:
-            self.state["_remote_revision"] = revision
-            self.state["_comment"] = c["html_url"]
-            self.save()
+            self.acknowledge(public, c)
             return
         if revision != self.state.get("_remote_revision"):
             raise Error(
@@ -329,9 +348,11 @@ class Task:
             )
         self.state["revision"] = str(uuid.uuid4())
         self.save()
-        public = {k: v for k, v in self.state.items() if not k.startswith("_")}
+        public = self.public_state()
         body = "# Work issue checkpoint\n\n" + block(MARK, public)
         public_safe(body)
+        if parse_block(MARK, body) != public:
+            raise Error("checkpoint serialization did not round trip")
         path = (
             f"repos/{board.REPO}/issues/comments/{c['id']}"
             if c
@@ -346,9 +367,7 @@ class Task:
         check, c = remote_state(self.gh, self.number)
         if check != public:
             raise Error("checkpoint publication not verified")
-        self.state["_remote_revision"] = check["revision"]
-        self.state["_comment"] = c["html_url"]
-        self.save()
+        self.acknowledge(check, c)
 
     def own(self, session):
         if not self.state or self.state.get("owner") != {
@@ -391,7 +410,22 @@ class Task:
                 self.state.get("_remote_revision"),
                 self.state["revision"],
             ):
-                raise Error("remote checkpoint changed; reconcile local history")
+                if (
+                    not remote
+                    or self.state.get("owner")
+                    or remote.get("owner")
+                    or self.public_state() != self.state.get("_published")
+                    or remote["branch"] != self.state["branch"]
+                ):
+                    raise Error("remote checkpoint changed; reconcile local history")
+                if not {r["id"] for r in self.state["reviews"]}.issubset(
+                    {r["id"] for r in remote["reviews"]}
+                ):
+                    raise Error(
+                        "remote checkpoint lost review history; reconcile before continuing"
+                    )
+                self.state = remote
+                self.state["_remote_revision"] = remote_revision
             # Reconcile a mutation accepted remotely before changing its saved intent.
             if remote_revision == self.state["revision"]:
                 self.publish()

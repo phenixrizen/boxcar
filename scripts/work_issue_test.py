@@ -584,6 +584,87 @@ class Workflow(unittest.TestCase):
         self.assertEqual(w.completed(later.state, "code"), 1)
         self.assertEqual(later.state["checkpoint"]["verification"], "44 tests passed")
 
+    def handoff_back(self):
+        self.ready()
+        self.ctx.release("one")
+        clone = Path(self.tmp.name) / "other-machine"
+        w.run(["git", "clone", "-q", str(self.root), str(clone)])
+        os.chdir(clone)
+        w.git(
+            "remote", "set-url", "origin", "https://github.com/" + board.REPO + ".git"
+        )
+        later = w.Task(43, self.gh)
+        later.start("two", here=True)
+        later.state["reviews"].append(self.receipt("code", 2))
+        later.checkpoint(
+            "two",
+            {
+                "completed": "Second machine finished its part",
+                "verification": "Synthetic tests passed",
+                "blockers": "none",
+                "next": "Return to first machine",
+            },
+        )
+        later.release("two")
+        os.chdir(self.root)
+        return w.Task(43, self.gh)
+
+    def test_return_handoff_keeps_remote_history(self):
+        returned = self.handoff_back()
+        returned.start("three", here=True)
+        self.assertEqual(w.completed(returned.state, "code"), 2)
+        self.assertEqual(
+            returned.state["checkpoint"]["next"], "Return to first machine"
+        )
+        self.assertEqual(returned.state["owner"]["session"], "three")
+        self.assertEqual(len(self.gh.notes), 1)
+
+    def test_return_handoff_refuses_unpublished_local_changes(self):
+        returned = self.handoff_back()
+        returned.state["checkpoint"]["next"] = "Unpublished work"
+        returned.save()
+        before = copy.deepcopy(self.gh.notes)
+        with self.assertRaisesRegex(w.Error, "reconcile"):
+            returned.start("three", here=True)
+        self.assertEqual(before, self.gh.notes)
+
+    def test_return_handoff_refuses_erased_review_history(self):
+        returned = self.handoff_back()
+        remote = w.parse_block(w.MARK, self.gh.notes[0]["body"])
+        remote["reviews"] = []
+        self.gh.notes[0]["body"] = w.block(w.MARK, remote)
+        with self.assertRaisesRegex(w.Error, "history"):
+            returned.start("three", here=True)
+
+    def test_fenced_text_survives_checkpoint_correction_and_release(self):
+        self.start()
+        data = {
+            "completed": "done",
+            "verification": "```text\n72 tests passed\n```",
+            "blockers": "",
+            "next": "review",
+        }
+        self.ctx.checkpoint("one", data)
+        self.ctx.state["triage"] = "```text\nfindings reproduced\n```"
+        self.ctx.save()
+        self.ctx.publish()
+        data["verification"] = "Corrected: 73 tests passed"
+        self.ctx.checkpoint("one", data)
+        self.ctx.release("one")
+        remote, _ = w.remote_state(self.gh, 43)
+        self.assertEqual(remote["checkpoint"], data)
+        self.assertIn("```text", remote["triage"])
+        self.assertIsNone(remote["owner"])
+
+    def test_malformed_or_ambiguous_evidence_is_refused(self):
+        for body in [
+            w.block(w.MARK, []),
+            w.block(w.MARK, {})[:-3],
+            w.block(w.MARK, {}) + "\n" + w.block(w.MARK, {}),
+        ]:
+            with self.assertRaises(w.Error):
+                w.parse_block(w.MARK, body)
+
     def test_retarget_updates_existing_pr_instead_of_creating_another(self):
         self.ready()
         original = w.run
