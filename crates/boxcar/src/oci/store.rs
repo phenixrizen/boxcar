@@ -73,6 +73,11 @@ fn invalid(what: impl Into<String>) -> io::Error {
 /// component can start with `_`, so a repository and a deeper
 /// repository's tag never claim one path.
 pub const TAGS: &str = "_tags";
+/// The directory, beside `_tags`, of a repository's index entries: files
+/// named by an index's digest holding the `linux/amd64` manifest's, so a
+/// reference by an index's digest is found offline. Lookups, not refs:
+/// only tags keep an image from `prune`; an entry goes with its image.
+pub const INDEXES: &str = "_indexes";
 /// Shared by pulls, exclusive for rm and prune.
 const LOCK: &str = ".lock";
 /// Exclusive for the sweep, which runs under the shared lock.
@@ -87,6 +92,11 @@ pub struct ImageJson {
     pub defaults: Defaults,
     /// Paths of the device nodes and FIFOs not made.
     pub skipped: Vec<String>,
+    /// Paths whose mode in the tree is not the image's, with the image's
+    /// mode: the tree stores every entry readable by its owner. Absent in
+    /// trees cached before this field, which may hold unreadable entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<(String, u32)>,
 }
 
 /// One layer of an image.
@@ -188,8 +198,19 @@ pub struct ImageStaging<'s> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Listing {
     pub refs: Vec<RefEntry>,
+    /// The index entries: an index's digest and the manifest it led to.
+    pub indexes: Vec<IndexEntry>,
     /// Every image at a final name.
     pub images: Vec<Digest>,
+}
+
+/// One index entry under a repository's `_indexes`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub registry: String,
+    pub repository: String,
+    pub index: Digest,
+    pub manifest: Digest,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -384,6 +405,14 @@ impl Store {
             .join(TAGS)
     }
 
+    fn indexes_dir(&self, reference: &Reference) -> PathBuf {
+        self.dir
+            .join("refs")
+            .join(reference.registry())
+            .join(reference.repository())
+            .join(INDEXES)
+    }
+
     fn ref_path(&self, reference: &Reference) -> io::Result<PathBuf> {
         let tag = reference.tag().ok_or_else(|| {
             io::Error::new(
@@ -397,12 +426,30 @@ impl Store {
     /// Points `reference`'s tag at `digest`.
     pub fn write_ref(&self, reference: &Reference, digest: &Digest) -> io::Result<()> {
         let path = self.ref_path(reference)?;
-        let dir = self.tags_dir(reference);
+        let tag = reference.tag().expect("checked by ref_path");
+        self.write_entry(&self.tags_dir(reference), tag, &path, digest)
+    }
+
+    /// Records that the index `index` of `reference`'s repository led to
+    /// the manifest `manifest`, replacing what the entry said before.
+    pub fn write_index(
+        &self,
+        reference: &Reference,
+        index: &Digest,
+        manifest: &Digest,
+    ) -> io::Result<()> {
+        let dir = self.indexes_dir(reference);
+        let path = dir.join(index.hex());
+        self.write_entry(&dir, index.hex(), &path, manifest)
+    }
+
+    /// Writes `digest` as the entry `name` in `dir` (a tags or indexes
+    /// directory), at its final name `path` only once whole and durable.
+    fn write_entry(&self, dir: &Path, name: &str, path: &Path, digest: &Digest) -> io::Result<()> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
-        builder.create(&dir)?;
-        let tag = reference.tag().expect("checked by ref_path");
-        let staging = dir.join(staging_name(tag, "partial"));
+        builder.create(dir)?;
+        let staging = dir.join(staging_name(name, "partial"));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -418,7 +465,7 @@ impl Store {
             return Err(error);
         }
         drop(file);
-        self.fs.rename(&staging, &path)?;
+        self.fs.rename(&staging, path)?;
         // The tags directory, then every directory above it up to `refs`:
         // the first ref of a repository made them, and a crash must not
         // take the chain, and the tag with it, from under a published
@@ -437,18 +484,32 @@ impl Store {
     // the registry; until then only the tests read one.
     #[allow(dead_code)]
     pub fn read_ref(&self, reference: &Reference) -> io::Result<Option<Digest>> {
-        let path = self.ref_path(reference)?;
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+        read_entry(&self.ref_path(reference)?)
+    }
+
+    /// The manifest the index entry `index` of `reference`'s repository
+    /// led to, if there is one.
+    pub fn read_index(&self, reference: &Reference, index: &Digest) -> io::Result<Option<Digest>> {
+        read_entry(&self.indexes_dir(reference).join(index.hex()))
+    }
+
+    /// The manifest digest of the cached image `reference` names, when it
+    /// is whole in the cache: a tag through its ref, a digest as the image
+    /// itself or through its index entry. An entry whose image is gone
+    /// counts for nothing.
+    pub fn find(&self, reference: &Reference) -> io::Result<Option<Digest>> {
+        let manifest = match reference.digest() {
+            Some(digest) if self.image_dir(digest).is_some() => digest.clone(),
+            Some(digest) => match self.read_index(reference, digest)? {
+                Some(manifest) => manifest,
+                None => return Ok(None),
+            },
+            None => match self.read_ref(reference)? {
+                Some(manifest) => manifest,
+                None => return Ok(None),
+            },
         };
-        Digest::parse(text.trim()).map(Some).map_err(|error| {
-            invalid(format!(
-                "the ref {} does not parse: {error}",
-                path.display()
-            ))
-        })
+        Ok(self.image_dir(&manifest).map(|_| manifest))
     }
 
     pub fn list(&self) -> io::Result<Listing> {
@@ -469,9 +530,11 @@ impl Store {
         let mut tags_dirs = Vec::new();
         collect_dirs(&self.dir.join("refs"), &mut tags_dirs)?;
         for dir in tags_dirs {
-            if dir.file_name().and_then(|n| n.to_str()) != Some(TAGS) {
+            let kind = dir.file_name().and_then(|n| n.to_str());
+            if kind != Some(TAGS) && kind != Some(INDEXES) {
                 continue;
             }
+            let indexes = kind == Some(INDEXES);
             let rel = dir
                 .strip_prefix(self.dir.join("refs"))
                 .map_err(|_| invalid("a tags directory outside refs"))?;
@@ -501,16 +564,35 @@ impl Store {
                         entry.path().display()
                     ))
                 })?;
-                listing.refs.push(RefEntry {
-                    registry: registry.clone(),
-                    repository: repository.clone(),
-                    tag: tag.to_owned(),
-                    digest,
-                });
+                if indexes {
+                    let Ok(index) = Digest::parse(&format!("sha256:{tag}")) else {
+                        continue;
+                    };
+                    listing.indexes.push(IndexEntry {
+                        registry: registry.clone(),
+                        repository: repository.clone(),
+                        index,
+                        manifest: digest,
+                    });
+                } else {
+                    listing.refs.push(RefEntry {
+                        registry: registry.clone(),
+                        repository: repository.clone(),
+                        tag: tag.to_owned(),
+                        digest,
+                    });
+                }
             }
         }
         listing.refs.sort_by(|a, b| {
             (&a.registry, &a.repository, &a.tag).cmp(&(&b.registry, &b.repository, &b.tag))
+        });
+        listing.indexes.sort_by(|a, b| {
+            (&a.registry, &a.repository, a.index.hex()).cmp(&(
+                &b.registry,
+                &b.repository,
+                b.index.hex(),
+            ))
         });
         Ok(listing)
     }
@@ -536,7 +618,8 @@ impl Store {
         // now: an rm interrupted after an unlink and before the sync left
         // one with an unsynced unlink and nothing to show for it.
         let refs = self.dir.join("refs");
-        for entry in self.list()?.refs {
+        let listing = self.list()?;
+        for entry in &listing.refs {
             if entry.digest != *digest {
                 continue;
             }
@@ -546,13 +629,23 @@ impl Store {
                 .join(TAGS);
             self.fs.unlink(&dir.join(&entry.tag))?;
         }
+        for entry in &listing.indexes {
+            if entry.manifest != *digest {
+                continue;
+            }
+            let dir = refs
+                .join(&entry.registry)
+                .join(&entry.repository)
+                .join(INDEXES);
+            self.fs.unlink(&dir.join(entry.index.hex()))?;
+        }
         let mut dirs = Vec::new();
         collect_dirs(&refs, &mut dirs)?;
         dirs.sort();
-        for dir in dirs
-            .iter()
-            .filter(|dir| dir.file_name() == Some(OsStr::new(TAGS)))
-        {
+        for dir in dirs.iter().filter(|dir| {
+            dir.file_name() == Some(OsStr::new(TAGS))
+                || dir.file_name() == Some(OsStr::new(INDEXES))
+        }) {
             self.fs.fsync_dir(dir)?;
         }
         let deleting = staging_name(digest.hex(), "deleting");
@@ -603,6 +696,21 @@ impl Store {
         }
         Ok(pruned)
     }
+}
+
+/// The digest an entry file holds, or none when there is no file.
+fn read_entry(path: &Path) -> io::Result<Option<Digest>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Digest::parse(text.trim()).map(Some).map_err(|error| {
+        invalid(format!(
+            "the ref {} does not parse: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Every directory under `dir`, itself included, deepest last.
@@ -785,6 +893,7 @@ mod tests {
                 .collect(),
             defaults: Defaults::default(),
             skipped: Vec::new(),
+            modes: Vec::new(),
         }
     }
 
@@ -1307,6 +1416,76 @@ mod tests {
     }
 
     #[test]
+    fn index_entries_are_lookups_that_go_with_their_image() {
+        let (_tmp, store) = store();
+        let m1 = put_blob(&store, b"manifest one");
+        let m2 = put_blob(&store, b"manifest two");
+        put_image(&store, &json(&m1, &digest(2), &[]));
+        put_image(&store, &json(&m2, &digest(3), &[]));
+        let index_a = digest(0xa);
+        let index_b = digest(0xb);
+        let by_a = Reference::parse(&format!("host.example/x@{index_a}")).unwrap();
+        let by_b = Reference::parse(&format!("host.example/x@{index_b}")).unwrap();
+        let by_m1 = Reference::parse(&format!("host.example/x@{m1}")).unwrap();
+        let tag = Reference::parse("host.example/x:v1").unwrap();
+        // Nothing yet: not by index, not by manifest, not by tag.
+        assert_eq!(store.find(&by_a).unwrap(), None);
+        assert_eq!(
+            store.find(&by_m1).unwrap(),
+            Some(m1.clone()),
+            "by its own digest"
+        );
+        assert_eq!(store.find(&tag).unwrap(), None);
+        store.write_index(&by_a, &index_a, &m1).unwrap();
+        store.write_ref(&tag, &m1).unwrap();
+        assert_eq!(store.find(&by_a).unwrap(), Some(m1.clone()));
+        assert_eq!(store.find(&tag).unwrap(), Some(m1.clone()));
+        let listing = store.list().unwrap();
+        assert_eq!(
+            listing.indexes,
+            [IndexEntry {
+                registry: "host.example".into(),
+                repository: "x".into(),
+                index: index_a.clone(),
+                manifest: m1.clone(),
+            }]
+        );
+        assert_eq!(listing.refs.len(), 1, "an index entry is not a ref");
+        // The tag moves to index B: two images, two entries; prune keeps
+        // only what a tag names, and A's entry goes with A's image.
+        store.write_index(&by_b, &index_b, &m2).unwrap();
+        store.write_ref(&tag, &m2).unwrap();
+        let pruned = store.prune().unwrap();
+        assert_eq!(pruned.images, 1);
+        assert_eq!(store.image_dir(&m1), None);
+        assert!(store.image_dir(&m2).is_some());
+        let listing = store.list().unwrap();
+        assert_eq!(listing.indexes.len(), 1);
+        assert_eq!(listing.indexes[0].index, index_b);
+        assert_eq!(store.find(&by_a).unwrap(), None, "gone with its image");
+        assert_eq!(store.find(&by_b).unwrap(), Some(m2.clone()));
+        // A stale entry (its image removed by hand) counts for nothing and
+        // is overwritten by the next write.
+        store.write_index(&by_a, &index_a, &m1).unwrap();
+        assert_eq!(store.find(&by_a).unwrap(), None);
+        store.write_index(&by_a, &index_a, &m2).unwrap();
+        assert_eq!(store.find(&by_a).unwrap(), Some(m2.clone()));
+        // Removing the image removes its tag and both entries.
+        assert!(store.remove_image(&m2).unwrap());
+        let listing = store.list().unwrap();
+        assert_eq!(listing.refs, []);
+        assert_eq!(listing.indexes, []);
+        assert_eq!(listing.images, []);
+        // The tag removed, then prune: everything goes.
+        put_image(&store, &json(&m1, &digest(2), &[]));
+        store.write_ref(&tag, &m1).unwrap();
+        store.write_index(&by_a, &index_a, &m1).unwrap();
+        assert!(store.remove_ref(&tag).unwrap());
+        assert_eq!(store.prune().unwrap().images, 1);
+        assert_eq!(store.list().unwrap().indexes, []);
+    }
+
+    #[test]
     fn two_sweeps_at_once_remove_everything_and_fail_nothing() {
         let (_tmp, store) = store();
         let store = Arc::new(store);
@@ -1353,6 +1532,7 @@ mod tests {
                 user: String::new(),
             },
             skipped: vec!["dev/null".into()],
+            modes: vec![("etc/shadow".into(), 0o000)],
         };
         let text = serde_json::to_string(&j).unwrap();
         assert!(

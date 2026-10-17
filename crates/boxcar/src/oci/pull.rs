@@ -82,6 +82,71 @@ pub enum PullError {
     },
     #[error("the cached blob {digest} is not the size this manifest gives it")]
     CachedSize { digest: Digest },
+    #[error("the image is not in the cache; `boxcar image pull` it first")]
+    NotCached,
+}
+
+/// When `boxcar run --image` pulls: `--pull missing|always|never`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullMode {
+    /// Pull only an image the cache does not have.
+    Missing,
+    /// Pull: an unchanged tag fetches its manifest and nothing else.
+    Always,
+    /// Never: an image the cache does not have is an error.
+    Never,
+}
+
+/// A cached image `ensure` found or pulled.
+#[derive(Debug)]
+pub struct Found {
+    pub manifest: Digest,
+    /// The image's directory, `rootfs` and `image.json` in it.
+    // Read by `run --image` when it copies the tree.
+    #[allow(dead_code)]
+    pub dir: PathBuf,
+    pub json: ImageJson,
+    /// Whether anything was fetched.
+    pub pulled: bool,
+}
+
+/// The image `reference` names, in the cache, as `mode` says: found there,
+/// or pulled with a client from `client`, which is asked for only when a
+/// pull happens. The caller holds the store's shared lock across this and
+/// whatever it does with the image, so `rm` and `prune` wait.
+pub fn ensure(
+    store: &Store,
+    reference: &Reference,
+    mode: PullMode,
+    client: impl FnOnce() -> Result<Client, ClientError>,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<Found, PullError> {
+    if mode != PullMode::Always {
+        if let Some(manifest) = store.find(reference).map_err(PullError::Store)? {
+            let dir = store.image_dir(&manifest).ok_or(PullError::NotCached)?;
+            let json = store.image_json(&manifest).map_err(PullError::Store)?;
+            return Ok(Found {
+                manifest,
+                dir,
+                json,
+                pulled: false,
+            });
+        }
+        if mode == PullMode::Never {
+            return Err(PullError::NotCached);
+        }
+    }
+    let mut client = client()?;
+    let pulled = pull(store, &mut client, reference, progress)?;
+    let json = store
+        .image_json(&pulled.manifest)
+        .map_err(PullError::Store)?;
+    Ok(Found {
+        manifest: pulled.manifest,
+        dir: pulled.dir,
+        json,
+        pulled: pulled.fetched > 0,
+    })
 }
 
 /// Pulls `reference` into `store` with `client`, telling `progress` about
@@ -106,12 +171,15 @@ pub fn pull_within(
     let _lock = store.lock_shared().map_err(PullError::Store)?;
     store.sweep().map_err(PullError::Store)?;
 
-    // The manifest, through an index when the reference names one.
+    // The manifest, through an index when the reference names one; the
+    // index's digest is kept for its entry.
     let response = client.manifest(&reference.manifest_reference())?;
+    let mut index_digest = None;
     let (manifest, response) =
         match manifest::parse_document(&response.content_type, &response.body)? {
             Document::Manifest(manifest) => (manifest, response),
             Document::Index(index) => {
+                index_digest = Some(response.digest.clone());
                 let descriptor = index.linux_amd64()?.clone();
                 let response = client.manifest(&descriptor.digest.to_string())?;
                 match manifest::parse_document(&response.content_type, &response.body)? {
@@ -129,6 +197,7 @@ pub fn pull_within(
         .map_err(PullError::Store)?
     {
         write_ref(store, reference, &manifest_digest)?;
+        write_index(store, reference, index_digest.as_ref(), &manifest_digest)?;
         return Ok(Pulled {
             manifest: manifest_digest,
             config: config_digest,
@@ -197,7 +266,7 @@ pub fn pull_within(
             framer.finish().map_err(layer_error)?;
         }
     }
-    let skipped = unpacker.finish().map_err(PullError::Store)?;
+    let finished = unpacker.finish().map_err(PullError::Store)?;
     let json = ImageJson {
         manifest: manifest_digest.clone(),
         config: config_digest.clone(),
@@ -211,10 +280,12 @@ pub fn pull_within(
             })
             .collect(),
         defaults: image_config.defaults,
-        skipped: skipped.0,
+        skipped: finished.skipped,
+        modes: finished.modes,
     };
     let dir = staging.publish(&json).map_err(PullError::Store)?;
     write_ref(store, reference, &manifest_digest)?;
+    write_index(store, reference, index_digest.as_ref(), &manifest_digest)?;
     Ok(Pulled {
         manifest: manifest_digest,
         config: config_digest,
@@ -244,6 +315,21 @@ fn cached_blob(
         });
     }
     Ok(Some(file))
+}
+
+/// Records the index entry when the pull went through an index.
+fn write_index(
+    store: &Store,
+    reference: &Reference,
+    index: Option<&Digest>,
+    manifest: &Digest,
+) -> Result<(), PullError> {
+    if let Some(index) = index {
+        store
+            .write_index(reference, index, manifest)
+            .map_err(PullError::Store)?;
+    }
+    Ok(())
 }
 
 /// Points the reference's tag, when it has one, at `digest`.
@@ -289,7 +375,7 @@ mod tests {
     }
 
     fn client(_registry: &Registry, reference: &Reference) -> Client {
-        Client::insecure_loopback(reference, None).unwrap()
+        Client::new(reference, vec![], None).unwrap()
     }
 
     /// Pulls, collecting progress.
@@ -442,6 +528,18 @@ mod tests {
             !store.has_blob(&digest(&index.digest())),
             "the index itself is not kept"
         );
+        // Its entry is: the reference by the index's digest is found.
+        let by_index = Reference::parse(&format!(
+            "{}/library/app@{}",
+            registry.host(),
+            index.digest()
+        ))
+        .unwrap();
+        assert_eq!(
+            store.find(&by_index).unwrap(),
+            Some(pulled.manifest.clone())
+        );
+        assert_eq!(store.list().unwrap().indexes.len(), 1);
         // An index with no linux/amd64 fails before any blob.
         let arm_only = boxcar_testreg::index(&[(&arm64, "linux", "arm64")]);
         registry.put_manifest("library/app", "arm", &arm_only);
@@ -451,6 +549,110 @@ mod tests {
             matches!(err, PullError::Manifest(ManifestError::NoLinuxAmd64)),
             "{err}"
         );
+    }
+
+    #[test]
+    fn ensure_finds_or_pulls_as_the_mode_says() {
+        let registry = Registry::start(Auth::None, Faults::default());
+        let (cfg, layers) = two_layers();
+        let amd64 = boxcar_testreg::manifest(&cfg, &layers);
+        registry.put_blob(&cfg);
+        for layer in &layers {
+            registry.put_blob(layer);
+        }
+        registry.put_manifest("library/app", &amd64.digest(), &amd64);
+        let index = boxcar_testreg::index(&[(&amd64, "linux", "amd64")]);
+        registry.put_manifest("library/app", "latest", &index);
+        let (_tmp, store) = store();
+        let tag = reference(&registry, "library/app", "latest");
+        let by_index = Reference::parse(&format!(
+            "{}/library/app@{}",
+            registry.host(),
+            index.digest()
+        ))
+        .unwrap();
+        let by_manifest = Reference::parse(&format!(
+            "{}/library/app@{}",
+            registry.host(),
+            amd64.digest()
+        ))
+        .unwrap();
+        let client_for = |r: &Reference| {
+            let r = r.clone();
+            move || Client::new(&r, vec![], None)
+        };
+        let requests = || registry.requests().len();
+        // never, empty cache: nothing asked, nothing made.
+        let err = ensure(&store, &tag, PullMode::Never, client_for(&tag), &mut |_| {}).unwrap_err();
+        assert!(matches!(err, PullError::NotCached), "{err}");
+        assert_eq!(requests(), 0);
+        // missing, empty cache: the pull.
+        let found = ensure(
+            &store,
+            &tag,
+            PullMode::Missing,
+            client_for(&tag),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(found.pulled);
+        assert_eq!(found.manifest.to_string(), amd64.digest());
+        assert_eq!(found.json.layers.len(), 2);
+        let after_pull = requests();
+        assert!(after_pull > 0);
+        // missing again, by tag, by index digest and by manifest digest:
+        // found, no request.
+        for r in [&tag, &by_index, &by_manifest] {
+            let found = ensure(&store, r, PullMode::Missing, client_for(r), &mut |_| {}).unwrap();
+            assert!(!found.pulled, "{r}");
+            assert_eq!(found.manifest.to_string(), amd64.digest());
+        }
+        assert_eq!(requests(), after_pull);
+        // never: the same.
+        let found = ensure(
+            &store,
+            &by_index,
+            PullMode::Never,
+            client_for(&by_index),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(!found.pulled);
+        // always: the manifest (through the index) asked for, nothing fetched.
+        let found = ensure(
+            &store,
+            &tag,
+            PullMode::Always,
+            client_for(&tag),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(!found.pulled);
+        assert_eq!(requests(), after_pull + 2, "the index and the manifest");
+        // The registry gone: missing and never still find the image; always
+        // cannot reach it.
+        drop(registry);
+        for r in [&tag, &by_index] {
+            assert!(
+                !ensure(&store, r, PullMode::Missing, client_for(r), &mut |_| {})
+                    .unwrap()
+                    .pulled
+            );
+            assert!(
+                !ensure(&store, r, PullMode::Never, client_for(r), &mut |_| {})
+                    .unwrap()
+                    .pulled
+            );
+        }
+        let err = ensure(
+            &store,
+            &tag,
+            PullMode::Always,
+            client_for(&tag),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, PullError::Client(_)), "{err}");
     }
 
     #[test]
@@ -726,7 +928,7 @@ mod tests {
         ))
         .unwrap();
         let reference = reference(&registry, "library/app", "latest");
-        let mut client = Client::insecure_loopback(&reference, Some(&config)).unwrap();
+        let mut client = Client::new(&reference, vec![], Some(&config)).unwrap();
         let mut progress = Vec::new();
         pull(&store, &mut client, &reference, &mut |p| {
             progress.push(format!("{p:?}"))
@@ -734,7 +936,7 @@ mod tests {
         .unwrap();
         // A missing tag: the registry echoes the Authorization it got.
         let missing = self::reference(&registry, "library/app", "missing");
-        let mut client = Client::insecure_loopback(&missing, Some(&config)).unwrap();
+        let mut client = Client::new(&missing, vec![], Some(&config)).unwrap();
         let err = pull(&store, &mut client, &missing, &mut |p| {
             progress.push(format!("{p:?}"))
         })
@@ -874,7 +1076,7 @@ mod tests {
         }
         for tag in ["echo", "digest", "pax", "link", "parent"] {
             let reference = reference(&registry, "library/app", tag);
-            let mut client = Client::insecure_loopback(&reference, Some(&config)).unwrap();
+            let mut client = Client::new(&reference, vec![], Some(&config)).unwrap();
             let err = pull(&store, &mut client, &reference, &mut |_| {}).unwrap_err();
             let text = format!("{err} {err:?}");
             assert!(

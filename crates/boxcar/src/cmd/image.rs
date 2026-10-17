@@ -114,6 +114,12 @@ fn ls(args: &CacheArgs) -> Result<ExitCode> {
             entry.registry, entry.repository, entry.tag, entry.digest
         );
     }
+    for entry in &listing.indexes {
+        println!(
+            "{}/{}@{}\t{}",
+            entry.registry, entry.repository, entry.index, entry.manifest
+        );
+    }
     for image in &listing.images {
         if !listing.refs.iter().any(|r| r.digest == *image) {
             println!("(no ref)\t{image}");
@@ -128,6 +134,12 @@ fn rm(args: &ImageRmArgs) -> Result<ExitCode> {
     let removed = match Digest::parse(&args.target) {
         Ok(digest) => store.remove_image(&digest)?,
         Err(_) => match Reference::parse(&args.target) {
+            // A reference with a digest names an image (through its index
+            // entry when the digest is an index's); one with a tag, a tag.
+            Ok(reference) if reference.digest().is_some() => match store.find(&reference)? {
+                Some(manifest) => store.remove_image(&manifest)?,
+                None => false,
+            },
             Ok(reference) => store.remove_ref(&reference)?,
             Err(error) => {
                 super::tell(&format!(

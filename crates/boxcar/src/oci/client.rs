@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use rustls_pki_types::CertificateDer;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-use ureq::ResponseExt;
 
 use super::auth::{self, Challenge, Credentials, DockerConfig};
 use super::manifest::{self, MAX_CONFIG, MAX_MANIFEST};
@@ -107,9 +106,6 @@ pub enum Transport {
     Protocol,
     #[error("an I/O error")]
     Io,
-    #[cfg(test)]
-    #[error("not a loopback host")]
-    NotLoopback,
 }
 
 impl Transport {
@@ -156,20 +152,29 @@ enum Scheme {
 /// A client for one repository of one registry.
 pub struct Client {
     agent: ureq::Agent,
-    /// `https://host[:port]`: the registry's origin.
+    /// `https://host[:port]`: the registry's origin. A loopback registry
+    /// starts as `http://`, and becomes `https://` when it declines plain
+    /// HTTP, since a plain-HTTP server reading a TLS handshake may hold the
+    /// connection until a timeout, while a TLS server reading plain HTTP
+    /// closes it at once.
     base: String,
     registry: String,
     repository: String,
     credentials: Option<Credentials>,
     helper: Option<String>,
     scheme: Scheme,
-    /// Whether a plain-http loopback realm is allowed: test builds only.
+    /// Whether the registry is on the loopback, where plain HTTP is
+    /// allowed when TLS is declined, as Docker allows its insecure local
+    /// registries.
     loopback: bool,
     timeout: Duration,
 }
 
 impl Client {
-    /// A client for `reference`'s repository, over HTTPS with `roots`,
+    /// A client for `reference`'s repository, over HTTPS with `roots`;
+    /// a registry on `localhost` or `127.0.0.0/8` is spoken to over plain
+    /// HTTP, as Docker's insecure-by-default rule for local registries,
+    /// and over HTTPS when it declines that; nothing else is.
     /// with the credentials `config` has for its registry.
     pub fn new(
         reference: &Reference,
@@ -185,7 +190,7 @@ impl Client {
             .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .root_certs(RootCerts::new_with_certs(&roots))
             .build();
-        Client::build(reference, config, tls, false)
+        Client::build(reference, config, tls, is_loopback(reference.api_host()))
     }
 
     fn build(
@@ -194,10 +199,14 @@ impl Client {
         tls: TlsConfig,
         loopback: bool,
     ) -> Result<Client, ClientError> {
+        // Redirects are followed by hand (`get`), so that a loopback
+        // client, which may speak plain HTTP to its registry, is still
+        // refused a plain-HTTP redirect anywhere else.
         let agent = ureq::config::Config::builder()
             .https_only(!loopback)
             .http_status_as_error(false)
-            .max_redirects(MAX_REDIRECTS)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
             .user_agent(format!("boxcar/{}", env!("CARGO_PKG_VERSION")))
             .tls_config(tls)
             .timeout_resolve(Some(TIMEOUT))
@@ -205,7 +214,6 @@ impl Client {
             .timeout_recv_response(Some(TIMEOUT))
             .build()
             .new_agent();
-        let scheme = if loopback { "http" } else { "https" };
         let (credentials, helper) = match config {
             Some(config) => (
                 config.credentials_for(reference.registry()).cloned(),
@@ -215,7 +223,11 @@ impl Client {
         };
         Ok(Client {
             agent,
-            base: format!("{scheme}://{}", reference.api_host()),
+            base: format!(
+                "{}://{}",
+                if loopback { "http" } else { "https" },
+                reference.api_host()
+            ),
             registry: reference.registry().to_owned(),
             repository: reference.repository().to_owned(),
             credentials,
@@ -224,22 +236,6 @@ impl Client {
             loopback,
             timeout: TIMEOUT,
         })
-    }
-
-    /// A client over plain HTTP to a loopback registry, for tests.
-    #[cfg(test)]
-    pub fn insecure_loopback(
-        reference: &Reference,
-        config: Option<&DockerConfig>,
-    ) -> Result<Client, ClientError> {
-        if !is_loopback(reference.api_host()) {
-            return Err(ClientError::Transport(Transport::NotLoopback));
-        }
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::Rustls)
-            .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .build();
-        Client::build(reference, config, tls, true)
     }
 
     /// Shortens the body deadline's floor, so a test of a stall ends soon.
@@ -364,9 +360,13 @@ impl Client {
         what: &'static str,
         body_timeout: Duration,
     ) -> Result<ureq::http::Response<ureq::Body>, ClientError> {
-        let url = format!("{}{path}", self.base);
+        let mut url = format!("{}{path}", self.base);
         let mut authenticated = false;
+        let mut hops = 0;
         loop {
+            // Credentials go to the registry's own origin, never to where
+            // a redirect sent the request.
+            let at_registry = self.at_registry(&url);
             let mut request = self
                 .agent
                 .get(&url)
@@ -376,24 +376,56 @@ impl Client {
             if let Some(accept) = accept {
                 request = request.header("Accept", accept);
             }
-            match &self.scheme {
-                Scheme::Bearer(token) => {
-                    request = request.header("Authorization", format!("Bearer {token}"));
-                }
-                Scheme::Basic => {
-                    if let Some(credentials) = &self.credentials {
-                        request = request.header("Authorization", credentials.basic_header());
+            if at_registry {
+                match &self.scheme {
+                    Scheme::Bearer(token) => {
+                        request = request.header("Authorization", format!("Bearer {token}"));
                     }
+                    Scheme::Basic => {
+                        if let Some(credentials) = &self.credentials {
+                            request = request.header("Authorization", credentials.basic_header());
+                        }
+                    }
+                    Scheme::None => {}
                 }
-                Scheme::None => {}
             }
-            let mut response = request.call().map_err(transport)?;
+            let mut response = match request.call() {
+                Ok(response) => response,
+                // A loopback registry that declines plain HTTP (a TLS server
+                // closes the connection on it, or answers no HTTP): HTTPS
+                // from here on.
+                Err(error)
+                    if self.loopback
+                        && hops == 0
+                        && !authenticated
+                        && self.base.starts_with("http://")
+                        && matches!(
+                            classify(&error),
+                            Transport::Tls | Transport::Closed | Transport::Protocol
+                        ) =>
+                {
+                    self.base = format!("https://{}", &self.base["http://".len()..]);
+                    url = format!("{}{path}", self.base);
+                    continue;
+                }
+                Err(error) => return Err(transport(error)),
+            };
             let status = response.status().as_u16();
+            if (300..400).contains(&status) {
+                hops += 1;
+                if hops > MAX_REDIRECTS {
+                    return Err(ClientError::Transport(Transport::TooManyRedirects));
+                }
+                let location = header(&response, "location")
+                    .ok_or(ClientError::Transport(Transport::Protocol))?;
+                url = redirect_target(&url, &location)?;
+                continue;
+            }
             if status == 401 {
                 if authenticated {
                     return Err(self.auth_failed());
                 }
-                if !self.same_origin(response.get_uri()) {
+                if !at_registry {
                     return Err(ClientError::ChallengeFromElsewhere {
                         registry: self.registry.clone(),
                     });
@@ -502,6 +534,13 @@ impl Client {
         }
     }
 
+    /// Whether the URL `url` is at the registry's own origin.
+    fn at_registry(&self, url: &str) -> bool {
+        url.parse::<ureq::http::Uri>()
+            .map(|uri| self.same_origin(&uri))
+            .unwrap_or(false)
+    }
+
     /// Whether `uri` is at the registry's own origin.
     fn same_origin(&self, uri: &ureq::http::Uri) -> bool {
         let Ok(base) = self.base.parse::<ureq::http::Uri>() else {
@@ -520,9 +559,37 @@ impl Client {
     }
 }
 
+/// Whether `host` (with or without a port) is the loopback: `localhost`
+/// or an address in `127.0.0.0/8`.
 fn is_loopback(host: &str) -> bool {
     let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
-    host == "127.0.0.1" || host == "localhost"
+    host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|addr| addr.is_loopback())
+}
+
+/// Where a redirect from `from` with `location` goes: an absolute `https`
+/// URL, or a plain-HTTP one on the loopback; anything else is refused in
+/// boxcar's words, the location itself never repeated.
+fn redirect_target(from: &str, location: &str) -> Result<String, ClientError> {
+    let refused = || ClientError::Transport(Transport::Protocol);
+    let from_uri: ureq::http::Uri = from.parse().map_err(|_| refused())?;
+    let target = if location.starts_with('/') {
+        let authority = from_uri.authority().ok_or_else(refused)?;
+        let scheme = from_uri.scheme_str().ok_or_else(refused)?;
+        format!("{scheme}://{authority}{location}")
+    } else {
+        location.to_owned()
+    };
+    let uri: ureq::http::Uri = target.parse().map_err(|_| refused())?;
+    let host = uri.host().ok_or_else(refused)?;
+    match uri.scheme_str() {
+        Some("https") => Ok(target),
+        Some("http") if is_loopback(host) => Ok(target),
+        Some("http") => Err(ClientError::Transport(Transport::PlainHttpRedirect)),
+        _ => Err(refused()),
+    }
 }
 
 fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
@@ -542,7 +609,12 @@ fn sha256(data: &[u8]) -> Digest {
 }
 
 fn transport(error: ureq::Error) -> ClientError {
-    ClientError::Transport(match error {
+    ClientError::Transport(classify(&error))
+}
+
+/// What went wrong on the wire, in boxcar's words.
+fn classify(error: &ureq::Error) -> Transport {
+    match error {
         ureq::Error::HostNotFound => Transport::HostNotFound,
         ureq::Error::ConnectionFailed => Transport::ConnectionFailed,
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::Pem(_) => Transport::Tls,
@@ -550,9 +622,9 @@ fn transport(error: ureq::Error) -> ClientError {
         ureq::Error::TooManyRedirects | ureq::Error::RedirectFailed => Transport::TooManyRedirects,
         ureq::Error::RequireHttpsOnly(_) => Transport::PlainHttpRedirect,
         ureq::Error::BodyExceedsLimit(_) => Transport::BodyTooLarge,
-        ureq::Error::Io(error) => Transport::io(&error),
+        ureq::Error::Io(error) => Transport::io(error),
         _ => Transport::Protocol,
-    })
+    }
 }
 
 fn body_error(error: ureq::Error, what: &'static str, max: u64) -> ClientError {
@@ -572,7 +644,7 @@ mod tests {
     }
 
     fn anon(registry: &Registry) -> Client {
-        Client::insecure_loopback(&reference(registry), None).unwrap()
+        Client::new(&reference(registry), vec![], None).unwrap()
     }
 
     fn docker_config(registry: &Registry, user: &str, password: &str) -> DockerConfig {
@@ -752,7 +824,7 @@ mod tests {
         );
         image(&registry);
         let config = docker_config(&registry, "alice", "pw");
-        let mut client = Client::insecure_loopback(&reference(&registry), Some(&config)).unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config)).unwrap();
         client.manifest("latest").unwrap();
         let requests = registry.requests();
         let basic = format!(
@@ -770,7 +842,7 @@ mod tests {
         }
         // Wrong credentials: the failure names the registry, never them.
         let wrong = docker_config(&registry, "alice", "nope");
-        let mut client = Client::insecure_loopback(&reference(&registry), Some(&wrong)).unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&wrong)).unwrap();
         let err = client.manifest("latest").unwrap_err();
         assert!(matches!(err, ClientError::Auth { .. }), "{err}");
         let text = err.to_string();
@@ -783,7 +855,7 @@ mod tests {
         let registry = Registry::start(Auth::Basic("bob".into(), "pw".into()), Faults::default());
         image(&registry);
         let config = docker_config(&registry, "bob", "pw");
-        let mut client = Client::insecure_loopback(&reference(&registry), Some(&config)).unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config)).unwrap();
         client.manifest("latest").unwrap();
         let requests = registry.requests();
         assert_eq!(requests.len(), 2);
@@ -813,7 +885,7 @@ mod tests {
             registry.host()
         ))
         .unwrap();
-        let mut client = Client::insecure_loopback(&reference(&registry), Some(&config)).unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config)).unwrap();
         let err = client.manifest("latest").unwrap_err();
         assert!(
             matches!(err, ClientError::Auth { helper: Some(ref h), .. } if h == "gcloud"),
@@ -841,7 +913,7 @@ mod tests {
         );
         let (_, layer) = image(&registry);
         let config = docker_config(&registry, "alice", "pw");
-        let mut client = Client::insecure_loopback(&reference(&registry), Some(&config)).unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config)).unwrap();
         let err = client
             .blob_to(
                 &Digest::parse(&layer.digest()).unwrap(),
