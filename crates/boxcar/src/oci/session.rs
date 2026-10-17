@@ -160,7 +160,7 @@ fn copy_tree_inner(
     drop(dest_parent_fd);
 
     let mut copied = Copied::default();
-    copied.dirs.push((Vec::new(), u32::from(root_mode)));
+    copied.dirs.push((Vec::new(), root_mode));
     // Hardlink groups: the first path of each inode seen with more links.
     let mut groups: HashMap<(u64, u64), Vec<u8>> = HashMap::new();
     // The path of the current directory from the copy's root.
@@ -169,10 +169,7 @@ fn copy_tree_inner(
     let mut cur_dst = openat(&dst_root, c".", dir_flags, 0)?;
     let mut levels: Vec<Vec<CString>> =
         vec![children(reopen(&cur_src).map_err(from_source)?).map_err(from_source)?];
-    loop {
-        let Some(pending) = levels.last_mut() else {
-            break;
-        };
+    while let Some(pending) = levels.last_mut() {
         let Some(name) = pending.pop() else {
             levels.pop();
             if levels.is_empty() {
@@ -186,7 +183,7 @@ fn copy_tree_inner(
             continue;
         };
         let st = fstatat(&cur_src, &name).map_err(from_source)?;
-        let mode = u32::from(st.st_mode & 0o7777);
+        let mode = st.st_mode & 0o7777;
         let kind = st.st_mode & libc::S_IFMT;
         let child_path = beneath(&path, name.to_bytes());
         if kind == libc::S_IFDIR {
@@ -753,7 +750,7 @@ fn readlinkat(dir: &OwnedFd, name: &CStr) -> io::Result<CString> {
 }
 
 fn dup(fd: &OwnedFd) -> io::Result<OwnedFd> {
-    Ok(fd.try_clone()?)
+    fd.try_clone()
 }
 
 fn reopen(dir: &OwnedFd) -> io::Result<OwnedFd> {
