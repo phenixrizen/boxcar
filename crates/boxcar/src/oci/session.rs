@@ -567,8 +567,16 @@ pub fn follow(root: &OwnedFd, path: &str) -> Result<Followed, String> {
             Part::Name(name) => {
                 let next = resolved.join(&name);
                 let rel = next.strip_prefix("/").unwrap_or(&next).to_path_buf();
+                // Beneath a mount the guest makes, the image's entries are
+                // hidden: not looked up, and not followed. That is not the
+                // same as a missing component: a `..` that leaves the mount
+                // resumes the lookups.
                 let hidden = BOUNDARIES.iter().any(|b| next.starts_with(b));
-                let kind = if exists && !hidden {
+                if hidden {
+                    resolved = next;
+                    continue;
+                }
+                let kind = if exists {
                     kind_at(root, &rel).map_err(|error| format!("lstat: {error}"))?
                 } else {
                     Kind::Missing
@@ -1214,6 +1222,23 @@ mod tests {
             prepared(&hidden, "/workspace/app/build", false, false).unwrap();
         assert!(workspace.join("app/build").is_dir());
         assert!(!dst.join("opt/app/build").exists());
+        // Leaving the mount through `..` resumes the lookups: the link after
+        // it is followed, for the working directory and for the resolver's
+        // file alike.
+        let leaving = vec![layer(&[
+            dir("srv/", 0o755),
+            dir("etc/", 0o755),
+            symlink("app", "/srv"),
+            symlink("dns", "/srv/resolv.conf"),
+            symlink("etc/resolv.conf", "/workspace/../dns"),
+        ])];
+        let (_tmp, dst, workspace) =
+            prepared(&leaving, "/workspace/../app/build", true, false).unwrap();
+        let l = listing(&dst);
+        assert_eq!(l["srv/build"], "dir 755");
+        assert_eq!(l["srv/resolv.conf"], "file 644 \"\"");
+        assert!(!l.contains_key("app/build"));
+        assert_eq!(fs::read_dir(&workspace).unwrap().count(), 0);
         // A file whited out and its name reused for the working directory:
         // the directory gets no mode of the file's.
         let reused = vec![
