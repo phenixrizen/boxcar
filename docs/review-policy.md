@@ -1,150 +1,181 @@
-# Review policy (version 2)
+# Review policy (version 3)
 
-A merge-ready change has no unresolved blocking findings, completed required
-verification, and applicable independent review/owner approvals. Optional
-suggestions are not a reason to spend another review. Ordinary draft PRs may
-open before review or verification; they remain explicitly pending.
+Ready means the acceptance criteria are met, required affected-surface verification
+is complete, independent review applies to the revision, and no blocking findings
+or important unverified concerns remain. Optional suggestions do not require a new
+issue or review. Stop when these criteria are met; submit and merge when already
+authorized. A draft PR can precede readiness and must say what remains pending.
 
-Use the existing Codex plugin (`codex@openai-codex`) through
-`scripts/work_issue.py review`. It calls `scripts/codex_review.py`, which resolves
-the installed registry entry for this repository/user and refuses ambiguity.
-A Codex implementation session needs a separate reviewer session: its own
-self-review does not count. The plugin starts a separate read-only review thread.
-Unavailable services, authentication failures and missing output approve nothing.
+This is the canonical review and spending policy. Historical plans and execution
+logs preserve technical decisions and evidence, not competing process rules.
+Skills and the workflow guides explain how to invoke the helpers.
 
-## Planning and logical boundaries
+## Deliverables, planning and spending
 
-Review a design before code when behavior or guarantees materially change:
-architecture, protocols, trust boundaries, ownership, concurrency or assumptions
-underlying an earlier approval. Merely touching a file with a state machine does
-not require a design document. A bounded correction restoring an invariant can
-use the issue, regression test and PR explanation. Plans cover relevant events,
-failure paths, interleavings, invariants, tests and coverage limits; do not claim
-exhaustive ordering coverage without a method establishing it. A clean first
-plan review does not require a second. Resolve material plan blockers before code.
+A deliverable is one explicitly owner-selected outcome with acceptance criteria.
+It can use an existing issue; extending a long-lived issue does not require another
+issue merely to establish this boundary. The owner's direct request or approval of
+that defined outcome authorizes recording its default bounded grant; do not ask
+again for machine syntax or the same approval. With the authenticated owner's
+GitHub identity, the agent can transcribe that actual instruction into the required
+comment using `--body-file`. Record the boundary, acceptance criteria and source
+instruction before spending; another actor cannot self-issue an owner grant. Branches, sessions, PRs, rebases and renaming do not
+create a new deliverable or replenish its allowance. Necessary corrections and
+regression tests stay within the same deliverable.
 
-Keep changes together when they implement and verify one coherent outcome.
-Split independently useful, risky or revertible work. A necessary correction in
-another file may belong; unrelated cleanup in the same file usually does not.
-Parallel work must account for shared contracts/state, not just file overlap.
-Test the affected surfaces as specified in AGENTS.md; Python-only workflow
-changes do not require unrelated application runtime suites.
+For a new policy-3 deliverable the ceilings are:
 
-## Phase, scope and inputs
+- Docs/process: one review when required.
+- Plan: up to two reviews when required; a clean first review is sufficient.
+- Code: one initial review and up to two focused follow-ups. An integration review
+  consumes a focused slot. A renewed broad review needs a scoped owner exception.
 
-Phase is `docs`, `plan` or `code`. Independently select review scope:
+These are ceilings, not targets. Record an owner's bounded extension upfront,
+including phase and scope, rather than repeatedly requesting single-round grants.
+An exhausted allowance produces one consolidated decision: findings/evidence,
+tested state, and the exact additional review needed. Spending permission never
+accepts a defect, approves disclosure, or proves safety. Existing exhausted
+allowances are not reset by adopting this policy. Lifetime counts and original
+attempts remain immutable; the deliverable records the spending boundary.
 
-- `initial`: complete logical change, requirements, important invariants and
-  relevant surrounding code. Renew this scope after material design changes.
-- `follow-up`: previous findings, bounded fixes, tests and affected behavior,
-  including surrounding code and callers. It may discover serious new defects;
-  it does not restart unrestricted architectural review after each correction.
-- `integration`: target changes, conflict resolution or stack retargeting,
-  including callers, dependencies, configuration and shared assumptions.
+Review a design before implementation when behavior or guarantees materially
+change: architecture, protocols, trust boundaries, ownership, concurrency or
+assumptions underlying earlier approval. Touching a state-machine file alone does
+not require a plan. A bounded correction restoring an invariant can use the issue,
+regression test and PR explanation. Cover relevant events, failure paths,
+interleavings, invariants, tests and coverage limits; do not claim exhaustive
+ordering coverage without a method. Resolve material plan blockers before code.
 
-The helper's `--scope` is a workflow option. The installed plugin supports only
-`--scope branch|working-tree|auto`; it receives `branch`, an immutable base SHA,
-and the selected workflow scope/instructions in its focus text. Prior receipts
-and restricted reports are supplied as private context. Focused scopes require
-prior completed receipts in the same phase and a continuity rationale. Transfer
-missing reports privately or choose initial scope; never invent their contents.
-Use `--verifies F-ID` for each prior finding being verified. A reviewer can retain
-its stable ID in the finding title; otherwise a new claim receives a new opaque
-ID and earlier findings remain in the ledger.
+Keep one coherent outcome and its verification together. Split independently useful,
+risky or revertible work. Parallel work considers shared contracts and state, not
+just file overlap. Test affected surfaces; Python-only workflow changes do not
+require unrelated runtime suites.
 
-Branch review runs in a detached snapshot of the exact commit. Receipts record
-head, comparison base and merge base; uncommitted files are excluded. Remote
-bases are fetched; fetch/comparison failures stop the operation. Being behind
-is permitted and does not assert current integration. Direct wrapper users can
-pin `--head SHA`; this is consumed by the wrapper, not forwarded to the plugin.
-Plan-only review can use `--comparison COMMIT_BEFORE_PLAN`.
+## Findings and their disposition
 
-Before readiness, fetch and incorporate the current target, run affected checks,
-checkpoint actual results, and use `integrate` with an applicable receipt.
-Integration evidence binds the actual head/target/merge base, rationale and
-review receipt. The selected receipt must be the applicable code/docs review;
-a plan receipt never substitutes for implementation coverage. The current target must be an ancestor of that head. A bounded
-fix against an unchanged target accepts an exact-head follow-up linked to the
-prior review. Target changes need integration or renewed initial scope; material
-changes need initial scope. Unchanged patch identity alone is not evidence of
-unchanged behavior. A new head/base never silently inherits old approval.
-Retargeting/rebasing preserves historical receipts rather than rewriting SHAs.
-
-## Finding dispositions
-
-Keep original structured results in restricted reports. A public checkpoint
-contains opaque IDs and sanitized evidence, never undisclosed technical claims
-or reproductions. Severity and confidence are separate and retained per source claim. Repeated
-claims preserve earlier observations and enforce any later severity escalation. Classify with evidence
-and consequences, not confidence alone:
+A finding is a claim to investigate, not an automatic task. Preserve its original
+result, severity and confidence separately. Require evidence and consequences:
 
 - `blocking`: demonstrated incorrect behavior, violated requirement/invariant,
   material security risk, or missing verification of critical behavior.
-- `nonblocking`: optional refinement; requirements are met without it.
-- `concern`: unverified claim needing investigation. High-impact concerns hold
-  readiness until investigated; a high/critical reviewer claim cannot simply
-  be labelled nonblocking.
-- `independent`: existing defect tracked separately unless this change worsens,
-  exposes or depends on it. Requires a separate issue reference; preserve the
-  owner's decision on whether/when to pursue unrelated work.
-- `unclassified`: missing detail, including legacy findings. Never an approval.
+- `concern`: an unverified claim needing investigation. Credible high-impact
+  concerns hold readiness; uncertainty is not permission to dismiss them.
+- `nonblocking`: an optional refinement; requirements are met without it.
+- `independent`: a demonstrated actionable defect outside this change. Search
+  for an existing issue, then create or reuse one; preserve the owner's decision
+  on whether/when to do that work. If this change worsens, exposes or depends on
+  it, resolve it here. An owner-selected independent follow-up also gets an issue.
+- `unclassified`: insufficient detail, including legacy findings; never approval.
 
-`dispose` appends a history event: `investigate`, `fixed-unverified`, `verified`,
-`refuted`, `deferred`, or `excepted`, plus evidence and consequence. Blocking
-findings/concerns cannot disappear by reclassification. Resolve them with
-verification, refuting evidence or a specific owner exception. Only nonblocking
-or independent findings may be deferred. Resolution applies to its recorded
-head/base; explicitly reconcile it after further changes. A repeated reviewer
-claim reopens investigation. Original verdicts are immutable: a needs-attention
-review can support readiness after evidence shows all findings are resolved or
-nonblocking. Missing review output can never support readiness.
+Optional suggestions remain dispositions with a reason. Unverified concerns do not
+become backlog issues merely because a reviewer mentioned them. Never classify an
+unknown as optional to obtain a pass. Undisclosed findings follow the private
+advisory workflow instead of public issue creation.
 
-These are attestations, not proofs of model judgment or semantic equivalence.
-The helper cannot decide whether prose establishes a real defect or whether an
-unreported architecture change is material. The agent must investigate and
-choose scope honestly; CI checks evidence consistency and trusted provenance.
+Append dispositions (`investigate`, `fixed-unverified`, `verified`, `refuted`,
+`deferred`, `excepted`) with evidence and consequence. Only nonblocking/independent
+findings may be deferred. Blockers and concerns need verification, refuting evidence
+or a specific owner exception, not relabelling. A repeated claim reopens the finding
+and preserves earlier observations and severity escalation.
 
-## Spending and migration
+Original verdicts are immutable. A `needs-attention` review can support readiness
+once its findings are resolved or nonblocking; a cosmetic `approve` verdict or zero
+findings is not required. Missing review output never approves anything. Keep raw
+results restricted and public evidence sanitized: no undisclosed technical claims,
+reproduction details, private identifiers or advisory links in public checkpoints.
 
-Version 2 ceilings: docs/process one when required; plans two; code three
-autonomously. Code rounds four and five each require explicit scoped owner
-authorization; beyond five requires another explicit exception. Initial,
-follow-up and integration code reviews all count. Stop once criteria are met.
-Round three is a spending/triage checkpoint; a nonempty triage note is not
-permission. Exhaustion is neither proof of safety nor an order to redesign.
+## Review scope, revisions and continuity
 
-The existing `authorize` command validates an owner-authored/latest-edited exact
-phase/round comment before invocation and again in CI. `ceiling` records a
-narrower task allowance, also checked in both paths. Task-specific allowances
-belong in the issue's owner authorization and durable ledger, not in this general
-policy. When the owner extends a task into a new implementation phase, record the
-whole bounded allowance before starting its reviews. Continue cumulative counts;
-do not apply a completed amendment's historical allowance as a permanent ceiling
-or infer permission beyond the current grant. A spending grant never waives
-blockers, authorizes disclosure or resets previous rounds.
+Phase (`docs`, `plan`, `code`) and scope are separate:
 
-Only completed structured invocations consume rounds. Pending attempts block
-another invocation until recovered exactly once. Two consecutive failures require
-repairing the cause and an exact owner `retry` authorization naming the failed-attempt digest printed by the helper; that authorization
-covers only the failed attempt IDs recorded then, not unlimited retries.
+- `initial`: the complete logical change, requirements, important invariants and
+  relevant surrounding code. Material design changes require renewed broad review.
+- `follow-up`: previous findings, bounded fixes, tests, callers and affected behavior.
+  It can discover a serious new defect without restarting unrestricted design review.
+- `integration`: newer target changes, conflicts or stack retargeting, including
+  dependencies, configuration, callers and shared assumptions.
 
-Schema 2 retains the stable `work-issue-checkpoint:v1` envelope marker so old
-clients find the existing comment and fail closed on its version. Migration
-preserves all attempts/outcomes/counts/authorizations, stores historical receipt
-digests and a local v1 backup, and creates unclassified legacy findings. Recover
-pending v1 attempts before migration. Historic rounds retain policy 1 (including
-its old fourth/fifth-round rules); no retrospective permission is fabricated.
-New rounds use policy 2. Migration publishes through the same recoverable atomic
-protocol. Released returning clones adopt migrated remote history; active or
-unpublished conflicting state still requires explicit reconciliation.
+Use `scripts/work_issue.py review` and the existing Codex plugin through
+`scripts/codex_review.py`. The wrapper resolves the installed registry entry and
+refuses ambiguity. Codex implementation requires a separate reviewer session;
+self-review does not count. The plugin starts a separate read-only review thread.
+The plugin's supported scope is `branch|working-tree|auto`; the helper passes
+`branch`, immutable inputs and workflow scope instructions in focus text. Do not
+invent plugin flags. Prior receipts/reports and finding IDs identify what a focused
+review verifies. Transfer missing reports privately or obtain an authorized initial
+review; never invent their contents.
+
+Branch review uses a detached snapshot of the exact commit. A receipt records head,
+comparison base and merge base; it does not cover uncommitted files. Fetch/comparison
+failures stop the operation. A behind-base review remains useful but proves no
+current integration. Direct wrapper `--head SHA` is consumed by the wrapper. Plan
+review may use `--comparison COMMIT_BEFORE_PLAN`.
+
+Preserve receipts and their SHAs. Carry-forward explicitly connects prior resolved
+findings to the current revision with evidence about changes and affected behavior.
+One focused review can reconcile an identified batch of earlier dispositions; do
+not demand individual re-attestation of every historical finding after every commit.
+It cannot carry an unresolved blocker, erase a new claim or invent verification.
+Behavior-changing revisions need applicable independent review. A checked continuity
+record may cover only insertion of the two fixed license-header lines in existing
+regular Python files: other bytes, file paths and modes stay unchanged, and encoding
+cookies/BOMs are refused. Current tests are still required. Docs/instruction edits
+are not eligible. An arbitrary prose claim, unchanged patch, or matching tree alone
+is insufficient.
+Unexplained revision/base changes fail readiness.
+
+Before readiness fetch and incorporate the current target, run affected checks,
+checkpoint actual results and validate integration. Evidence binds the actual
+head/target/merge base and applicable implementation review, never a plan receipt.
+The target must be an ancestor of the head. Target changes require integration or
+renewed initial review; material changes require renewed initial scope. A bounded
+fix against an unchanged target can use a focused review linked to the prior one.
+No integration evidence is claimed when fetching/comparison fails.
+
+These records check consistency and provenance, not model judgment or semantic
+equivalence. Investigate honestly and use the repository validator everywhere;
+a temporary finishing script must not add a zero-findings gate or blanket-resolve
+findings merely to finish.
+
+## Durable history, authorization and rollout
+
+Only completed structured reviews consume rounds. Failed/unavailable calls approve
+nothing. Pending attempts block new spending until recovered exactly once. Two
+consecutive failures require repairing the cause and an exact owner retry grant
+bound to those failed attempts, not unlimited retries.
+
+Owner authorizations must be scoped, authenticated and latest-editor checked in
+both invocation and CI validation. Existing `authorize`, `ceiling`, `retry` and
+finding-exception records retain their original meaning. A triage note is not an
+authorization. Preserve all attempt IDs, counts, outcomes, grants and unresolved
+findings through migration, resume and handoff; never fabricate historical approvals.
+
+Ordinary policy/schema 3 is opt-in after its compatible validator reaches trusted
+main. Existing live checkpoints stay schema 2 during bootstrap; legacy policy-2 reviews
+use their cumulative grants. Policy 1 retains its original fourth/fifth-round
+rules; policy 2 retains docs one, plans two, code three autonomous with explicit
+permission for each later round. These historic rules do not change retroactively.
+The migration preserves the existing comment envelope and history, records the
+explicit owner-scoped deliverable boundary, and uses recoverable publication.
+Pending attempts must recover first; an active or unpublished conflicting clone
+requires reconciliation. A released returning clone imports the migrated remote
+history; an older incompatible helper stops instead of resetting it.
+
+The privileged contract workflow executes trusted-main files only. Candidate local
+validation is not an enforced GitHub check. Ship dual-version validation before
+publishing schema-3 checkpoints; update returning clones before using them. Do not
+change branch protections, waive checks or execute PR-controlled validators to
+bypass bootstrap.
 
 ## Confidential reviews
 
-Undisclosed vulnerabilities belong in the affected repository's GitHub Draft
-Security Advisories. Search related drafts, preserve unconfirmed claims and
-verification, and fail closed on unavailable access. No fix without owner
-remediation authorization; no disclosure or publication without explicit owner
-approval. Revealing patches/tests and review reports stay private. The advisory
-helper records private results and reuses this policy; consult
-`docs/security-workflow.md` for permissions, owner-provenance handoff and fork limits.
-Never upload raw reports as public CI artifacts or paste them into checkpoints.
+Draft Security Advisories are authoritative for undisclosed findings. Search related
+drafts, preserve unconfirmed claims and verification, and fail closed on unavailable
+access. Remediation needs owner authorization; publication and disclosure need a
+separate explicit decision. Patches, tests and reports that reveal a finding stay
+private; never upload raw reviews as public CI artifacts. Use the same spending,
+findings and continuity rules, with private authorization and evidence. Consult
+`docs/security-workflow.md` for its currently supported ledger version and fork limits.
+Finishing the workflow software does not require disclosure or retirement of the
+source artifact; retain those separate private decisions without extending the
+software deliverable indefinitely.

@@ -27,7 +27,8 @@ publication and source retirement remain separate decisions.
 
 Add opt-in checkpoint schema 3 and policy-3 reviews; continue supporting v1/v2.
 An explicit `deliverable` operation previews an owner authorization line bound to
-an ID, outcome, acceptance criteria and the complete preceding attempt-ID prefix.
+an ID, outcome, acceptance criteria, the complete preceding attempt-ID prefix,
+and a digest of the complete preceding receipts (not merely their IDs).
 Activation verifies its comment author/latest editor and exact binding. The private
 helper uses its existing exact-snapshot owner decision and trusted private grants.
 No inferred scope transition on start, branch, rebase, rename or handoff. Repeating
@@ -68,7 +69,10 @@ or clean-verdict gate is added outside the repository readiness validator.
 A `continuity` operation supports a deliberately narrow exception: insertion of
 exact approved Python license header comments after an unchanged shebang (or at
 the start), with every other byte and every path/file mode unchanged. No additions,
-deletions, renames, symlinks, binary or executable-content changes qualify. Reviewed
+deletions, renames, symlinks, binary or executable-content changes qualify. Reject
+any UTF-8 BOM or Python encoding cookie in the first two original lines: moving
+these can change decoding or compilation. Require matching local/CI rejection
+tests. Reviewed
 head must be an ancestor, target unchanged. Bind the proof to actual Git blobs and
 trees, receipt and disposition snapshot. Recompute it locally and through GitHub
 Git-object reads in CI; never execute candidate files. There is no general semantic

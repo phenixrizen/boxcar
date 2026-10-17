@@ -1,5 +1,11 @@
 # M3: guest sensor and reconciler
 
+> Process note: the current repository contract and [review policy](../review-policy.md)
+> supersede this plan's historical instructions about planning, review counts,
+> task splitting, parallel work and check selection. Technical requirements,
+> acceptance criteria and recorded results below remain relevant. Run the suites
+> for affected surfaces; an unavailable or skipped KVM run is never a pass.
+
 **Goal:** After M3, a session's log carries two rings. Ring 1 is a small eBPF sensor in the guest, started by init from the initramfs before privileges drop, reporting process lineage (exec with argv, fork, exit), connection attempts with the full 4-tuple, `memfd_create`, sampled file opens, and the denials of its own self-protection, over vsock port 1026 with a heartbeat. Ring 0 is unchanged. A reconciler thread on the host consumes the log in sequence order, joins effects to processes and flows to processes, and writes `finding` records back into the same chained log. A `sync` record pairs the guest clock with the host's. `curl` to a blocked host inside the guest yields a finding whose evidence points at records in both rings.
 
 **Architecture:** Three new crates in the roadmap's shape. `boxcar-sensor-common` (`no_std`, `repr(C)` events) is shared by `boxcar-sensor-ebpf` (the programs, built for `bpfel-unknown-none` on a pinned nightly by the userspace crate's `build.rs`, excluded from the workspace) and `boxcar-sensor` (static musl userspace that loads and attaches the programs, drains the ring buffer, frames records and heartbeats to vsock 1026). On the host, `SensorIngest` is one more internal vsock service that validates frames and emits ring 1 submissions to the audit writer; `GuestCtl` turns its ping round trips into `sync` records; `boxcar_audit::reconcile` is a subscriber thread with state, joins, rules and a paused-clock test harness. Findings reach control clients through the existing `audit.subscribe`, which gains `min_score`.

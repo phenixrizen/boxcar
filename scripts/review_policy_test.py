@@ -2,6 +2,7 @@
 # Copyright 2026 The boxcar Authors
 """Policy transitions with synthetic findings, fake GitHub and real Git inputs."""
 
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -823,6 +824,497 @@ class PolicyWorkflow(unittest.TestCase):
         ):
             with self.assertRaisesRegex(w.Error, "executable"):
                 w.validate_pr(88, self.gh)
+
+
+class DeliverablePolicy(unittest.TestCase):
+    """Pure ledger tests; synthetic claims never need GitHub or a model."""
+
+    def setUp(self):
+        self.state = {"version": 2, "reviews": [], "findings": {}, "authorizations": []}
+        self.grants = {}
+
+    def grant_check(self, phase, round_, comment, kind, binding=None):
+        self.assertEqual(self.grants[comment], (phase, round_, kind, binding))
+
+    def begin(self, ident="change", comment=10):
+        self.state = policy.begin_deliverable(
+            self.state, ident, "One coherent outcome", "Affected tests pass", comment
+        )
+        d = self.state["deliverables"][-1]
+        self.grants[comment] = (
+            "deliverable",
+            len(self.state["deliverables"]),
+            "deliverable",
+            d["binding"],
+        )
+        return d
+
+    def add(
+        self,
+        phase="code",
+        scope=None,
+        head="a" * 40,
+        base="b" * 40,
+        result=None,
+        material=False,
+        prior=None,
+    ):
+        prior_phase = [
+            r
+            for r in self.state["reviews"]
+            if r["phase"] == phase and r["status"] == "completed"
+        ]
+        same = [
+            r
+            for r in prior_phase
+            if r.get("deliverable") == self.state.get("active_deliverable")
+        ]
+        scope = scope or ("follow-up" if same else "initial")
+        result = result or {"verdict": "approve", "findings": []}
+        r = {
+            "id": "attempt-" + str(len(self.state["reviews"]) + 1),
+            "phase": phase,
+            "status": "completed",
+            "round": policy.count(self.state, phase) + 1,
+            "scope": scope,
+            "commit": head,
+            "base_sha": base,
+            "merge_base": base,
+            "inputs": {"head": head, "base": base, "merge_base": base},
+            "outcome": result["verdict"],
+            "rationale": "Relevant behavior and fixes checked.",
+            "prior": prior if prior is not None else [r["id"] for r in prior_phase],
+            "verifies": list(self.state["findings"]),
+            "material_change": material,
+            **policy.review_fields(self.state, phase),
+        }
+        self.state["reviews"].append(r)
+        policy.register_result(self.state, r, result)
+        return r
+
+    def finding(self, severity="medium"):
+        r = self.add(
+            result={
+                "verdict": "needs-attention",
+                "findings": [
+                    {
+                        "title": "Synthetic behavior claim",
+                        "severity": severity,
+                        "confidence": 0.5,
+                    }
+                ],
+            }
+        )
+        return r, r["finding_ids"][0]
+
+    def settle(self, fid, category="blocking", status="verified", **extra):
+        r = self.state["reviews"][-1]
+        return policy.disposition(
+            self.state,
+            fid,
+            {
+                "category": category,
+                "status": status,
+                "evidence": "Synthetic regression and code trace.",
+                "consequence": "Acceptance requirement remains satisfied.",
+                **extra,
+            },
+            r["commit"],
+            r["base_sha"],
+        )
+
+    def test_delivery_budget_preserves_lifetime_history_and_scoped_counts(self):
+        for number in range(1, 6):
+            self.add()
+            if number > 3:
+                self.state["authorizations"].append(
+                    {"phase": "code", "round": number, "comment": number}
+                )
+                self.grants[number] = ("code", number, "authorize", None)
+        previous = copy.deepcopy(self.state["reviews"])
+        self.begin()
+        for number in range(6, 9):
+            self.assertEqual(policy.budget(self.state, "code"), number)
+            r = self.add()
+            self.assertEqual(r["deliverable_round"], number - 5)
+        self.assertEqual(self.state["reviews"][:5], previous)
+        policy.check_ledger(self.state, self.grant_check)
+        with self.assertRaisesRegex(policy.Error, "round 9"):
+            policy.budget(self.state, "code")
+        self.add()
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.check_ledger(self.state, self.grant_check)
+
+    def test_docs_plans_have_independent_deliverable_ceilings(self):
+        self.begin()
+        for phase, limit in (("docs", 1), ("plan", 2), ("code", 3)):
+            for _ in range(limit):
+                policy.budget(self.state, phase)
+                self.add(phase)
+            with self.assertRaisesRegex(policy.Error, "authorization"):
+                policy.budget(self.state, phase)
+        policy.check_ledger(self.state, self.grant_check)
+
+    def test_resume_branch_rebase_and_renaming_do_not_reset_budget(self):
+        self.begin()
+        for _ in range(3):
+            self.add()
+        before = copy.deepcopy(self.state)
+        self.state = policy.begin_deliverable(
+            self.state, "change", "One coherent outcome", "Affected tests pass", 10
+        )
+        self.assertEqual(self.state, before)
+        for key, value in (
+            ("branch", "other"),
+            ("session", "new"),
+            ("base_sha", "c" * 40),
+        ):
+            self.state[key] = value
+            with self.assertRaisesRegex(policy.Error, "authorization"):
+                policy.budget(self.state, "code")
+        with self.assertRaisesRegex(policy.Error, "already used"):
+            policy.begin_deliverable(
+                self.state, "change", "Renamed outcome", "Affected tests pass", 10
+            )
+        renamed = policy.begin_deliverable(
+            self.state, "renamed", "One coherent outcome", "Affected tests pass", 10
+        )
+        with self.assertRaises(AssertionError):
+            policy.check_ledger(renamed, self.grant_check)
+
+    def test_new_authorized_delivery_does_not_drop_old_blockers(self):
+        self.begin()
+        first, fid = self.finding("high")
+        self.settle(fid, "concern", "investigate")
+        original = copy.deepcopy(self.state["findings"])
+        self.begin("another-outcome", 11)
+        current = self.add()
+        self.assertEqual(policy.count(self.state, "code"), 2)
+        self.assertEqual(current["deliverable_round"], 1)
+        self.assertEqual(self.state["findings"], original)
+        self.assertFalse(
+            policy.approved(self.state, current["commit"], current["base_sha"])
+        )
+        policy.check_ledger(self.state, self.grant_check)
+        self.assertEqual(first["outcome"], "needs-attention")
+
+    def test_boundary_digest_prevents_rewriting_previous_deliverable(self):
+        self.begin()
+        self.add()
+        self.begin("next", 11)
+        self.add()
+        policy.check_ledger(self.state, self.grant_check)
+        self.state["reviews"][0]["rationale"] = "Rewritten historical review"
+        with self.assertRaisesRegex(policy.Error, "boundary changed"):
+            policy.check_ledger(self.state, self.grant_check)
+
+    def test_v1_migration_hashes_and_unclassified_findings_survive(self):
+        legacy = {
+            "id": "legacy",
+            "phase": "code",
+            "status": "completed",
+            "round": 1,
+            "outcome": "needs-attention",
+            "unresolved": 2,
+        }
+        self.state.update(version=1, reviews=[legacy])
+        self.begin()
+        self.assertEqual(
+            self.state["migration"]["history"]["legacy"], policy.digest(legacy)
+        )
+        self.assertEqual(
+            self.state["deliverable_migration"]["history"]["legacy"],
+            policy.digest(legacy),
+        )
+        self.assertEqual(self.state["reviews"], [legacy])
+        self.assertEqual(len(self.state["findings"]), 2)
+        policy.check_ledger(self.state, self.grant_check)
+        self.assertFalse(policy.findings_ready(self.state, "a" * 40, "b" * 40))
+        self.state["reviews"][0]["outcome"] = "approve"
+        with self.assertRaisesRegex(policy.Error, "historical"):
+            policy.check_ledger(self.state, self.grant_check)
+
+    def test_old_ceiling_is_not_applied_to_new_deliverable_but_is_preserved(self):
+        self.add()
+        self.state["ceilings"] = {"code": {"round": 1, "comment": 9}}
+        self.grants[9] = ("code", 1, "ceiling", None)
+        self.begin()
+        self.assertEqual(policy.budget(self.state, "code"), 2)
+        self.add()
+        policy.check_ledger(self.state, self.grant_check)
+        self.assertEqual(self.state["ceilings"]["code"]["round"], 1)
+
+    def test_later_narrow_deliverable_ceiling_limits_default_allowance(self):
+        d = self.begin()
+        self.add()
+        d["ceilings"] = {"code": {"round": 1, "comment": 9}}
+        self.grants[9] = ("code", 1, "ceiling", None)
+        policy.check_ledger(self.state, self.grant_check)
+        with self.assertRaisesRegex(policy.Error, "scoped allowance"):
+            policy.budget(self.state, "code")
+        self.add()
+        with self.assertRaisesRegex(policy.Error, "allowance exceeded"):
+            policy.check_ledger(self.state, self.grant_check)
+        self.begin("new-deliverable", 11)
+        with self.assertRaisesRegex(policy.Error, "allowance exceeded"):
+            policy.check_ledger(self.state, self.grant_check)
+
+    def test_material_renewal_requires_exact_owner_grant_without_reset(self):
+        self.begin()
+        self.add()
+        renewed = self.add(scope="initial", material=True)
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.validate_scope(self.state, renewed)
+        self.state["authorizations"].append(
+            {"phase": "code", "round": 2, "comment": 12}
+        )
+        self.grants[12] = ("code", 2, "authorize", None)
+        policy.validate_scope(self.state, renewed, self.grant_check)
+        policy.check_ledger(self.state, self.grant_check)
+        self.assertEqual(policy.budget(self.state, "code"), 3)
+        with self.assertRaisesRegex(policy.Error, "revoked"):
+            policy.validate_scope(
+                self.state,
+                renewed,
+                lambda *args: (_ for _ in ()).throw(policy.Error("revoked")),
+            )
+
+    def test_failed_attempts_do_not_count_or_erase_retry_limits(self):
+        self.begin()
+        for _ in range(2):
+            r = self.add()
+            r.update(status="failed", outcome="unavailable")
+        self.assertEqual(policy.count(self.state, "code"), 0)
+        self.assertEqual(policy.deliverable_count(self.state, "code"), 0)
+        with self.assertRaisesRegex(policy.Error, "failed attempts"):
+            policy.budget(self.state, "code")
+        policy.check_ledger(self.state, self.grant_check)
+        self.state["reviews"][-1]["status"] = "pending"
+        with self.assertRaisesRegex(policy.Error, "pending"):
+            policy.begin_deliverable(self.state, "next", "Another outcome", "Tests", 11)
+
+    def test_migration_cannot_infer_original_context_for_historical_review(self):
+        first, fid = self.finding()
+        self.settle(fid)
+        historical = self.add(head="c" * 40)
+        before = copy.deepcopy(self.state["reviews"])
+        self.begin()
+        with self.assertRaisesRegex(policy.Error, "policy 3 review"):
+            policy.carry_forward(
+                self.state,
+                historical["id"],
+                [fid],
+                "Migration cannot prove missing source context.",
+            )
+        self.assertEqual(self.state["reviews"], before)
+        finding = self.state["findings"][fid]
+        forged = {
+            "receipt": historical["id"],
+            "head": historical["commit"],
+            "base": historical["base_sha"],
+            "rationale": "Historical context not established.",
+            "findings": {
+                fid: {
+                    "disposition": policy.digest(finding["history"][-1]),
+                    "sources": policy.digest(finding["sources"]),
+                }
+            },
+        }
+        forged["id"] = policy.digest(forged)
+        self.state["carry_forwards"] = [forged]
+        with self.assertRaisesRegex(policy.Error, "policy 3 review"):
+            policy.approved(self.state, historical["commit"], historical["base_sha"])
+        self.state.pop("carry_forwards")
+        current = self.add(head="c" * 40, prior=[first["id"], historical["id"]])
+        policy.carry_forward(
+            self.state,
+            current["id"],
+            [fid],
+            "New review explicitly receives original reports.",
+        )
+        self.assertTrue(
+            policy.approved(self.state, current["commit"], current["base_sha"])
+        )
+
+    def test_batch_carry_forward_preserves_dispositions_and_survives_handoff(self):
+        self.begin()
+        first, fid = self.finding()
+        self.settle(fid)
+        old = copy.deepcopy(self.state["findings"])
+        current = self.add(head="c" * 40)
+        self.assertFalse(
+            policy.approved(self.state, current["commit"], current["base_sha"])
+        )
+        batch = policy.carry_forward(
+            self.state, current["id"], [fid], "Verified bounded fix and callers."
+        )
+        self.assertEqual(
+            policy.carry_forward(
+                self.state, current["id"], [fid], "Verified bounded fix and callers."
+            ),
+            batch,
+        )
+        self.assertEqual(len(self.state["carry_forwards"]), 1)
+        self.assertEqual(self.state["findings"], old)
+        self.assertTrue(
+            policy.approved(
+                json.loads(json.dumps(self.state)),
+                current["commit"],
+                current["base_sha"],
+            )
+        )
+        self.assertFalse(policy.approved(self.state, "d" * 40, current["base_sha"]))
+        self.assertEqual(first["outcome"], "needs-attention")
+
+    def test_carry_cannot_resolve_concerns_or_unknown_legacy_findings(self):
+        for status in ("investigate", "fixed-unverified"):
+            self.setUp()
+            self.begin()
+            _, fid = self.finding("high")
+            self.settle(fid, "concern", status)
+            current = self.add(head="c" * 40)
+            with self.assertRaisesRegex(policy.Error, "unresolved"):
+                policy.carry_forward(
+                    self.state, current["id"], [fid], "Silence is not verification."
+                )
+            with self.assertRaisesRegex(policy.Error, "reclassification"):
+                self.settle(fid, "nonblocking", "deferred")
+
+    def test_carry_requires_original_reports_and_actual_review_context(self):
+        self.begin()
+        first, fid = self.finding()
+        self.settle(fid)
+        middle = self.add()
+        current = self.add(head="c" * 40, prior=[middle["id"]])
+        with self.assertRaisesRegex(policy.Error, "original source"):
+            policy.carry_forward(
+                self.state, current["id"], [fid], "Missing claim context."
+            )
+        current["prior"].append(first["id"])
+        current["verifies"] = []
+        with self.assertRaisesRegex(policy.Error, "explicitly reviewed"):
+            policy.carry_forward(self.state, current["id"], [fid], "Missing request.")
+
+    def test_code_carry_can_include_plan_source_without_substituting_plan_review(self):
+        self.begin()
+        plan = self.add(
+            "plan",
+            result={
+                "verdict": "needs-attention",
+                "findings": [
+                    {"title": "Synthetic plan verification claim", "severity": "medium"}
+                ],
+            },
+        )
+        fid = plan["finding_ids"][0]
+        self.settle(fid)
+        code = self.add(prior=[plan["id"]], head="c" * 40)
+        policy.carry_forward(
+            self.state,
+            code["id"],
+            [fid],
+            "Initial code review verified plan requirement.",
+        )
+        self.assertTrue(policy.approved(self.state, code["commit"], code["base_sha"]))
+        followup = self.add(head="d" * 40, prior=[plan["id"]])
+        with self.assertRaisesRegex(policy.Error, "own phase"):
+            policy.validate_scope(self.state, followup)
+        followup["prior"].append(code["id"])
+        policy.carry_forward(
+            self.state,
+            followup["id"],
+            [fid],
+            "Focused code review includes original plan claim.",
+        )
+        policy.check_ledger(self.state, self.grant_check)
+
+    def test_repeated_claim_reopens_and_cannot_reuse_earlier_carry(self):
+        self.begin()
+        first, fid = self.finding()
+        self.settle(fid)
+        current = self.add(head="c" * 40)
+        policy.carry_forward(self.state, current["id"], [fid], "Fix checked.")
+        repeated = self.add(
+            head="c" * 40,
+            result={
+                "verdict": "needs-attention",
+                "findings": [
+                    {"title": fid + " remains reproducible", "severity": "high"}
+                ],
+            },
+        )
+        self.assertEqual(repeated["finding_ids"], [fid])
+        self.assertFalse(
+            policy.approved(self.state, repeated["commit"], repeated["base_sha"])
+        )
+        with self.assertRaisesRegex(policy.Error, "original source"):
+            policy.carry_forward(
+                self.state, repeated["id"], [fid], "Cannot carry new occurrence."
+            )
+        self.assertEqual(first["outcome"], "needs-attention")
+
+    def test_nonblocking_needs_attention_remains_ready_without_issue(self):
+        self.begin()
+        r, fid = self.finding()
+        self.settle(fid, "nonblocking", "deferred")
+        self.assertTrue(policy.approved(self.state, r["commit"], r["base_sha"]))
+        with self.assertRaisesRegex(policy.Error, "separate issue"):
+            self.settle(fid, "independent", "deferred")
+        self.assertEqual(policy.deliverable_count(self.state, "code"), 1)
+
+    def test_nonsemantic_continuity_preserves_receipt_and_binds_exact_revision(self):
+        self.begin()
+        r = self.add()
+        original = copy.deepcopy(r)
+        head, base = "c" * 40, r["base_sha"]
+        proof = {
+            "kind": "license-headers",
+            "from_head": r["commit"],
+            "head": head,
+            "base": base,
+        }
+        policy.record_continuity(self.state, r["id"], head, base, proof)
+        self.assertTrue(policy.approved(self.state, head, base))
+        self.assertFalse(policy.approved(self.state, "d" * 40, base))
+        self.assertEqual(r, original)
+        self.state["integration"] = {
+            "head": head,
+            "base": base,
+            "merge_base": base,
+            "receipt": r["id"],
+            "rationale": "Target incorporated; narrow delta checked.",
+        }
+        policy.integration_current(self.state, head, base)
+        self.state["continuity"]["proof"]["base"] = "d" * 40
+        self.assertFalse(policy.approved(self.state, head, base))
+
+    def test_continuity_cannot_bless_unresolved_work_or_revision_exception(self):
+        self.begin()
+        r, fid = self.finding()
+        head, base = "c" * 40, r["base_sha"]
+        proof = {
+            "kind": "license-headers",
+            "from_head": r["commit"],
+            "head": head,
+            "base": base,
+        }
+        with self.assertRaisesRegex(policy.Error, "lacks applicable"):
+            policy.record_continuity(self.state, r["id"], head, base, proof)
+        self.settle(fid, status="excepted", comment=99)
+        with self.assertRaisesRegex(policy.Error, "revision-specific"):
+            policy.record_continuity(self.state, r["id"], head, base, proof)
+        current = self.add(head=head)
+        with self.assertRaisesRegex(policy.Error, "revision-specific"):
+            policy.carry_forward(
+                self.state, current["id"], [fid], "Cannot expand exception."
+            )
+
+    def test_missing_review_output_never_becomes_continuity_approval(self):
+        self.begin()
+        r = self.add()
+        r.pop("result_digest")
+        with self.assertRaisesRegex(policy.Error, "structured review output"):
+            policy.approved(self.state, r["commit"], r["base_sha"])
 
 
 if __name__ == "__main__":

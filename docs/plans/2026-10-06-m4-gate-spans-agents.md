@@ -1,5 +1,11 @@
 # M4: model traffic gate, spans, Claude Code and Codex running inside
 
+> Process note: the current repository contract and [review policy](../review-policy.md)
+> supersede this plan's historical instructions about planning, review counts,
+> task splitting, parallel work and check selection. Technical requirements,
+> acceptance criteria and recorded results below remain relevant. Run the suites
+> for affected surfaces; an unavailable or skipped KVM run is never a pass.
+
 **Goal:** After M4, a session's log holds what the agent asked its model and what the model told it to do, taken on the host where the guest cannot alter it, with no credential ever held by boxcar. For a destination the policy marks `inspect`, the network stack ends the guest's TLS with a certificate from a per-session CA the guest trusts, opens its own verified TLS connection to the real host, relays the plaintext unchanged both ways, and observes it: every HTTP/1.1 and HTTP/2 exchange becomes `http.request` and `http.response`, and the model APIs it knows (Anthropic Messages; OpenAI chat and responses, the latter also over WebSocket) become `llm.*` and `tool.*` records. A `tool.open` opens a span, the `tool.close` in the agent's next request closes it, and the reconciler attributes the processes and effects in between to it, fires `intent_effect_mismatch` and `orphaned_work`, and answers `span.list`. The sensor reports the size and time of each TLS write and read of a process whose runtime exports OpenSSL's functions, so the reconciler can name the process behind a model request. `boxcar run --dump DIR` writes the guest's frames, the decrypted streams and each decoded exchange, after bitvessel's `DebugNet`. Claude Code (the native build and the npm build under Node) and Codex run inside a Debian guest on their own account logins, and a Bash tool call brackets its `proc.exec` and `fs.close` in one chain-verified log.
 
 The design this plan argues from is `docs/specs/2026-09-29-boxcar-design.md` as amended on 2026-10-06 (its section 14), which replaced the model gateway with this gate. The roadmap's "Gateway (`boxcar-gateway`, M4)" section and its M4.1 to M4.4 rows are superseded by this plan where they differ.

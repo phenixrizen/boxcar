@@ -138,6 +138,489 @@ class PrivateWorkflowTest(unittest.TestCase):
         r = self.client.change(r, m, "claim", "Synthetic setup", trust=True)
         return r
 
+    def deliverable(self, record=None, client=None):
+        client = client or self.client
+        record = record or client.read(GHSA)
+        return client.deliverable(
+            GHSA,
+            {
+                "expected": policy.digest(record),
+                "owner": board.OWNER,
+                "source": "Synthetic selected deliverable instruction",
+                "id": "synthetic-deliverable",
+                "outcome": "One bounded synthetic correction",
+                "acceptance": "Synthetic regression verifies the required outcome",
+            },
+        )
+
+    def review_output(self, head=HEAD, findings=None):
+        def reviewer(args, **kwargs):
+            kwargs["stdout"].write(
+                json.dumps(
+                    {
+                        "codex": {"status": 0},
+                        "inputs": {"head": head, "base": BASE, "merge_base": BASE},
+                        "result": {
+                            "verdict": "needs-attention" if findings else "approve",
+                            "findings": findings or [],
+                            "summary": "Synthetic private review",
+                        },
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(args, 0)
+
+        return reviewer
+
+    def test_deliverable_requires_trusted_remediation_and_exact_owner_scope(self):
+        record = self.create()
+        with self.assertRaisesRegex(a.Error, "provenance"):
+            self.deliverable(record)
+        record = self.approve(record)
+        original = copy.deepcopy(a.metadata(record))
+        decision = {
+            "expected": policy.digest(record),
+            "owner": board.OWNER,
+            "source": "Synthetic selected deliverable instruction",
+            "id": "synthetic-deliverable",
+            "outcome": "Synthetic outcome",
+            "acceptance": "Synthetic acceptance criteria",
+        }
+        for changed in (
+            {"expected": "stale"},
+            {"owner": "another-owner"},
+            {"source": ""},
+        ):
+            with self.assertRaises(a.Error):
+                self.client.deliverable(GHSA, {**decision, **changed})
+        record = self.deliverable(record)
+        current = a.metadata(record)
+        self.assertEqual(current["scope"], original["scope"])
+        self.assertEqual(current["status"], original["status"])
+        self.assertEqual(current["owner"], original["owner"])
+        self.assertEqual(current["ledger"]["version"], 3)
+        self.assertEqual(len(current["grants"]), len(original["grants"]) + 1)
+        self.assertEqual(self.deliverable(record), record)
+        changed = {
+            **decision,
+            "expected": policy.digest(record),
+            "outcome": "Changed scope",
+        }
+        with self.assertRaisesRegex(a.Error, "already used"):
+            self.client.deliverable(GHSA, changed)
+        missing_scope = a.metadata(record)
+        missing_scope.pop("scope")
+        record = self.client.change(
+            record, missing_scope, "synthetic", "Test only", trust=True
+        )
+        with self.assertRaisesRegex(a.Error, "authorize remediation"):
+            self.deliverable(record)
+
+    def test_deliverable_interrupted_write_recovers_without_duplicate_grant(self):
+        record = self.approve()
+        self.api.lose = True
+        with self.assertRaises(a.APIError):
+            self.deliverable(record)
+        restored = a.Advisory(api=self.api, directory=self.root / "state")
+        record = restored.recover()
+        grants = copy.deepcopy(a.metadata(record)["grants"])
+        patches = sum(c[2] == "PATCH" for c in self.api.calls)
+        self.assertEqual(self.deliverable(record, restored), record)
+        self.assertEqual(a.metadata(restored.read(GHSA))["grants"], grants)
+        self.assertEqual(sum(c[2] == "PATCH" for c in self.api.calls), patches)
+        self.assertEqual(len(a.metadata(record)["ledger"]["deliverables"]), 1)
+
+    def test_deliverable_preserves_lifetime_grants_and_budget_across_handoff(self):
+        pending = self.pending_review()
+        a.atomic(
+            self.client.directory / (pending["id"] + ".json"),
+            {
+                "codex": {"status": 0},
+                "inputs": {"head": HEAD, "base": BASE, "merge_base": BASE},
+                "result": {"verdict": "approve", "findings": []},
+            },
+        )
+        record = self.client.recover_review(GHSA, "s")
+        record = self.client.authorize(
+            GHSA,
+            {
+                "expected": policy.digest(record),
+                "owner": board.OWNER,
+                "source": "Synthetic historical cumulative ceiling",
+                "scope": "Synthetic bounded correction",
+                "reconfirm": True,
+                "allowances": {"code": 1},
+            },
+        )
+        original = copy.deepcopy(a.metadata(record)["ledger"])
+        record = self.deliverable(record)
+        ledger = a.metadata(record)["ledger"]
+        self.assertEqual(ledger["reviews"], original["reviews"])
+        self.assertEqual(ledger["authorizations"], original["authorizations"])
+        self.assertEqual(
+            ledger["deliverable_migration"]["ceilings"], original["ceilings"]
+        )
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(self.client, "inputs", return_value=(HEAD, BASE, BASE)),
+            mock.patch(
+                "subprocess.run", side_effect=self.review_output()
+            ) as invocation,
+        ):
+            previous = None
+            for scope in ("initial", "follow-up", "integration"):
+                request = {"phase": "code", "scope": scope, "focus": "Synthetic check"}
+                if previous:
+                    request.update(
+                        prior=[previous], rationale="Synthetic bounded change"
+                    )
+                record = self.client.review(GHSA, "s", request)
+                previous = a.metadata(record)["ledger"]["reviews"][-1]["id"]
+                if scope == "initial":
+                    with self.assertRaises(a.Error):
+                        self.client.review(
+                            GHSA,
+                            "s",
+                            {"phase": "code", "focus": "Unbounded broad retry"},
+                        )
+            self.assertEqual(invocation.call_count, 3)
+        ledger = a.metadata(record)["ledger"]
+        self.assertEqual(policy.count(ledger, "code"), 4)
+        self.assertEqual(policy.deliverable_count(ledger, "code"), 3)
+        self.assertEqual(ledger["reviews"][0], original["reviews"][0])
+        with self.assertRaisesRegex(a.Error, "exhausted"):
+            policy.budget(ledger, "code")
+        released = self.client.release(GHSA, "s")
+        other = a.Advisory(api=self.api, directory=self.root / "next-machine")
+        with self.assertRaisesRegex(a.Error, "provenance"):
+            self.deliverable(released, other)
+        record = other.authorize(
+            GHSA,
+            {
+                "expected": policy.digest(released),
+                "owner": board.OWNER,
+                "source": "Synthetic owner released handoff",
+                "scope": "Synthetic bounded correction",
+                "reconfirm": True,
+            },
+        )
+        self.assertEqual(a.metadata(record)["ledger"], ledger)
+        self.assertEqual(self.deliverable(record, other), record)
+        with self.assertRaisesRegex(a.Error, "exhausted"):
+            policy.budget(a.metadata(record)["ledger"], "code")
+        callback = lambda ph, rd, grant, kind, binding=None: other.check_auth(
+            a.metadata(record), ph, rd, grant, kind, binding
+        )
+        policy.check_ledger(ledger, callback)
+        with self.assertRaisesRegex(a.Error, "does not bind"):
+            other.check_auth(
+                a.metadata(record), "deliverable", 1, 3, "deliverable", "altered"
+            )
+
+    def test_deliverable_cannot_migrate_pending_review_or_erase_retry_failures(self):
+        self.pending_review()
+        with self.assertRaisesRegex(a.Error, "pending"):
+            self.deliverable()
+        record = self.client.recover_review(GHSA, "s", True)
+        before = copy.deepcopy(a.metadata(record)["ledger"]["reviews"])
+        record = self.deliverable(record)
+        ledger = a.metadata(record)["ledger"]
+        self.assertEqual(ledger["reviews"], before)
+        self.assertEqual(policy.failed_attempts(ledger, "code"), (["attempt-1"], 1))
+        self.assertEqual(policy.count(ledger, "code"), 0)
+
+    def test_private_carry_requires_current_review_and_resolved_dispositions(self):
+        self.claimed()
+        self.deliverable()
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(
+                self.client, "inputs", return_value=(HEAD, BASE, BASE)
+            ) as inputs,
+        ):
+            with mock.patch(
+                "subprocess.run",
+                side_effect=self.review_output(
+                    findings=[
+                        {"title": "Synthetic optional refinement", "severity": "low"},
+                        {"title": "Synthetic required correction", "severity": "high"},
+                    ]
+                ),
+            ):
+                record = self.client.review(
+                    GHSA, "s", {"focus": "Synthetic private initial"}
+                )
+            initial = a.metadata(record)["ledger"]["reviews"][-1]
+            optional, blocker = initial["finding_ids"]
+            record = self.client.dispose(
+                GHSA,
+                "s",
+                {
+                    "finding": optional,
+                    "category": "nonblocking",
+                    "status": "deferred",
+                    "evidence": "Synthetic acceptance criteria already met",
+                    "consequence": "Optional readability improvement only",
+                },
+            )
+            record = self.client.dispose(
+                GHSA,
+                "s",
+                {
+                    "finding": blocker,
+                    "category": "blocking",
+                    "status": "investigate",
+                    "evidence": "Synthetic demonstrated incorrect behavior",
+                    "consequence": "Required synthetic invariant not established",
+                },
+            )
+            new_head = "c" * 40
+            inputs.return_value = (new_head, BASE, BASE)
+            with mock.patch("subprocess.run", side_effect=self.review_output(new_head)):
+                record = self.client.review(
+                    GHSA,
+                    "s",
+                    {
+                        "focus": "Synthetic private follow-up",
+                        "scope": "follow-up",
+                        "prior": [initial["id"]],
+                        "verifies": [optional, blocker],
+                        "rationale": "Synthetic affected behavior inspected",
+                    },
+                )
+            before = copy.deepcopy(a.metadata(record)["ledger"])
+            followup = before["reviews"][-1]
+            with self.assertRaisesRegex(a.Error, "current private head"):
+                self.client.carry(
+                    GHSA,
+                    "s",
+                    {
+                        "receipt": initial["id"],
+                        "findings": [optional],
+                        "rationale": "Wrong inputs",
+                    },
+                )
+            with self.assertRaises(a.Error):
+                self.client.carry(
+                    GHSA,
+                    "s",
+                    {
+                        "receipt": followup["id"],
+                        "findings": [optional, blocker],
+                        "rationale": "Unresolved blocker cannot carry",
+                    },
+                )
+            self.assertEqual(a.metadata(self.client.read(GHSA))["ledger"], before)
+            record = self.client.carry(
+                GHSA,
+                "s",
+                {
+                    "receipt": followup["id"],
+                    "findings": [optional],
+                    "rationale": "Synthetic optional disposition remains applicable",
+                },
+            )
+            after = a.metadata(record)["ledger"]
+            self.assertEqual(after["reviews"], before["reviews"])
+            self.assertEqual(after["findings"], before["findings"])
+            self.assertFalse(policy.approved(after, new_head, BASE, confidential=True))
+            returning = a.Advisory(api=self.api, directory=self.root / "state")
+            self.assertEqual(a.metadata(returning.read(GHSA))["ledger"], after)
+
+    def test_explicit_deliverable_cap_limits_spending_without_changing_legacy_cap(self):
+        record = self.claimed()
+        record = self.client.authorize(
+            GHSA,
+            {
+                "expected": policy.digest(record),
+                "owner": board.OWNER,
+                "source": "Synthetic historical stopped allowance",
+                "scope": "Synthetic bounded correction",
+                "reconfirm": True,
+                "allowances": {"code": 0},
+            },
+        )
+        legacy = copy.deepcopy(a.metadata(record)["ledger"]["ceilings"])
+        record = self.deliverable(record)
+        record = self.client.authorize(
+            GHSA,
+            {
+                "expected": policy.digest(record),
+                "owner": board.OWNER,
+                "source": "Synthetic one-review allowance for this deliverable",
+                "scope": "Synthetic bounded correction",
+                "reconfirm": True,
+                "allowances": {"code": 1},
+            },
+        )
+        ledger = a.metadata(record)["ledger"]
+        self.assertEqual(ledger["ceilings"], legacy)
+        self.assertEqual(ledger["deliverable_migration"]["ceilings"], legacy)
+        self.assertEqual(
+            policy.active_deliverable(ledger)["ceilings"]["code"]["round"], 1
+        )
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(self.client, "inputs", return_value=(HEAD, BASE, BASE)),
+            mock.patch(
+                "subprocess.run", side_effect=self.review_output()
+            ) as invocation,
+        ):
+            record = self.client.review(
+                GHSA, "s", {"focus": "Synthetic bounded review"}
+            )
+            prior = a.metadata(record)["ledger"]["reviews"][-1]["id"]
+            with self.assertRaisesRegex(a.Error, "allowance exhausted"):
+                self.client.review(
+                    GHSA,
+                    "s",
+                    {
+                        "focus": "Synthetic follow-up",
+                        "scope": "follow-up",
+                        "prior": [prior],
+                        "rationale": "Bounded fix",
+                    },
+                )
+            self.assertEqual(invocation.call_count, 1)
+        ledger = a.metadata(record)["ledger"]
+        policy.check_ledger(
+            ledger,
+            lambda ph, rd, grant, kind, binding=None: self.client.check_auth(
+                a.metadata(record), ph, rd, grant, kind, binding
+            ),
+        )
+
+    def test_code_followup_carries_plan_finding_only_with_its_original_context(self):
+        self.claimed()
+        self.deliverable()
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(
+                self.client, "inputs", return_value=(HEAD, BASE, BASE)
+            ) as inputs,
+        ):
+            with mock.patch(
+                "subprocess.run",
+                side_effect=self.review_output(
+                    findings=[
+                        {
+                            "title": "Synthetic optional plan suggestion",
+                            "severity": "low",
+                        }
+                    ]
+                ),
+            ):
+                record = self.client.review(
+                    GHSA, "s", {"phase": "plan", "focus": "Synthetic design"}
+                )
+            plan = a.metadata(record)["ledger"]["reviews"][-1]
+            fid = plan["finding_ids"][0]
+            self.client.dispose(
+                GHSA,
+                "s",
+                {
+                    "finding": fid,
+                    "category": "nonblocking",
+                    "status": "deferred",
+                    "evidence": "Synthetic required plan guarantees are met",
+                    "consequence": "Optional refinement does not affect correctness",
+                },
+            )
+            with mock.patch("subprocess.run", side_effect=self.review_output()):
+                record = self.client.review(
+                    GHSA, "s", {"focus": "Synthetic initial implementation"}
+                )
+            initial = a.metadata(record)["ledger"]["reviews"][-1]
+            head = "e" * 40
+            inputs.return_value = (head, BASE, BASE)
+            request = {
+                "scope": "follow-up",
+                "focus": "Synthetic focused implementation",
+                "verifies": [fid],
+                "rationale": "Synthetic plan disposition inspected with implementation",
+            }
+            with mock.patch(
+                "subprocess.run", side_effect=self.review_output(head)
+            ) as invocation:
+                with self.assertRaises(a.Error):
+                    self.client.review(GHSA, "s", {**request, "prior": [plan["id"]]})
+                self.assertFalse(invocation.called)
+                record = self.client.review(
+                    GHSA, "s", {**request, "prior": [initial["id"], plan["id"]]}
+                )
+            followup = a.metadata(record)["ledger"]["reviews"][-1]
+            record = self.client.carry(
+                GHSA,
+                "s",
+                {
+                    "receipt": followup["id"],
+                    "findings": [fid],
+                    "rationale": "Original plan disposition still applies",
+                },
+            )
+            ledger = a.metadata(record)["ledger"]
+            self.assertEqual(ledger["reviews"][0], plan)
+            self.assertTrue(policy.approved(ledger, head, BASE, confidential=True))
+
+    def test_private_verification_recomputes_imported_continuity_proof(self):
+        self.claimed()
+        self.deliverable()
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(
+                self.client, "inputs", return_value=(HEAD, BASE, BASE)
+            ) as inputs,
+            mock.patch("subprocess.run", side_effect=self.review_output()),
+        ):
+            record = self.client.review(
+                GHSA, "s", {"focus": "Synthetic private initial"}
+            )
+            m = a.metadata(record)
+            receipt = m["ledger"]["reviews"][-1]
+            current = "d" * 40
+            proof = {
+                "kind": "license-headers",
+                "from_head": HEAD,
+                "head": current,
+                "base": BASE,
+            }
+            policy.record_continuity(
+                m["ledger"], receipt["id"], current, BASE, proof, confidential=True
+            )
+            m["checkpoint"] = {
+                "head": current,
+                "base": BASE,
+                "verification": "Synthetic tests passed",
+            }
+            self.client.change(
+                record, m, "synthetic", "Synthetic imported continuity only", trust=True
+            )
+            inputs.return_value = (current, BASE, BASE)
+            with mock.patch.object(
+                work_issue,
+                "license_continuity",
+                return_value={"different": "actual Git proof"},
+            ) as comparison:
+                with self.assertRaisesRegex(a.Error, "actual Git objects"):
+                    self.client.verified(
+                        GHSA,
+                        "s",
+                        {
+                            "receipt": receipt["id"],
+                            "rationale": "Synthetic integration",
+                        },
+                    )
+                comparison.assert_called_once()
+            self.assertNotEqual(
+                a.metadata(self.client.read(GHSA))["status"],
+                "Fixed, awaiting disclosure",
+            )
+
     def test_draft_create_retrieval_and_normal_retry_are_idempotent(self):
         one = self.create()
         two = self.create()

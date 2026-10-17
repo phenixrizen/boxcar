@@ -1,5 +1,11 @@
 # M2: remaining work (Tasks 13, 14, 15)
 
+> Process note: the current repository contract and [review policy](../review-policy.md)
+> supersede this plan's historical instructions about planning, review counts,
+> task splitting, parallel work and check selection. Technical requirements,
+> acceptance criteria and recorded results below remain relevant. Run the suites
+> for affected surfaces; an unavailable or skipped KVM run is never a pass.
+
 Written 2026-10-02 so that a fresh session can pick up M2 from here with no other context. It supersedes the original M2 plan (`docs/plans/2026-10-01-m2-network-vsock-pty-control.md`) for Tasks 13 to 15. The design spec (`docs/specs/2026-09-29-boxcar-design.md`) stays the authority on anything this document leaves open.
 
 ## 1. Where things stand

@@ -613,7 +613,10 @@ class Advisory:
                 a = {"phase": phase, "round": n, "comment": grant["id"]}
                 if not policy.authorization(m["ledger"], phase, n):
                     m["ledger"]["authorizations"].append(a)
-            m["ledger"].setdefault("ceilings", {})[phase] = {
+            spending = policy.active_deliverable(m["ledger"])
+            if spending is None:
+                spending = m["ledger"]
+            spending.setdefault("ceilings", {})[phase] = {
                 "phase": phase,
                 "round": ceiling,
                 "comment": grant["id"],
@@ -622,6 +625,65 @@ class Advisory:
         m["scope"] = data["scope"]
         m["status"] = "Approved for remediation"
         return self.change(record, m, "owner-authorization", data["source"], trust=True)
+
+    def deliverable(self, ghsa, data):
+        """Record an explicit spending boundary within already-authorized work."""
+        record = self.read(ghsa, True)
+        self.trusted(record)
+        self.decision(record, data)
+        if set(data) != {"expected", "owner", "source", "id", "outcome", "acceptance"}:
+            raise Error(
+                "deliverable needs an exact owner decision, outcome and acceptance criteria"
+            )
+        m = metadata(record)
+        if not m.get("scope") or not m.get("grants"):
+            raise Error("authorize remediation scope before defining its deliverable")
+        if m.get("owner") and m["owner"].get("clone") != self.clone_id():
+            raise Error("active owner must release before another clone changes scope")
+        old = next(
+            (d for d in m["ledger"].get("deliverables", []) if d["id"] == data["id"]),
+            None,
+        )
+        grant_id = old["comment"] if old else len(m["grants"]) + 1
+        ledger = policy.begin_deliverable(
+            m["ledger"], data["id"], data["outcome"], data["acceptance"], grant_id
+        )
+        deliverable = policy.active_deliverable(ledger)
+        if old:
+            grant = next((g for g in m["grants"] if g["id"] == grant_id), {})
+            if grant.get("source") != data["source"]:
+                raise Error("deliverable already bound to another owner instruction")
+        else:
+            m["grants"].append(
+                {
+                    "id": grant_id,
+                    "owner": board.OWNER,
+                    "source": data["source"],
+                    "snapshot": policy.digest(record),
+                    "at": now(),
+                    "deliverable": {
+                        k: deliverable[k]
+                        for k in ("id", "outcome", "acceptance", "binding")
+                    }
+                    | {"ordinal": len(ledger["deliverables"])},
+                }
+            )
+        m["ledger"] = ledger
+        policy.check_ledger(
+            ledger,
+            lambda ph, rd, g, kind, binding=None: self.check_auth(
+                m, ph, rd, g, kind, binding
+            ),
+        )
+        if old:
+            return record
+        return self.change(
+            record,
+            m,
+            "deliverable",
+            "Exact owner-scoped spending boundary; remediation and disclosure grants unchanged.",
+            trust=True,
+        )
 
     def reconcile(self, ghsa, data):
         """Explicit owner recovery of observed edits, never a silent takeover."""
@@ -996,7 +1058,18 @@ class Advisory:
         grant = next((g for g in m["grants"] if g["id"] == grant_id), None)
         if not grant or grant["owner"] != board.OWNER or not grant.get("source"):
             raise Error("private owner grant missing")
-        if kind == "retry":
+        if kind == "deliverable":
+            scoped = grant.get("deliverable", {})
+            if (
+                phase != "deliverable"
+                or scoped.get("ordinal") != round_
+                or scoped.get("binding") != binding
+                or not binding
+            ):
+                raise Error(
+                    "private deliverable grant does not bind this scope and history"
+                )
+        elif kind == "retry":
             if grant.get("retry") != {
                 "phase": phase,
                 "round": round_,
@@ -1082,8 +1155,7 @@ class Advisory:
             "base": "main",
             "base_sha": base,
             "merge_base": merge,
-            "policy_version": 2,
-            "receipt_version": 2,
+            **policy.review_fields(s, phase),
             "status": "pending",
             "outcome": "pending",
             "prior": data.get("prior", []),
@@ -1091,21 +1163,10 @@ class Advisory:
             "rationale": data.get("rationale", ""),
             "material_change": data.get("material_change", False),
         }
-        if r["material_change"] and scope != "initial":
-            raise Error("material changes need initial review")
-        if scope != "initial" and (not r["prior"] or not r["rationale"].strip()):
-            raise Error(
-                "focused review requires prior receipts and continuity rationale"
-            )
+        policy.validate_scope(s, r, check_auth=callback)
         prior = []
         for previous in r["prior"]:
             old = policy.receipt(s, previous)
-            if old["phase"] != phase or (
-                scope == "follow-up" and old["base_sha"] != base
-            ):
-                raise Error(
-                    "prior phase/base incompatible; use integration or initial review"
-                )
             if (
                 not old.get("result")
                 or policy.digest(old["result"]) != old["result_digest"]
@@ -1294,7 +1355,35 @@ class Advisory:
             trust=True,
         )
 
+    def carry(self, ghsa, session, data):
+        record, m = self.owned(ghsa, session)
+        if set(data) != {"receipt", "findings", "rationale"}:
+            raise Error(
+                "carry requires a current receipt, finding IDs and private rationale"
+            )
+        head, base, _ = self.inputs()
+        reviewed = policy.receipt(m["ledger"], data["receipt"])
+        if (reviewed["commit"], reviewed["base_sha"]) != (head, base):
+            raise Error("carry receipt does not cover current private head and target")
+        policy.carry_forward(
+            m["ledger"],
+            data["receipt"],
+            data["findings"],
+            data["rationale"],
+            confidential=True,
+        )
+        self.tracking(m["ledger"])
+        return self.change(
+            record,
+            m,
+            "finding-carry",
+            "Identified prior resolutions verified by current independent review.",
+            trust=True,
+        )
+
     def verified(self, ghsa, session, data):
+        import work_issue
+
         record, m = self.owned(ghsa, session)
         s = m["ledger"]
         head, base, merge = self.inputs()
@@ -1321,6 +1410,7 @@ class Advisory:
             ),
         )
         self.tracking(s)
+        work_issue.verify_continuity(s, head, base, confidential=True)
         if not policy.approved(s, head, base, confidential=True):
             raise Error("private review/findings unresolved or stale")
         if not policy.findings_ready(
@@ -1397,6 +1487,7 @@ def main(argv=None):
             "close",
             "recover",
             "authorize",
+            "deliverable",
             "work",
             "checkpoint",
             "release",
@@ -1404,6 +1495,7 @@ def main(argv=None):
             "recover-review",
             "retry",
             "dispose",
+            "carry",
             "verified",
             "exception",
             "reconcile",
@@ -1454,7 +1546,14 @@ def main(argv=None):
                     result = client.read(args.ghsa)
                 elif op == "exception":
                     result = client.finding_exception(args.ghsa, data)
-                elif op in ("update", "close", "authorize", "retry", "reconcile"):
+                elif op in (
+                    "update",
+                    "close",
+                    "authorize",
+                    "deliverable",
+                    "retry",
+                    "reconcile",
+                ):
                     result = getattr(client, op)(args.ghsa, data)
                 else:
                     if not args.session:

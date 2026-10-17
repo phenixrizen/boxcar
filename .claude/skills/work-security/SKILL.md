@@ -40,13 +40,20 @@ and inspect its restricted output file. No public issue, Project card or PR.
   and do not upload transcripts or raw reviews to public Actions artifacts.
 - Use the advisory helper's private `review` operation: it invokes the existing
   Codex review helper and records phase/head/base/count/outcome privately.
-  Follow policy 2: docs one, plans two, code three autonomous; each later
-  code round requires scoped owner authorization. Phase and review scope are
-  separate; findings need evidence-backed dispositions and current integration. Failed/unavailable reviews are never passes. Recover interrupted
-  attempts before another round; a session change does not reset the budget.
-- Record findings from that review in the same advisory when related, or search
-  and create a separate draft for an independent credible finding. Preserve
-  the owner decision for unrelated work. Keep verification and dispositions.
+  Follow `docs/review-policy.md`; the guide identifies the private helper's supported
+  ledger version and migration limits. Existing authorization/resume never creates
+  a fresh allowance: explicit `deliverable` records an already owner-authorized
+  outcome using a trusted private input file. Use `carry` for a reviewed batch of
+  resolved findings; exact schemas are in the guide. Phase and scope are separate. Persist
+  evidence-backed dispositions and current integration; optional suggestions need
+  no extra round. Recover interrupted attempts before spending again. Record the
+  owner's bounded allowance upfront; sessions and branches never reset it. Stop at
+  readiness or present one consolidated spending decision. Unavailable reviews
+  approve nothing.
+- Keep related claims, necessary fixes and their tests in the same remediation.
+  Search existing drafts before recording a separate credible security finding;
+  optional suggestions remain dispositions. Preserve unconfirmed claims and the
+  owner's decision on unrelated work; never convert them into public issues.
 - When fixed and verified, use `verified` to validate integration evidence and
   set internal status to Fixed, awaiting disclosure;
   leave native state draft. Never open a public PR automatically. The owner

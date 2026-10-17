@@ -118,7 +118,7 @@ an owner decision. Generic progress and migration never establish this trust.
 
 One `security-finding:v1` JSON block preserves schema/revision, creation key,
 original IDs, discovery/confidence, append-only progress, scope/owner grants,
-session/clone/workspace and the policy-2 review ledger. Native `draft` is separate
+session/clone/workspace and the versioned review ledger. Native `draft` is separate
 from internal New, Investigating, Confirmed, Approved for remediation, Fixing,
 Awaiting verification, Fixed awaiting disclosure and Closed. GHSA is the stable
 cross-session identifier. Technical prose and historical outcomes remain intact.
@@ -203,8 +203,30 @@ Codex plugin through the existing wrapper, passing scope instructions through fo
 not invented plugin flags. Raw private focus and continuity rationale stay in the restricted context file;
 subprocess arguments contain only fixed instructions and opaque review inputs.
 
-Use the same policy-2 ceilings: docs one, plans two, code three autonomously; later
-rounds need explicit scoped grants. Failed/unavailable output counts zero and
+Use the canonical [review policy](review-policy.md). Existing private policy-2
+ledgers and cumulative grants remain unchanged until an explicit `deliverable`
+operation; `authorize`, resume, branch changes and ordinary issue migration never
+reset them. After installing the compatible helper, an already-authorized remediation
+scope and current trusted owner snapshot can establish a policy-3 deliverable:
+
+```bash
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json deliverable GHSA-xxxx-yyyy-zzzz --input /private/deliverable.json
+python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json carry GHSA-xxxx-yyyy-zzzz --session SESSION --input /private/carry.json
+```
+
+The deliverable input is `expected`, `owner`, `source`, `id`, `outcome` and
+`acceptance`. Record the actual private owner instruction and existing remediation
+scope; creating a spending boundary does not authorize a new fix or disclosure.
+It preserves historical attempts/counts and binds the new scoped outcome. Carry input
+is `receipt`, `findings` (IDs) and `rationale`; it connects already-resolved findings
+to the current independently reviewed inputs without rewriting original results.
+The private helper does not offer the ordinary license-header continuity shortcut.
+Public CI and branch protection do not enforce this private ledger; use the compatible
+helper and preserve the advisory's owner-provenance checks.
+
+Record the owner's entire bounded extension upfront, preserve exhausted allowances,
+and present one consolidated decision if it is spent. Optional suggestions need no
+extra review; stop at verified readiness. Failed/unavailable output counts zero and
 approves nothing. Recover pending attempts exactly once; `recover-review --failed`
 requires first confirming the invocation stopped. After two failures, `retry`
 requires an owner decision file naming `phase` and the exact failed-attempt `binding`
@@ -224,6 +246,8 @@ independent review and resolved blocking findings. It records **Fixed, awaiting
 disclosure** and keeps native state **draft**. `close` is separate: expected/owner/
 source plus private `reason`, no active/pending work; it preserves an invalid/resolved
 claim and sets native closed. Published/closed records are otherwise read-only.
+Finishing this workflow software is separate from a finding's disclosure or source
+retirement; keep those pending private decisions in their existing records.
 
 Temporary private forks have no normal public status checks or enforced branch
 protections, and integrations cannot access them. Validate locally/private; public
