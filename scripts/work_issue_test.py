@@ -442,6 +442,45 @@ class Workflow(unittest.TestCase):
                 with self.assertRaisesRegex(w.Error, "verified"):
                     self.ctx.submit("one", "Change", "Implemented", pending=False)
 
+    def test_released_branch_with_unrelated_open_pr_cannot_be_adopted(self):
+        self.ready()
+        self.gh.pr_write(None, "A", "Fixes #43", "issue-43", "main", False)
+        self.ctx.release("one")
+        other = FakeGitHub()
+        other.pulls = self.gh.pulls
+        api = other.api
+        other.api = lambda path, *args, **kwargs: (
+            {**other.issue, "number": 44}
+            if path.endswith("/issues/44")
+            else api(path, *args, **kwargs)
+        )
+        task = w.Task(44, other)
+        with self.assertRaisesRegex(w.Error, "different issue"):
+            task.start("two", here=True)
+        self.assertFalse(task.path.exists())
+        self.assertEqual(other.notes, [])
+
+    def test_submit_checks_foreign_or_ambiguous_pr_before_any_push(self):
+        self.ready()
+        self.gh.pr_write(None, "A", "Fixes #44", "issue-43", "main", False)
+        original = w.run
+        with mock.patch.object(
+            w,
+            "run",
+            side_effect=lambda a, **kw: (
+                "" if a[:2] == ["git", "push"] else original(a, **kw)
+            ),
+        ) as run:
+            with self.assertRaisesRegex(w.Error, "different issue"):
+                self.ctx.submit("one", "Change", "Implemented")
+            self.gh.pulls[0]["body"] = "Fixes #43"
+            self.gh.pulls.append({**copy.deepcopy(self.gh.pulls[0]), "number": 89})
+            with self.assertRaisesRegex(w.Error, "ambiguous"):
+                self.ctx.submit("one", "Change", "Implemented")
+            self.assertFalse(
+                any(c.args[0][:2] == ["git", "push"] for c in run.call_args_list)
+            )
+
     def test_oversized_checkpoint_rejected_before_save_and_can_be_corrected(self):
         self.start()
         before = self.ctx.path.read_text()

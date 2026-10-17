@@ -258,6 +258,21 @@ def pulls(gh):
     return gh.api(f"repos/{board.REPO}/pulls?state=all&per_page=100", pages=True)
 
 
+def branch_prs(gh, branch, number):
+    existing = [
+        p
+        for p in pulls(gh)
+        if p["state"] == "open"
+        and p.get("head", {}).get("ref") == branch
+        and (p["head"].get("repo") or {}).get("full_name") == board.REPO
+    ]
+    if len(existing) > 1:
+        raise Error("ambiguous existing PRs")
+    if existing and relation(existing[0]["body"], number) not in ("fixes", "part of"):
+        raise Error("existing branch PR has a different issue relationship")
+    return existing
+
+
 def relation(body, number):
     ref = rf"(?:#{number}|{re.escape(board.REPO)}#{number}|https://github.com/{re.escape(board.REPO)}/issues/{number})"
     matches = re.findall(rf"^(Fixes|Part of) {ref}\s*$", body or "", re.M | re.I)
@@ -519,6 +534,8 @@ class Task:
         branch = self.state["branch"]
         if not branch or branch == "main":
             raise Error("use a task branch, not main or detached HEAD")
+        # Released local ownership does not free a branch with another task's open PR.
+        branch_prs(self.gh, branch, self.number)
         for p in self.directory.glob("[0-9]*.json"):
             if not p.stem.isdecimal():
                 continue
@@ -743,26 +760,14 @@ class Task:
             body += "\n\nReview decision pending; this draft has unreviewed or unresolved work.\n"
         branch = self.state["branch"]
         base = self.state["base"].removeprefix("origin/")
-        run(["git", "push", "--set-upstream", "origin", branch])
 
         def candidates():
-            return [
-                p
-                for p in pulls(self.gh)
-                if p["head"]["ref"] == branch
-                and p["head"]["repo"]["full_name"] == board.REPO
-                and p["state"] == "open"
-            ]
+            return branch_prs(self.gh, branch, self.number)
 
         existing = candidates()
-        if len(existing) > 1:
-            raise Error("ambiguous existing PRs")
-        if existing and relation(existing[0]["body"], self.number) not in (
-            "fixes",
-            "part of",
-        ):
-            raise Error("existing branch PR has a different issue relationship")
         number = existing[0]["number"] if existing else None
+        # A push changes an existing PR immediately; validate its ownership first.
+        run(["git", "push", "--set-upstream", "origin", branch])
         try:
             self.gh.pr_write(number, title, body, branch, base, pending)
         except Error:
