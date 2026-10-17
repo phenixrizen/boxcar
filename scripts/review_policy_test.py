@@ -718,6 +718,112 @@ class PolicyWorkflow(unittest.TestCase):
             with self.assertRaisesRegex(w.Error, "executable"):
                 w.validate_pr(88, self.gh)
 
+    def test_revoked_retry_permission_prevents_any_new_attempt_or_invocation(self):
+        self.start()
+        for i in range(2):
+            r = self.receipt()
+            r.update(id="failure" + str(i), status="failed", outcome="unavailable")
+            self.ctx.state["reviews"].append(r)
+        self.ctx.save()
+        self.ctx.publish()
+        ids, _ = policy.failed_attempts(self.ctx.state, "code")
+        note = {
+            "id": 99,
+            "body": f"work-issue retry {w.board.REPO}#43 code 1 {policy.digest(ids)}",
+            "user": {"login": w.board.OWNER},
+            "editor": w.board.OWNER,
+        }
+        self.gh.notes.append(note)
+        self.ctx.authorize("one", "code", 1, 99, "retry")
+        original = subprocess.run
+        for revocation in ("deleted", "changed", "nonowner-editor"):
+            self.gh.notes = [c for c in self.gh.notes if c["id"] != 99]
+            if revocation != "deleted":
+                self.gh.notes.append(
+                    {
+                        **note,
+                        "body": "revoked" if revocation == "changed" else note["body"],
+                        "editor": "someone-else"
+                        if revocation == "nonowner-editor"
+                        else w.board.OWNER,
+                    }
+                )
+
+            def guarded(args, **kw):
+                if len(args) > 1 and str(args[1]).endswith("codex_review.py"):
+                    self.fail("reviewer invoked after authorization revocation")
+                return original(args, **kw)
+
+            with mock.patch.object(subprocess, "run", side_effect=guarded):
+                with self.assertRaises(w.Error):
+                    self.ctx.review("one", "code", "synthetic retry")
+            self.assertEqual(len(self.ctx.state["reviews"]), 2)
+            self.assertFalse(
+                any(r["status"] == "pending" for r in self.ctx.state["reviews"])
+            )
+
+    def test_cli_docs_classification_checks_executable_rename_sources(self):
+        (self.root / "script.py").write_text('print("synthetic")\n')
+        w.git("add", "script.py")
+        w.git("commit", "-qm", "executable baseline")
+        w.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        w.git("mv", "script.py", "script.py.md")
+        w.git("commit", "-qm", "rename")
+        self.start()
+        original = subprocess.run
+
+        def guarded(args, **kw):
+            if len(args) > 1 and str(args[1]).endswith("codex_review.py"):
+                self.fail("docs reviewer invoked for removed executable")
+            return original(args, **kw)
+
+        with mock.patch.object(subprocess, "run", side_effect=guarded):
+            with self.assertRaisesRegex(w.Error, "executable"):
+                self.ctx.review("one", "docs", "rename classification")
+        self.assertEqual(self.ctx.state["reviews"], [])
+
+    def test_ci_docs_classification_checks_executable_rename_sources(self):
+        self.ready()
+        self.ctx.state["reviews"][-1]["phase"] = "docs"
+        self.ctx.save()
+        self.ctx.publish()
+        r = self.ctx.state["reviews"][-1]
+        token = {
+            "repo": w.board.REPO,
+            "issue": 43,
+            "relation": "fixes",
+            "head": r["commit"],
+            "base": r["base_sha"],
+            "checkpoint": self.ctx.state["_comment"],
+            "pending": False,
+        }
+        self.gh.pr_write(
+            None,
+            "Rename",
+            "Fixes #43\n\n" + w.block(w.PR_MARK, token),
+            "issue-43",
+            "main",
+            False,
+        )
+        api = self.gh.api
+        with mock.patch.object(
+            self.gh,
+            "api",
+            side_effect=lambda path, *a, **kw: (
+                [
+                    {
+                        "filename": "docs/board.py.md",
+                        "previous_filename": "scripts/board.py",
+                        "status": "renamed",
+                    }
+                ]
+                if "/files?" in path
+                else api(path, *a, **kw)
+            ),
+        ):
+            with self.assertRaisesRegex(w.Error, "executable"):
+                w.validate_pr(88, self.gh)
+
 
 if __name__ == "__main__":
     unittest.main()

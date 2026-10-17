@@ -744,7 +744,7 @@ class Task:
         if phase == "docs" and any(
             Path(p).suffix not in (".md", ".txt")
             for p in git(
-                "diff", "--name-only", self.state["base"] + "...HEAD"
+                "diff", "--no-renames", "--name-only", self.state["base"] + "...HEAD"
             ).splitlines()
         ):
             raise Error("executable changes require the code phase, not docs")
@@ -774,7 +774,19 @@ class Task:
             "material_change": material,
         }
         if policy.failed_attempts(self.state, phase)[1] >= 2:
-            r["retry"] = dict(self.state["retry_authorizations"][phase])
+            grant = self.state["retry_authorizations"][phase]
+            # A cached grant is not current permission. Validate the selected
+            # comment revision before recording/spending this new attempt.
+            authorize_check(
+                self.gh,
+                self.number,
+                phase,
+                round_,
+                grant["comment"],
+                "retry",
+                grant["binding"],
+            )
+            r["retry"] = dict(grant)
         public_safe(json.dumps(r))
         if scope not in policy.SCOPES or (material and scope != "initial"):
             raise Error("material changes require initial scope; unknown scope refused")
@@ -1002,7 +1014,12 @@ def validate_pr(number, gh):
         files = gh.api(
             f"repos/{board.REPO}/pulls/{number}/files?per_page=100", pages=True
         )
-        if any(Path(f["filename"]).suffix not in (".md", ".txt") for f in files):
+        if any(
+            Path(f[name]).suffix not in (".md", ".txt")
+            for f in files
+            for name in ("filename", "previous_filename")
+            if name in f
+        ):
             raise Error("executable PR changes require code review, not docs")
     readiness(s, head, base, gh, n)
     if s.get("version") == 2:
