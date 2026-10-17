@@ -16,7 +16,7 @@ pub const DEFAULT_REGISTRY: &str = "docker.io";
 pub const DOCKER_API_HOST: &str = "registry-1.docker.io";
 
 /// A `sha256` digest: its 64 lowercase hex digits.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest(String);
 
 impl Digest {
@@ -48,6 +48,19 @@ impl Digest {
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "sha256:{}", self.0)
+    }
+}
+
+impl serde::Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Digest, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Digest::parse(&text).map_err(serde::de::Error::custom)
     }
 }
 

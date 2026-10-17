@@ -8,3 +8,8 @@
 pub mod decode;
 pub mod framer;
 pub mod reference;
+pub mod store;
+pub mod unpack;
+
+#[cfg(test)]
+pub(crate) mod testutil;
