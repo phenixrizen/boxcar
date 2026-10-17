@@ -123,6 +123,9 @@ def refused_flag(argv: list[str]) -> str:
         if a in VALUED_FLAGS:
             i += 2
             continue
+        if a == "--json":
+            i += 1
+            continue
         if a.startswith("-") and not any(a.startswith(f + "=") for f in VALUED_FLAGS):
             return a
         i += 1
@@ -191,7 +194,7 @@ def main(argv: list[str]) -> int:
     if not script.exists():
         sys.stderr.write(f"codex_review: {script} is missing; reinstall {PLUGIN}\n")
         return 1
-    flags = [] if "--base" in argv else ["--base", "origin/main"]
+    flags = [] if any(a == "--base" or a.startswith("--base=") for a in argv) else ["--base", "origin/main"]
     return subprocess.run(["node", str(script), "adversarial-review", "--wait", *flags, *argv], env=clean_env(dict(os.environ))).returncode
 
 
