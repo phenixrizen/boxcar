@@ -60,7 +60,8 @@ impl serde::Serialize for Digest {
 impl<'de> serde::Deserialize<'de> for Digest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Digest, D::Error> {
         let text = String::deserialize(deserializer)?;
-        Digest::parse(&text).map_err(serde::de::Error::custom)
+        Digest::parse(&text)
+            .map_err(|_| serde::de::Error::custom("a digest is not `sha256:` and 64 hex digits"))
     }
 }
 

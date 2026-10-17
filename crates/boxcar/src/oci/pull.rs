@@ -8,7 +8,7 @@
 
 use std::cell::Cell;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use super::client::{Client, ClientError};
@@ -80,6 +80,8 @@ pub enum PullError {
         #[source]
         source: io::Error,
     },
+    #[error("the cached blob {digest} is not the size this manifest gives it")]
+    CachedSize { digest: Digest },
 }
 
 /// Pulls `reference` into `store` with `client`, telling `progress` about
@@ -121,8 +123,11 @@ pub fn pull_within(
     let manifest_digest = response.digest.clone();
     let config_digest = manifest.config.digest.clone();
 
-    // Already whole in the cache: only the ref moves.
-    if let Some(dir) = store.image_dir(&manifest_digest) {
+    // Already whole in the cache, made durable first: only the ref moves.
+    if let Some(dir) = store
+        .existing_image(&manifest_digest)
+        .map_err(PullError::Store)?
+    {
         write_ref(store, reference, &manifest_digest)?;
         return Ok(Pulled {
             manifest: manifest_digest,
@@ -135,8 +140,12 @@ pub fn pull_within(
     keep_blob(store, &manifest_digest, &response.body)?;
 
     // The config.
-    let config_bytes = if store.has_blob(&config_digest) {
-        std::fs::read(store.blob_path(&config_digest)).map_err(PullError::Store)?
+    let config_bytes = if let Some(file) = cached_blob(store, &manifest.config)? {
+        let mut bytes = Vec::with_capacity(manifest.config.size as usize);
+        file.take(manifest.config.size)
+            .read_to_end(&mut bytes)
+            .map_err(PullError::Store)?;
+        bytes
     } else {
         let bytes = client.config(&config_digest, manifest.config.size)?;
         keep_blob(store, &config_digest, &bytes)?;
@@ -154,7 +163,7 @@ pub fn pull_within(
     let mut fetched = 0;
     let layers = manifest.layers.len();
     for (at, layer) in manifest.layers.iter().enumerate() {
-        let cached = store.has_blob(&layer.digest);
+        let cached = cached_blob(store, layer)?.is_some();
         progress(&Progress {
             layer: at + 1,
             layers,
@@ -174,8 +183,8 @@ pub fn pull_within(
             writer.finish().map_err(layer_error)?;
             fetched += 1;
         }
-        let compression = Compression::for_media_type(&layer.media_type)
-            .ok_or_else(|| ManifestError::LayerType(layer.media_type.clone()))?;
+        let compression =
+            Compression::for_media_type(&layer.media_type).ok_or(ManifestError::LayerType)?;
         for whiteouts in [true, false] {
             let file = File::open(store.blob_path(&layer.digest)).map_err(layer_error)?;
             let stream = decode::stream(file, compression, &bytes_left);
@@ -213,6 +222,28 @@ pub fn pull_within(
         fetched,
         existed: false,
     })
+}
+
+/// The cached blob `descriptor` names, when there is one: its size must
+/// be what the manifest says, since the manifest's sizes bound what is
+/// read.
+fn cached_blob(
+    store: &Store,
+    descriptor: &manifest::Descriptor,
+) -> Result<Option<File>, PullError> {
+    let path = store.blob_path(&descriptor.digest);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PullError::Store(error)),
+    };
+    let size = file.metadata().map_err(PullError::Store)?.len();
+    if size != descriptor.size {
+        return Err(PullError::CachedSize {
+            digest: descriptor.digest.clone(),
+        });
+    }
+    Ok(Some(file))
 }
 
 /// Points the reference's tag, when it has one, at `digest`.
@@ -711,6 +742,115 @@ mod tests {
         let everything = format!("{err} {err:?} {}", progress.join(" "));
         for secret in ["s3cret-pw", &auth, "t0k3n"] {
             assert!(!everything.contains(secret), "{secret} in: {everything}");
+        }
+    }
+
+    #[test]
+    fn a_cached_blob_must_be_the_size_the_manifest_says() {
+        let registry = Registry::start(Auth::None, Faults::default());
+        let (_tmp, store) = store();
+        // A big verified blob in the cache (a layer of an earlier image).
+        let big = vec![7u8; 2 * 1024 * 1024];
+        let big_digest = boxcar_testreg::sha256(&big);
+        {
+            let mut w = store
+                .blob_writer(&digest(&big_digest), big.len() as u64)
+                .unwrap();
+            w.write_all(&big).unwrap();
+            w.finish().unwrap();
+        }
+        // A manifest naming it as a 1-byte config, and another as a layer
+        // of the wrong size.
+        let layer = layer_tar(&testutil::layer(&[testutil::file("a", 0o644, b"a")]));
+        registry.put_blob(&layer);
+        let lying_config = serde_json::json!({
+            "schemaVersion": 2, "mediaType": boxcar_testreg::OCI_MANIFEST,
+            "config": {"mediaType": boxcar_testreg::OCI_CONFIG, "digest": big_digest, "size": 1},
+            "layers": [layer.descriptor()],
+        });
+        let m = Blob {
+            media_type: boxcar_testreg::OCI_MANIFEST.into(),
+            data: serde_json::to_vec(&lying_config).unwrap(),
+        };
+        registry.put_manifest("library/app", "config", &m);
+        let err = do_pull(
+            &store,
+            &registry,
+            &reference(&registry, "library/app", "config"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PullError::CachedSize { .. }), "{err}");
+        let cfg = config(&[], &[], &[], "/");
+        registry.put_blob(&cfg);
+        let lying_layer = serde_json::json!({
+            "schemaVersion": 2, "mediaType": boxcar_testreg::OCI_MANIFEST,
+            "config": cfg.descriptor(),
+            "layers": [{"mediaType": boxcar_testreg::LAYER_TAR, "digest": big_digest, "size": 5}],
+        });
+        let m = Blob {
+            media_type: boxcar_testreg::OCI_MANIFEST.into(),
+            data: serde_json::to_vec(&lying_layer).unwrap(),
+        };
+        registry.put_manifest("library/app", "layer", &m);
+        let err = do_pull(
+            &store,
+            &registry,
+            &reference(&registry, "library/app", "layer"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PullError::CachedSize { .. }), "{err}");
+        assert_eq!(names(&store.dir().join("images")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn what_a_registry_puts_in_a_manifest_reaches_no_error() {
+        let registry = Registry::start(
+            Auth::Basic("alice".into(), "s3cret-pw".into()),
+            Faults::default(),
+        );
+        let auth = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "alice:s3cret-pw",
+        );
+        let config = crate::oci::auth::DockerConfig::parse(&format!(
+            r#"{{"auths": {{"{}": {{"auth": "{auth}"}}}}}}"#,
+            registry.host()
+        ))
+        .unwrap();
+        let (_tmp, store) = store();
+        let cfg = boxcar_testreg::config(&[], &[], &[], "/");
+        registry.put_blob(&cfg);
+        // A layer whose media type is the Authorization header the
+        // registry received, and a manifest with a digest that is not one.
+        let echo = serde_json::json!({
+            "schemaVersion": 2, "mediaType": boxcar_testreg::OCI_MANIFEST,
+            "config": cfg.descriptor(),
+            "layers": [{"mediaType": format!("Basic {auth}"), "digest": boxcar_testreg::sha256(b"x"), "size": 1}],
+        });
+        let m = Blob {
+            media_type: boxcar_testreg::OCI_MANIFEST.into(),
+            data: serde_json::to_vec(&echo).unwrap(),
+        };
+        registry.put_manifest("library/app", "echo", &m);
+        let bad_digest = serde_json::json!({
+            "schemaVersion": 2, "mediaType": boxcar_testreg::OCI_MANIFEST,
+            "config": cfg.descriptor(),
+            "layers": [{"mediaType": boxcar_testreg::LAYER_TAR, "digest": format!("Basic {auth}"), "size": 1}],
+        });
+        let m = Blob {
+            media_type: boxcar_testreg::OCI_MANIFEST.into(),
+            data: serde_json::to_vec(&bad_digest).unwrap(),
+        };
+        registry.put_manifest("library/app", "digest", &m);
+        for tag in ["echo", "digest"] {
+            let reference = reference(&registry, "library/app", tag);
+            let mut client = Client::insecure_loopback(&reference, Some(&config)).unwrap();
+            let err = pull(&store, &mut client, &reference, &mut |_| {}).unwrap_err();
+            let text = format!("{err} {err:?}");
+            assert!(
+                !text.contains(&auth) && !text.contains("s3cret"),
+                "{tag}: {text}"
+            );
         }
     }
 

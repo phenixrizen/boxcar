@@ -72,6 +72,10 @@ fn invalid(what: impl Into<String>) -> io::Error {
 /// component can start with `_`, so a repository and a deeper
 /// repository's tag never claim one path.
 pub const TAGS: &str = "_tags";
+/// Shared by pulls, exclusive for rm and prune.
+const LOCK: &str = ".lock";
+/// Exclusive for the sweep, which runs under the shared lock.
+const SWEEP_LOCK: &str = ".sweep.lock";
 
 /// What an image is made of, kept beside its tree as `image.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,7 +158,7 @@ pub struct Store {
     fs: Box<dyn Fs>,
 }
 
-/// A held `.lock`.
+/// A held lock file.
 pub struct Lock {
     file: File,
 }
@@ -215,12 +219,14 @@ impl Store {
         for sub in ["", "blobs/sha256", "images", "refs"] {
             builder.create(dir.join(sub))?;
         }
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(dir.join(".lock"))?;
+        for name in [LOCK, SWEEP_LOCK] {
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(dir.join(name))?;
+        }
         Ok(Store {
             dir: dir.to_path_buf(),
             fs,
@@ -234,16 +240,16 @@ impl Store {
 
     /// Held by a pull, so a prune waits for it.
     pub fn lock_shared(&self) -> io::Result<Lock> {
-        self.lock(libc::LOCK_SH)
+        self.lock(LOCK, libc::LOCK_SH)
     }
 
     /// Held by rm and prune: no pull runs meanwhile.
     pub fn lock_exclusive(&self) -> io::Result<Lock> {
-        self.lock(libc::LOCK_EX)
+        self.lock(LOCK, libc::LOCK_EX)
     }
 
-    fn lock(&self, how: libc::c_int) -> io::Result<Lock> {
-        let file = File::open(self.dir.join(".lock"))?;
+    fn lock(&self, name: &str, how: libc::c_int) -> io::Result<Lock> {
+        let file = File::open(self.dir.join(name))?;
         // SAFETY: flock on a descriptor we hold; it blocks until taken.
         if unsafe { libc::flock(file.as_raw_fd(), how) } < 0 {
             return Err(io::Error::last_os_error());
@@ -252,8 +258,10 @@ impl Store {
     }
 
     /// Removes the staging and deleting entries of pids that are gone.
-    /// Answers how many.
+    /// Answers how many. One sweep at a time: two pulls starting together
+    /// both hold the shared lock, and must not delete the same tree.
     pub fn sweep(&self) -> io::Result<usize> {
+        let _sweeping = self.lock(SWEEP_LOCK, libc::LOCK_EX)?;
         let mut removed = 0;
         let mut dirs = vec![self.dir.join("blobs/sha256"), self.dir.join("images")];
         collect_dirs(&self.dir.join("refs"), &mut dirs)?;
@@ -336,6 +344,17 @@ impl Store {
     pub fn image_dir(&self, digest: &Digest) -> Option<PathBuf> {
         let dir = self.dir.join("images").join(digest.hex());
         dir.is_dir().then_some(dir)
+    }
+
+    /// The image's directory, when it is at its final name, made durable
+    /// first: the pull that put it there may not have synced the rename
+    /// yet, and a ref written to it must not outlive it.
+    pub fn existing_image(&self, digest: &Digest) -> io::Result<Option<PathBuf>> {
+        let Some(dir) = self.image_dir(digest) else {
+            return Ok(None);
+        };
+        self.fs.fsync_dir(&self.dir.join("images"))?;
+        Ok(Some(dir))
     }
 
     pub fn image_json(&self, digest: &Digest) -> io::Result<ImageJson> {
@@ -492,8 +511,9 @@ impl Store {
         let Some(final_dir) = self.image_dir(digest) else {
             return Ok(false);
         };
-        // The refs first, each tags directory synced before the image goes.
-        let mut synced: BTreeSet<PathBuf> = BTreeSet::new();
+        // The refs first: every one unlinked, then each changed directory
+        // synced, before the image goes.
+        let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
         let refs = self.dir.join("refs");
         for entry in self.list()?.refs {
             if entry.digest != *digest {
@@ -504,9 +524,10 @@ impl Store {
                 .join(&entry.repository)
                 .join(TAGS);
             self.fs.unlink(&dir.join(&entry.tag))?;
-            if synced.insert(dir.clone()) {
-                self.fs.fsync_dir(&dir)?;
-            }
+            changed.insert(dir);
+        }
+        for dir in &changed {
+            self.fs.fsync_dir(dir)?;
         }
         let deleting = staging_name(digest.hex(), "deleting");
         let images = self.dir.join("images");
@@ -662,7 +683,7 @@ impl ImageStaging<'_> {
             .create_new(true)
             .mode(0o644)
             .open(self.partial.join("image.json"))?;
-        file.write_all(&serde_json::to_vec_pretty(json).map_err(io::Error::other)?)?;
+        serde_json::to_writer_pretty(&mut file, json).map_err(io::Error::other)?;
         fs_.fsync_file(&file)?;
         drop(file);
         fs_.fsync_dir(&self.partial)?;
@@ -685,6 +706,7 @@ impl ImageStaging<'_> {
             }
         }
         self.discard()?;
+        fs_.fsync_dir(&images)?;
         Ok(final_dir)
     }
 
@@ -783,7 +805,10 @@ mod tests {
             fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(names(&dir), [".lock", "blobs", "images", "refs"]);
+        assert_eq!(
+            names(&dir),
+            [".lock", ".sweep.lock", "blobs", "images", "refs"]
+        );
         assert!(dir.join("blobs/sha256").is_dir());
         assert_eq!(store.dir(), dir);
         // Opening again keeps what is there.
@@ -1188,18 +1213,74 @@ mod tests {
                 format!("fsync-dir refs/host.example/x/{TAGS}"),
             ]
         );
+        // A second tag in the same directory: both unlinks come before the
+        // one sync of their directory, and that before the image goes.
+        let r2 = Reference::parse("host.example/x:v2").unwrap();
+        store.write_ref(&r2, &m).unwrap();
         calls.lock().unwrap().clear();
         assert!(store.remove_image(&m).unwrap());
         let got = calls.lock().unwrap().clone();
         assert_eq!(
-            got[..4],
+            got[..5],
             [
                 format!("unlink refs/host.example/x/{TAGS}/v1"),
+                format!("unlink refs/host.example/x/{TAGS}/v2"),
                 format!("fsync-dir refs/host.example/x/{TAGS}"),
                 format!("rename images/{hex} -> images/.{hex}.deleting"),
                 "fsync-dir images".to_owned(),
             ]
         );
+        // An existing image is made durable before anyone builds on it,
+        // and a losing publisher syncs the directory it found it in.
+        put_image(&store, &json(&m, &digest(2), &[]));
+        calls.lock().unwrap().clear();
+        assert!(store.existing_image(&m).unwrap().is_some());
+        assert_eq!(*calls.lock().unwrap(), ["fsync-dir images".to_owned()]);
+        calls.lock().unwrap().clear();
+        let loser = store.stage_image(&m).unwrap();
+        loser.publish(&json(&m, &digest(2), &[])).unwrap();
+        assert_eq!(
+            calls.lock().unwrap().last().map(String::as_str),
+            Some("fsync-dir images")
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("rename")),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn two_sweeps_at_once_remove_everything_and_fail_nothing() {
+        let (_tmp, store) = store();
+        let store = Arc::new(store);
+        for round in 0..10 {
+            let blobs = store.dir().join("blobs/sha256");
+            let images = store.dir().join("images");
+            for i in 0..40 {
+                fs::write(blobs.join(format!(".b{round}{i}.partial.999999-{i}")), b"x").unwrap();
+                let dir = images.join(format!(".i{round}{i}.partial.999999-{i}"));
+                fs::create_dir_all(dir.join("rootfs/a/b")).unwrap();
+                fs::write(dir.join("rootfs/a/b/f"), b"x").unwrap();
+            }
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let store = store.clone();
+                    thread::spawn(move || store.sweep())
+                })
+                .collect();
+            let removed: usize = threads
+                .into_iter()
+                .map(|t| t.join().unwrap().unwrap())
+                .sum();
+            assert_eq!(removed, 80, "round {round}");
+            assert_eq!(names(&blobs), Vec::<String>::new());
+            assert_eq!(names(&images), Vec::<String>::new());
+        }
     }
 
     #[test]

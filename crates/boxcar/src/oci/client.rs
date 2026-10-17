@@ -42,7 +42,7 @@ pub struct ManifestResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("{0}")]
-    Transport(String),
+    Transport(Transport),
     #[error("{registry}/{repository}: the {what} request answered {status}{}", describe(.codes))]
     Status {
         registry: String,
@@ -81,6 +81,49 @@ pub enum ClientError {
     Manifest(#[from] manifest::ManifestError),
     #[error("writing the blob: {0}")]
     Write(#[source] io::Error),
+}
+
+/// What went wrong on the wire, in boxcar's words: a registry chooses
+/// URLs and messages, and none of them is repeated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Transport {
+    #[error("the host was not found")]
+    HostNotFound,
+    #[error("the connection failed")]
+    ConnectionFailed,
+    #[error("the TLS handshake failed")]
+    Tls,
+    #[error("the transfer timed out")]
+    Timeout,
+    #[error("the registry closed the connection")]
+    Closed,
+    #[error("too many redirects")]
+    TooManyRedirects,
+    #[error("the registry redirected to plain http")]
+    PlainHttpRedirect,
+    #[error("the body is larger than allowed")]
+    BodyTooLarge,
+    #[error("an HTTP protocol error")]
+    Protocol,
+    #[error("an I/O error")]
+    Io,
+    #[cfg(test)]
+    #[error("not a loopback host")]
+    NotLoopback,
+}
+
+impl Transport {
+    fn io(error: &io::Error) -> Transport {
+        match error.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Transport::Timeout,
+            io::ErrorKind::ConnectionRefused => Transport::ConnectionFailed,
+            io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof => Transport::Closed,
+            _ => Transport::Io,
+        }
+    }
 }
 
 fn describe(codes: &[&'static str]) -> String {
@@ -190,10 +233,7 @@ impl Client {
         config: Option<&DockerConfig>,
     ) -> Result<Client, ClientError> {
         if !is_loopback(reference.api_host()) {
-            return Err(ClientError::Transport(format!(
-                "{} is not a loopback host",
-                reference.api_host()
-            )));
+            return Err(ClientError::Transport(Transport::NotLoopback));
         }
         let tls = TlsConfig::builder()
             .provider(TlsProvider::Rustls)
@@ -278,7 +318,7 @@ impl Client {
         loop {
             let n = reader
                 .read(&mut buf)
-                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                .map_err(|error| ClientError::Transport(Transport::io(&error)))?;
             if n == 0 {
                 break;
             }
@@ -502,7 +542,17 @@ fn sha256(data: &[u8]) -> Digest {
 }
 
 fn transport(error: ureq::Error) -> ClientError {
-    ClientError::Transport(error.to_string())
+    ClientError::Transport(match error {
+        ureq::Error::HostNotFound => Transport::HostNotFound,
+        ureq::Error::ConnectionFailed => Transport::ConnectionFailed,
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::Pem(_) => Transport::Tls,
+        ureq::Error::Timeout(_) => Transport::Timeout,
+        ureq::Error::TooManyRedirects | ureq::Error::RedirectFailed => Transport::TooManyRedirects,
+        ureq::Error::RequireHttpsOnly(_) => Transport::PlainHttpRedirect,
+        ureq::Error::BodyExceedsLimit(_) => Transport::BodyTooLarge,
+        ureq::Error::Io(error) => Transport::io(&error),
+        _ => Transport::Protocol,
+    })
 }
 
 fn body_error(error: ureq::Error, what: &'static str, max: u64) -> ClientError {
@@ -885,6 +935,35 @@ mod tests {
             started.elapsed()
         );
         assert!(matches!(err, ClientError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn a_transport_error_repeats_no_url_the_registry_chose() {
+        let tls = Tls::new();
+        let ca = CertificateDer::from(tls.ca_der.clone());
+        let registry = Registry::start_tls(
+            Auth::None,
+            Faults {
+                redirect_blobs_to: Some("http://registry.example/cdn".into()),
+                ..Faults::default()
+            },
+            tls,
+        );
+        let (_, layer) = image(&registry);
+        let mut client = Client::new(&reference(&registry), vec![ca], None).unwrap();
+        let err = client
+            .blob_to(
+                &Digest::parse(&layer.digest()).unwrap(),
+                layer.data.len() as u64,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::Transport(Transport::PlainHttpRedirect)),
+            "{err}"
+        );
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("registry.example"), "{text}");
     }
 
     #[test]

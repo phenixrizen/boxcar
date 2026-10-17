@@ -75,22 +75,22 @@ pub struct ImageConfig {
 pub enum ManifestError {
     #[error("schema 1 manifests are not supported")]
     Schema1,
-    #[error("`{0}` is not a manifest media type")]
-    UnknownType(String),
-    #[error("the {what} does not parse: {why}")]
-    Json { what: &'static str, why: String },
+    #[error("the manifest's media type is not one boxcar reads")]
+    UnknownType,
+    #[error("the {what} does not parse")]
+    Json { what: &'static str },
     #[error("{0} layers: more than {MAX_LAYERS}")]
     TooManyLayers(usize),
-    #[error("a layer of type `{0}` is not one boxcar unpacks")]
-    LayerType(String),
+    #[error("a layer's media type is not one boxcar unpacks")]
+    LayerType,
     #[error("the {what} is {size} bytes: more than {max}")]
     TooLarge {
         what: &'static str,
         size: u64,
         max: u64,
     },
-    #[error("the config is for {os}/{architecture}, not linux/amd64")]
-    Platform { os: String, architecture: String },
+    #[error("the config is not for linux/amd64")]
+    Platform,
     #[error("the index has no linux/amd64 manifest")]
     NoLinuxAmd64,
 }
@@ -99,10 +99,7 @@ pub enum ManifestError {
 /// decides when it is there, else `content_type` (its parameters
 /// ignored).
 pub fn parse_document(content_type: &str, body: &[u8]) -> Result<Document, ManifestError> {
-    let json = |why: serde_json::Error| ManifestError::Json {
-        what: "manifest",
-        why: why.to_string(),
-    };
+    let json = |_: serde_json::Error| ManifestError::Json { what: "manifest" };
     let header_type = content_type.split(';').next().unwrap_or("").trim();
     #[derive(Deserialize)]
     struct Peek {
@@ -138,7 +135,7 @@ pub fn parse_document(content_type: &str, body: &[u8]) -> Result<Document, Manif
             }
             for layer in &raw.layers {
                 if Compression::for_media_type(&layer.media_type).is_none() {
-                    return Err(ManifestError::LayerType(layer.media_type.clone()));
+                    return Err(ManifestError::LayerType);
                 }
                 if layer.size > MAX_BLOB {
                     return Err(ManifestError::TooLarge {
@@ -189,7 +186,7 @@ pub fn parse_document(content_type: &str, body: &[u8]) -> Result<Document, Manif
                 .collect();
             Ok(Document::Index(Index { manifests }))
         }
-        other => Err(ManifestError::UnknownType(other.to_owned())),
+        _ => Err(ManifestError::UnknownType),
     }
 }
 
@@ -241,15 +238,10 @@ pub fn parse_config(body: &[u8]) -> Result<ImageConfig, ManifestError> {
         #[serde(default)]
         config: Option<Inner>,
     }
-    let raw: Raw = serde_json::from_slice(body).map_err(|why| ManifestError::Json {
-        what: "config",
-        why: why.to_string(),
-    })?;
+    let raw: Raw =
+        serde_json::from_slice(body).map_err(|_| ManifestError::Json { what: "config" })?;
     if raw.os != "linux" || raw.architecture != "amd64" {
-        return Err(ManifestError::Platform {
-            os: raw.os,
-            architecture: raw.architecture,
-        });
+        return Err(ManifestError::Platform);
     }
     let inner = raw.config.unwrap_or_default();
     Ok(ImageConfig {
@@ -348,7 +340,7 @@ mod tests {
         );
         assert_eq!(
             parse_document("text/html", &body),
-            Err(ManifestError::UnknownType("text/html".into()))
+            Err(ManifestError::UnknownType)
         );
         assert!(matches!(
             parse_document(OCI_MANIFEST, b"not json"),
@@ -379,9 +371,7 @@ mod tests {
         );
         assert_eq!(
             parse_document(OCI_MANIFEST, &body),
-            Err(ManifestError::LayerType(
-                "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip".into()
-            ))
+            Err(ManifestError::LayerType)
         );
         let big = json!({
             "schemaVersion": 2,
@@ -496,10 +486,7 @@ mod tests {
         let other = json!({"architecture": "arm64", "os": "linux"});
         assert_eq!(
             parse_config(&serde_json::to_vec(&other).unwrap()),
-            Err(ManifestError::Platform {
-                os: "linux".into(),
-                architecture: "arm64".into()
-            })
+            Err(ManifestError::Platform)
         );
         assert!(matches!(
             parse_config(b"{"),
