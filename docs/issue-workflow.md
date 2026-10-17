@@ -177,6 +177,9 @@ checks current author/editor and exact scope. A narrower allowance uses
 same arguments. Record every round in one bounded owner instruction upfront when
 an extension is authorized. A generic policy cannot expand a narrower allowance.
 A triage note, new branch or session does not grant spending.
+For schema 3, append the active deliverable's `binding` to both authorization and
+ceiling lines. The helper verifies that exact scope; unused older grants cannot
+fund another outcome. Legacy lines remain valid only for their historical scope.
 
 After trusted main supports schema 3, prepare a deliverable JSON file containing
 `id`, `outcome` and `acceptance`. A direct owner request or approved plan for that
@@ -200,6 +203,10 @@ A focused review can reconcile earlier dispositions as a batch. Supply JSON
 `{"findings": ["F-ID"], "rationale": "What changed and why this review covers it"}`
 to `carry REFERENCE --session SESSION --receipt ID --file FILE`. It verifies the
 identified batch against the current reviewed inputs, retaining original events.
+The review captures disposition/source digests before invocation. Later resolutions
+cannot be attributed to that earlier review. Transferred source reports must match
+their receipt's result digest and immutable inputs; unverifiable legacy reports
+require reconciliation through a new initial review, not automatic carry-forward.
 It cannot carry unresolved findings or fabricate evidence. For strictly allowed
 license-header-only changes at an unchanged target, use
 `continuity REFERENCE --session SESSION --receipt ID`. This accepts only insertion

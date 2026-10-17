@@ -593,10 +593,24 @@ class Advisory:
                 raise Error(
                     "active owner must release before another clone can reconfirm"
                 )
+        spending = policy.active_deliverable(m["ledger"])
+        scope_fields = (
+            {"deliverable": spending["id"], "binding": spending["binding"]}
+            if spending
+            else {}
+        )
         grant = {
             "id": len(m["grants"]) + 1,
             "owner": board.OWNER,
             "source": data["source"],
+            **(
+                {
+                    "spending_deliverable": spending["id"],
+                    "spending_binding": spending["binding"],
+                }
+                if spending
+                else {}
+            ),
             "scope": data["scope"],
             "snapshot": policy.digest(record),
             "at": now(),
@@ -610,16 +624,15 @@ class Advisory:
             ):
                 raise Error("allowance cannot erase reviews or use an unknown phase")
             for n in range(policy.count(m["ledger"], phase) + 1, ceiling + 1):
-                a = {"phase": phase, "round": n, "comment": grant["id"]}
+                a = {"phase": phase, "round": n, "comment": grant["id"], **scope_fields}
                 if not policy.authorization(m["ledger"], phase, n):
                     m["ledger"]["authorizations"].append(a)
-            spending = policy.active_deliverable(m["ledger"])
-            if spending is None:
-                spending = m["ledger"]
-            spending.setdefault("ceilings", {})[phase] = {
+            target = spending if spending is not None else m["ledger"]
+            target.setdefault("ceilings", {})[phase] = {
                 "phase": phase,
                 "round": ceiling,
                 "comment": grant["id"],
+                **scope_fields,
             }
         m["grants"].append(grant)
         m["scope"] = data["scope"]
@@ -1076,8 +1089,16 @@ class Advisory:
                 "binding": binding,
             }:
                 raise Error("retry authorization does not bind failed attempts")
-        elif grant.get("allowances", {}).get(phase, 0) < round_:
-            raise Error("private spending exceeds the explicit owner grant")
+        else:
+            if grant.get("spending_binding") != binding:
+                raise Error("private spending grant belongs to another deliverable")
+            if binding and not any(
+                d["binding"] == binding and d["id"] == grant.get("spending_deliverable")
+                for d in m["ledger"].get("deliverables", [])
+            ):
+                raise Error("private spending grant lacks its original deliverable")
+            if grant.get("allowances", {}).get(phase, 0) < round_:
+                raise Error("private spending exceeds the explicit owner grant")
 
     def retry(self, ghsa, data):
         record = self.read(ghsa, True)
@@ -1138,7 +1159,7 @@ class Advisory:
         policy.check_ledger(s, callback)
         auth = policy.authorization(s, phase, round_)
         if auth:
-            callback(phase, round_, auth["comment"], "authorize")
+            callback(phase, round_, auth["comment"], "authorize", auth.get("binding"))
         head, base, merge = self.inputs()
         if phase == "docs" and any(
             Path(p).suffix not in (".md", ".txt")
@@ -1163,6 +1184,8 @@ class Advisory:
             "rationale": data.get("rationale", ""),
             "material_change": data.get("material_change", False),
         }
+        if r["policy_version"] == policy.POLICY_VERSION:
+            r["finding_context"] = policy.capture_findings(s, r["verifies"])
         policy.validate_scope(s, r, check_auth=callback)
         prior = []
         for previous in r["prior"]:

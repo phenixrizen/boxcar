@@ -429,6 +429,227 @@ class PrivateWorkflowTest(unittest.TestCase):
             returning = a.Advisory(api=self.api, directory=self.root / "state")
             self.assertEqual(a.metadata(returning.read(GHSA))["ledger"], after)
 
+    def test_private_review_cannot_carry_a_disposition_written_after_invocation(self):
+        self.claimed()
+        self.deliverable()
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(
+                self.client, "inputs", return_value=(HEAD, BASE, BASE)
+            ) as inputs,
+        ):
+            with mock.patch(
+                "subprocess.run",
+                side_effect=self.review_output(
+                    findings=[
+                        {"title": "Synthetic required correction", "severity": "high"}
+                    ]
+                ),
+            ):
+                record = self.client.review(
+                    GHSA, "s", {"focus": "Synthetic initial review"}
+                )
+            initial = a.metadata(record)["ledger"]["reviews"][-1]
+            fid = initial["finding_ids"][0]
+            self.client.dispose(
+                GHSA,
+                "s",
+                {
+                    "finding": fid,
+                    "category": "blocking",
+                    "status": "investigate",
+                    "evidence": "Synthetic required invariant not established",
+                    "consequence": "Investigation is still required",
+                },
+            )
+            b_head, c_head = "b1" * 20, "c1" * 20
+            inputs.return_value = (b_head, BASE, BASE)
+            with mock.patch("subprocess.run", side_effect=self.review_output(b_head)):
+                record = self.client.review(
+                    GHSA,
+                    "s",
+                    {
+                        "scope": "follow-up",
+                        "focus": "Synthetic review at B",
+                        "prior": [initial["id"]],
+                        "verifies": [fid],
+                        "rationale": "Inspect the still unresolved claim",
+                    },
+                )
+            review_b = copy.deepcopy(a.metadata(record)["ledger"]["reviews"][-1])
+            inputs.return_value = (c_head, BASE, BASE)
+            self.client.dispose(
+                GHSA,
+                "s",
+                {
+                    "finding": fid,
+                    "category": "blocking",
+                    "status": "verified",
+                    "evidence": "Synthetic correction implemented and checked only at C",
+                    "consequence": "Required invariant restored at C",
+                },
+            )
+            inputs.return_value = (b_head, BASE, BASE)
+            before = self.client.read(GHSA)
+            with self.assertRaises(a.Error):
+                self.client.carry(
+                    GHSA,
+                    "s",
+                    {
+                        "receipt": review_b["id"],
+                        "findings": [fid],
+                        "rationale": "C evidence must not be attributed to the earlier B review",
+                    },
+                )
+            self.assertEqual(self.client.read(GHSA), before)
+            ledger = a.metadata(before)["ledger"]
+            self.assertEqual(ledger["reviews"][-1], review_b)
+            self.assertFalse(policy.approved(ledger, b_head, BASE, confidential=True))
+            # A later review can attest the already-written resolution.
+            inputs.return_value = (c_head, BASE, BASE)
+            with mock.patch("subprocess.run", side_effect=self.review_output(c_head)):
+                record = self.client.review(
+                    GHSA,
+                    "s",
+                    {
+                        "scope": "follow-up",
+                        "focus": "Synthetic verification at C",
+                        "prior": [initial["id"], review_b["id"]],
+                        "verifies": [fid],
+                        "rationale": "Inspect the actual C resolution",
+                    },
+                )
+            review_c = a.metadata(record)["ledger"]["reviews"][-1]
+            record = self.client.carry(
+                GHSA,
+                "s",
+                {
+                    "receipt": review_c["id"],
+                    "findings": [fid],
+                    "rationale": "The current reviewer received this exact resolution",
+                },
+            )
+            self.assertTrue(
+                policy.approved(
+                    a.metadata(record)["ledger"], c_head, BASE, confidential=True
+                )
+            )
+
+    def test_private_unused_extensions_cannot_fund_another_deliverable(self):
+        record = self.claimed()
+        record = self.client.authorize(
+            GHSA,
+            {
+                "expected": policy.digest(record),
+                "owner": board.OWNER,
+                "source": "Synthetic old lifetime allowance",
+                "scope": "Synthetic old scope",
+                "reconfirm": True,
+                "allowances": {"code": 7},
+            },
+        )
+        old_grants = copy.deepcopy(a.metadata(record)["grants"])
+        old_auth = copy.deepcopy(a.metadata(record)["ledger"]["authorizations"])
+        self.deliverable(record)
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(self.client, "inputs", return_value=(HEAD, BASE, BASE)),
+            mock.patch(
+                "subprocess.run", side_effect=self.review_output()
+            ) as invocation,
+        ):
+            previous = None
+            for index in range(3):
+                request = {
+                    "focus": "Synthetic first deliverable",
+                    "scope": "initial" if index == 0 else "follow-up",
+                }
+                if previous:
+                    request.update(
+                        prior=[previous], rationale="Synthetic bounded follow-up"
+                    )
+                record = self.client.review(GHSA, "s", request)
+                previous = a.metadata(record)["ledger"]["reviews"][-1]["id"]
+            with self.assertRaisesRegex(a.Error, "budget exhausted"):
+                self.client.review(
+                    GHSA,
+                    "s",
+                    {
+                        "scope": "follow-up",
+                        "focus": "Old grant is insufficient",
+                        "prior": [previous],
+                        "rationale": "No current extension",
+                    },
+                )
+            self.assertEqual(invocation.call_count, 3)
+            record = self.client.authorize(
+                GHSA,
+                {
+                    "expected": policy.digest(record),
+                    "owner": board.OWNER,
+                    "source": "Synthetic scoped extension",
+                    "scope": "Synthetic first deliverable",
+                    "reconfirm": True,
+                    "allowances": {"code": 8},
+                },
+            )
+            record = self.client.review(
+                GHSA,
+                "s",
+                {
+                    "scope": "follow-up",
+                    "focus": "Current scoped fourth review",
+                    "prior": [previous],
+                    "rationale": "Explicit extension",
+                },
+            )
+            record = self.client.deliverable(
+                GHSA,
+                {
+                    "expected": policy.digest(record),
+                    "owner": board.OWNER,
+                    "source": "Synthetic second selected outcome",
+                    "id": "synthetic-second-deliverable",
+                    "outcome": "Another explicitly selected synthetic outcome",
+                    "acceptance": "Second synthetic outcome verified",
+                },
+            )
+            previous = None
+            for index in range(3):
+                request = {
+                    "focus": "Synthetic second deliverable",
+                    "scope": "initial" if index == 0 else "follow-up",
+                }
+                if previous:
+                    request.update(
+                        prior=[previous], rationale="Synthetic bounded follow-up"
+                    )
+                record = self.client.review(GHSA, "s", request)
+                previous = a.metadata(record)["ledger"]["reviews"][-1]["id"]
+            with self.assertRaisesRegex(a.Error, "budget exhausted"):
+                self.client.review(
+                    GHSA,
+                    "s",
+                    {
+                        "scope": "follow-up",
+                        "focus": "Earlier scope extension is insufficient",
+                        "prior": [previous],
+                        "rationale": "No second-scope extension",
+                    },
+                )
+            self.assertEqual(invocation.call_count, 7)
+        meta = a.metadata(record)
+        self.assertEqual(meta["grants"][: len(old_grants)], old_grants)
+        self.assertEqual(meta["ledger"]["authorizations"][: len(old_auth)], old_auth)
+        policy.check_ledger(
+            meta["ledger"],
+            lambda ph, rd, grant, kind, binding=None: self.client.check_auth(
+                meta, ph, rd, grant, kind, binding
+            ),
+        )
+
     def test_explicit_deliverable_cap_limits_spending_without_changing_legacy_cap(self):
         record = self.claimed()
         record = self.client.authorize(

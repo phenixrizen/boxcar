@@ -470,6 +470,38 @@ def verify_continuity(state, head, base, gh=None, confidential=False):
             raise Error("continuity proof does not match the actual Git objects")
 
 
+def review_source(receipt, path):
+    """Only receipt-bound structured claims may be transferred into review context."""
+    try:
+        payload = json.loads(path.read_text())
+    except (ValueError, OSError):
+        raise Error("prior source report is missing or incomplete") from None
+    result = payload.get("result") if isinstance(payload, dict) else None
+    expected = {
+        "head": receipt["commit"],
+        "base": receipt["base_sha"],
+        "merge_base": receipt.get("merge_base"),
+    }
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("findings"), list)
+        or not all(isinstance(f, dict) for f in result["findings"])
+        or not isinstance(payload.get("codex"), dict)
+        or payload.get("codex", {}).get("status") != 0
+        or payload.get("parseError")
+        or result.get("verdict") != receipt["outcome"]
+        or not receipt.get("result_digest")
+        or policy.digest(result) != receipt["result_digest"]
+        or receipt.get("inputs") != expected
+        or payload.get("inputs") != expected
+    ):
+        raise Error(
+            "prior source result/inputs do not match its receipt; recover the original report or reconcile through a new initial review"
+        )
+    # Unbound transcript/metadata fields must not masquerade as authenticated claims.
+    return {"result": result, "inputs": expected}
+
+
 completed = policy.count
 budget = policy.budget
 approved = policy.approved
@@ -886,8 +918,13 @@ class Task:
             if r["phase"] == phase and r["status"] == "failed"
         ]
         binding = policy.digest(failed_ids) if kind == "retry" else None
+        deliverable = policy.active_deliverable(self.state)
+        if deliverable and kind in ("authorize", "ceiling"):
+            binding = deliverable["binding"]
         authorize_check(self.gh, self.number, phase, round_, comment, kind, binding)
         a = {"phase": phase, "round": round_, "comment": comment}
+        if deliverable and kind in ("authorize", "ceiling"):
+            a.update(deliverable=deliverable["id"], binding=binding)
         if kind == "ceiling":
             if round_ < completed(self.state, phase):
                 raise Error("ceiling cannot erase completed reviews")
@@ -969,7 +1006,14 @@ class Task:
         round_ = budget(self.state, phase)
         auth = policy.authorization(self.state, phase, round_)
         if auth:
-            authorize_check(self.gh, self.number, phase, round_, auth["comment"])
+            authorize_check(
+                self.gh,
+                self.number,
+                phase,
+                round_,
+                auth["comment"],
+                binding=auth.get("binding"),
+            )
         scope_state = policy.active_deliverable(self.state)
         ceiling = (
             (scope_state if scope_state is not None else self.state)
@@ -984,6 +1028,7 @@ class Task:
                 ceiling["round"],
                 ceiling["comment"],
                 "ceiling",
+                ceiling.get("binding"),
             )
         # Validate all previous counts before spending, including historical exceptions.
         policy.check_ledger(
@@ -1023,6 +1068,8 @@ class Task:
             "rationale": rationale,
             "material_change": material,
         }
+        if r["policy_version"] == 3:
+            r["finding_context"] = policy.capture_findings(self.state, r["verifies"])
         if policy.failed_attempts(self.state, phase)[1] >= 2:
             grant = self.state["retry_authorizations"][phase]
             # A cached grant is not current permission. Validate the selected
@@ -1063,7 +1110,9 @@ class Task:
             for source in self.state["findings"][fid]["sources"]
         }
         if r["policy_version"] == 3 and not required_sources.issubset(r["prior"]):
-            raise Error("include every source receipt before verifying carried findings")
+            raise Error(
+                "include every source receipt before verifying carried findings"
+            )
         for ident in r["prior"]:
             path = self.directory / (ident + ".json")
             if (scope != "initial" or ident in required_sources) and not path.exists():
@@ -1073,7 +1122,7 @@ class Task:
             previous_context.append(
                 {
                     "receipt": policy.receipt(self.state, ident),
-                    "report": json.loads(path.read_text())
+                    "report": review_source(policy.receipt(self.state, ident), path)
                     if path.exists()
                     else "unavailable; recover privately or broaden review",
                 }
@@ -1296,7 +1345,7 @@ def authorize_check(gh, n, phase, round_, comment, kind="authorize", binding=Non
         f"work-issue deliverable {board.REPO}#{n} {round_} {binding}"
         if kind == "deliverable"
         else f"work-issue {kind} {board.REPO}#{n} {phase} {round_}"
-        + (f" {binding}" if kind == "retry" else "")
+        + (f" {binding}" if binding else "")
     )
     if not c or expected not in gh.trusted(c)["body"].splitlines():
         raise Error("missing exact owner authorization")

@@ -178,12 +178,39 @@ def review_fields(state, phase):
     }
 
 
-def authorization(state, phase, round_):
+def capture_findings(state, verifies):
+    """Immutable input fingerprints captured before sending reviewer context."""
+    context = {}
+    for fid in verifies:
+        f = state.get("findings", {}).get(fid)
+        if f is None:
+            raise Error("unknown finding to verify")
+        context[fid] = {
+            "disposition": digest(f["history"][-1]) if f.get("history") else None,
+            "sources": digest(f["sources"]),
+        }
+    return context
+
+
+def authorization(state, phase, round_, deliverable=None, legacy=False):
+    scope = None
+    if state.get("version") == CHECKPOINT_VERSION and not legacy:
+        ident = deliverable or active_deliverable(state)["id"]
+        scope = next((d for d in state["deliverables"] if d["id"] == ident), None)
+        if scope is None:
+            raise Error("unknown deliverable for review authorization")
     return next(
         (
             a
             for a in state.get("authorizations", [])
-            if a["phase"] == phase and a["round"] == round_
+            if a["phase"] == phase
+            and a["round"] == round_
+            and (
+                (a.get("deliverable"), a.get("binding"))
+                == (scope["id"], scope["binding"])
+                if scope
+                else not a.get("deliverable") and not a.get("binding")
+            )
         ),
         None,
     )
@@ -277,19 +304,33 @@ def check_ledger(state, check_auth):
                 r["deliverable_round"] if policy == POLICY_VERSION else r["round"]
             )
             if scoped_round > limit:
-                a = authorization(state, phase, r["round"])
+                a = authorization(
+                    state,
+                    phase,
+                    r["round"],
+                    r.get("deliverable"),
+                    legacy=policy != POLICY_VERSION,
+                )
                 if not a:
                     raise Error("review budget exceeded without owner authorization")
-                check_auth(phase, r["round"], a["comment"], "authorize")
+                check_auth(
+                    phase,
+                    r["round"],
+                    a["comment"],
+                    "authorize",
+                    *([a["binding"]] if policy == POLICY_VERSION else []),
+                )
             if policy in (VERSION, POLICY_VERSION):
                 validate_receipt(state, r)
                 if policy == POLICY_VERSION and renewed_initial(state, r):
-                    a = authorization(state, phase, r["round"])
+                    a = authorization(state, phase, r["round"], r["deliverable"])
                     if not a:
                         raise Error(
                             "renewed initial review needs scoped owner authorization"
                         )
-                    check_auth(phase, r["round"], a["comment"], "authorize")
+                    check_auth(
+                        phase, r["round"], a["comment"], "authorize", a["binding"]
+                    )
         legacy_done = [r for r in done if r.get("policy_version", 1) != POLICY_VERSION]
         ceiling = (
             state["deliverable_migration"].get("ceilings", {})
@@ -386,7 +427,18 @@ def check_deliverables(state, check_auth):
             if r["status"] == "completed":
                 per_phase[r["phase"]] += 1
         for phase, ceiling in d.get("ceilings", {}).items():
-            check_auth(phase, ceiling["round"], ceiling["comment"], "ceiling")
+            if (ceiling.get("deliverable"), ceiling.get("binding")) != (
+                d["id"],
+                d["binding"],
+            ):
+                raise Error("review ceiling is not bound to this deliverable")
+            check_auth(
+                phase,
+                ceiling["round"],
+                ceiling["comment"],
+                "ceiling",
+                ceiling["binding"],
+            )
             if any(
                 r["phase"] == phase
                 and r["status"] == "completed"
@@ -450,6 +502,25 @@ def renewed_initial(state, r):
 def validate_scope(state, r, check_auth=None):
     if r.get("scope") not in SCOPES:
         raise Error("invalid review scope")
+    if r.get("policy_version") == POLICY_VERSION:
+        context = r.get("finding_context")
+        if (
+            not isinstance(context, dict)
+            or set(context) != set(r.get("verifies", []))
+            or any(
+                not isinstance(value, dict)
+                or set(value) != {"disposition", "sources"}
+                or not re.fullmatch("[0-9a-f]{64}", value.get("sources") or "")
+                or (
+                    value.get("disposition") is not None
+                    and not re.fullmatch("[0-9a-f]{64}", value["disposition"])
+                )
+                for value in context.values()
+            )
+        ):
+            raise Error(
+                "review lacks immutable finding context captured before invocation"
+            )
     prior_ids = r.get("prior", [])
     if r["scope"] != "initial" and (
         not prior_ids or not r.get("rationale", "").strip()
@@ -482,13 +553,13 @@ def validate_scope(state, r, check_auth=None):
         raise Error("unknown finding to verify")
     if renewed_initial(state, r):
         round_ = r.get("round", count({"reviews": before}, r["phase"]) + 1)
-        a = authorization(state, r["phase"], round_)
+        a = authorization(state, r["phase"], round_, r["deliverable"])
         if not r.get("material_change") or not a:
             raise Error(
                 "renewed initial review needs material change and scoped owner authorization"
             )
         if check_auth:
-            check_auth(r["phase"], round_, a["comment"], "authorize")
+            check_auth(r["phase"], round_, a["comment"], "authorize", a["binding"])
 
 
 def high_impact(f):
@@ -645,14 +716,16 @@ def carry_forward(state, ident, finding_ids, rationale, confidential=False):
             )
         if e["status"] == "excepted":
             raise Error("revision-specific owner exceptions cannot be carried forward")
+        current_context = capture_findings(state, [fid])[fid]
+        if r["finding_context"].get(fid) != current_context:
+            raise Error(
+                "finding disposition or sources changed after the review's captured input"
+            )
         if not findings_ready(
             {"findings": {fid: f}}, e["head"], e["base"], confidential=confidential
         ):
             raise Error("unresolved finding cannot be carried forward")
-        batch["findings"][fid] = {
-            "disposition": digest(e),
-            "sources": digest(f["sources"]),
-        }
+        batch["findings"][fid] = current_context
     batch["id"] = digest(batch)
     batches = state.setdefault("carry_forwards", [])
     if batch not in batches:
@@ -686,10 +759,11 @@ def carried(state, f, head, base):
             raise Error(
                 "carry-forward does not match the review's actual inputs/context"
             )
-        if evidence == {
-            "disposition": digest(f["history"][-1]),
-            "sources": digest(f["sources"]),
-        }:
+        if (
+            evidence
+            == r["finding_context"].get(f["id"])
+            == capture_findings(state, [f["id"]])[f["id"]]
+        ):
             return True
     return False
 

@@ -908,6 +908,8 @@ class DeliverablePolicy(unittest.TestCase):
             "material_change": material,
             **policy.review_fields(self.state, phase),
         }
+        if r["policy_version"] == policy.POLICY_VERSION:
+            r["finding_context"] = policy.capture_findings(self.state, r["verifies"])
         self.state["reviews"].append(r)
         policy.register_result(self.state, r, result)
         return r
@@ -974,6 +976,77 @@ class DeliverablePolicy(unittest.TestCase):
             with self.assertRaisesRegex(policy.Error, "authorization"):
                 policy.budget(self.state, phase)
         policy.check_ledger(self.state, self.grant_check)
+
+    def test_legacy_unused_authorizations_cannot_fund_new_deliverable(self):
+        self.state["authorizations"] = [
+            {"phase": "code", "round": number, "comment": 30 + number}
+            for number in range(4, 10)
+        ]
+        self.begin()
+        for _ in range(3):
+            self.add()
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.budget(self.state, "code")
+        self.add()
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.check_ledger(self.state, self.grant_check)
+
+    def test_prior_scope_unused_grant_cannot_fund_extension_or_renewal(self):
+        original = self.begin()
+        self.state["authorizations"].extend(
+            {
+                "phase": "code",
+                "round": number,
+                "comment": 30 + number,
+                "deliverable": original["id"],
+                "binding": original["binding"],
+            }
+            for number in range(2, 10)
+        )
+        self.add()
+        current = self.begin("new-outcome", 11)
+        for _ in range(3):
+            self.add()
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.budget(self.state, "code")
+        renewed = self.add(scope="initial", material=True)
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.validate_scope(self.state, renewed)
+        with self.assertRaisesRegex(policy.Error, "authorization"):
+            policy.check_ledger(self.state, self.grant_check)
+        grant = {
+            "phase": "code",
+            "round": renewed["round"],
+            "comment": 21,
+            "deliverable": current["id"],
+            "binding": current["binding"],
+        }
+        self.state["authorizations"].append(grant)
+        self.grants[21] = ("code", renewed["round"], "authorize", current["binding"])
+        policy.validate_scope(self.state, renewed, self.grant_check)
+        policy.check_ledger(self.state, self.grant_check)
+
+    def test_authorization_lookup_retains_historical_scope_after_new_grant(self):
+        original = self.begin()
+        for _ in range(3):
+            self.add()
+        grant = {
+            "phase": "code",
+            "round": 4,
+            "comment": 21,
+            "deliverable": original["id"],
+            "binding": original["binding"],
+        }
+        self.state["authorizations"].append(grant)
+        self.grants[21] = ("code", 4, "authorize", original["binding"])
+        self.add()
+        self.begin("new-outcome", 11)
+        self.add()
+        policy.check_ledger(self.state, self.grant_check)
+        self.assertIsNone(policy.authorization(self.state, "code", 4))
+        self.assertEqual(
+            policy.authorization(self.state, "code", 4, original["id"]), grant
+        )
 
     def test_resume_branch_rebase_and_renaming_do_not_reset_budget(self):
         self.begin()
@@ -1067,8 +1140,15 @@ class DeliverablePolicy(unittest.TestCase):
     def test_later_narrow_deliverable_ceiling_limits_default_allowance(self):
         d = self.begin()
         self.add()
-        d["ceilings"] = {"code": {"round": 1, "comment": 9}}
-        self.grants[9] = ("code", 1, "ceiling", None)
+        d["ceilings"] = {
+            "code": {
+                "round": 1,
+                "comment": 9,
+                "deliverable": d["id"],
+                "binding": d["binding"],
+            }
+        }
+        self.grants[9] = ("code", 1, "ceiling", d["binding"])
         policy.check_ledger(self.state, self.grant_check)
         with self.assertRaisesRegex(policy.Error, "scoped allowance"):
             policy.budget(self.state, "code")
@@ -1080,15 +1160,21 @@ class DeliverablePolicy(unittest.TestCase):
             policy.check_ledger(self.state, self.grant_check)
 
     def test_material_renewal_requires_exact_owner_grant_without_reset(self):
-        self.begin()
+        d = self.begin()
         self.add()
         renewed = self.add(scope="initial", material=True)
         with self.assertRaisesRegex(policy.Error, "authorization"):
             policy.validate_scope(self.state, renewed)
         self.state["authorizations"].append(
-            {"phase": "code", "round": 2, "comment": 12}
+            {
+                "phase": "code",
+                "round": 2,
+                "comment": 12,
+                "deliverable": d["id"],
+                "binding": d["binding"],
+            }
         )
-        self.grants[12] = ("code", 2, "authorize", None)
+        self.grants[12] = ("code", 2, "authorize", d["binding"])
         policy.validate_scope(self.state, renewed, self.grant_check)
         policy.check_ledger(self.state, self.grant_check)
         self.assertEqual(policy.budget(self.state, "code"), 3)
@@ -1186,6 +1272,55 @@ class DeliverablePolicy(unittest.TestCase):
         self.assertFalse(policy.approved(self.state, "d" * 40, current["base_sha"]))
         self.assertEqual(first["outcome"], "needs-attention")
 
+    def test_carry_cannot_retroactively_resolve_review_input_from_later_revision(self):
+        self.begin()
+        _, fid = self.finding("high")
+        self.settle(fid, "concern", "investigate")
+        reviewed = self.add(head="c" * 40)
+        original_input = copy.deepcopy(reviewed["finding_context"])
+        policy.disposition(
+            self.state,
+            fid,
+            {
+                "category": "concern",
+                "status": "verified",
+                "evidence": "Fix and regression were established at a later revision.",
+                "consequence": "Only that later revision has corrected behavior.",
+            },
+            "d" * 40,
+            reviewed["base_sha"],
+        )
+        with self.assertRaisesRegex(policy.Error, "captured input"):
+            policy.carry_forward(
+                self.state,
+                reviewed["id"],
+                [fid],
+                "Cannot attach later fix to earlier review.",
+            )
+        forged = {
+            "receipt": reviewed["id"],
+            "head": reviewed["commit"],
+            "base": reviewed["base_sha"],
+            "rationale": "Synthetic forged carry.",
+            "findings": policy.capture_findings(self.state, [fid]),
+        }
+        forged["id"] = policy.digest(forged)
+        self.state["carry_forwards"] = [forged]
+        self.assertFalse(
+            policy.approved(self.state, reviewed["commit"], reviewed["base_sha"])
+        )
+        self.assertEqual(reviewed["finding_context"], original_input)
+        current = self.add(head="d" * 40)
+        policy.carry_forward(
+            self.state,
+            current["id"],
+            [fid],
+            "New review received actual resolved state.",
+        )
+        self.assertTrue(
+            policy.approved(self.state, current["commit"], current["base_sha"])
+        )
+
     def test_carry_cannot_resolve_concerns_or_unknown_legacy_findings(self):
         for status in ("investigate", "fixed-unverified"):
             self.setUp()
@@ -1212,6 +1347,7 @@ class DeliverablePolicy(unittest.TestCase):
             )
         current["prior"].append(first["id"])
         current["verifies"] = []
+        current["finding_context"] = {}
         with self.assertRaisesRegex(policy.Error, "explicitly reviewed"):
             policy.carry_forward(self.state, current["id"], [fid], "Missing request.")
 

@@ -4,6 +4,7 @@
 
 import base64
 import copy
+import json
 import subprocess
 import unittest
 from unittest import mock
@@ -96,6 +97,7 @@ class DeliverableWorkflow(unittest.TestCase):
         self.assertFalse(
             w.approved(self.ctx.state, follow["commit"], follow["base_sha"])
         )
+
         self.ctx.carry(
             "one",
             follow["id"],
@@ -119,6 +121,59 @@ class DeliverableWorkflow(unittest.TestCase):
             )
         self.assertFalse(
             w.approved(self.ctx.state, follow["commit"], follow["base_sha"])
+        )
+
+    def test_carry_cannot_use_a_resolution_recorded_after_review(self):
+        self.start()
+        self.grant()
+        first, fid = self.finding()
+        self.dispose(fid, status="fixed-unverified")
+        self.commit(b"print('B')\n")
+        follow, _ = self.review(scope="follow-up", prior=[first["id"]], verifies=[fid])
+        reviewed_context = copy.deepcopy(follow["finding_context"])
+        self.commit(b"print('C')\n")
+        self.dispose(fid)
+        w.git("reset", "--hard", follow["commit"])
+        with self.assertRaisesRegex(w.Error, "captured input"):
+            self.ctx.carry(
+                "one",
+                follow["id"],
+                {"findings": [fid], "rationale": "Later evidence was not reviewed."},
+            )
+        self.assertEqual(reviewed_context, follow["finding_context"])
+        self.assertFalse(
+            w.approved(self.ctx.state, follow["commit"], follow["base_sha"])
+        )
+
+    def test_old_unspent_grants_cannot_extend_new_deliverable(self):
+        self.start()
+        self.review()
+        line = f"work-issue authorize {w.board.REPO}#43 code 5"
+        c = self.gh.api(
+            f"repos/{w.board.REPO}/issues/43/comments", {"body": line}, method="POST"
+        )
+        self.ctx.authorize("one", "code", 5, c["id"])
+        self.grant()
+        first, _ = self.review()
+        for _ in range(2):
+            self.review(scope="follow-up", prior=[first["id"]])
+        with self.assertRaisesRegex(w.Error, "budget exhausted"):
+            w.policy.budget(self.ctx.state, "code")
+        with self.assertRaisesRegex(w.Error, "exact owner authorization"):
+            self.ctx.authorize("one", "code", 5, c["id"])
+        d = w.policy.active_deliverable(self.ctx.state)
+        new = self.gh.api(
+            f"repos/{w.board.REPO}/issues/43/comments",
+            {"body": line + " " + d["binding"]},
+            method="POST",
+        )
+        self.ctx.authorize("one", "code", 5, new["id"])
+        self.review(scope="follow-up", prior=[first["id"]])
+        w.policy.check_ledger(
+            self.ctx.state,
+            lambda ph, rd, c, kind, binding=None: w.authorize_check(
+                self.gh, 43, ph, rd, c, kind, binding
+            ),
         )
 
     def object_api(self, corrupt=False, truncated=False):
@@ -171,6 +226,31 @@ class DeliverableWorkflow(unittest.TestCase):
                 material=True,
             )
         self.assertEqual(before, self.ctx.state["reviews"])
+
+    def test_transferred_source_must_match_receipt_before_spending(self):
+        self.start()
+        self.grant()
+        first, fid = self.finding()
+        self.dispose(fid)
+        path = self.ctx.directory / (first["id"] + ".json")
+        original = json.loads(path.read_text())
+        before = copy.deepcopy(self.ctx.state["reviews"])
+        changed_inputs = copy.deepcopy(original)
+        changed_inputs["inputs"]["head"] = "f" * 40
+        changed_result = copy.deepcopy(original)
+        changed_result["result"] = {"verdict": "approve", "findings": []}
+        for payload in (changed_inputs, changed_result, {}, {"result": None}):
+            with self.subTest(payload=payload):
+                path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(w.Error, "source result/inputs"):
+                    self.review(scope="follow-up", prior=[first["id"]], verifies=[fid])
+                self.assertEqual(before, self.ctx.state["reviews"])
+        path.write_text('{"result":')
+        with self.assertRaisesRegex(w.Error, "missing or incomplete"):
+            self.review(scope="follow-up", prior=[first["id"]], verifies=[fid])
+        original["rawOutput"] = "Unbound supplemental text"
+        path.write_text(json.dumps(original))
+        self.assertEqual(set(w.review_source(first, path)), {"result", "inputs"})
 
     def test_license_continuity_and_ci_use_same_real_objects(self):
         self.start()
