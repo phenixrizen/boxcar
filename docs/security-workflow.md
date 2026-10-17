@@ -179,8 +179,10 @@ asynchronous fork request. Pending provisioning polls retrieval; never POST agai
 It uses an isolated clone with only private `origin`, a confidential common-directory
 marker and a pre-push destination guard. It refuses conflicting hooks/remotes and
 session ownership. The claim binds its path before asynchronous provisioning.
-A released handoff restores the checkpoint's private branch and verifies its
-commit is available from the private fork; unpublished work must be pushed there
+Preparation is acknowledged for the exact active session/clone, not merely a
+pathname. A released handoff restores the checkpoint's private branch and verifies
+its commit even when both machines use the same path or provisioning is retried.
+Remediation/review remains blocked until preparation succeeds. Unpublished work must be pushed there
 before another machine can resume. A new workspace starts on `remediation`, while
 an existing explicitly selected private clone retains its branch. Existing public
 issue/board/PR helpers reject marked clones

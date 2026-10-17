@@ -706,6 +706,10 @@ class Advisory:
             raise Error("owner remediation scope required")
         if workspace:
             associated = m.get("workspace", {})
+            if associated.get("prepared_for") != claim:
+                raise Error(
+                    "private workspace preparation is incomplete for this claim; resume work before implementation/review"
+                )
             if (
                 not associated.get("path")
                 or Path(associated["path"]).resolve() != Path.cwd().resolve()
@@ -850,7 +854,13 @@ class Advisory:
         hook.write_text(code)
         os.chmod(hook, 0o700)
         guard.verify(path)
-        resume = previous and Path(previous["path"]).resolve() != path.resolve()
+        resume = bool(
+            previous
+            and (
+                previous.get("prepared_for") != claim
+                or Path(previous["path"]).resolve() != path.resolve()
+            )
+        )
         if created or resume:
             branch = (
                 (m.get("checkpoint", {}).get("branch") or previous.get("branch"))
@@ -898,6 +908,7 @@ class Advisory:
         self.trusted(record)
         m = metadata(record)
         associated = {
+            "prepared_for": claim,
             "fork": full,
             "path": str(path),
             "branch": guard.command(["git", "branch", "--show-current"], path),

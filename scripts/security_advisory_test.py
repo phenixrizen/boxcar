@@ -124,6 +124,7 @@ class PrivateWorkflowTest(unittest.TestCase):
         m = a.metadata(r)
         m["owner"] = {"session": "s", "clone": self.client.clone_id()}
         m["workspace"] = {
+            "prepared_for": m["owner"],
             "path": str(Path.cwd()),
             "branch": "synthetic",
             "fork": "owner/private-fork",
@@ -1139,6 +1140,7 @@ class PrivateWorkflowTest(unittest.TestCase):
         )
         m = a.metadata(record)
         m["owner"] = {"session": "successor", "clone": other.clone_id()}
+        m["workspace"]["prepared_for"] = m["owner"]
         other.change(record, m, "claim", "Synthetic successor claim", trust=True)
 
         def reviewer(args, **kwargs):
@@ -1201,6 +1203,155 @@ class PrivateWorkflowTest(unittest.TestCase):
         after = other.recover_review(GHSA, "successor", failed=True)
         self.assertEqual(policy.count(a.metadata(after)["ledger"], "code"), 1)
         self.assertEqual(a.metadata(after)["ledger"]["reviews"][-1]["status"], "failed")
+
+    def test_same_path_successor_must_restore_branch_even_after_failed_retry(self):
+        self.approve()
+        shared = self.root / "same-path"
+        bare = self.root / "remote.git"
+        archive = self.root / "first-machine-copy"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(shared)], check=True)
+        for key, value in (
+            ("user.name", "Synthetic"),
+            ("user.email", "test@example.invalid"),
+        ):
+            subprocess.run(["git", "-C", str(shared), "config", key, value], check=True)
+        (shared / "test.txt").write_text("base\n")
+        subprocess.run(["git", "-C", str(shared), "add", "test.txt"], check=True)
+        subprocess.run(["git", "-C", str(shared), "commit", "-qm", "base"], check=True)
+        subprocess.run(
+            ["git", "-C", str(shared), "switch", "-qc", "remediation"], check=True
+        )
+        (shared / "test.txt").write_text("synthetic remediation\n")
+        subprocess.run(
+            ["git", "-C", str(shared), "commit", "-qam", "synthetic correction"],
+            check=True,
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(shared), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "clone", "-q", "--bare", str(shared), str(bare)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(bare), "update-ref", "-d", "refs/heads/remediation"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(shared),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/private-fork.git",
+            ],
+            check=True,
+        )
+        original = guard.command
+        clones = []
+
+        def command(args, cwd=None):
+            if args[0] == "gh":
+                return json.dumps({"full_name": "owner/private-fork", "private": True})
+            if args[:2] == ["git", "clone"]:
+                clones.append(args[-1])
+                original(["git", "clone", "--", str(bare), args[-1]])
+                return original(
+                    [
+                        "git",
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/owner/private-fork.git",
+                    ],
+                    args[-1],
+                )
+            if args == ["git", "fetch", "origin"]:
+                return original(
+                    ["git", "fetch", str(bare), "+refs/heads/*:refs/remotes/origin/*"],
+                    cwd,
+                )
+            return original(args, cwd)
+
+        with mock.patch.object(guard, "command", side_effect=command):
+            self.client.work(GHSA, "s", shared)
+            old = Path.cwd()
+            try:
+                os.chdir(shared)
+                with mock.patch.object(
+                    self.client, "inputs", return_value=(head, head, head)
+                ):
+                    self.client.checkpoint(
+                        GHSA,
+                        "s",
+                        {
+                            "completed": "Synthetic correction",
+                            "verification": "Synthetic tests passed",
+                            "blockers": "",
+                            "next": "Push and hand off",
+                        },
+                    )
+                self.client.release(GHSA, "s")
+            finally:
+                os.chdir(old)
+            shared.rename(archive)  # Model another machine with the identical pathname.
+            successor = a.Advisory(
+                api=self.api, directory=self.root / "second-machine-state"
+            )
+            r = successor.read(GHSA)
+            successor.authorize(
+                GHSA,
+                {
+                    "expected": policy.digest(r),
+                    "owner": board.OWNER,
+                    "source": "Explicit synthetic handoff",
+                    "scope": "Same bounded correction",
+                    "reconfirm": True,
+                },
+            )
+            for _ in range(2):
+                with self.assertRaisesRegex(a.Error, "branch has not reached"):
+                    successor.work(GHSA, "next", shared)
+                self.assertEqual(
+                    original(["git", "branch", "--show-current"], shared), "main"
+                )
+                self.assertNotEqual(
+                    original(["git", "rev-parse", "HEAD"], shared), head
+                )
+                try:
+                    os.chdir(shared)
+                    with self.assertRaisesRegex(a.Error, "preparation is incomplete"):
+                        successor.owned(GHSA, "next")
+                finally:
+                    os.chdir(old)
+            # Original machine makes its already-recorded commit available privately.
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(bare),
+                    "fetch",
+                    "-q",
+                    str(archive),
+                    "remediation:remediation",
+                ],
+                check=True,
+            )
+            r = successor.work(GHSA, "next", shared)
+            self.assertEqual(
+                original(["git", "branch", "--show-current"], shared), "remediation"
+            )
+            self.assertEqual(original(["git", "rev-parse", "HEAD"], shared), head)
+            self.assertEqual(
+                a.metadata(r)["workspace"]["prepared_for"], a.metadata(r)["owner"]
+            )
+            self.assertEqual(successor.work(GHSA, "next", shared), r)
+            self.assertEqual(len(clones), 1)
 
 
 if __name__ == "__main__":
