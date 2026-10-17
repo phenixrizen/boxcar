@@ -128,6 +128,16 @@ Execution files live in `~/.local/state/repository-advisories/phenixrizen/boxcar
 local trust/clone identity, restricted contexts and raw reports. GitHub holds the
 recoverable record, structured original review results, counts and dispositions.
 The local files are execution metadata, not a Markdown vulnerability backlog.
+Each trusted acknowledgement also retains its exact snapshot for owner recovery.
+For an out-of-band edit during active work, `reconcile` accepts expected/owner/source,
+private reason, and `stopped_attempts` listing every pending invocation the owner
+has confirmed stopped. It restores known trusted ownership/grants/attempts/history,
+retains the observed untrusted metadata as private evidence, and accepts no silent
+takeover by another clone. Recover the retained pending review afterward. A pending
+publication journal must be reconciled first; restore its exact recorded control
+snapshot privately if a fork provisioned while an unauthorized edit occurred.
+Missing trusted snapshots or an unresolved remote write remain explicit private
+reconciliation limits; never discard history or retry creation under a new key.
 
 A local flock coordinates only sessions sharing that state directory. The advisory
 claim detects observed session/clone conflicts, but REST PATCH is not an atomic
@@ -179,7 +189,8 @@ JSON records `phase` (plan/code/docs), `scope` (initial/follow-up/integration), 
 `focus`, and for focused scopes `prior` receipt IDs, `verifies` finding IDs and
 `rationale`; `material_change: true` requires initial scope. It invokes the installed
 Codex plugin through the existing wrapper, passing scope instructions through focus,
-not invented plugin flags. Raw private focus stays in the restricted context file.
+not invented plugin flags. Raw private focus and continuity rationale stay in the restricted context file;
+subprocess arguments contain only fixed instructions and opaque review inputs.
 
 Use the same policy-2 ceilings: docs one, plans two, code three autonomously; later
 rounds need explicit scoped grants. Failed/unavailable output counts zero and

@@ -601,7 +601,7 @@ class PrivateWorkflowTest(unittest.TestCase):
                     "scope": "follow-up",
                     "focus": "Synthetic verification",
                     "prior": [prior],
-                    "rationale": "Bounded correction",
+                    "rationale": "Synthetic private continuity detail",
                 },
             )
             prior = a.metadata(record)["ledger"]["reviews"][-1]["id"]
@@ -655,6 +655,7 @@ class PrivateWorkflowTest(unittest.TestCase):
             self.assertEqual(args[args.index("--scope") + 1], "branch")
             self.assertIn("Scope: " + scope, args[-1])
             self.assertNotIn("Synthetic private focus", args[-1])
+            self.assertNotIn("Synthetic private continuity detail", str(args))
 
     def test_verification_needs_actual_current_integration_and_keeps_draft(self):
         r = self.pending_review()
@@ -810,6 +811,185 @@ class PrivateWorkflowTest(unittest.TestCase):
                 "Synthetic multiline\ntext",
             )
             self.assertNotIn("Synthetic", str(run.call_args.args[0]))
+
+    def test_pending_fork_does_not_bless_control_edits_or_public_state(self):
+        self.approve()
+        self.api.fork_ready = False
+        with self.assertRaises(a.Error):
+            self.client.work(GHSA, "s", self.root / "private")
+        original = copy.deepcopy(self.api.records[GHSA])
+        m = a.metadata(original)
+        m["scope"] = "Unauthorized expansion"
+        m["grants"][0]["allowances"] = {"code": 99}
+        self.api.records[GHSA]["description"] = a.description(seed()["description"], m)
+        self.api.records[GHSA]["private_fork"] = {
+            "full_name": "owner/private-fork",
+            "private": True,
+        }
+        with self.assertRaisesRegex(a.Error, "control state changed"):
+            self.client.recover()
+        self.assertTrue(self.client.pending())
+        with self.assertRaises(a.Error):
+            self.client.trusted(self.client.read(GHSA))
+        self.api.records[GHSA]["description"] = original["description"]
+        self.api.records[GHSA]["state"] = "published"
+        with self.assertRaisesRegex(a.Error, "control state changed"):
+            self.client.recover()
+        self.api.records[GHSA]["state"] = "draft"
+        self.client.recover()
+        self.client.trusted(self.client.read(GHSA))
+        self.assertEqual(
+            a.metadata(self.client.read(GHSA))["scope"], a.metadata(original)["scope"]
+        )
+
+    def test_existing_creation_never_returns_an_unrelated_pending_advisory(self):
+        original = self.create()
+        other = seed("different-key", "Unrelated synthetic phenomenon")
+        other["legacy_ids"] = ["TEST-2"]
+        other["reviewed_related"] = [GHSA]
+        self.api.lose = True
+        with self.assertRaises(a.APIError):
+            self.client.create(other)
+        with self.assertRaisesRegex(a.Error, "unrelated pending"):
+            self.create()
+        self.client.recover()
+        self.assertEqual(self.create()["ghsa_id"], original["ghsa_id"])
+        self.assertEqual(self.client.create(other)["ghsa_id"], OTHER)
+        self.assertEqual(sum(c[2] == "POST" for c in self.api.calls), 2)
+
+    def test_matching_pending_create_still_rejects_changed_input(self):
+        self.api.lose = True
+        with self.assertRaises(a.APIError):
+            self.create()
+        with self.assertRaisesRegex(a.Error, "changed content"):
+            self.client.create({**seed(), "description": "Different content"})
+        self.assertTrue(self.client.pending())
+        self.create()
+        self.assertIsNone(self.client.pending())
+
+    def test_owner_reconciles_active_pending_work_without_losing_history(self):
+        pending = self.pending_review()
+        known = self.client.read(GHSA)
+        old = a.metadata(known)
+        changed = a.metadata(known)
+        changed["scope"] = "Unexpected scope"
+        changed["ledger"]["reviews"] = []
+        self.api.records[GHSA]["description"] = a.description(
+            seed()["description"], changed
+        )
+        observed = self.client.read(GHSA)
+        decision = {
+            "expected": policy.digest(observed),
+            "owner": board.OWNER,
+            "source": "Explicit current owner recovery instruction",
+            "reason": "Restore trusted control history after inspecting observed edit",
+            "stopped_attempts": [pending["id"]],
+        }
+        with self.assertRaises(a.Error):
+            self.client.reconcile(GHSA, {**decision, "expected": "stale"})
+        with self.assertRaisesRegex(a.Error, "pending invocation"):
+            self.client.reconcile(GHSA, {**decision, "stopped_attempts": []})
+        restored = self.client.reconcile(GHSA, decision)
+        meta = a.metadata(restored)
+        self.assertEqual(meta["owner"], old["owner"])
+        self.assertEqual(meta["ledger"], old["ledger"])
+        self.assertEqual(meta["grants"], old["grants"])
+        self.assertEqual(meta["history"][:-1], old["history"])
+        self.assertEqual(meta["history"][-1]["note"]["observed_metadata"], changed)
+        a.atomic(
+            self.client.directory / (pending["id"] + ".json"),
+            {
+                "codex": {"status": 0},
+                "inputs": {"head": HEAD, "base": BASE, "merge_base": BASE},
+                "result": {"verdict": "approve", "findings": []},
+            },
+        )
+        recovered = self.client.recover_review(GHSA, "s")
+        self.assertEqual(policy.count(a.metadata(recovered)["ledger"], "code"), 1)
+        with self.assertRaises(a.Error):
+            self.client.recover_review(GHSA, "s")
+
+    def test_reconciliation_never_takes_over_another_clones_active_work(self):
+        r = self.claimed()
+        other = a.Advisory(api=self.api, directory=self.root / "another-machine")
+        for file in (
+            self.client.anchor,
+            self.client.directory / (GHSA + ".trusted.json"),
+        ):
+            a.atomic(other.directory / file.name, a.read_file(file))
+        with self.assertRaisesRegex(a.Error, "another clone"):
+            other.reconcile(
+                GHSA,
+                {
+                    "expected": policy.digest(r),
+                    "owner": board.OWNER,
+                    "source": "Synthetic decision",
+                    "reason": "test",
+                    "stopped_attempts": [],
+                },
+            )
+
+    def test_repeated_independent_finding_retains_tracking_through_history_replay(self):
+        for confidential, tracking in (
+            (True, board.REPO + "#" + GHSA),
+            (False, "#123"),
+        ):
+            with self.subTest(confidential=confidential):
+                fid = "F-123456789abc"
+                s = {
+                    "findings": {
+                        fid: {
+                            "id": fid,
+                            "sources": [["first", 0]],
+                            "history": [],
+                            "severity": "low",
+                        }
+                    }
+                }
+                disposition = {
+                    "category": "independent",
+                    "status": "deferred",
+                    "tracking": tracking,
+                    "evidence": "Synthetic independent claim",
+                    "consequence": "No dependency on this change.",
+                }
+                policy.disposition(
+                    s, fid, disposition, HEAD, BASE, confidential=confidential
+                )
+                r = {
+                    "id": "second",
+                    "commit": HEAD,
+                    "base_sha": BASE,
+                    "verifies": [fid],
+                }
+                policy.register_result(
+                    s,
+                    r,
+                    {
+                        "verdict": "needs-attention",
+                        "findings": [
+                            {
+                                "title": fid + " Synthetic repeated claim",
+                                "severity": "low",
+                            }
+                        ],
+                    },
+                )
+                self.assertEqual(
+                    s["findings"][fid]["history"][-1]["tracking"], tracking
+                )
+                self.assertFalse(
+                    policy.findings_ready(s, HEAD, BASE, confidential=confidential)
+                )
+                policy.disposition(
+                    s, fid, disposition, HEAD, BASE, confidential=confidential
+                )
+                returning = json.loads(json.dumps(s))
+                self.assertTrue(
+                    policy.findings_ready(
+                        returning, HEAD, BASE, confidential=confidential
+                    )
+                )
 
 
 if __name__ == "__main__":

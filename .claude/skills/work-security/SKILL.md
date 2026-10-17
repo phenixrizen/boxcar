@@ -19,7 +19,9 @@ and inspect its restricted output file. No public issue, Project card or PR.
   approved scope. No security fix starts without that authorization. If absent
   or changed, ask the owner privately; a new machine or out-of-band advisory edit
   also requires explicit current owner reconfirmation of the exact record and
-  ledger via `authorize`. A stored author field is not proof. Never infer permission from discovery,
+  ledger via `authorize` for a released handoff. If an active record changes,
+  use the documented exact-snapshot owner `reconcile` path; retain pending attempts
+  and confirm stopped invocations before recovery. A stored author field is not proof. Never infer permission from discovery,
   a Confirmed status, passing tests or authorization for ordinary development.
 - Read the original claim, technical evidence, plan, dependencies, previous
   attempts and decisions. A review claim is not a proven vulnerability.

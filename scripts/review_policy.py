@@ -310,6 +310,11 @@ def register_result(state, r, result):
                     "sources_seen": len(f["sources"]),
                     "evidence": "Reviewer raised this finding again.",
                     "consequence": "Reconcile the new claim before readiness.",
+                    **(
+                        {"tracking": previous["tracking"]}
+                        if previous.get("tracking")
+                        else {}
+                    ),
                     "head": r["commit"],
                     "base": r["base_sha"],
                 }

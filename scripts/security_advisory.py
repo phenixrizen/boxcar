@@ -274,6 +274,7 @@ class Advisory:
         intent = self.pending()
         if intent and intent.get("trusted"):
             anchors = read_file(self.anchor) if self.anchor.exists() else {}
+            atomic(self.directory / (record["ghsa_id"] + ".trusted.json"), record)
             anchors[record["ghsa_id"]] = policy.digest(record)
             atomic(self.anchor, anchors)
         if intent:
@@ -323,10 +324,23 @@ class Advisory:
                     "other advisory fields changed during publication; reconcile privately before trusting this revision"
                 )
         if intent["kind"] == "fork":
+            if (
+                record.get("state") != "draft"
+                or record.get("description") != intent["before"]["description"]
+            ):
+                raise Error(
+                    "advisory control state changed during fork provisioning; restore/reconcile the recorded snapshot privately before recovery"
+                )
             if not record.get("private_fork"):
                 raise Error(
                     "private fork request pending/unknown; retry retrieval, not POST"
                 )
+            full = record["private_fork"].get("full_name", "")
+            if not re.fullmatch(r"[\w.-]+/[\w.-]+", full):
+                raise Error("invalid provisioned fork identity")
+            fork = self.api.request("repos/" + full)
+            if fork.get("full_name") != full or fork.get("private") is not True:
+                raise Error("provisioned fork privacy is unverified")
         elif (
             record.get("description") != intent["payload"]["description"]
             or record["state"] != intent["expected_state"]
@@ -404,14 +418,26 @@ class Advisory:
             if len(exact) != 1:
                 raise Error("ambiguous duplicate creation key; inspect privately")
             record = self.read(exact[0]["ghsa_id"])
-            if self.pending():
-                return self.recover()
+            pending = self.pending()
+            if pending and (
+                pending["kind"] != "create" or pending.get("key") != data["key"]
+            ):
+                raise Error(
+                    "unrelated pending operation; recover it explicitly before retrying this creation"
+                )
             if metadata(record).get("source_digest") != policy.digest(
                 {k: v for k, v in data.items() if k != "reviewed_related"}
             ):
                 raise Error(
                     "creation key reused with changed content; update the existing advisory"
                 )
+            if pending:
+                recovered = self.recover()
+                if recovered["ghsa_id"] != record["ghsa_id"]:
+                    raise Error(
+                        "recovered another advisory; reconcile before continuing migration"
+                    )
+                return recovered
             return record
         if self.pending():
             raise Error(
@@ -594,6 +620,50 @@ class Advisory:
         m["scope"] = data["scope"]
         m["status"] = "Approved for remediation"
         return self.change(record, m, "owner-authorization", data["source"], trust=True)
+
+    def reconcile(self, ghsa, data):
+        """Explicit owner recovery of observed edits, never a silent takeover."""
+        record = self.read(ghsa, True)
+        self.decision(record, data)
+        if (
+            set(data) - {"expected", "owner", "source", "reason", "stopped_attempts"}
+            or not data.get("reason", "").strip()
+        ):
+            raise Error(
+                "reconciliation needs an explicit owner reason for this inspected snapshot"
+            )
+        if self.pending():
+            raise Error(
+                "recover the pending write first; preserve its journal and restore its recorded snapshot privately if necessary"
+            )
+        path = self.directory / (ghsa + ".trusted.json")
+        if not path.exists():
+            raise Error(
+                "last trusted snapshot unavailable; obtain a private released handoff, not a takeover"
+            )
+        known = read_file(path)
+        anchors = read_file(self.anchor)
+        if anchors.get(ghsa) != policy.digest(known):
+            raise Error("trusted snapshot does not match local anchor")
+        m = metadata(known)
+        if m.get("owner") and m["owner"].get("clone") != self.clone_id():
+            raise Error("another clone owns the trusted state; it must release first")
+        pending = [r["id"] for r in m["ledger"]["reviews"] if r["status"] == "pending"]
+        if sorted(data.get("stopped_attempts", [])) != sorted(pending):
+            raise Error(
+                "owner must confirm each pending invocation stopped before reconciliation"
+            )
+        # Retain the observed untrusted control state as evidence, not as grants.
+        note = {
+            "source": data["source"],
+            "reason": data["reason"],
+            "trusted_snapshot": policy.digest(known),
+            "observed_snapshot": policy.digest(record),
+            "observed_metadata": metadata(record),
+            "stopped_attempts": pending,
+        }
+        atomic(self.directory / (str(uuid.uuid4()) + ".observed.json"), record)
+        return self.change(record, m, "owner-reconciliation", note, trust=True)
 
     def close(self, ghsa, data):
         record = self.read(ghsa, True)
@@ -959,6 +1029,7 @@ class Advisory:
             context,
             {
                 "focus": data["focus"],
+                "current_receipt": r,
                 "prior": prior,
                 "findings": s["findings"],
                 "approved_scope": m["scope"],
@@ -974,7 +1045,10 @@ class Advisory:
         )
         report = self.directory / (r["id"] + ".json")
         instruction = work_issue.review_focus(
-            r,
+            {
+                **r,
+                "rationale": "Read the private continuity rationale in the restricted context.",
+            },
             "Read the private focus and scope from the restricted context file. Do not publish or modify files.",
             context,
         )
@@ -1237,6 +1311,7 @@ def main(argv=None):
             "dispose",
             "verified",
             "exception",
+            "reconcile",
         ),
     )
     p.add_argument("ghsa", nargs="?")
@@ -1284,7 +1359,7 @@ def main(argv=None):
                     result = client.read(args.ghsa)
                 elif op == "exception":
                     result = client.finding_exception(args.ghsa, data)
-                elif op in ("update", "close", "authorize", "retry"):
+                elif op in ("update", "close", "authorize", "retry", "reconcile"):
                     result = getattr(client, op)(args.ghsa, data)
                 else:
                     if not args.session:

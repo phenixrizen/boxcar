@@ -412,3 +412,11 @@ refused. The ordinary validator retains issue-number-only tracking and rejects
 advisory references. Both transition validation and history replay receive the
 same mode; test private disposition through handoff and readiness. Preserve all
 previous policy-2 receipts and ordinary checkpoint schemas.
+
+Implementation review tightened the planned recovery invariants: fork provisioning
+may change only its expected server fields, never bless scope/ledger edits; create
+recovery is bound to the requested key and original content; trusted snapshots
+permit explicit owner reconciliation of active work without deleting attempts;
+generated reopening events retain their independent tracking; and private focus
+**and continuity rationale** remain outside process arguments. These corrections
+restore the existing privacy/recovery contract and have focused synthetic tests.
