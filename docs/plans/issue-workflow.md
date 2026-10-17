@@ -65,3 +65,41 @@ Use temporary Git repositories and realistic fake gh responses; run all Python
 helper tests and demonstrate the actual workflow on this issue. Product runtime
 surfaces are untouched; unrelated Go/UI or Rust/KVM runs are not evidence for
 this workflow. Preserve their testing requirements for changes to those surfaces.
+
+## Recovery and evidence protocol (plan review dispositions)
+
+The first plan reviews identified missing protocols, not reasons for another
+service. The implementation will enforce these boundaries:
+
+- State writes use a temporary file in the same directory, fsync, atomic
+  replacement and directory fsync. Corrupt or conflicting metadata is refused.
+  The persisted issue/branch identity and a monotonically changing checkpoint
+  revision precede mutations. Before retrying a comment creation, enumerate
+  every issue comment and find the single owner-authored marker; before a PR
+  creation, enumerate PRs for the exact repository/head/base. Read back writes.
+  An ambiguous set of matches blocks rather than choosing or creating another.
+- A completed review is saved with its attempt UUID before publication. Retry
+  publishes the same attempt, never increments it twice. A pending attempt
+  blocks another review. Recover it from its local structured plugin result;
+  incomplete results require explicit failure reconciliation, not an assumed
+  pass. A release first publishes and verifies all local history and refuses
+  pending attempts. Only then does it publish the released ownership state.
+  Lost acknowledgements are reconciled by revision and attempt IDs. A fresh
+  clone must see the released checkpoint; active ownership is a conflict.
+- CI runs the validator from main via a read-only pull_request_target workflow,
+  never checks out or imports PR files. PR changes to scripts or workflows are
+  tested separately without privileged tokens. Main is the trust root, so
+  branch/ruleset protection is an explicit setup requirement (currently absent
+  in both repositories). The new workflow cannot validate its own bootstrap
+  until merged; run its exact command locally for these initial PRs and report
+  that distinction. Owner-authored comments are the attestation boundary, not
+  cryptographic proof of a model run. The helper generates receipts from the
+  plugin's structured result, and CI verifies author identity plus exact repo,
+  issue, phase, head and current base, and count/exception rules. Changed or
+  replaced comments are revalidated, never trusted merely by marker. Owner
+  exceptions bind the exact revision/base or next phase/round; their public
+  text is neutral. Explicit workflow dispatch supports rechecking evidence.
+- Tests cover success with a lost comment/PR response, atomic replacement
+  failure, review saved but unpublished followed by release, duplicate attempt
+  recovery, unauthorized markers/exceptions, mismatched and stale receipts,
+  and the workflow's trusted checkout. No handoff can silently drop a round.
