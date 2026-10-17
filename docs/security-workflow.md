@@ -132,8 +132,10 @@ Each trusted acknowledgement also retains its exact snapshot for owner recovery.
 For an out-of-band edit during active work, `reconcile` accepts expected/owner/source,
 private reason, and `stopped_attempts` listing every pending invocation the owner
 has confirmed stopped. It restores known trusted ownership/grants/attempts/history,
-retains the observed untrusted metadata as private evidence, and accepts no silent
-takeover by another clone. Recover the retained pending review afterward. A pending
+retains the observed untrusted metadata as private evidence, and requires the
+same active claim in both the saved and current record. A released clone cannot
+restore its stale ledger over a successor's completed/pending attempts. Changed
+ownership needs a coordinated released handoff, not restoration by another clone. Recover the retained pending review afterward. A pending
 publication journal must be reconciled first; restore its exact recorded control
 snapshot privately if a fork provisioned while an unauthorized edit occurred.
 Missing trusted snapshots or an unresolved remote write remain explicit private
@@ -176,14 +178,21 @@ python3 /path/to/trusted/scripts/security_advisory.py --out /private/output.json
 asynchronous fork request. Pending provisioning polls retrieval; never POST again.
 It uses an isolated clone with only private `origin`, a confidential common-directory
 marker and a pre-push destination guard. It refuses conflicting hooks/remotes and
-session ownership. Existing public issue/board/PR helpers reject marked clones
+session ownership. The claim binds its path before asynchronous provisioning.
+A released handoff restores the checkpoint's private branch and verifies its
+commit is available from the private fork; unpublished work must be pushed there
+before another machine can resume. A new workspace starts on `remediation`, while
+an existing explicitly selected private clone retains its branch. Existing public
+issue/board/PR helpers reject marked clones
 before their GitHub calls. Direct review needs `--private`, immutable branch scope
 and restricted regular-file output outside Git; the advisory helper supplies these.
 These guards prevent accidental routing, not bypass with raw Git/gh or semantic
 leaks from arbitrary prose. Inspect every proposed public artifact yourself.
 
 Checkpoint JSON records `completed`, `verification` actually performed/results,
-`blockers` and `next`. The helper adds current branch/head/base/session. It fetches
+`blockers` and `next`, with optional `status` of Fixing or Awaiting verification.
+It cannot set approval or verified completion. The helper adds current
+branch/head/base/session and updates the associated branch. It fetches
 current public main for comparison without adding a public push remote. Review
 JSON records `phase` (plan/code/docs), `scope` (initial/follow-up/integration), private
 `focus`, and for focused scopes `prior` receipt IDs, `verifies` finding IDs and

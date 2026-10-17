@@ -420,3 +420,12 @@ permit explicit owner reconciliation of active work without deleting attempts;
 generated reopening events retain their independent tracking; and private focus
 **and continuity rationale** remain outside process arguments. These corrections
 restore the existing privacy/recovery contract and have focused synthetic tests.
+
+Final handoff corrections require a matching active claim in both trusted and
+current state before reconciliation: a released clone cannot restore a stale
+ledger over its successor. The workspace path is recorded before asynchronous
+provisioning; active work cannot silently move to a second clone. A released
+handoff restores the recorded private branch and checks that its checkpoint
+commit is available from the private fork. Synthetic tests cover completed and
+pending successor reviews, returning clones, real temporary Git branches and
+idempotent resource reuse. These restore the planned ownership/handoff guarantees.

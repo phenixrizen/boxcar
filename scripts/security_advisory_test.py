@@ -123,6 +123,11 @@ class PrivateWorkflowTest(unittest.TestCase):
         r = self.approve()
         m = a.metadata(r)
         m["owner"] = {"session": "s", "clone": self.client.clone_id()}
+        m["workspace"] = {
+            "path": str(Path.cwd()),
+            "branch": "synthetic",
+            "fork": "owner/private-fork",
+        }
         r["private_fork"] = {"full_name": "owner/private-fork", "private": True}
         self.api.records[GHSA] = copy.deepcopy(r)
         # Explicitly account for fake server provisioning before owned test setup.
@@ -917,7 +922,7 @@ class PrivateWorkflowTest(unittest.TestCase):
             self.client.directory / (GHSA + ".trusted.json"),
         ):
             a.atomic(other.directory / file.name, a.read_file(file))
-        with self.assertRaisesRegex(a.Error, "another clone"):
+        with self.assertRaisesRegex(a.Error, "trusted active claim"):
             other.reconcile(
                 GHSA,
                 {
@@ -990,6 +995,212 @@ class PrivateWorkflowTest(unittest.TestCase):
                         returning, HEAD, BASE, confidential=confidential
                     )
                 )
+
+    def test_released_handoff_restores_the_recorded_private_branch_and_commit(self):
+        self.approve()
+        first = self.root / "first"
+        bare = self.root / "private.git"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "remediation", str(first)], check=True
+        )
+        for key, value in (
+            ("user.name", "Synthetic"),
+            ("user.email", "test@example.invalid"),
+        ):
+            subprocess.run(["git", "-C", str(first), "config", key, value], check=True)
+        (first / "test.txt").write_text("synthetic only\n")
+        subprocess.run(["git", "-C", str(first), "add", "test.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(first), "commit", "-qm", "synthetic"], check=True
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(first), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(["git", "-C", str(first), "branch", "main"], check=True)
+        subprocess.run(
+            ["git", "clone", "-q", "--bare", str(first), str(bare)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(first),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/private-fork.git",
+            ],
+            check=True,
+        )
+        original = guard.command
+        clones = []
+
+        def command(args, cwd=None):
+            if args[0] == "gh":
+                return json.dumps({"full_name": "owner/private-fork", "private": True})
+            if args[:2] == ["git", "clone"]:
+                clones.append(args[-1])
+                original(["git", "clone", "--", str(bare), args[-1]])
+                return original(
+                    [
+                        "git",
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/owner/private-fork.git",
+                    ],
+                    args[-1],
+                )
+            if args == ["git", "fetch", "origin"]:
+                return original(
+                    ["git", "fetch", str(bare), "+refs/heads/*:refs/remotes/origin/*"],
+                    cwd,
+                )
+            return original(args, cwd)
+
+        with mock.patch.object(guard, "command", side_effect=command):
+            self.client.work(GHSA, "s", first)
+            with self.assertRaisesRegex(a.Error, "another workspace"):
+                self.client.work(GHSA, "s", self.root / "duplicate")
+            with self.assertRaisesRegex(a.Error, "associated private workspace"):
+                self.client.owned(GHSA, "s")
+            old = Path.cwd()
+            try:
+                os.chdir(first)
+                with mock.patch.object(
+                    self.client, "inputs", return_value=(head, head, head)
+                ):
+                    self.client.checkpoint(
+                        GHSA,
+                        "s",
+                        {
+                            "completed": "Synthetic code",
+                            "verification": "Synthetic test passed",
+                            "blockers": "",
+                            "next": "Private handoff",
+                        },
+                    )
+                self.client.release(GHSA, "s")
+            finally:
+                os.chdir(old)
+            other = a.Advisory(api=self.api, directory=self.root / "other-state")
+            r = other.read(GHSA)
+            other.authorize(
+                GHSA,
+                {
+                    "expected": policy.digest(r),
+                    "owner": board.OWNER,
+                    "source": "Explicit synthetic owner handoff",
+                    "scope": "Same correction",
+                    "reconfirm": True,
+                },
+            )
+            second = self.root / "second"
+            r = other.work(GHSA, "new", second)
+            self.assertEqual(
+                original(["git", "branch", "--show-current"], second), "remediation"
+            )
+            self.assertEqual(original(["git", "rev-parse", "HEAD"], second), head)
+            self.assertEqual(a.metadata(r)["checkpoint"]["head"], head)
+            self.assertEqual(other.work(GHSA, "new", second), r)
+            self.assertEqual(len(clones), 1)
+
+    def test_initial_pending_claim_already_binds_workspace(self):
+        self.approve()
+        self.api.fork_ready = False
+        with self.assertRaises(a.Error):
+            self.client.work(GHSA, "s", self.root / "first")
+        self.api.records[GHSA]["private_fork"] = {
+            "full_name": "owner/private-fork",
+            "private": True,
+        }
+        self.client.recover()
+        with self.assertRaisesRegex(a.Error, "another workspace"):
+            self.client.work(GHSA, "s", self.root / "second")
+
+    def test_released_clone_cannot_erase_successors_completed_or_pending_review(self):
+        self.claimed()
+        self.client.release(GHSA, "s")
+        other = a.Advisory(api=self.api, directory=self.root / "successor")
+        record = other.read(GHSA)
+        record = other.authorize(
+            GHSA,
+            {
+                "expected": policy.digest(record),
+                "owner": board.OWNER,
+                "source": "Synthetic released handoff",
+                "scope": "Same bounded work",
+                "reconfirm": True,
+            },
+        )
+        m = a.metadata(record)
+        m["owner"] = {"session": "successor", "clone": other.clone_id()}
+        other.change(record, m, "claim", "Synthetic successor claim", trust=True)
+
+        def reviewer(args, **kwargs):
+            kwargs["stdout"].write(
+                json.dumps(
+                    {
+                        "codex": {"status": 0},
+                        "inputs": {"head": HEAD, "base": BASE, "merge_base": BASE},
+                        "result": {"verdict": "approve", "findings": []},
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(args, 0)
+
+        marker = {"repository": board.REPO, "ghsa": GHSA, "fork": "owner/private-fork"}
+        with (
+            mock.patch.object(guard, "verify", return_value=marker),
+            mock.patch.object(other, "inputs", return_value=(HEAD, BASE, BASE)),
+        ):
+            with mock.patch("subprocess.run", side_effect=reviewer):
+                other.review(
+                    GHSA,
+                    "successor",
+                    {
+                        "phase": "code",
+                        "scope": "initial",
+                        "focus": "Synthetic successor review",
+                    },
+                )
+            with mock.patch(
+                "subprocess.run", side_effect=OSError("synthetic stopped invocation")
+            ):
+                with self.assertRaises(OSError):
+                    other.review(
+                        GHSA,
+                        "successor",
+                        {
+                            "phase": "code",
+                            "scope": "initial",
+                            "focus": "Synthetic pending successor review",
+                        },
+                    )
+        before = other.read(GHSA)
+        ledger = a.metadata(before)["ledger"]
+        self.assertEqual(policy.count(ledger, "code"), 1)
+        self.assertEqual(sum(r["status"] == "pending" for r in ledger["reviews"]), 1)
+        with self.assertRaisesRegex(a.Error, "trusted active claim"):
+            self.client.reconcile(
+                GHSA,
+                {
+                    "expected": policy.digest(before),
+                    "owner": board.OWNER,
+                    "source": "Synthetic stale returning decision",
+                    "reason": "Must not erase successor",
+                    "stopped_attempts": [],
+                },
+            )
+        self.assertEqual(other.read(GHSA), before)
+        other.owned(GHSA, "successor", False)
+        after = other.recover_review(GHSA, "successor", failed=True)
+        self.assertEqual(policy.count(a.metadata(after)["ledger"], "code"), 1)
+        self.assertEqual(a.metadata(after)["ledger"]["reviews"][-1]["status"], "failed")
 
 
 if __name__ == "__main__":

@@ -646,8 +646,15 @@ class Advisory:
         if anchors.get(ghsa) != policy.digest(known):
             raise Error("trusted snapshot does not match local anchor")
         m = metadata(known)
-        if m.get("owner") and m["owner"].get("clone") != self.clone_id():
-            raise Error("another clone owns the trusted state; it must release first")
+        claim = m.get("owner")
+        if not claim or claim.get("clone") != self.clone_id():
+            raise Error(
+                "reconciliation requires this clone's trusted active claim; a released snapshot cannot restore another session's history"
+            )
+        if metadata(record).get("owner") != claim:
+            raise Error(
+                "current ownership differs; another clone/session must not be overwritten"
+            )
         pending = [r["id"] for r in m["ledger"]["reviews"] if r["status"] == "pending"]
         if sorted(data.get("stopped_attempts", [])) != sorted(pending):
             raise Error(
@@ -698,6 +705,14 @@ class Advisory:
         if not m.get("scope") or not m.get("grants"):
             raise Error("owner remediation scope required")
         if workspace:
+            associated = m.get("workspace", {})
+            if (
+                not associated.get("path")
+                or Path(associated["path"]).resolve() != Path.cwd().resolve()
+            ):
+                raise Error(
+                    "run remediation operations from the associated private workspace"
+                )
             data = guard.verify()
             if (
                 data.get("ghsa") != ghsa
@@ -731,6 +746,24 @@ class Advisory:
             raise Error(
                 "current explicit owner scope and actionable remediation status required"
             )
+        path = Path(workspace).expanduser().absolute()
+        secure_path(path.parent, True)
+        if path.is_symlink():
+            raise Error("workspace symlinks refused")
+        previous = m.get("workspace", {})
+        active_path = m.get("work_path") or previous.get("path")
+        if (
+            m.get("owner")
+            and active_path
+            and Path(active_path).resolve() != path.resolve()
+        ):
+            raise Error(
+                "active work already has another workspace; release before a handoff"
+            )
+        if previous.get("fork") and not record.get("private_fork"):
+            raise Error(
+                "previous private fork unavailable; reconcile before requesting another"
+            )
         claim = {"session": session, "clone": self.clone_id()}
         if m.get("owner") and m["owner"] != claim:
             raise Error(
@@ -738,6 +771,7 @@ class Advisory:
             )
         if not m.get("owner"):
             m["owner"] = claim
+            m["work_path"] = str(path)
             m["status"] = "Fixing"
             record = self.change(
                 record,
@@ -768,11 +802,8 @@ class Advisory:
         remote = self.api.request("repos/" + full)
         if remote.get("private") is not True or remote.get("full_name") != full:
             raise Error("fork privacy could not be verified")
-        path = Path(workspace).expanduser().absolute()
-        secure_path(path.parent, True)
-        if path.is_symlink():
-            raise Error("workspace symlinks refused")
-        if not path.exists():
+        created = not path.exists()
+        if created:
             guard.command(
                 ["git", "clone", "--", "https://github.com/" + full + ".git", str(path)]
             )
@@ -819,6 +850,50 @@ class Advisory:
         hook.write_text(code)
         os.chmod(hook, 0o700)
         guard.verify(path)
+        resume = previous and Path(previous["path"]).resolve() != path.resolve()
+        if created or resume:
+            branch = (
+                (m.get("checkpoint", {}).get("branch") or previous.get("branch"))
+                if previous
+                else "remediation"
+            )
+            if not branch:
+                raise Error(
+                    "handoff branch unavailable; inspect the private checkpoint"
+                )
+            guard.command(["git", "check-ref-format", "refs/heads/" + branch], path)
+            if guard.command(["git", "status", "--porcelain"], path):
+                raise Error(
+                    "workspace has uncommitted work; reconcile before resuming another branch"
+                )
+            if resume:
+                guard.command(["git", "fetch", "origin"], path)
+            local = guard.command(
+                ["git", "for-each-ref", "--format=%(refname)", "refs/heads/" + branch],
+                path,
+            ).splitlines()
+            remote_ref = "refs/remotes/origin/" + branch
+            remote_branches = guard.command(
+                ["git", "for-each-ref", "--format=%(refname)", remote_ref], path
+            ).splitlines()
+            if previous and remote_ref not in remote_branches:
+                raise Error("handoff branch has not reached the private fork")
+            if "refs/heads/" + branch in local:
+                guard.command(["git", "switch", branch], path)
+                if remote_ref in remote_branches:
+                    guard.command(["git", "merge", "--ff-only", remote_ref], path)
+            elif remote_ref in remote_branches:
+                guard.command(
+                    ["git", "switch", "--track", "-c", branch, remote_ref], path
+                )
+            else:
+                guard.command(["git", "switch", "-c", branch], path)
+            checkpoint = m.get("checkpoint", {})
+            if checkpoint.get("head"):
+                guard.command(
+                    ["git", "merge-base", "--is-ancestor", checkpoint["head"], "HEAD"],
+                    path,
+                )
         record = self.read(ghsa, True)
         self.trusted(record)
         m = metadata(record)
@@ -859,7 +934,7 @@ class Advisory:
 
     def checkpoint(self, ghsa, session, data):
         if (
-            set(data) - {"completed", "verification", "blockers", "next"}
+            set(data) - {"completed", "verification", "blockers", "next", "status"}
             or any(
                 not isinstance(data.get(k), str)
                 for k in ("completed", "verification", "blockers", "next")
@@ -870,6 +945,12 @@ class Advisory:
                 "checkpoint needs completed work, actual verification, blockers and next action"
             )
         record, m = self.owned(ghsa, session)
+        if "status" in data:
+            if data["status"] not in ("Fixing", "Awaiting verification"):
+                raise Error(
+                    "checkpoint cannot grant approval or claim verified completion"
+                )
+            m["status"] = data["status"]
         head, base, merge = self.inputs()
         m["checkpoint"] = {
             **data,
@@ -880,6 +961,7 @@ class Advisory:
             "branch": guard.command(["git", "branch", "--show-current"]),
             "session": session,
         }
+        m["workspace"]["branch"] = m["checkpoint"]["branch"]
         return self.change(record, m, "checkpoint", data, trust=True)
 
     def release(self, ghsa, session):
