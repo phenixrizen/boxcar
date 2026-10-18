@@ -271,4 +271,25 @@ mod tests {
             .any(|(n, k)| n == "ssl_read_ex_ret" && k == "uretprobe"));
         assert!(report.maps.iter().any(|(n, t)| n == "TLS_READS" && *t == 1));
     }
+
+    /// The eBPF crate stands alone: its own lock file, toolchain and
+    /// licence, and its own workspace root, so that cargo's search upward
+    /// from it stops there. A checkout nested inside another (a work-issue
+    /// worktree under `.git/`) otherwise reaches the outer checkout's
+    /// manifest, whose exclude does not name this path, and the sensor's
+    /// build script fails. The root still excludes it, so the root is not a
+    /// second workspace claiming it.
+    #[test]
+    fn the_ebpf_crate_is_its_own_workspace_root_and_excluded_from_this_one() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let ebpf =
+            std::fs::read_to_string(root.join("crates/boxcar-sensor-ebpf/Cargo.toml")).unwrap();
+        let tables: Vec<&str> = ebpf.lines().filter(|l| l.starts_with('[')).collect();
+        assert!(tables.contains(&"[workspace]"), "{tables:?}");
+        let workspace = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            workspace.contains("\"crates/boxcar-sensor-ebpf\""),
+            "the root workspace must exclude the eBPF crate"
+        );
+    }
 }
