@@ -137,3 +137,14 @@ jobs:
 
       - name: KVM-gated tests, M4
         run: cargo xtask test-kvm m4
+
+  # The one check branch protection requires: green only when no job above
+  # failed. `kvm` may be skipped (the HAS_KVM gate); nothing may fail.
+  required-checks:
+    if: always()
+    needs: [check, ebpf, kvm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: No job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

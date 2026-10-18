@@ -11,4 +11,4 @@ about: A deliverable change, defect or follow-up
 
 ## Context, constraints and dependencies
 
-<!-- Reuse an existing issue for the same outcome. Link a plan only when the changed guarantees need one. Optional review suggestions do not require issues. Undisclosed security findings belong in private draft advisories, never here. -->
+<!-- Reuse an existing issue for the same outcome. Add the `ready` label when an agent may pick it up. Vulnerabilities go in a Draft Security Advisory, never here. -->

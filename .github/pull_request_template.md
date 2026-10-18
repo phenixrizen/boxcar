@@ -1,17 +1,9 @@
-## Issue relationship
+Fixes #N <!-- or: Part of #N, when the issue stays open -->
 
-<!-- Fixes #N for finishing work; Part of #N for partial work. Private fixes use the documented neutral owner exception. -->
+## What changed and why
 
-## Outcome and what changed
+## Verification
 
-<!-- State the deliverable and acceptance criteria. Necessary fixes and their tests belong together. -->
+<!-- The commands run and their results, per affected surface. A check that did not run is listed as not run, never as passed. -->
 
-## Verification performed
-
-<!-- Actual commands, results and affected surfaces. Skipped/unavailable is not passed. -->
-
-## Review
-
-<!-- work_issue.py submit appends exact revision/base receipts. Identify review phase/scope, receipt IDs and actual head/comparison/merge base; record sanitized finding dispositions, verification and current integration evidence. Identify any explicit continuity evidence and unresolved blockers; optional suggestions need no new review. State pending work and scoped authorizations. Never publish private findings. -->
-
-## Limitations or pending decisions
+<!-- Made by (agent or person), with a session link when there is one. -->
