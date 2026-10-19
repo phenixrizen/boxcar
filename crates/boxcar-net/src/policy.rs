@@ -254,6 +254,36 @@ pub struct PolicyError {
     pub kind: PolicyErrorKind,
 }
 
+/// One of a policy's lists of targets: the rules' denies and allows, and
+/// the inspect lines (see [`Policy::from_lists`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum List {
+    Deny,
+    Allow,
+    Inspect,
+}
+
+impl List {
+    /// The list's name, which is also the first word of its lines.
+    pub fn name(self) -> &'static str {
+        match self {
+            List::Deny => "deny",
+            List::Allow => "allow",
+            List::Inspect => "inspect",
+        }
+    }
+}
+
+/// A target in one of [`Policy::from_lists`]' lists that does not parse:
+/// the list, its place in the list from 0, and why.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}[{index}]: {kind}", list.name())]
+pub struct ListError {
+    pub list: List,
+    pub index: usize,
+    pub kind: PolicyErrorKind,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyErrorKind {
     #[error("{0:?} is not a rule; a rule starts with allow, deny, inspect or default")]
@@ -293,8 +323,7 @@ impl Policy {
     /// and lose a trailing dot. `#` starts a comment.
     pub fn parse<S: AsRef<str>>(lines: &[S]) -> Result<Policy, PolicyError> {
         let mut default = None;
-        let mut rules = Vec::new();
-        let mut inspect = Vec::new();
+        let mut policy = Policy::default();
         for (index, line) in lines.iter().enumerate() {
             let at = |kind| PolicyError {
                 line: index + 1,
@@ -315,38 +344,84 @@ impl Policy {
                         return Err(at(PolicyErrorKind::DuplicateDefault));
                     }
                 }
-                [verb @ ("allow" | "deny"), rest @ ..] => {
-                    let (verdict, verb) = if *verb == "allow" {
-                        (Verdict::Allow, "allow")
-                    } else {
-                        (Verdict::Deny, "deny")
+                [verb @ ("allow" | "deny" | "inspect"), rest @ ..] => {
+                    let list = match *verb {
+                        "allow" => List::Allow,
+                        "deny" => List::Deny,
+                        _ => List::Inspect,
                     };
                     let [target] = rest else {
-                        return Err(at(PolicyErrorKind::Target(verb)));
+                        return Err(at(PolicyErrorKind::Target(list.name())));
                     };
-                    rules.push(Rule {
-                        verdict,
-                        target: parse_target(target).map_err(at)?,
-                        text: format!("{verb} {target}"),
-                    });
-                }
-                ["inspect", rest @ ..] => {
-                    let [target] = rest else {
-                        return Err(at(PolicyErrorKind::Target("inspect")));
-                    };
-                    inspect.push(Inspect {
-                        target: parse_target(target).map_err(at)?,
-                        text: format!("inspect {target}"),
-                    });
+                    policy.add(list, target).map_err(at)?;
                 }
                 [word, ..] => return Err(at(PolicyErrorKind::UnknownWord((*word).to_owned()))),
             }
         }
-        Ok(Policy {
-            default: default.unwrap_or(Verdict::Deny),
-            rules,
-            inspect,
-        })
+        policy.default = default.unwrap_or(Verdict::Deny);
+        Ok(policy)
+    }
+
+    /// The policy of `default` and three lists of targets: what the lines
+    /// `default <default>`, then `deny <target>` for each of `deny`,
+    /// `allow <target>` for each of `allow` and `inspect <target>` for each
+    /// of `inspect`, in order, would make (see [`add`](Self::add)). So a
+    /// deny of a target wins over an allow of it, the first rule that
+    /// matches deciding. The first target that does not parse is named by
+    /// its list and its place in it.
+    pub fn from_lists<S: AsRef<str>>(
+        default: Verdict,
+        deny: &[S],
+        allow: &[S],
+        inspect: &[S],
+    ) -> Result<Policy, ListError> {
+        let mut policy = Policy {
+            default,
+            rules: Vec::new(),
+            inspect: Vec::new(),
+        };
+        for (list, targets) in [
+            (List::Deny, deny),
+            (List::Allow, allow),
+            (List::Inspect, inspect),
+        ] {
+            for (index, target) in targets.iter().enumerate() {
+                policy
+                    .add(list, target.as_ref())
+                    .map_err(|kind| ListError { list, index, kind })?;
+            }
+        }
+        Ok(policy)
+    }
+
+    /// Adds `target` to `list`, after the rules (a deny or an allow) or the
+    /// inspect lines already there, as the line `<list> <target>` would:
+    /// the same targets, the same rule text. A target is one word: one with
+    /// a space in it, or none at all, is refused as the line `allow two
+    /// words` is, and a `#` is no comment here, but a character no target
+    /// has.
+    pub fn add(&mut self, list: List, target: &str) -> Result<(), PolicyErrorKind> {
+        if target.is_empty() || target.contains(char::is_whitespace) {
+            return Err(PolicyErrorKind::Target(list.name()));
+        }
+        let parsed = parse_target(target)?;
+        let text = format!("{} {target}", list.name());
+        match list {
+            List::Deny | List::Allow => self.rules.push(Rule {
+                verdict: if list == List::Allow {
+                    Verdict::Allow
+                } else {
+                    Verdict::Deny
+                },
+                target: parsed,
+                text,
+            }),
+            List::Inspect => self.inspect.push(Inspect {
+                target: parsed,
+                text,
+            }),
+        }
+        Ok(())
     }
 
     /// Whether any `inspect` line could name a connection to `dst` the
@@ -1541,5 +1616,100 @@ mod tests {
         for name in ["example.com", "127.0.0.1", "0.0.0.0"] {
             assert_eq!(p.gate_allows(name, 443), (Verdict::Deny, None), "{name}");
         }
+    }
+
+    /// The lists make what their lines would: the default, the denies,
+    /// the allows, the inspect lines, each in order, with the same rule
+    /// text; so a deny of a target wins over an allow of it.
+    #[test]
+    fn lists_make_the_policy_their_lines_would() {
+        let made = Policy::from_lists(
+            Verdict::Allow,
+            &["*.evil.example:8080", "203.0.113.0/24"],
+            &["Example.COM.", "198.51.100.7:22", "*.evil.example"],
+            &["api.example.com:443", "127.0.0.1:8443"],
+        )
+        .unwrap();
+        let lines = parse(&[
+            "default allow",
+            "deny *.evil.example:8080",
+            "deny 203.0.113.0/24",
+            "allow Example.COM.",
+            "allow 198.51.100.7:22",
+            "allow *.evil.example",
+            "inspect api.example.com:443",
+            "inspect 127.0.0.1:8443",
+        ]);
+        assert_eq!(made, lines);
+        assert_eq!(
+            made.egress(at([192, 0, 2, 1], 8080), &names(&["a.evil.example"])),
+            deny("deny *.evil.example:8080")
+        );
+        assert_eq!(
+            made.egress(at([192, 0, 2, 1], 443), &names(&["a.evil.example"])),
+            allow("allow *.evil.example")
+        );
+        let empty: [&str; 0] = [];
+        assert_eq!(
+            Policy::from_lists(Verdict::Deny, &empty, &empty, &empty).unwrap(),
+            Policy::default()
+        );
+    }
+
+    /// The first target that does not parse is named by its list and place,
+    /// with what is wrong with it. A target is one word: spaces, nothing at
+    /// all, and a `#` (no comment in a list) are refused.
+    #[test]
+    fn a_target_in_a_list_that_does_not_parse_is_named() {
+        // The deny, allow and inspect lists, and what they are refused for.
+        type Case = ([&'static [&'static str]; 3], ListError);
+        let refused = |list, index, kind| ListError { list, index, kind };
+        let cases: [Case; 7] = [
+            (
+                [&[], &["exa_mple.com"], &[]],
+                refused(
+                    List::Allow,
+                    0,
+                    PolicyErrorKind::Pattern("exa_mple.com".into()),
+                ),
+            ),
+            (
+                [&["ok.test", "192.168.1.300"], &["a.test"], &[]],
+                refused(
+                    List::Deny,
+                    1,
+                    PolicyErrorKind::Address("192.168.1.300".into()),
+                ),
+            ),
+            (
+                [&[], &["b.test", "two words"], &[]],
+                refused(List::Allow, 1, PolicyErrorKind::Target("allow")),
+            ),
+            (
+                [&[], &[""], &[]],
+                refused(List::Allow, 0, PolicyErrorKind::Target("allow")),
+            ),
+            (
+                [&[], &[" a.test"], &[]],
+                refused(List::Allow, 0, PolicyErrorKind::Target("allow")),
+            ),
+            (
+                [&[], &["a.test#x"], &[]],
+                refused(List::Allow, 0, PolicyErrorKind::Pattern("a.test#x".into())),
+            ),
+            (
+                [&[], &["a.test"], &["a.test:0"]],
+                refused(List::Inspect, 0, PolicyErrorKind::Port("0".into())),
+            ),
+        ];
+        for ([deny, allow, inspect], want) in cases {
+            let error = Policy::from_lists(Verdict::Deny, deny, allow, inspect).unwrap_err();
+            assert_eq!(error, want, "{deny:?} {allow:?} {inspect:?}");
+        }
+        let error = Policy::from_lists(Verdict::Deny, &["10.1.2.3/8"], &[], &[]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "deny[0]: 10.1.2.3/8 has host bits set; the network is 10.0.0.0/8"
+        );
     }
 }

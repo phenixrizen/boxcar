@@ -67,7 +67,9 @@ pub use device::VirtioNet;
 pub use dump::{DumpDir, FrameDump};
 pub use frame::Dispatch;
 pub use gate::{InspectConfig, LeafTarget, SessionCa};
-pub use policy::{Inspect, Ipv4Net, Policy, PolicyError, Rule, Target, Verdict};
+pub use policy::{
+    Inspect, Ipv4Net, List, ListError, Policy, PolicyError, PolicyErrorKind, Rule, Target, Verdict,
+};
 pub use stack::{FdChange, Interest, NetStack, PollOutcome, DNS_TOKEN};
 pub use tcp::{TcpLimits, TCP_TOKEN_BASE};
 pub use udp::{UdpLimits, UDP_TOKEN_BASE};

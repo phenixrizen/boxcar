@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
-use boxcar_net::{Policy, Verdict};
+use boxcar_net::{List, Policy, Verdict};
 use boxcar_proto::control::{NetPolicy, PolicyUpdateParams, PolicyView, VsockPolicy};
 use boxcar_vsock::AllowPorts;
 use vmm_sys_util::eventfd::EventFd;
@@ -170,14 +170,6 @@ impl LivePolicy {
     }
 }
 
-/// The verdict's wire word.
-fn verb(verdict: Verdict) -> &'static str {
-    match verdict {
-        Verdict::Allow => "allow",
-        Verdict::Deny => "deny",
-    }
-}
-
 /// `policy` as the control protocol shows it: its default, and its rules'
 /// targets as written, the allows and the denies each in order.
 pub fn net_view(policy: &Policy) -> NetPolicy {
@@ -205,31 +197,19 @@ pub fn net_view(policy: &Policy) -> NetPolicy {
 }
 
 /// The policy `view` describes: the denies, then the allows, then the
-/// inspect lines, each in order, and the default. A target that does not
-/// parse names itself.
+/// inspect lines, each in order, and the default
+/// ([`Policy::from_lists`]). A target that does not parse names itself.
 pub fn net_policy(view: &NetPolicy) -> Result<Policy, UpdateError> {
-    let mut lines = vec![format!("default {}", verb(view.default))];
-    lines.extend(view.deny.iter().map(|rule| format!("deny {rule}")));
-    lines.extend(view.allow.iter().map(|rule| format!("allow {rule}")));
-    lines.extend(view.inspect.iter().map(|rule| format!("inspect {rule}")));
-    Policy::parse(&lines).map_err(|error| {
-        // Line 1 is the default, which cannot fail; the denies follow it,
-        // then the allows, then the inspect lines.
-        let index = error.line.saturating_sub(2);
-        let (list, at, rule) = if index < view.deny.len() {
-            ("deny", index, view.deny[index].as_str())
-        } else if index < view.deny.len() + view.allow.len() {
-            let at = index - view.deny.len();
-            ("allow", at, view.allow[at].as_str())
-        } else {
-            let at = index - view.deny.len() - view.allow.len();
-            let rule = view.inspect.get(at).map_or("", String::as_str);
-            ("inspect", at, rule)
+    Policy::from_lists(view.default, &view.deny, &view.allow, &view.inspect).map_err(|error| {
+        let rules = match error.list {
+            List::Deny => &view.deny,
+            List::Allow => &view.allow,
+            List::Inspect => &view.inspect,
         };
         UpdateError::Rule {
-            list,
-            at,
-            rule: rule.to_owned(),
+            list: error.list.name(),
+            at: error.index,
+            rule: rules.get(error.index).cloned().unwrap_or_default(),
             problem: error.kind.to_string(),
         }
     })
