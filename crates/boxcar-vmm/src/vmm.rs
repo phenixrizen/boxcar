@@ -34,7 +34,9 @@ use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
 use boxcar_net::{InspectConfig, NetConfig, Policy};
-use boxcar_proto::{ArtifactRef, Hash, ImageRef, Payload, Ring, SessionId, ShareRef, VmmStart};
+use boxcar_proto::{
+    ArtifactRef, Hash, ImageRef, Payload, PolicyLoaded, Ring, SessionId, ShareRef, VmmStart,
+};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
 use boxcar_vsock::VsockConfig;
@@ -242,6 +244,10 @@ pub struct VmConfig {
     /// The image the session boots from (`boxcar run --image`), recorded in
     /// `vmm.start`; none when the root share is a directory given as such.
     pub image: Option<ImageRef>,
+    /// Where the session's policy came from and what it holds, recorded as
+    /// `policy.loaded` right after `vmm.start`, before anything else
+    /// (`boxcar run` always gives it); nothing is recorded without it.
+    pub policy_loaded: Option<PolicyLoaded>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -291,6 +297,7 @@ impl VmConfig {
             dump: None,
             scrub_argv: None,
             image: None,
+            policy_loaded: None,
         }
     }
 }
@@ -611,6 +618,16 @@ impl Vmm {
             span: None,
             priority: Priority::Normal,
         })?;
+        if let Some(loaded) = &cfg.policy_loaded {
+            cfg.audit.emit(Submission {
+                ring: Ring::Host,
+                ts_guest_ns: None,
+                subject: None,
+                payload: Payload::PolicyLoaded(loaded.clone()),
+                span: None,
+                priority: Priority::Normal,
+            })?;
+        }
 
         // After vmm.start, so the log never has a control.connect before
         // it; a failure here is recorded like one in `run`.
