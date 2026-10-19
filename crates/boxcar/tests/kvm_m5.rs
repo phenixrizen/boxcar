@@ -610,3 +610,70 @@ fn the_package_can_be_dumped_for_inspection() {
         fs::write(path, apk()).unwrap();
     }
 }
+
+/// A policy file is recorded as `policy.loaded` right after `vmm.start`,
+/// with its path and the SHA-256 of its text, and its DNS rate holds in
+/// the guest: lookups past a burst of two are answered REFUSED, each
+/// recorded as the rate's, and nothing else of the session changes.
+#[test]
+fn a_policy_file_is_recorded_and_its_dns_rate_holds() {
+    let Some(guest) = guest_or_skip("a_policy_file_is_recorded_and_its_dns_rate_holds") else {
+        return;
+    };
+    let image = publish(&guest.rootfs);
+    let scratch = Scratch::new();
+    let policy = scratch.path("policy.toml");
+    let text = "version = 1\n\n[egress]\nmax_dns_qps = 2\n\n[fs]\nwritable = [\"/**\"]\n";
+    fs::write(&policy, text).unwrap();
+    // Each lookup is of a name of its own, which the policy's default
+    // denies: within the rate NXDOMAIN, past it REFUSED.
+    let script = "for i in 1 2 3 4 5 6 7 8; do nslookup n$i.boxcar.test 10.0.2.2 >/dev/null 2>&1; \
+                  done; echo looked";
+    let run = run_image(
+        &guest,
+        &scratch,
+        &image.by_tag,
+        &["--policy", policy.to_str().unwrap()],
+        &["sh", "-c", script],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(run.stdout.contains("looked"), "{}", run.describe());
+    assert!(!run.stderr.contains("warning: --policy"), "{}", run.stderr);
+    let records = run.records();
+    assert_eq!(records[0].kind, "vmm.start");
+    assert_eq!(records[1].kind, "policy.loaded", "{:?}", records[1]);
+    let sha256: String = ring::digest::digest(&ring::digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        records[1].data,
+        serde_json::json!({
+            "source": "file",
+            "name": policy.to_str().unwrap(),
+            "sha256": sha256,
+            "egress_rules": 0,
+            "fs_rules": 1,
+            "exec_rules": 0,
+        })
+    );
+    assert_eq!(of_kind(&records, "policy.loaded").len(), 1, "once");
+    let dns = of_kind(&records, "net.dns");
+    let refused: Vec<_> = dns
+        .iter()
+        .filter(|r| r.data["rule"] == "dns_rate")
+        .collect();
+    assert!(
+        !refused.is_empty(),
+        "no lookup was refused for the rate: {dns:?}"
+    );
+    for record in &refused {
+        assert_eq!(record.data["rcode"], 5, "{record:?}");
+        assert_eq!(record.data["verdict"], "deny", "{record:?}");
+    }
+    assert!(
+        dns.iter().any(|r| r.data["rcode"] == 3),
+        "the burst got its NXDOMAIN: {dns:?}"
+    );
+}
