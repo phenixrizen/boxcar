@@ -279,6 +279,7 @@ impl VirtioNet {
                     trace_id,
                     dump.clone(),
                     gate.declared().cloned(),
+                    gate.keep_tool_args(),
                 )
                 .map_err(|error| ConfigError::Observer(error.to_string()))?;
                 (Some(observer), Some(thread))
