@@ -8,8 +8,9 @@
 //! every guest message is counted against it first: one over the rate gets
 //! REFUSED, made here, and goes no further ([`rate`]). A guest message that
 //! is not one plain query (a response, another opcode, other than one
-//! question, or one that does not read) gets FORMERR. A name the policy denies gets NXDOMAIN, made here. Any other
-//! query goes upstream ([`forwarder`]); its answer comes back to the guest
+//! question, or one that does not read) gets FORMERR. A name the policy
+//! denies gets NXDOMAIN, made here. Any other query goes upstream
+//! ([`forwarder`]); its answer comes back to the guest
 //! with the guest's id, without AAAA answers (the guest network carries no
 //! IPv6), and cut to its header and question with TC set if it would not
 //! fit the link in one frame. A query the upstream does not answer in time,

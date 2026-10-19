@@ -606,8 +606,14 @@ struct Loaded {
 /// should see it.
 fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
     let Some(given) = &args.policy else {
+        // A line policy has no size limit: read whole, as it always was,
+        // never cut short at a policy file's.
         let file = match &args.policy_file {
-            Some(path) => Some((path.as_path(), read_policy(path, "--policy-file")?)),
+            Some(path) => {
+                let text = fs::read_to_string(path)
+                    .with_context(|| format!("--policy-file {}", path.display()))?;
+                Some((path.as_path(), text))
+            }
             None => None,
         };
         let text = file.as_ref().map(|(path, text)| (*path, text.as_str()));
@@ -633,7 +639,7 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
     // A profile's name is the profile; anything else is a path.
     let (source, text) = match given.to_str().and_then(boxcar_policy::profiles::text) {
         Some(text) => ("profile", text.to_owned()),
-        None => ("file", read_policy(given, "--policy")?),
+        None => ("file", read_policy(given)?),
     };
     let shown = shown_path(given);
     let file = match boxcar_policy::parse(&text) {
@@ -665,19 +671,19 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
     }))
 }
 
-/// The text of the policy at `path`, which `flag` named: read up to one
-/// byte past the policy file's limit, so a file that is too long is said to
-/// be by the parser rather than read whole.
-fn read_policy(path: &Path, flag: &str) -> anyhow::Result<String> {
+/// The text of the policy file at `path` (`--policy`): read up to one byte
+/// past the policy file's limit, so a file that is too long is said to be
+/// by the parser rather than read whole.
+fn read_policy(path: &Path) -> anyhow::Result<String> {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|file| {
             file.take(boxcar_policy::MAX_TEXT as u64 + 1)
                 .read_to_end(&mut bytes)
         })
-        .with_context(|| format!("{flag} {}", path.display()))?;
+        .with_context(|| format!("--policy {}", path.display()))?;
     String::from_utf8(bytes)
-        .map_err(|_| anyhow::anyhow!("{flag} {}: not UTF-8 text", path.display()))
+        .map_err(|_| anyhow::anyhow!("--policy {}: not UTF-8 text", path.display()))
 }
 
 /// A path as `policy.loaded` names it: as given, cut to the path limit.
@@ -1733,13 +1739,22 @@ mod tests {
     }
 
     /// A policy file over the limit is said to be by its size, and only
-    /// that much of it is read; one that is not UTF-8 cannot be read.
+    /// that much of it is read; one that is not UTF-8 cannot be read. A
+    /// line policy has no such limit: one longer is read whole, its last
+    /// rule included.
     #[test]
     fn a_policy_file_is_read_up_to_its_limit() {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("big.toml");
         fs::write(&big, vec![b'#'; boxcar_policy::MAX_TEXT + 4096]).unwrap();
-        let text = read_policy(&big, "--policy").unwrap();
+        let lines = dir.path().join("big.policy");
+        let mut text = "# padding\n".repeat(boxcar_policy::MAX_TEXT / 10 + 1);
+        text.push_str("deny last.test\n");
+        fs::write(&lines, &text).unwrap();
+        let whole = loaded(&["--policy-file", lines.to_str().unwrap()]);
+        assert_eq!(whole.net.rules.last().unwrap().text, "deny last.test");
+        assert_eq!(whole.record.sha256, Some(sha256_hex(&text)));
+        let text = read_policy(&big).unwrap();
         assert_eq!(text.len(), boxcar_policy::MAX_TEXT + 1);
         let error = load_policy(&run_args(&["--policy", big.to_str().unwrap()]))
             .unwrap()

@@ -49,7 +49,7 @@ keep_tool_args = true       # the default
 scrub_argv = false          # the default
 ```
 
-Every table is optional; every key in it too. Unknown keys are refused at every level (`deny_unknown_fields`). Targets are today's (`name[:port]`, `*.name[:port]`, `ip[:port]`, `ip/prefix[:port]`), checked by `boxcar_net::Policy`'s own parser so their meaning is the line policy's exactly. Path globs are `globset` globs with `literal_separator`, absolute (starting `/` or `**/`): a relative glob could never match a guest path, so it is refused rather than left to match nothing. Limits: the text at most 1 MiB, each list at most 1024 entries.
+Every table is optional; every key in it too. Unknown keys are refused at every level (`deny_unknown_fields`). Targets are today's (`name[:port]`, `*.name[:port]`, `ip[:port]`, `ip/prefix[:port]`), checked by `boxcar_net::Policy`'s own parser so their meaning is the line policy's exactly. Path globs are `globset` globs with `literal_separator`, absolute (starting `/` or `**/`): a relative glob could never match a guest path, so it is refused rather than left to match nothing. Limits: the text at most 1 MiB (read no further than one byte past it), each list at most 1024 entries. A `--policy-file` line policy keeps having no limit and is read whole.
 
 ### Errors with line and column
 
@@ -116,7 +116,7 @@ Enforcing `[fs]` and `[exec]`, applying `[spans]`, `[record]` and `indicators`, 
 
 - **Denies before allows.** The file's lists have no order between them, so a deny of a target wins over an allow of it, as the flags and `policy.update` already order them.
 - **The rate is the session's, not the rules'.** `policy.update` replaces rules; a rate it could drop would be a rate a client could lift.
-- **Every answered message counts against the rate**, malformed ones included, before the policy is read: it bounds what the guest can make the stack do and log per second.
+- **Every answered message counts against the rate**, malformed ones included, before the policy is read: it bounds the lookups the guest can send upstream and the policy decisions it can ask for each second. A refused message is still answered and recorded, one `net.dns` each, as a FORMERR is.
 - **A profile's name is the profile.** `--policy NAME|PATH` cannot ask the filesystem first without a file named `agent-isolate` changing what the flag means.
 - **The Debian mirrors on 80 too.** apt's default sources are plain HTTP (signed); 443 alone would leave `apt-get update` failing under `agent-isolate`. A domain rule on 80 still admits only a request that names the host.
 - **Absolute globs only**, and a 1 MiB, 1024-per-list cap: a relative glob matches no guest path, and a policy is decided linearly per connection.

@@ -214,6 +214,6 @@ Made by Task 4 (`docs/plans/policy-files.md`), 2026-10-19:
 - **The DNS rate is the session's**, in `NetConfig`, never in the rules `policy.update` replaces, so no client can lift it; every answered message counts, malformed ones included, before the policy is read.
 - **A profile's name is the profile**; anything else given to `--policy` is a path. `--policy` does not need the network.
 - **The Debian mirrors on 80 as well as 443** in the profiles: apt's default sources are plain HTTP (signed), and 443 alone would fail `apt-get update`.
-- **Absolute globs only, 1024 entries per list, 1 MiB of text** (read no further than one byte past it).
+- **Absolute globs only, 1024 entries per list, 1 MiB of text** (read no further than one byte past it); a `--policy-file` line policy keeps having no limit and is read whole.
 - **`policy.loaded` for every session**, right after `vmm.start`: `flags` names the line policy, its `--policy-file` and the file's hash when there is one.
 - **The network half in force first.** Until Task 5 enforces `[fs]`, `[exec]`, `[spans]` and `[record]`, `boxcar run` names on stderr what a policy sets of them that would restrict (`agent-isolate` sets nothing of the kind; `agent-isolate-strict` its `writable` and `[exec] deny`).
