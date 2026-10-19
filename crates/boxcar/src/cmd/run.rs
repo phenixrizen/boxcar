@@ -390,6 +390,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             spans: Some(spans),
             declared: Some(declared),
             raw_argv,
+            indicators: None,
         },
     )
     .context("cannot start the reconciler")?;

@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 vmm-sys-util = { workspace = true }
+# A policy file's `[fs] indicators`: guest-path globs.
+globset = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

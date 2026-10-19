@@ -55,6 +55,7 @@ use crate::subscribe::{Item, Next};
 use crate::Filter;
 pub use argv::{ExecKey, RawArgv};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use paths::PolicyIndicators;
 use spans::Spans;
 pub use spans::{Declared, DeclaredArgs, SpanIndex};
 use state::State;
@@ -96,6 +97,8 @@ pub struct ReconcileConfig {
     /// The argvs as run of the execs the log records scrubbed
     /// (`--scrub-argv`): the reconciler compares and joins by what ran.
     pub raw_argv: Option<RawArgv>,
+    /// A policy file's `[fs] indicators`, besides the built-in ones.
+    pub indicators: Option<PolicyIndicators>,
 }
 
 /// The reconciler's state machine: feed it records and ticks, take the

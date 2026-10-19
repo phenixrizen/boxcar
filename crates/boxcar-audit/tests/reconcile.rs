@@ -13,14 +13,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use boxcar_audit::{
-    Declared, DeclaredArgs, ExecKey, ManualClock, RawArgv, ReconcileConfig, Reconciler, SpanIndex,
+    Declared, DeclaredArgs, ExecKey, ManualClock, PolicyIndicators, RawArgv, ReconcileConfig,
+    Reconciler, SpanIndex,
 };
 use boxcar_proto::{
-    Attrib, ClockSync, Finding, FsClose, FsCreate, FsPathOp, Hash, HashStatus, HttpRequest,
-    NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec, ProcExit, ProcFork, ProcHeartbeat,
-    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsIo, ProgramStatus, Record,
-    Ring, SensorPhase, SessionId, SessionStart, SpanEffects, SpanRef, Subject, ToolClose, ToolOpen,
-    Verdict, VmmStop, VsockConnect,
+    Attrib, ClockSync, Finding, FsClose, FsCreate, FsDenied, FsPathOp, Hash, HashStatus,
+    HttpRequest, NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec, ProcExit, ProcFork,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsIo,
+    ProgramStatus, Record, Ring, SensorPhase, SessionId, SessionStart, SpanEffects, SpanRef,
+    Subject, ToolClose, ToolOpen, Verdict, VmmStop, VsockConnect,
 };
 use serde_json::{json, Value};
 
@@ -567,6 +568,17 @@ fn run_scrubbed(
     declared: Option<DeclaredArgs>,
     raw_argv: Option<RawArgv>,
 ) -> (Vec<Out>, SpanIndex) {
+    run_configured(sensor_expected, steps, declared, raw_argv, None)
+}
+
+/// [`run_scrubbed`] with a policy file's `[fs] indicators`.
+fn run_configured(
+    sensor_expected: bool,
+    steps: Vec<Step>,
+    declared: Option<DeclaredArgs>,
+    raw_argv: Option<RawArgv>,
+    indicators: Option<Vec<String>>,
+) -> (Vec<Out>, SpanIndex) {
     let clock = Arc::new(ManualClock::new(T0));
     let index = SpanIndex::new();
     let mut reconciler = Reconciler::new(ReconcileConfig {
@@ -575,6 +587,7 @@ fn run_scrubbed(
         spans: Some(index.clone()),
         declared,
         raw_argv,
+        indicators: indicators.map(|globs| PolicyIndicators::new(&globs).unwrap()),
     });
     let mut out = Vec::new();
     for step in steps {
@@ -943,6 +956,110 @@ fn a_query_refused_for_the_rate_says_so() {
         "the DNS query for a.example was refused: over the session's DNS rate"
     );
     assert_eq!(denials[0].score, 40);
+}
+
+/// A refusal by the session's policy says which rule refused it: a
+/// denied glob, an exec deny, or a write outside the writable paths.
+#[test]
+fn a_policy_refusal_names_the_policy() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    let denied = |op: &str, path: &str, errno: i32, reason: Option<&str>, rule: Option<&str>| {
+        Payload::FsDenied(FsDenied {
+            mount: "root".into(),
+            path: path.into(),
+            path_b64: None,
+            op: op.into(),
+            errno,
+            reason: reason.map(Into::into),
+            rule: rule.map(Into::into),
+        })
+    };
+    let subject = Some((300, 1000, 1000));
+    for (at, payload) in [
+        (
+            1500,
+            denied("exec", "/usr/bin/nc", 13, Some("policy"), Some("**/nc")),
+        ),
+        (
+            1510,
+            denied(
+                "lookup",
+                "/etc/secret",
+                13,
+                Some("policy"),
+                Some("/etc/secret"),
+            ),
+        ),
+        (1520, denied("create", "/etc/x", 30, Some("policy"), None)),
+        (1530, denied("lookup", "/root", 13, None, None)),
+    ] {
+        steps.push(log.rec(at, Ring::Host, subject, payload));
+    }
+    let findings = run(true, steps);
+    let summaries: Vec<&str> = findings
+        .iter()
+        .filter(|f| f.rule == "policy_denial")
+        .map(|f| f.summary.as_str())
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            "exec of /usr/bin/nc was refused by the policy ([exec] deny **/nc)",
+            "lookup of /etc/secret was refused by the policy ([fs] denied /etc/secret)",
+            "create of /etc/x was refused by the policy (outside [fs] writable)",
+            "lookup of /root was refused (13)",
+        ]
+    );
+    assert!(findings.iter().all(|f| f.score == 40), "{findings:?}");
+}
+
+/// A policy file's indicators add to the built-in ones, by guest path:
+/// the workspace's paths under /workspace.
+#[test]
+fn a_policy_indicator_is_watched_by_guest_path() {
+    let steps = || {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        steps.push(log.exec(1500, 300, 100, 20, &["sh", "-c", "rm notes/*"]));
+        steps.push(log.rec(
+            1600,
+            Ring::Host,
+            Some((300, 1000, 1000)),
+            Payload::FsUnlink(FsPathOp {
+                mount: "workspace".into(),
+                path: "/notes/today.md".into(),
+                path_b64: None,
+                result: OpResult::ok(),
+            }),
+        ));
+        // The same path in the root share is not under /workspace.
+        steps.push(log.fs_unlink(1700, 300, "/notes/today.md"));
+        steps
+    };
+    let watched = Some(vec!["/workspace/notes/**".to_owned()]);
+    let findings: Vec<Finding> = run_configured(true, steps(), None, None, watched)
+        .0
+        .into_iter()
+        .filter_map(|out| match out {
+            Out::Finding(finding) => Some(finding),
+            Out::Span(_) => None,
+        })
+        .collect();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rule, "indicator_removal");
+    assert_eq!(findings[0].score, 90);
+    assert!(
+        findings[0]
+            .summary
+            .ends_with("removed /notes/today.md, a path the policy watches ([fs] indicators /workspace/notes/**)"),
+        "{}",
+        findings[0].summary
+    );
+    // Without the policy's indicators, nothing.
+    assert!(run(true, steps()).is_empty());
 }
 
 #[test]
