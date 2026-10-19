@@ -386,7 +386,7 @@
           "type": "string"
         },
         "op": {
-          "description": "The refused operation: `lookup`, `access`, `open`, and so on.",
+          "description": "The refused operation: `lookup`, `access`, `open`, and so on; `exec` for an open to run a program.",
           "type": "string"
         },
         "path": {
@@ -394,6 +394,20 @@
         },
         "path_b64": {
           "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "`policy` when the session's policy refused it (`[fs] denied`, `[fs] writable`, `[exec] deny`), before it reached the host; omitted for a refusal of the host's own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule": {
+          "description": "The glob that refused it: the `[fs] denied` or `[exec] deny` glob, also for a file refused by its identity under another name; omitted for a write outside `[fs] writable`, where no glob matched.",
           "type": [
             "string",
             "null"
@@ -2292,6 +2306,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/PolicyException"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.exception"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/ClockSync"
             },
             "type": {
@@ -2673,13 +2705,65 @@
       ],
       "properties": {
         "by_pid": {
-          "description": "The client's process id.",
+          "description": "The client's process id; 0 when the VMM changed it, at a live exception's expiry.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "version": {
           "description": "The policy's version from now on: 1 is the policy the VM started with, and each update adds one. `policy.get` reports it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "PolicyException": {
+      "description": "`policy.exception`: a client granted a live exception, which lives `ttl_s` seconds on top of the permanent policy and then expires (with a `policy.changed` whose `by_pid` is 0).",
+      "type": "object",
+      "required": [
+        "by_pid",
+        "expires_ns",
+        "id",
+        "kind",
+        "rule",
+        "ttl_s",
+        "version"
+      ],
+      "properties": {
+        "by_pid": {
+          "description": "The client's process id.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "expires_ns": {
+          "description": "When it expires: the host's realtime clock, as `ts_host_ns`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "description": "The session's number for it, from 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "kind": {
+          "description": "`egress`, `writable` or `exec`.",
+          "type": "string"
+        },
+        "rule": {
+          "description": "An egress target, or a path glob.",
+          "type": "string"
+        },
+        "ttl_s": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "version": {
+          "description": "The policy's version from now on.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -3928,6 +4012,24 @@
               "type": "string",
               "enum": [
                 "policy.loaded"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/PolicyException"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.exception"
               ]
             }
           }

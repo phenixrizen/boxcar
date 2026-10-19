@@ -441,9 +441,20 @@ pub struct FsDenied {
     /// byte); omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_b64: Option<String>,
-    /// The refused operation: `lookup`, `access`, `open`, and so on.
+    /// The refused operation: `lookup`, `access`, `open`, and so on;
+    /// `exec` for an open to run a program.
     pub op: String,
     pub errno: i32,
+    /// `policy` when the session's policy refused it (`[fs] denied`,
+    /// `[fs] writable`, `[exec] deny`), before it reached the host; omitted
+    /// for a refusal of the host's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The glob that refused it: the `[fs] denied` or `[exec] deny` glob,
+    /// also for a file refused by its identity under another name; omitted
+    /// for a write outside `[fs] writable`, where no glob matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// `checkpoint`: a summary the log writer chains in periodically, so a reader
@@ -498,10 +509,32 @@ pub struct ControlStop {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyChanged {
-    /// The client's process id.
+    /// The client's process id; 0 when the VMM changed it, at a live
+    /// exception's expiry.
     pub by_pid: u32,
     /// The policy's version from now on: 1 is the policy the VM started
     /// with, and each update adds one. `policy.get` reports it.
+    pub version: u64,
+}
+
+/// `policy.exception`: a client granted a live exception, which lives
+/// `ttl_s` seconds on top of the permanent policy and then expires (with a
+/// `policy.changed` whose `by_pid` is 0).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PolicyException {
+    /// The session's number for it, from 1.
+    pub id: u32,
+    /// An egress target, or a path glob.
+    pub rule: String,
+    /// `egress`, `writable` or `exec`.
+    pub kind: String,
+    pub ttl_s: u32,
+    /// When it expires: the host's realtime clock, as `ts_host_ns`.
+    pub expires_ns: u64,
+    /// The client's process id.
+    pub by_pid: u32,
+    /// The policy's version from now on.
     pub version: u64,
 }
 

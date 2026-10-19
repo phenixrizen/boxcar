@@ -279,6 +279,8 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
             path_b64: path.path_b64,
             op: op.to_owned(),
             errno,
+            reason: None,
+            rule: None,
         });
         self.events.record(Some(subject(ctx)), payload);
     }

@@ -101,7 +101,7 @@ fn change(args: &PolicyRuleArgs, verdict: Verdict) -> anyhow::Result<ExitCode> {
     };
     let params = PolicyUpdateParams {
         net: Some(net),
-        vsock: None,
+        ..PolicyUpdateParams::default()
     };
     let result = client
         .request("policy.update", serde_json::to_value(&params)?)?
@@ -219,6 +219,7 @@ mod tests {
                 allow_ports: vec![5000],
             },
             version: 2,
+            exceptions: Vec::new(),
         };
         assert_eq!(
             table(&view),

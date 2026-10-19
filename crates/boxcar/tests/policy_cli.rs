@@ -39,6 +39,7 @@ fn starting_policy() -> PolicyView {
             allow_ports: vec![5000, 6000],
         },
         version: 1,
+        exceptions: Vec::new(),
     }
 }
 
@@ -200,6 +201,7 @@ fn policy_show_of_an_empty_policy() {
         },
         vsock: VsockPolicy::default(),
         version: 7,
+        exceptions: Vec::new(),
     };
     let server = fake_server(&socket, empty, None);
     let output = policy(&socket, &["show"]);

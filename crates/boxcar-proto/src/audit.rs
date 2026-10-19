@@ -45,11 +45,11 @@ pub use payloads::{
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
     FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
     HttpResponse, ImageRef, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns,
-    NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, PolicyLoaded, ProcConnectAttempt,
-    ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd,
-    ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SensorPhase,
-    SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict,
-    VmmStart, VmmStop, VsockClose, VsockConnect,
+    NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, PolicyException, PolicyLoaded,
+    ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
+    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus,
+    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen,
+    Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -459,6 +459,8 @@ pub enum Payload {
     PolicyChanged(PolicyChanged),
     #[serde(rename = "policy.loaded")]
     PolicyLoaded(PolicyLoaded),
+    #[serde(rename = "policy.exception")]
+    PolicyException(PolicyException),
     #[serde(rename = "sync")]
     ClockSync(ClockSync),
     #[serde(rename = "proc.exec")]
@@ -545,6 +547,7 @@ impl Payload {
             Payload::SessionExit(_) => "session.exit",
             Payload::PolicyChanged(_) => "policy.changed",
             Payload::PolicyLoaded(_) => "policy.loaded",
+            Payload::PolicyException(_) => "policy.exception",
             Payload::ClockSync(_) => "sync",
             Payload::ProcExec(_) => "proc.exec",
             Payload::ProcFork(_) => "proc.fork",
@@ -607,7 +610,9 @@ impl Payload {
             | Payload::NetUdp(_) => Source::Net,
             Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
             Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
-            Payload::PolicyChanged(_) | Payload::PolicyLoaded(_) => Source::Policy,
+            Payload::PolicyChanged(_) | Payload::PolicyLoaded(_) | Payload::PolicyException(_) => {
+                Source::Policy
+            }
             Payload::ClockSync(_) => Source::Vmm,
             Payload::ProcExec(_)
             | Payload::ProcFork(_)
@@ -661,8 +666,8 @@ mod tests {
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 58 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 58] = [
+    /// The 59 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 59] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -700,6 +705,7 @@ mod tests {
         "session.exit",
         "policy.changed",
         "policy.loaded",
+        "policy.exception",
         "sync",
         "proc.exec",
         "proc.fork",
@@ -1102,12 +1108,21 @@ mod tests {
             (
                 Payload::FsDenied(FsDenied {
                     mount: "root".into(),
-                    path: "/etc/shadow".into(),
+                    path: "/usr/bin/nc".into(),
                     path_b64: None,
-                    op: "lookup".into(),
+                    op: "exec".into(),
                     errno: 13,
+                    reason: Some("policy".into()),
+                    rule: Some("**/nc".into()),
                 }),
-                json!({"mount": "root", "path": "/etc/shadow", "op": "lookup", "errno": 13}),
+                json!({
+                    "mount": "root",
+                    "path": "/usr/bin/nc",
+                    "op": "exec",
+                    "errno": 13,
+                    "reason": "policy",
+                    "rule": "**/nc",
+                }),
             ),
             (
                 Payload::FsReaddir(FsPathOp {
@@ -1335,6 +1350,26 @@ mod tests {
                     "egress_rules": 25,
                     "fs_rules": 5,
                     "exec_rules": 0,
+                }),
+            ),
+            (
+                Payload::PolicyException(PolicyException {
+                    id: 3,
+                    rule: "/etc/**".into(),
+                    kind: "writable".into(),
+                    ttl_s: 600,
+                    expires_ns: 1_760_000_600_000_000_000,
+                    by_pid: 4242,
+                    version: 5,
+                }),
+                json!({
+                    "id": 3,
+                    "rule": "/etc/**",
+                    "kind": "writable",
+                    "ttl_s": 600,
+                    "expires_ns": 1_760_000_600_000_000_000u64,
+                    "by_pid": 4242,
+                    "version": 5,
                 }),
             ),
             (
@@ -1772,6 +1807,18 @@ mod tests {
     /// does not mark skip-if-none travel as explicit nulls.
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
+            (
+                Payload::FsDenied(FsDenied {
+                    mount: "root".into(),
+                    path: "/etc/shadow".into(),
+                    path_b64: None,
+                    op: "lookup".into(),
+                    errno: 13,
+                    reason: None,
+                    rule: None,
+                }),
+                json!({"mount": "root", "path": "/etc/shadow", "op": "lookup", "errno": 13}),
+            ),
             (
                 Payload::PolicyLoaded(PolicyLoaded {
                     source: "flags".into(),

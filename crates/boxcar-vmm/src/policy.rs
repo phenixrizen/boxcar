@@ -131,6 +131,7 @@ impl LivePolicy {
                 allow_ports: self.vsock_allow(),
             },
             version: self.version(),
+            exceptions: Vec::new(),
         }
     }
 
@@ -369,6 +370,7 @@ mod tests {
         let net_only = PolicyUpdateParams {
             net: Some(net(Verdict::Deny, &["api.github.com:443"], &[])),
             vsock: None,
+            exception: None,
         };
         assert_eq!(live.update(&net_only), Ok(2));
         assert_eq!(wake.read().unwrap(), 1, "woken once");
@@ -384,6 +386,7 @@ mod tests {
             vsock: Some(VsockPolicy {
                 allow_ports: vec![6000, 7000],
             }),
+            exception: None,
         };
         assert_eq!(live.update(&vsock_only), Ok(3));
         assert!(wake.read().is_err(), "not woken for a vsock swap");
@@ -396,6 +399,7 @@ mod tests {
                     allow_ports: vec![6000, 7000]
                 },
                 version: 3,
+                exceptions: Vec::new(),
             }
         );
 
@@ -404,6 +408,7 @@ mod tests {
         let refused = PolicyUpdateParams {
             net: Some(net(Verdict::Allow, &["exa_mple.com"], &[])),
             vsock: Some(VsockPolicy::default()),
+            exception: None,
         };
         assert!(matches!(
             live.update(&refused),
@@ -430,6 +435,7 @@ mod tests {
         let net_only = PolicyUpdateParams {
             net: Some(net(Verdict::Allow, &[], &[])),
             vsock: None,
+            exception: None,
         };
         assert_eq!(none.update(&net_only), Err(UpdateError::NoNetDevice));
         let vsock_only = PolicyUpdateParams {
@@ -437,6 +443,7 @@ mod tests {
             vsock: Some(VsockPolicy {
                 allow_ports: vec![5000],
             }),
+            exception: None,
         };
         assert_eq!(none.update(&vsock_only), Err(UpdateError::NoVsockDevice));
         assert_eq!(none.version(), FIRST_VERSION);
