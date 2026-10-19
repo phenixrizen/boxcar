@@ -67,6 +67,12 @@ tar = { version = "0.4", default-features = false }
 ruzstd = "0.9"
 boxcar-testreg = { path = "crates/boxcar-testreg" }
 
+# Policy files (M5): TOML read through serde (no writer), the path rules'
+# globs.
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+globset = { version = "0.4", default-features = false }
+boxcar-policy = { path = "crates/boxcar-policy" }
+
 # The user-mode network stack (boxcar-net).
 # The guest sensor (M3): aya loads the eBPF programs in the guest, aya-build
 # builds them from boxcar-sensor's build.rs, aya-obj parses the built object

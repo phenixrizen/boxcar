@@ -1,0 +1,17 @@
+[package]
+name = "boxcar-policy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "boxcar's policy files: the TOML model, its parser with line and column, the egress it compiles through the line policy, and the built-in profiles"
+
+[dependencies]
+# The line policy the egress compiles through.
+boxcar-net = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+globset = { workspace = true }
+thiserror = { workspace = true }
