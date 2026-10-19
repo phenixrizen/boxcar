@@ -505,6 +505,33 @@ pub struct PolicyChanged {
     pub version: u64,
 }
 
+/// `policy.loaded`: the policy the session started with, recorded once,
+/// right after `vmm.start`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PolicyLoaded {
+    /// Where the policy came from: `profile` (`boxcar run --policy NAME`),
+    /// `file` (`--policy PATH`, a policy file), or `flags` (the line policy
+    /// of `--policy-file`, `--deny`, `--allow` and `--inspect`, or of none
+    /// of them).
+    pub source: String,
+    /// The profile's name, or the path as given to `--policy` or
+    /// `--policy-file`, at most 4096 bytes; null when nothing named one.
+    pub name: Option<String>,
+    /// SHA-256 of the text the policy was read from (the policy file, the
+    /// profile, the `--policy-file` file), lowercase hex; null when there
+    /// was none.
+    pub sha256: Option<String>,
+    /// The allow, deny and inspect rules in force at the start, the flags'
+    /// included.
+    pub egress_rules: u32,
+    /// A policy file's `[fs]` globs: `writable` (its default included),
+    /// `denied`, `indicators`. 0 for a line policy.
+    pub fs_rules: u32,
+    /// A policy file's `[exec] deny` globs. 0 for a line policy.
+    pub exec_rules: u32,
+}
+
 /// `net.dhcp`: the network stack answered a guest DHCP message with the
 /// session's static lease.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

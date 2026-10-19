@@ -37,11 +37,11 @@ pub use audit::{
     FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hash, HashStatus,
     HttpRequest, HttpResponse, ImageRef, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp,
     NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult, ParseHashError, Payload, PolicyChanged,
-    ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
-    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, Record,
-    Ring, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, Source, SpanEffects, SpanRef,
-    Subject, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
-    SCHEMA_VERSION,
+    PolicyLoaded, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
+    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo,
+    ProgramStatus, Record, Ring, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, Source,
+    SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose,
+    VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

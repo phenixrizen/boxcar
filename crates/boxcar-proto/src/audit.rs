@@ -45,11 +45,11 @@ pub use payloads::{
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
     FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
     HttpResponse, ImageRef, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns,
-    NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, ProcConnectAttempt, ProcExec,
-    ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
-    ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SensorPhase, SessionExit,
-    SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop,
-    VsockClose, VsockConnect,
+    NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, PolicyLoaded, ProcConnectAttempt,
+    ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd,
+    ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SensorPhase,
+    SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict,
+    VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -457,6 +457,8 @@ pub enum Payload {
     SessionExit(SessionExit),
     #[serde(rename = "policy.changed")]
     PolicyChanged(PolicyChanged),
+    #[serde(rename = "policy.loaded")]
+    PolicyLoaded(PolicyLoaded),
     #[serde(rename = "sync")]
     ClockSync(ClockSync),
     #[serde(rename = "proc.exec")]
@@ -542,6 +544,7 @@ impl Payload {
             Payload::SessionStart(_) => "session.start",
             Payload::SessionExit(_) => "session.exit",
             Payload::PolicyChanged(_) => "policy.changed",
+            Payload::PolicyLoaded(_) => "policy.loaded",
             Payload::ClockSync(_) => "sync",
             Payload::ProcExec(_) => "proc.exec",
             Payload::ProcFork(_) => "proc.fork",
@@ -604,7 +607,7 @@ impl Payload {
             | Payload::NetUdp(_) => Source::Net,
             Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
             Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
-            Payload::PolicyChanged(_) => Source::Policy,
+            Payload::PolicyChanged(_) | Payload::PolicyLoaded(_) => Source::Policy,
             Payload::ClockSync(_) => Source::Vmm,
             Payload::ProcExec(_)
             | Payload::ProcFork(_)
@@ -658,8 +661,8 @@ mod tests {
 
     const SESSION: &str = "017f22e2-79b0-7cc3-98c4-dc0c0c07398f";
 
-    /// The 47 wire names of the typed payloads, in schema order.
-    const KINDS: [&str; 57] = [
+    /// The 58 wire names of the typed payloads, in schema order.
+    const KINDS: [&str; 58] = [
         "vmm.start",
         "vmm.stop",
         "fs.mount",
@@ -696,6 +699,7 @@ mod tests {
         "session.start",
         "session.exit",
         "policy.changed",
+        "policy.loaded",
         "sync",
         "proc.exec",
         "proc.fork",
@@ -1316,6 +1320,24 @@ mod tests {
                 json!({"by_pid": 4242, "version": 2}),
             ),
             (
+                Payload::PolicyLoaded(PolicyLoaded {
+                    source: "profile".into(),
+                    name: Some("agent-isolate".into()),
+                    sha256: Some("ab".repeat(32)),
+                    egress_rules: 25,
+                    fs_rules: 5,
+                    exec_rules: 0,
+                }),
+                json!({
+                    "source": "profile",
+                    "name": "agent-isolate",
+                    "sha256": "ab".repeat(32),
+                    "egress_rules": 25,
+                    "fs_rules": 5,
+                    "exec_rules": 0,
+                }),
+            ),
+            (
                 Payload::ClockSync(ClockSync {
                     method: "vsock_rtt".into(),
                     guest_mono_ns: 5_000_000_000,
@@ -1751,6 +1773,24 @@ mod tests {
     fn unset_optional_cases() -> Vec<(Payload, Value)> {
         vec![
             (
+                Payload::PolicyLoaded(PolicyLoaded {
+                    source: "flags".into(),
+                    name: None,
+                    sha256: None,
+                    egress_rules: 0,
+                    fs_rules: 0,
+                    exec_rules: 0,
+                }),
+                json!({
+                    "source": "flags",
+                    "name": null,
+                    "sha256": null,
+                    "egress_rules": 0,
+                    "fs_rules": 0,
+                    "exec_rules": 0,
+                }),
+            ),
+            (
                 Payload::ProcTlsAttach(ProcTlsAttach {
                     path: "/usr/bin/node".into(),
                     ok: true,
@@ -2179,6 +2219,26 @@ mod tests {
         assert!(serde_json::to_vec(&data).unwrap().len() < 2048);
     }
 
+    /// `policy.loaded` at its longest name (a path cut to 4096 bytes)
+    /// round-trips and fits the record limit with room to spare.
+    #[test]
+    fn a_policy_loaded_at_its_longest_name_fits_its_limit() {
+        let payload = Payload::PolicyLoaded(PolicyLoaded {
+            source: "file".into(),
+            name: Some("/p".repeat(crate::limits::MAX_PATH / 2)),
+            sha256: Some("f".repeat(64)),
+            egress_rules: u32::MAX,
+            fs_rules: u32::MAX,
+            exec_rules: u32::MAX,
+        });
+        let (kind, data) = payload.into_parts();
+        let back = Payload::from_record(&record(&kind, Source::Policy, data.clone())).unwrap();
+        assert_eq!(back, payload);
+        let bytes = serde_json::to_vec(&data).unwrap().len();
+        assert!(bytes < 8 * 1024, "{bytes}");
+        assert!(bytes < crate::limits::MAX_RECORD_BYTES);
+    }
+
     #[test]
     fn a_payload_belongs_to_the_source_of_its_kind_family() {
         for (payload, _) in cases() {
@@ -2217,6 +2277,7 @@ mod tests {
         assert_eq!(Source::from_kind("vsock.close"), Some(Source::Vsock));
         assert_eq!(Source::from_kind("session.exit"), Some(Source::Session));
         assert_eq!(Source::from_kind("policy.changed"), Some(Source::Policy));
+        assert_eq!(Source::from_kind("policy.loaded"), Some(Source::Policy));
         assert_eq!(Source::from_kind("sync"), Some(Source::Vmm));
         assert_eq!(Source::from_kind("proc.exec"), Some(Source::Sensor));
         assert_eq!(Source::from_kind("proc.heartbeat"), Some(Source::Sensor));

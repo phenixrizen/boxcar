@@ -2274,6 +2274,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/PolicyLoaded"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.loaded"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/ClockSync"
             },
             "type": {
@@ -2665,6 +2683,54 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        }
+      }
+    },
+    "PolicyLoaded": {
+      "description": "`policy.loaded`: the policy the session started with, recorded once, right after `vmm.start`.",
+      "type": "object",
+      "required": [
+        "egress_rules",
+        "exec_rules",
+        "fs_rules",
+        "source"
+      ],
+      "properties": {
+        "egress_rules": {
+          "description": "The allow, deny and inspect rules in force at the start, the flags' included.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "exec_rules": {
+          "description": "A policy file's `[exec] deny` globs. 0 for a line policy.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "fs_rules": {
+          "description": "A policy file's `[fs]` globs: `writable` (its default included), `denied`, `indicators`. 0 for a line policy.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "description": "The profile's name, or the path as given to `--policy` or `--policy-file`, at most 4096 bytes; null when nothing named one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "description": "SHA-256 of the text the policy was read from (the policy file, the profile, the `--policy-file` file), lowercase hex; null when there was none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Where the policy came from: `profile` (`boxcar run --policy NAME`), `file` (`--policy PATH`, a policy file), or `flags` (the line policy of `--policy-file`, `--deny`, `--allow` and `--inspect`, or of none of them).",
+          "type": "string"
         }
       }
     },
@@ -3844,6 +3910,24 @@
               "type": "string",
               "enum": [
                 "policy.changed"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/PolicyLoaded"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy.loaded"
               ]
             }
           }
