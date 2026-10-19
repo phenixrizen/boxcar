@@ -21,7 +21,9 @@ use boxcar_net::dns::forwarder::DNS_TIMEOUT;
 use boxcar_net::stack::{DNS_TOKEN, QUEUE_CAP};
 use boxcar_net::{Interest, Policy, Verdict};
 use boxcar_proto::{NetDns, NetDrop, Payload};
-use common::{harness, harness_with, udp, Harness, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC};
+use common::{
+    harness, harness_config, harness_with, udp, Harness, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC,
+};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -896,6 +898,87 @@ fn a_query_is_recorded_even_when_the_guest_queue_refuses_its_answer() {
 
 /// An answer must repeat the query's class as well as its name and type:
 /// a CH query is not answered by an IN reply, which is counted as bogus.
+/// The `net.dns` records a rate refused, by their rule.
+fn refused_for_the_rate(events: &[Payload]) -> Vec<Payload> {
+    dns_records(events)
+        .into_iter()
+        .filter(|e| matches!(e, Payload::NetDns(dns) if dns.rule.as_deref() == Some("dns_rate")))
+        .collect()
+}
+
+/// With a rate, a burst of that many messages goes on; the next, at
+/// once, is answered REFUSED with its question, recorded as the rate's
+/// (`dns_rate`, whatever the policy says of the name), and never goes
+/// upstream.
+#[test]
+fn a_message_over_the_rate_is_refused_and_never_forwarded() {
+    let mut h = harness_config(policy(&["allow example.com"]), |cfg| {
+        cfg.max_dns_qps = Some(2)
+    });
+    for id in [1, 2] {
+        h.stack
+            .push_guest_frame(&dns_frame(&query(id, "example.com", A)));
+    }
+    assert_eq!(all_forwarded(&h).len(), 2, "the burst went upstream");
+    let q = query(3, "Example.COM", A);
+    h.stack.push_guest_frame(&dns_frame(&q));
+    let frames = h.drain();
+    assert_eq!(frames.len(), 1);
+    let got = dns_payload(&frames[0]);
+    let m = read_message(&got);
+    assert_eq!(m.id, 3);
+    assert_eq!(m.flags, 0x8185, "QR, RD, RA and REFUSED");
+    assert_eq!(m.counts, [1, 0, 0, 0]);
+    assert_eq!(got[12..], q[12..], "the question, as asked");
+    assert!(all_forwarded(&h).is_empty(), "nothing more went upstream");
+    assert_eq!(
+        refused_for_the_rate(&h.events()),
+        [record(
+            3,
+            "example.com",
+            A,
+            5,
+            &[],
+            Verdict::Deny,
+            Some("dns_rate")
+        )]
+    );
+}
+
+/// Every message that gets an answer counts against the rate, one that is
+/// not a plain query too: after a response sent as a query (FORMERR), a
+/// rate of one a second refuses the query that follows it.
+#[test]
+fn a_malformed_message_counts_against_the_rate() {
+    let mut h = harness_config(policy(&["allow example.com"]), |cfg| {
+        cfg.max_dns_qps = Some(1)
+    });
+    let mut response = query(7, "example.com", A);
+    response[2] |= 0x80;
+    h.stack.push_guest_frame(&dns_frame(&response));
+    h.stack
+        .push_guest_frame(&dns_frame(&query(8, "example.com", A)));
+    let rcodes: Vec<u16> = h
+        .drain()
+        .iter()
+        .map(|frame| read_message(&dns_payload(frame)).flags & 0xf)
+        .collect();
+    assert_eq!(rcodes, [1, 5], "FORMERR, then REFUSED");
+    assert!(all_forwarded(&h).is_empty());
+    assert_eq!(
+        refused_for_the_rate(&h.events()),
+        [record(
+            8,
+            "example.com",
+            A,
+            5,
+            &[],
+            Verdict::Deny,
+            Some("dns_rate")
+        )]
+    );
+}
+
 #[test]
 fn a_reply_must_repeat_the_question_class() {
     const TXT: u16 = 16;

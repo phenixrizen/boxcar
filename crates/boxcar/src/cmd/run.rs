@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -22,7 +22,7 @@ use boxcar_audit::{
     WriterConfig, WriterHandle,
 };
 use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
-use boxcar_net::{DumpDir, InspectConfig, NetConfig, Policy, SessionCa};
+use boxcar_net::{DumpDir, InspectConfig, List, NetConfig, Policy, SessionCa};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
@@ -40,7 +40,8 @@ use boxcar_vmm::vmm::{
 use boxcar_vsock::VsockConfig;
 use tracing_subscriber::EnvFilter;
 
-use boxcar_proto::ImageRef;
+use boxcar_proto::limits::{truncate_utf8, MAX_PATH};
+use boxcar_proto::{ImageRef, PolicyLoaded};
 
 use crate::cli::{AuditLevelArg, PullArg, RunArgs};
 use crate::client;
@@ -108,13 +109,28 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         );
         return Ok(ExitCode::from(USAGE_EXIT));
     }
-    let policy = match load_policy(&args)? {
-        Ok(policy) => policy,
+    let Loaded {
+        net: policy,
+        max_dns_qps,
+        record: policy_loaded,
+        mut not_in_force,
+    } = match load_policy(&args)? {
+        Ok(loaded) => loaded,
         Err(message) => {
             tell(&format!("error: {message}"));
             return Ok(ExitCode::from(USAGE_EXIT));
         }
     };
+    // `--scrub-argv` puts `[record] scrub_argv` into force itself.
+    not_in_force.retain(|setting| !(args.scrub_argv && *setting == "[record] scrub_argv"));
+    if !not_in_force.is_empty() {
+        eprintln!(
+            "warning: --policy {}: this build does not enforce {} yet, only the policy's \
+             [egress] and DNS rate; the rest is recorded in policy.loaded",
+            policy_loaded.name.as_deref().unwrap_or_default(),
+            not_in_force.join(", ")
+        );
+    }
     let ready = args.ready_fd.map(ReadyFd::take).transpose()?;
     let rootfs = args
         .rootfs
@@ -339,7 +355,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         stdin: interactive && !relayed,
         audit: sink,
         fs_shares,
-        net: net.then(|| net_config(&args.dns)),
+        net: net.then(|| net_config(&args.dns, max_dns_qps)),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
         vsock: vsock.then(|| vsock_config(&state_dir, &args.vsock_allow)),
         sensor,
@@ -353,6 +369,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         dump,
         scrub_argv: raw_argv.clone(),
         image: image_ref,
+        policy_loaded: Some(policy_loaded),
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -570,21 +587,122 @@ mod fault {
     }
 }
 
-/// The policy of `--policy-file`, `--deny` and `--allow` (see
-/// [`build_policy`]). The outer error is a policy file that cannot be read;
-/// the inner one a rule that does not parse, said as the user should see
-/// it.
-fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Policy, String>> {
-    let file = match &args.policy_file {
-        Some(path) => {
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("--policy-file {}", path.display()))?;
-            Some((path.as_path(), text))
-        }
-        None => None,
+/// The session's policy, read and checked before the session exists.
+struct Loaded {
+    /// The network's: the policy's own rules, then the flags'.
+    net: Policy,
+    /// A policy file's DNS rate.
+    max_dns_qps: Option<u32>,
+    /// What `policy.loaded` records of it.
+    record: PolicyLoaded,
+    /// What a policy file sets that this build does not enforce yet.
+    not_in_force: Vec<&'static str>,
+}
+
+/// The policy of `--policy` (a profile or a policy file) or `--policy-file`
+/// (a line policy), then `--deny`, `--allow` and `--inspect`, and what
+/// `policy.loaded` says of it. The outer error is a file that cannot be
+/// read; the inner one a policy that does not parse, said as the user
+/// should see it.
+fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
+    let Some(given) = &args.policy else {
+        // A line policy has no size limit: read whole, as it always was,
+        // never cut short at a policy file's.
+        let file = match &args.policy_file {
+            Some(path) => {
+                let text = fs::read_to_string(path)
+                    .with_context(|| format!("--policy-file {}", path.display()))?;
+                Some((path.as_path(), text))
+            }
+            None => None,
+        };
+        let text = file.as_ref().map(|(path, text)| (*path, text.as_str()));
+        let net = match build_policy(text, &args.deny, &args.allow, &args.inspect) {
+            Ok(net) => net,
+            Err(message) => return Ok(Err(message)),
+        };
+        let record = PolicyLoaded {
+            source: "flags".into(),
+            name: file.as_ref().map(|(path, _)| shown_path(path)),
+            sha256: file.as_ref().map(|(_, text)| sha256_hex(text)),
+            egress_rules: egress_rules(&net),
+            fs_rules: 0,
+            exec_rules: 0,
+        };
+        return Ok(Ok(Loaded {
+            net,
+            max_dns_qps: None,
+            record,
+            not_in_force: Vec::new(),
+        }));
     };
-    let file = file.as_ref().map(|(path, text)| (*path, text.as_str()));
-    Ok(build_policy(file, &args.deny, &args.allow, &args.inspect))
+    // A profile's name is the profile; anything else is a path.
+    let (source, text) = match given.to_str().and_then(boxcar_policy::profiles::text) {
+        Some(text) => ("profile", text.to_owned()),
+        None => ("file", read_policy(given)?),
+    };
+    let shown = shown_path(given);
+    let file = match boxcar_policy::parse(&text) {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(format!("--policy {shown}:{error}"))),
+    };
+    let net = match add_flags(
+        file.egress.policy.clone(),
+        &args.deny,
+        &args.allow,
+        &args.inspect,
+    ) {
+        Ok(net) => net,
+        Err(message) => return Ok(Err(message)),
+    };
+    let record = PolicyLoaded {
+        source: source.into(),
+        name: Some(shown),
+        sha256: Some(sha256_hex(&text)),
+        egress_rules: egress_rules(&net),
+        fs_rules: u32::try_from(file.fs_rules()).unwrap_or(u32::MAX),
+        exec_rules: u32::try_from(file.exec_rules()).unwrap_or(u32::MAX),
+    };
+    Ok(Ok(Loaded {
+        net,
+        max_dns_qps: file.egress.max_dns_qps,
+        record,
+        not_in_force: file.not_in_force(),
+    }))
+}
+
+/// The text of the policy file at `path` (`--policy`): read up to one byte
+/// past the policy file's limit, so a file that is too long is said to be
+/// by the parser rather than read whole.
+fn read_policy(path: &Path) -> anyhow::Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| {
+            file.take(boxcar_policy::MAX_TEXT as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .with_context(|| format!("--policy {}", path.display()))?;
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("--policy {}: not UTF-8 text", path.display()))
+}
+
+/// A path as `policy.loaded` names it: as given, cut to the path limit.
+fn shown_path(path: &Path) -> String {
+    truncate_utf8(&path.to_string_lossy(), MAX_PATH).0
+}
+
+/// SHA-256 of `text`, lowercase hex.
+fn sha256_hex(text: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The allow, deny and inspect rules of `policy`.
+fn egress_rules(policy: &Policy) -> u32 {
+    u32::try_from(policy.rules.len() + policy.inspect.len()).unwrap_or(u32::MAX)
 }
 
 /// Root certificates the gated tests add to the upstream trust store, from
@@ -618,55 +736,57 @@ fn session_ca(policy: &Policy, session_id: &SessionId) -> anyhow::Result<Option<
     Ok(Some(Arc::new(ca)))
 }
 
-/// Where a line of the policy came from.
-enum Source<'a> {
-    File { path: &'a Path, line: usize },
-    Flag { flag: &'static str, rule: &'a str },
-}
-
-/// The policy the guest's network gets: the lines of the policy file
-/// (`file`, its path and its text) first, then a `deny` line for each of
-/// `deny`, then an `allow` line for each of `allow`, in order; the first
-/// rule that matches decides; then an `inspect` line for each of
-/// `inspect`, which decide no verdict. Deny by default, unless the file
-/// gives a `default`. A rule that does not parse is refused with where it
-/// came from: `--policy-file PATH line N: ...` or `--allow "RULE": ...`.
+/// The policy the guest's network gets from a line policy: the lines of
+/// the policy file (`file`, its path and its text) first, then the flags
+/// ([`add_flags`]). Deny by default, unless the file gives a `default`. A
+/// rule that does not parse is refused with where it came from:
+/// `--policy-file PATH line N: ...` or `--allow "RULE": ...`.
 fn build_policy(
     file: Option<(&Path, &str)>,
     deny: &[String],
     allow: &[String],
     inspect: &[String],
 ) -> Result<Policy, String> {
-    let mut lines: Vec<(String, Source<'_>)> = Vec::new();
-    if let Some((path, text)) = file {
-        for (index, line) in text.lines().enumerate() {
-            let source = Source::File {
-                path,
-                line: index + 1,
-            };
-            lines.push((line.to_owned(), source));
+    let base = match file {
+        Some((path, text)) => {
+            let lines: Vec<&str> = text.lines().collect();
+            Policy::parse(&lines).map_err(|error| {
+                format!(
+                    "--policy-file {} line {}: {}",
+                    path.display(),
+                    error.line,
+                    error.kind
+                )
+            })?
         }
-    }
-    for (verb, flag, rules) in [
-        ("deny", "--deny", deny),
-        ("allow", "--allow", allow),
-        ("inspect", "--inspect", inspect),
+        None => Policy::default(),
+    };
+    add_flags(base, deny, allow, inspect)
+}
+
+/// `policy` with a deny rule for each of `deny`, then an allow rule for
+/// each of `allow`, in order, after its own rules (the first rule that
+/// matches decides), and an inspect line for each of `inspect` after its
+/// own, which decide no verdict. A rule that does not parse is refused
+/// with its flag: `--allow "RULE": ...`.
+fn add_flags(
+    mut policy: Policy,
+    deny: &[String],
+    allow: &[String],
+    inspect: &[String],
+) -> Result<Policy, String> {
+    for (list, flag, rules) in [
+        (List::Deny, "--deny", deny),
+        (List::Allow, "--allow", allow),
+        (List::Inspect, "--inspect", inspect),
     ] {
         for rule in rules {
-            lines.push((format!("{verb} {rule}"), Source::Flag { flag, rule }));
+            policy
+                .add(list, rule)
+                .map_err(|kind| format!("{flag} {rule:?}: {kind}"))?;
         }
     }
-    let texts: Vec<&str> = lines.iter().map(|(text, _)| text.as_str()).collect();
-    Policy::parse(&texts).map_err(|error| {
-        let source = match lines.get(error.line.wrapping_sub(1)) {
-            Some((_, Source::File { path, line })) => {
-                format!("--policy-file {} line {line}", path.display())
-            }
-            Some((_, Source::Flag { flag, rule })) => format!("{flag} {rule:?}"),
-            None => "the policy".to_owned(),
-        };
-        format!("{source}: {}", error.kind)
-    })
+    Ok(policy)
 }
 
 /// Whether any of the flags that set the network's policy or its DNS was
@@ -706,13 +826,15 @@ fn vsock_config(state_dir: &Path, allow: &[u32]) -> VsockConfig {
 /// The name of the vsock device's host socket in the state directory.
 const VSOCK_SOCKET: &str = "vsock.sock";
 
-/// The guest network's config: the fixed addressing, and DNS forwarded to
-/// `dns`, or to the host's resolvers when it is empty.
-fn net_config(dns: &[SocketAddr]) -> NetConfig {
+/// The guest network's config: the fixed addressing, DNS forwarded to
+/// `dns`, or to the host's resolvers when it is empty, and at most
+/// `max_dns_qps` queries a second, when the policy gives a rate.
+fn net_config(dns: &[SocketAddr], max_dns_qps: Option<u32>) -> NetConfig {
     let mut cfg = NetConfig::from_host();
     if !dns.is_empty() {
         cfg.dns_upstreams = dns.to_vec();
     }
+    cfg.max_dns_qps = max_dns_qps;
     cfg
 }
 
@@ -1517,6 +1639,134 @@ mod tests {
         allow: &[String],
     ) -> Result<Policy, String> {
         super::build_policy(file, deny, allow, &[])
+    }
+
+    /// `boxcar run`'s arguments: `args` after a kernel and a rootfs.
+    fn run_args(args: &[&str]) -> RunArgs {
+        let base = ["boxcar", "run", "--kernel", "vmlinux", "--rootfs", "root"];
+        match crate::cli::Cli::try_parse_args(base.iter().chain(args))
+            .unwrap()
+            .command
+        {
+            crate::cli::Command::Run(args) => *args,
+            _ => unreachable!("a run"),
+        }
+    }
+
+    fn loaded(args: &[&str]) -> Loaded {
+        load_policy(&run_args(args)).unwrap().unwrap()
+    }
+
+    /// What `policy.loaded` records for each source: a profile by its name
+    /// and the hash of its text, a policy file by its path, a line policy
+    /// by its file or by nothing; the egress rules counted with the
+    /// flags'.
+    #[test]
+    fn policy_loaded_says_where_the_policy_came_from() {
+        let profile = loaded(&["--policy", "agent-isolate", "--allow", "x.test"]);
+        let text = boxcar_policy::profiles::text("agent-isolate").unwrap();
+        assert_eq!(
+            profile.record,
+            PolicyLoaded {
+                source: "profile".into(),
+                name: Some("agent-isolate".into()),
+                sha256: Some(sha256_hex(text)),
+                // 20 allows and 5 inspect lines, and the flag's allow.
+                egress_rules: 26,
+                // writable, and the reconciler's 4 indicators.
+                fs_rules: 5,
+                exec_rules: 0,
+            }
+        );
+        assert_eq!(profile.max_dns_qps, Some(20));
+        assert!(profile.not_in_force.is_empty());
+        assert_eq!(profile.net.rules.last().unwrap().text, "allow x.test");
+        assert_eq!(profile.net.inspect.len(), 5);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.toml");
+        let text = "version = 1\n[egress]\ndeny = [\"a.test\"]\n[exec]\ndeny = [\"**/nc\"]\n";
+        fs::write(&path, text).unwrap();
+        let file = loaded(&["--policy", path.to_str().unwrap()]);
+        assert_eq!(
+            file.record,
+            PolicyLoaded {
+                source: "file".into(),
+                name: Some(path.display().to_string()),
+                sha256: Some(sha256_hex(text)),
+                egress_rules: 1,
+                fs_rules: 1,
+                exec_rules: 1,
+            }
+        );
+        assert_eq!(file.max_dns_qps, None);
+        assert_eq!(file.not_in_force, ["[fs] writable", "[exec] deny"]);
+
+        let lines = dir.path().join("team.policy");
+        let text = "allow a.test\ninspect a.test:443\n";
+        fs::write(&lines, text).unwrap();
+        let flags = loaded(&["--policy-file", lines.to_str().unwrap(), "--deny", "b.test"]);
+        assert_eq!(
+            flags.record,
+            PolicyLoaded {
+                source: "flags".into(),
+                name: Some(lines.display().to_string()),
+                sha256: Some(sha256_hex(text)),
+                egress_rules: 3,
+                fs_rules: 0,
+                exec_rules: 0,
+            }
+        );
+        assert_eq!(flags.max_dns_qps, None);
+
+        let none = loaded(&[]);
+        assert_eq!(
+            none.record,
+            PolicyLoaded {
+                source: "flags".into(),
+                name: None,
+                sha256: None,
+                egress_rules: 0,
+                fs_rules: 0,
+                exec_rules: 0,
+            }
+        );
+        assert_eq!(none.net, Policy::default());
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// A policy file over the limit is said to be by its size, and only
+    /// that much of it is read; one that is not UTF-8 cannot be read. A
+    /// line policy has no such limit: one longer is read whole, its last
+    /// rule included.
+    #[test]
+    fn a_policy_file_is_read_up_to_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.toml");
+        fs::write(&big, vec![b'#'; boxcar_policy::MAX_TEXT + 4096]).unwrap();
+        let lines = dir.path().join("big.policy");
+        let mut text = "# padding\n".repeat(boxcar_policy::MAX_TEXT / 10 + 1);
+        text.push_str("deny last.test\n");
+        fs::write(&lines, &text).unwrap();
+        let whole = loaded(&["--policy-file", lines.to_str().unwrap()]);
+        assert_eq!(whole.net.rules.last().unwrap().text, "deny last.test");
+        assert_eq!(whole.record.sha256, Some(sha256_hex(&text)));
+        let text = read_policy(&big).unwrap();
+        assert_eq!(text.len(), boxcar_policy::MAX_TEXT + 1);
+        let error = load_policy(&run_args(&["--policy", big.to_str().unwrap()]))
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(error.contains(":1:1: the policy is"), "{error}");
+        let binary = dir.path().join("binary.toml");
+        fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        let error = load_policy(&run_args(&["--policy", binary.to_str().unwrap()]))
+            .err()
+            .unwrap();
+        assert!(error.to_string().ends_with("not UTF-8 text"), "{error}");
     }
 
     /// `--inspect` lines come last, in order, in their own list, and a

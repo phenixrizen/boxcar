@@ -2,7 +2,8 @@
 // Copyright 2026 The boxcar Authors
 
 //! `boxcar policy`: a running session's network policy, read and changed
-//! through its control socket (`policy.get` and `policy.update`).
+//! through its control socket (`policy.get` and `policy.update`), and the
+//! built-in profiles, printed (`profile NAME`, no session needed).
 //!
 //! `allow RULE` and `deny RULE` work on the policy as `policy.get`
 //! reports it: the rule goes to the end of its list and out of the other,
@@ -15,11 +16,11 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use anyhow::{anyhow, Context};
-use boxcar_net::{Policy, Verdict};
+use boxcar_net::{List, Policy, Verdict};
 use boxcar_proto::control::{PolicyUpdateParams, PolicyUpdated, PolicyView};
 use serde_json::Value;
 
-use crate::cli::{PolicyCommand, PolicyRuleArgs, PolicyShowArgs, SessionArgs};
+use crate::cli::{PolicyCommand, PolicyProfileArgs, PolicyRuleArgs, PolicyShowArgs, SessionArgs};
 use crate::client::{self, Client};
 
 /// The exit code of a rule that does not parse, as clap's usage errors and
@@ -31,7 +32,26 @@ pub fn run(command: PolicyCommand) -> anyhow::Result<ExitCode> {
         PolicyCommand::Show(args) => show(&args),
         PolicyCommand::Allow(args) => change(&args, Verdict::Allow),
         PolicyCommand::Deny(args) => change(&args, Verdict::Deny),
+        PolicyCommand::Profile(args) => profile(&args),
     }
+}
+
+/// Prints the built-in profile `args.name`, byte for byte as `boxcar run
+/// --policy NAME` reads it; a name there is no profile of is a usage
+/// error, naming the profiles there are.
+fn profile(args: &PolicyProfileArgs) -> anyhow::Result<ExitCode> {
+    let Some(text) = boxcar_policy::profiles::text(&args.name) else {
+        crate::cmd::tell(&format!(
+            "error: there is no profile {:?}; the profiles are {}",
+            args.name,
+            boxcar_policy::profiles::NAMES.join(", ")
+        ));
+        return Ok(ExitCode::from(USAGE_EXIT));
+    };
+    let mut out = io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn connect(session: &SessionArgs) -> anyhow::Result<Client> {
@@ -64,15 +84,13 @@ fn show(args: &PolicyShowArgs) -> anyhow::Result<ExitCode> {
 /// Adds `args.rule` to the `verdict` list of the session's network policy
 /// and sends the policy back, unless it is there already.
 fn change(args: &PolicyRuleArgs, verdict: Verdict) -> anyhow::Result<ExitCode> {
-    let verb = match verdict {
-        Verdict::Allow => "allow",
-        Verdict::Deny => "deny",
+    let (list, verb) = match verdict {
+        Verdict::Allow => (List::Allow, "allow"),
+        Verdict::Deny => (List::Deny, "deny"),
     };
-    if let Err(error) = Policy::parse(&[format!("{verb} {}", args.rule)]) {
-        crate::cmd::tell(&format!(
-            "error: policy {verb} {:?}: {}",
-            args.rule, error.kind
-        ));
+    // Checked as the VMM will check it, before any connection is made.
+    if let Err(kind) = Policy::default().add(list, &args.rule) {
+        crate::cmd::tell(&format!("error: policy {verb} {:?}: {kind}", args.rule));
         return Ok(ExitCode::from(USAGE_EXIT));
     }
     let mut client = connect(&args.session)?;

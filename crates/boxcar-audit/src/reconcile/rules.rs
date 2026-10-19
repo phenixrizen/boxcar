@@ -317,11 +317,17 @@ pub fn observe(
             state.last_effect_ts = Some(ts);
             state.dns.observe(ts, &dns.qname, &dns.answers);
             if verdict_denied(&dns.verdict) {
-                out.push(policy_denial(
-                    state,
-                    record.seq,
-                    format!("the DNS query for {} was denied", dns.qname),
-                ));
+                // `dns_rate` is the stack's DNS rate refusing the query
+                // (boxcar-net's `dns::rate::RULE`), not a rule on its name.
+                let summary = if dns.rule.as_deref() == Some("dns_rate") {
+                    format!(
+                        "the DNS query for {} was refused: over the session's DNS rate",
+                        dns.qname
+                    )
+                } else {
+                    format!("the DNS query for {} was denied", dns.qname)
+                };
+                out.push(policy_denial(state, record.seq, summary));
             }
             out.extend(dns_spike(state, record.seq, ts));
         }

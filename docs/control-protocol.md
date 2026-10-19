@@ -218,7 +218,9 @@ without a network card or a vsock device reports that part empty.
 Parameters: `net` and `vsock`, each optional and in the shape `policy.get`
 reports, each replacing its whole policy. At least one must be given. The
 result is `{"policy_version":V}`, the version from now on, and the update is
-recorded as `policy.changed{by_pid, version}`.
+recorded as `policy.changed{by_pid, version}`. A policy file's DNS rate
+(`max_dns_qps`, `boxcar run --policy`) is no part of it: the rate stays as
+the session started.
 
 The network policy in force puts every deny before every allow, each list
 in the order given, as `boxcar run` orders `--deny` and `--allow`: the first
@@ -240,7 +242,8 @@ connections already made to a port taken off the list stay open.
 Errors, with nothing changed: `bad_request` (parameters that do not parse;
 neither `net` nor `vsock`; over 4096 rules; a rule empty or over 512 bytes;
 over 1024 ports; a rule that does not parse, named as
-`net.allow[2] "exa_mple.com": ...`; a port below 1027, named as
+`net.allow[2] "exa_mple.com": ...` (a rule is one target: a space or a `#`
+in one is refused, not read as a comment); a port below 1027, named as
 `vsock.allow_ports[0]`), `invalid_state` (`net` on a VM without a network
 card, `vsock` on one without a vsock device).
 

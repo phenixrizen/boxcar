@@ -911,6 +911,40 @@ fn policy_denial() {
     check("policy_denial", &findings);
 }
 
+/// A query the stack's DNS rate refused is a policy denial too, and its
+/// summary says it was the rate, not a rule on the name.
+#[test]
+fn a_query_refused_for_the_rate_says_so() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.rec(
+        1500,
+        Ring::Host,
+        None,
+        Payload::NetDns(NetDns {
+            txid: 9,
+            qname: "a.example".into(),
+            qtype: 1,
+            rcode: 5,
+            answers: Vec::new(),
+            verdict: Verdict::Deny,
+            rule: Some("dns_rate".into()),
+        }),
+    ));
+    let findings = run(true, steps);
+    let denials: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.rule == "policy_denial")
+        .collect();
+    assert_eq!(denials.len(), 1, "{findings:?}");
+    assert_eq!(
+        denials[0].summary,
+        "the DNS query for a.example was refused: over the session's DNS rate"
+    );
+    assert_eq!(denials[0].score, 40);
+}
+
 #[test]
 fn unattributed_effect() {
     let mut log = Log::new();

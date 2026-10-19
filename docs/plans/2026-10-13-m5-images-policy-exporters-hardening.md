@@ -206,3 +206,14 @@ Made by Task 3 (`docs/plans/run-from-image.md`), 2026-10-17:
 - **Loopback registries are plain HTTP** (Docker's insecure-by-default rule for `localhost` and `127.0.0.0/8`), HTTPS when they decline it; redirects are followed by hand so a plain-HTTP redirect anywhere else is still refused.
 - **A given command replaces `Entrypoint` and `Cmd` both**; the image's defaults are bounded at 32 KiB.
 - **Whiteouts within a layer apply in archive order**, as Docker's applier does (pinned by Task 2's review, recorded here with Task 3).
+
+Made by Task 4 (`docs/plans/policy-files.md`), 2026-10-19:
+
+- **Denies before allows in a policy file.** Its lists have no order between them, so a deny of a target wins over an allow of it, as `--deny` before `--allow` and `policy.update` already order them; the flags add after the file's rules, as they add after a line file's.
+- **A target in a list is one word.** `Policy::from_lists` and `Policy::add` parse each target as itself, where `policy.update` used to make it a line in which a space or a `#` cut it short (`"a.test # x"` was taken as `allow a.test`); the flags and `boxcar policy allow|deny` check rules the same way.
+- **The DNS rate is the session's**, in `NetConfig`, never in the rules `policy.update` replaces, so no client can lift it; every answered message counts, malformed ones included, before the policy is read.
+- **A profile's name is the profile**; anything else given to `--policy` is a path. `--policy` does not need the network.
+- **The Debian mirrors on 80 as well as 443** in the profiles: apt's default sources are plain HTTP (signed), and 443 alone would fail `apt-get update`.
+- **Absolute globs only, 1024 entries per list, 1 MiB of text** (read no further than one byte past it); a `--policy-file` line policy keeps having no limit and is read whole.
+- **`policy.loaded` for every session**, right after `vmm.start`: `flags` names the line policy, its `--policy-file` and the file's hash when there is one.
+- **The network half in force first.** Until Task 5 enforces `[fs]`, `[exec]`, `[spans]` and `[record]`, `boxcar run` names on stderr what a policy sets of them that would restrict (`agent-isolate` sets nothing of the kind; `agent-isolate-strict` its `writable` and `[exec] deny`).

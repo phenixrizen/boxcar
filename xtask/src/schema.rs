@@ -743,6 +743,7 @@ mod tests {
             "NetConnect",
             "FsClose",
             "PolicyChanged",
+            "PolicyLoaded",
             "ClockSync",
             "ProcExec",
             "ProcSensorStatus",

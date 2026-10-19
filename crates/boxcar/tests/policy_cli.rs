@@ -285,6 +285,9 @@ fn a_rule_that_does_not_parse_exits_2_before_connecting() {
         ("allow", "a.test:0", "not a port"),
         ("allow", "two words", "one target"),
         ("allow", "", "one target"),
+        // No comment in a rule: what the VMM would refuse is refused here.
+        ("allow", "a.test # x", "one target"),
+        ("deny", "a.test#x", "not a host name"),
     ] {
         let output = policy(&missing, &[verb, rule]);
         assert_eq!(output.status.code(), Some(2), "{verb} {rule:?}");
@@ -294,6 +297,49 @@ fn a_rule_that_does_not_parse_exits_2_before_connecting() {
             stderr(&output)
         );
         assert!(!stderr(&output).contains("cannot connect"));
+    }
+}
+
+/// `boxcar policy profile NAME` with no session: what it printed.
+fn profile(name: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["policy", "profile", name])
+        .output()
+        .unwrap()
+}
+
+/// Each profile prints byte for byte as `boxcar run --policy NAME` reads
+/// it, so a copy of it in a file is the same policy.
+#[test]
+fn policy_profile_prints_each_profile_as_run_reads_it() {
+    for name in boxcar_policy::profiles::NAMES {
+        let output = profile(name);
+        assert_eq!(output.status.code(), Some(0), "{name}: {}", stderr(&output));
+        let text = boxcar_policy::profiles::text(name).unwrap();
+        assert_eq!(stdout(&output), text, "{name}");
+        assert_eq!(
+            boxcar_policy::parse(&stdout(&output)).unwrap(),
+            boxcar_policy::parse(text).unwrap()
+        );
+    }
+}
+
+/// A name there is no profile of is a usage error that names the ones
+/// there are.
+#[test]
+fn policy_profile_refuses_a_name_there_is_no_profile_of() {
+    for name in ["agent", "Agent-Isolate", "./agent-isolate", ""] {
+        let output = profile(name);
+        assert_eq!(output.status.code(), Some(2), "{name:?}");
+        assert!(stdout(&output).is_empty());
+        assert!(
+            stderr(&output).contains(&format!(
+                "error: there is no profile {name:?}; the profiles are agent-isolate, \
+                 agent-isolate-strict"
+            )),
+            "{name:?}: {}",
+            stderr(&output)
+        );
     }
 }
 

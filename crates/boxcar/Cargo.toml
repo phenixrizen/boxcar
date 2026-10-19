@@ -21,6 +21,8 @@ boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
 boxcar-net = { workspace = true }
+# Policy files and the built-in profiles (`run --policy`, `policy profile`).
+boxcar-policy = { workspace = true }
 # The gated tests' extra upstream roots are certificates (`--features kvm-tests`).
 rustls-pki-types = { workspace = true }
 boxcar-vsock = { workspace = true }

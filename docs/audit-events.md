@@ -51,7 +51,8 @@ Common pieces:
   `builtin:this-net` (`0.0.0.0/8`), `builtin:reserved` (multicast and
   reserved), `builtin:private` (a private range no rule lifts),
   `builtin:host-local` (one of the host's own addresses),
-  `builtin:udp-needs-cidr` (a domain allow passed over for UDP); `null` when
+  `builtin:udp-needs-cidr` (a domain allow passed over for UDP), or for
+  `net.dns`, `dns_rate` (a query over the policy's `max_dns_qps`); `null` when
   the policy's default decided.
 - `attrib`: whose identity `subject` is: `caller` (the requesting process)
   or `handle` (the process that opened the handle, when the request had no
@@ -121,7 +122,7 @@ either kind within a session.
 | Type | Fields | When |
 |---|---|---|
 | `net.dhcp` | `op` (`offer` or `ack`), `yiaddr` | The gateway answered a DHCP DISCOVER or REQUEST with the static lease. |
-| `net.dns` | `txid`, `qname`, `qtype` (1 A, 28 AAAA, ...), `rcode` (0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, 1 FORMERR), `answers [string]` (the addresses given), `verdict`, `rule` | A guest DNS query was answered: NXDOMAIN when the policy denies the name, else the upstream's answer (AAAA records stripped), SERVFAIL when the upstream did not answer in 5 s. |
+| `net.dns` | `txid`, `qname`, `qtype` (1 A, 28 AAAA, ...), `rcode` (0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, 1 FORMERR, 5 REFUSED), `answers [string]` (the addresses given), `verdict`, `rule` | A guest DNS query was answered: REFUSED, `verdict` `deny` and `rule` `dns_rate` when it came over the policy's `max_dns_qps` (counted before anything else, malformed queries included; nothing goes upstream), NXDOMAIN when the policy denies the name, else the upstream's answer (AAAA records stripped), SERVFAIL when the upstream did not answer in 5 s. |
 | `net.connect` | `flow`, `proto` (`tcp`), `src` (`ip:port`), `dst`, `names [string]` (the names DNS answers gave `dst`, newest first), `verdict`, `rule` | A guest SYN was decided, before anything answered it. A denied one gets an RST. |
 | `net.tls` | `flow`, `kind` (`tls` or `http`), `sni` (or null), `alpn [string]`, `verdict`, `inspect` (omitted when false) | The gate read a flow's first bytes: a flow a domain rule allowed must show that name as its TLS server name or HTTP `Host`, or both sides are reset. `inspect` is true when an `inspect` line names the flow: a TLS flow then gets a `net.inspect`, a plain HTTP flow is observed as it is. A flow a network rule allowed gets this record only when it is inspected. |
 | `net.inspect` | `flow`, `sni` (or null), `alpn` (the protocol both legs agreed on, or null), `version` (`1.3`, `1.2`, or null), `result`, `rule` | The gate ended an inspected flow's TLS, or could not. `result`: `ok` (recorded before any plaintext moves), `upstream_untrusted` (the real host's certificate is not one the host's trust store vouches for), `upstream_failed` (its handshake failed otherwise), `guest_rejected` (the guest refused the session CA's leaf, or closed during the handshake), `timeout` (the handshakes outran the gate's time). On anything but `ok` nothing was relayed, and the flow's `net.close` says `inspect`. |
@@ -162,6 +163,7 @@ session's process (uid and gid as configured).
 
 | Type | Fields | When |
 |---|---|---|
+| `policy.loaded` | `source` (`profile`, `file` or `flags`), `name` (or null), `sha256` (or null), `egress_rules`, `fs_rules`, `exec_rules` | The policy the session started with: once, right after `vmm.start`, before anything else is recorded. `source` is `profile` for `boxcar run --policy NAME`, `file` for `--policy PATH` (a TOML policy file), `flags` for the line policy (`--policy-file`, `--deny`, `--allow`, `--inspect`, or none of them). `name` is the profile's name or the path as given to `--policy` or `--policy-file` (4096 bytes at most), `sha256` the SHA-256, lowercase hex, of the text the policy was read from; both null when there was none. `egress_rules` counts the allow, deny and inspect rules in force, the flags' included; `fs_rules` the policy file's `[fs]` globs (`writable`, its default `/workspace/**` included, `denied`, `indicators`) and `exec_rules` its `[exec] deny` globs, both 0 for a line policy. |
 | `policy.changed` | `by_pid`, `version` | A control client replaced the session's policy (`policy.update`): the network rules, the vsock allowlist, or both. `version` is 1 for the policy the VM started with, one more for each update; `policy.get` reports it. The flows the new policy denies end with `net.close{reason:"policy"}`. |
 
 ## `sync` (host, src `vmm`)
@@ -251,7 +253,8 @@ that span (`span.effects`, docs/reconciler.md).
 
 Records are chained in the order the single writer took them, which is the
 order their producers submitted them, across all sources. A `vmm.start`
-is first; `vmm.stop` and a closing `checkpoint` are last. A `net.connect`
+is first and `policy.loaded` second; `vmm.stop` and a closing `checkpoint`
+are last. A `net.connect`
 precedes its flow's `net.tls` and `net.close`; `net.tls{allow}` is in the
 log before the first held byte reaches the host; `net.udp{allow}` before
 its first datagram does. Every record is on disk by the next checkpoint

@@ -116,7 +116,8 @@ pub enum Command {
     /// remove an image or a tag, prune what nothing names.
     #[command(subcommand)]
     Image(ImageCommand),
-    /// Show or change a running session's network policy.
+    /// Show or change a running session's network policy, or print a
+    /// built-in policy file.
     ///
     /// `show` prints the policy in force, as a table or with `--json` as
     /// the control socket returns it: its version, its default, the allow
@@ -129,10 +130,13 @@ pub enum Command {
     /// `policy`) and records `policy.changed`. Every deny comes before every
     /// allow, so a deny of a target wins over an allow of it. The session is
     /// the one `--control` or SESSION_ID names, or the only one running.
+    /// `profile NAME` prints a built-in policy file, the text `boxcar run
+    /// --policy NAME` reads; it needs no session.
     ///
     /// Exits 0 and prints `policy version N`, 1 when the control socket
     /// cannot be reached or refuses the change (a VM without a network card
-    /// has no policy to change), 2 for a RULE that does not parse.
+    /// has no policy to change), 2 for a RULE that does not parse or a
+    /// profile there is none of.
     #[command(subcommand)]
     Policy(PolicyCommand),
     /// Boot a microVM.
@@ -185,9 +189,9 @@ pub enum Command {
     /// s in all), and says on stderr how many bytes stdout did not get.
     ///
     /// With shares the guest also gets a network card (see `--net`): it
-    /// reaches only what the policy allows (`--policy-file`, `--deny`,
-    /// `--allow`; everything else is denied), and every DNS query and
-    /// connection is in the audit log. A policy rule that does not parse
+    /// reaches only what the policy allows (`--policy` or `--policy-file`,
+    /// `--deny`, `--allow`; everything else is denied), and every DNS query
+    /// and connection is in the audit log. A policy that does not parse
     /// exits 2.
     ///
     /// With shares the guest also gets a vsock device (see `--vsock`),
@@ -235,6 +239,16 @@ pub enum PolicyCommand {
     Allow(PolicyRuleArgs),
     /// Deny RULE: add it to the deny rules (and take it out of the allows).
     Deny(PolicyRuleArgs),
+    /// Print the built-in policy file NAME, as `boxcar run --policy NAME`
+    /// reads it. Needs no session.
+    Profile(PolicyProfileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PolicyProfileArgs {
+    /// `agent-isolate` or `agent-isolate-strict`.
+    #[arg(value_name = "NAME")]
+    pub name: String,
 }
 
 #[derive(Debug, Args)]
@@ -488,12 +502,13 @@ pub struct RunArgs {
     /// clients that present the name, in a TLS SNI or an HTTP Host header,
     /// and lets it resolve; SSH, SMTP, and UDP need a CIDR rule. Private
     /// and local networks stay denied unless a rule names one exactly.
-    /// Repeatable; the allows come after `--policy-file` and `--deny`, and
-    /// the first rule that matches decides.
+    /// Repeatable; the allows come after the policy's own rules (`--policy`
+    /// or `--policy-file`) and `--deny`, and the first rule that matches
+    /// decides.
     #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
     pub allow: Vec<String>,
     /// Deny the guest RULE, written as for `--allow`. Repeatable; the
-    /// denies come after `--policy-file` and before `--allow`.
+    /// denies come after the policy's own rules and before `--allow`.
     #[arg(long, value_name = "RULE", conflicts_with = "no_net")]
     pub deny: Vec<String>,
     /// Read policy rules from PATH, one a line: `allow RULE`, `deny RULE`,
@@ -501,6 +516,20 @@ pub struct RunArgs {
     /// (deny if none says); `#` starts a comment. Its rules come first.
     #[arg(long, value_name = "PATH", conflicts_with = "no_net")]
     pub policy_file: Option<PathBuf>,
+    /// The session's policy: a built-in profile by NAME (`agent-isolate`,
+    /// `agent-isolate-strict`; `boxcar policy profile NAME` prints one), or
+    /// a policy file at FILE, anything else (`./agent-isolate` for a file
+    /// of that name). A policy file is TOML: `version = 1`, `[egress]`
+    /// (`default`, `allow`, `deny`, `inspect` and `max_dns_qps`, the guest's
+    /// DNS queries a second), `[fs]` (`writable`, `denied`, `indicators`),
+    /// `[exec]` (`deny`), `[spans]` (`keep_tool_args`) and `[record]`
+    /// (`scrub_argv`). Its egress comes first, the denies before the
+    /// allows; `--deny`, `--allow` and `--inspect` add to it. Recorded as
+    /// `policy.loaded`. This build enforces its `[egress]` and the DNS rate
+    /// and records the rest, saying on stderr what it would restrict. A
+    /// policy that does not parse exits 2, with its line and column.
+    #[arg(long, value_name = "FILE|NAME", conflicts_with = "policy_file")]
+    pub policy: Option<PathBuf>,
     /// Watch the guest's traffic to RULE, written as for `--allow` (which
     /// must still admit it): a connection whose name, or address for a
     /// CIDR rule, matches ends its TLS in boxcar, which connects to the
