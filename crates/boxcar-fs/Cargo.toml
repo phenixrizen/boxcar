@@ -17,6 +17,10 @@ virtio-bindings = { workspace = true }
 vmm-sys-util = { workspace = true }
 event-manager = { workspace = true }
 blake3 = { workspace = true }
+# The path rules: guest-path globs, and the rules every share reads,
+# swapped whole when an exception comes or goes.
+globset = { workspace = true }
+arc-swap = { workspace = true }
 # `path_b64`: a name that is not UTF-8, as its raw bytes.
 base64 = { workspace = true }
 crossbeam-channel = { workspace = true }

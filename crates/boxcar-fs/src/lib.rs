@@ -7,6 +7,8 @@
 //! - [`device`]: [`VirtioFs`], the virtio-fs device serving a share.
 //! - [`audit_fs`]: [`AuditFs`], the `FileSystem` decorator that records.
 //! - [`path_map`]: inode to path, without syscalls.
+//! - [`rules`]: the path rules a policy puts in force, by guest path.
+//! - [`scan`]: what a share's denied paths are, by host identity.
 //! - [`handles`]: open handles and what went through them.
 //! - [`hasher`]: content hashes for `fs.close`, off the reply path.
 //! - `events` and `forward`: building submissions, and the `forward!` macro
@@ -21,6 +23,8 @@ mod events;
 pub mod handles;
 pub mod hasher;
 pub mod path_map;
+pub mod rules;
+pub mod scan;
 pub mod share;
 
 pub use audit_fs::{AuditFs, AuditFsOptions, AuditLevel};
@@ -28,6 +32,8 @@ pub use device::{FsError, FsServer, OpcodeCounts, VirtioFs, MAX_REQUEST_QUEUES};
 pub use handles::{HandleEntry, HandleTable};
 pub use hasher::{HashJob, HashWorker};
 pub use path_map::{FileId, PathMap, PathText, ROOT_INO};
+pub use rules::{LiveRules, PathRules, PathSpec};
+pub use scan::{DeniedIds, ScanError};
 pub use share::{passthrough_config, CachePolicyKind, FsShareConfig};
 
 #[cfg(test)]

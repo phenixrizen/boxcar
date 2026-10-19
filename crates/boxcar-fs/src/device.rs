@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
 use boxcar_virtio::features::{EVENT_IDX, VERSION_1};
 use boxcar_virtio::{drain_queue, ActivateError, ActivatedQueue, IrqTrigger, VirtioDevice};
@@ -64,6 +65,8 @@ use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use crate::audit_fs::{AuditFs, AuditFsOptions};
+use crate::rules::{LiveRules, PathRules};
+use crate::scan::DeniedIds;
 use crate::share::{passthrough_config, FsShareConfig};
 
 /// The virtio device ID of a file system device.
@@ -142,6 +145,20 @@ impl VirtioFs {
         opts: AuditFsOptions,
         request_queues: u16,
     ) -> Result<Self, FsError> {
+        let rules = Arc::new(ArcSwap::from_pointee(PathRules::allow_all()));
+        Self::with_rules(share, sink, opts, request_queues, rules, Arc::default())
+    }
+
+    /// [`new`](Self::new), with `rules` in force on the share and `denied`,
+    /// what the session's boot scan found ([`crate::scan`]).
+    pub fn with_rules(
+        share: FsShareConfig,
+        sink: AuditSink,
+        opts: AuditFsOptions,
+        request_queues: u16,
+        rules: LiveRules,
+        denied: Arc<DeniedIds>,
+    ) -> Result<Self, FsError> {
         if request_queues == 0 || request_queues > MAX_REQUEST_QUEUES {
             return Err(FsError::RequestQueues(request_queues));
         }
@@ -159,7 +176,7 @@ impl VirtioFs {
                 source,
             }
         })?;
-        let fs = Arc::new(AuditFs::new(inner, &share, root, sink, opts));
+        let fs = Arc::new(AuditFs::new(inner, &share, root, sink, opts).with_rules(rules, denied));
         let server = Arc::new(Server::new(Arc::clone(&fs)));
         Ok(VirtioFs {
             metrics: Arc::new(OpcodeCounts::new(&share.tag)),
