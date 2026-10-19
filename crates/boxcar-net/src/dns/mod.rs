@@ -4,9 +4,11 @@
 //! DNS for the guest: the gateway (`10.0.2.2:53`) answers its queries by
 //! forwarding them to the host's resolver, under the egress policy.
 //!
-//! A guest message that is not one plain query (a response, another
-//! opcode, other than one question, or one that does not read) gets
-//! FORMERR. A name the policy denies gets NXDOMAIN, made here. Any other
+//! With a rate (`NetConfig::max_dns_qps`, a policy file's `max_dns_qps`),
+//! every guest message is counted against it first: one over the rate gets
+//! REFUSED, made here, and goes no further ([`rate`]). A guest message that
+//! is not one plain query (a response, another opcode, other than one
+//! question, or one that does not read) gets FORMERR. A name the policy denies gets NXDOMAIN, made here. Any other
 //! query goes upstream ([`forwarder`]); its answer comes back to the guest
 //! with the guest's id, without AAAA answers (the guest network carries no
 //! IPv6), and cut to its header and question with TC set if it would not
@@ -17,10 +19,12 @@
 //! - [`parse`]: reading, and rewriting, DNS messages.
 //! - [`forwarder`]: the upstream socket and the queries waiting on it.
 //! - [`cache`]: which names each address was given for.
+//! - [`rate`]: how many messages a second the guest may send.
 
 pub mod cache;
 pub mod forwarder;
 pub mod parse;
+pub mod rate;
 
 use parse::{Header, FLAG_OPCODE, FLAG_QR, FLAG_RA, FLAG_RCODE, FLAG_RD, FLAG_TC};
 
@@ -31,6 +35,7 @@ pub const NOERROR: u16 = 0;
 pub const FORMERR: u16 = 1;
 pub const SERVFAIL: u16 = 2;
 pub const NXDOMAIN: u16 = 3;
+pub const REFUSED: u16 = 5;
 
 /// The largest DNS message the guest's link carries in one frame: the IP
 /// MTU less the IPv4 and UDP headers.

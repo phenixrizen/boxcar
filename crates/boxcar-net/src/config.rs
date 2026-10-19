@@ -52,6 +52,10 @@ pub struct NetConfig {
     pub tcp: TcpLimits,
     /// The UDP relay's bounds.
     pub udp: UdpLimits,
+    /// The DNS messages a second the guest may send, in a burst of as many
+    /// (a policy file's `max_dns_qps`); `None` for no rate. Fixed for the
+    /// session: `policy.update` replaces the rules, never this.
+    pub max_dns_qps: Option<u32>,
 }
 
 /// The fixed addressing, with [`FALLBACK_DNS`] as the only upstream.
@@ -68,6 +72,7 @@ impl Default for NetConfig {
             dns_upstreams: vec![FALLBACK_DNS],
             tcp: TcpLimits::default(),
             udp: UdpLimits::default(),
+            max_dns_qps: None,
         }
     }
 }
@@ -149,6 +154,9 @@ impl NetConfig {
         if self.dns_upstreams.is_empty() {
             return Err(ConfigError::NoDnsUpstream);
         }
+        if self.max_dns_qps == Some(0) {
+            return Err(ConfigError::DnsRate);
+        }
         self.tcp.check().map_err(ConfigError::TcpLimits)?;
         self.udp.check().map_err(ConfigError::UdpLimits)?;
         Ok(())
@@ -196,6 +204,8 @@ pub enum ConfigError {
     TcpLimits(&'static str),
     #[error("{0}")]
     UdpLimits(&'static str),
+    #[error("a DNS rate of 0 queries a second answers nothing; give none for no rate")]
+    DnsRate,
 }
 
 fn mac_text(mac: [u8; 6]) -> String {
@@ -268,6 +278,8 @@ mod tests {
             cfg.validate()
         };
         assert_eq!(with(|c| c.netmask = 0), Err(ConfigError::Netmask(0)));
+        assert_eq!(with(|c| c.max_dns_qps = Some(0)), Err(ConfigError::DnsRate));
+        assert_eq!(with(|c| c.max_dns_qps = Some(1)), Ok(()));
         assert_eq!(with(|c| c.netmask = 31), Err(ConfigError::Netmask(31)));
         assert_eq!(with(|c| c.netmask = 99), Err(ConfigError::Netmask(99)));
         assert!(matches!(

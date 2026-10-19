@@ -64,6 +64,7 @@ use crate::audit::{self, DropReason, Drops};
 use crate::config::{ConfigError, NetConfig};
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{self, ForwardError, Forwarder, Pending, Received};
+use crate::dns::rate::{self, QueryRate};
 use crate::dns::{self as dns, parse};
 use crate::dump::FrameDump;
 use crate::frame::{self, classify, Dispatch, DNS_PORT};
@@ -129,6 +130,8 @@ pub struct NetStack {
     dns_cache: DnsCache,
     /// Whether the net thread has been asked to watch the DNS socket.
     dns_watched: bool,
+    /// The guest's DNS rate (`NetConfig::max_dns_qps`), if it has one.
+    dns_rate: Option<QueryRate>,
     /// The TCP relay: the guest's connections and their host sockets.
     tcp: Relay,
     /// The UDP relay: the guest's mappings and their host sockets.
@@ -198,6 +201,7 @@ impl NetStack {
         iface.set_any_ip(true);
         let tcp = Relay::new(cfg.tcp.clone());
         let udp = UdpRelay::new(cfg.udp.clone());
+        let dns_rate = cfg.max_dns_qps.map(QueryRate::new);
         let policy_seen = policy.load_full();
         Ok(NetStack {
             cfg,
@@ -211,6 +215,7 @@ impl NetStack {
             dns,
             dns_cache: DnsCache::new(),
             dns_watched: false,
+            dns_rate,
             tcp,
             udp,
             ids,
@@ -581,9 +586,10 @@ impl NetStack {
 
     /// A guest DNS message to the gateway, from `guest`. One shorter than a
     /// header is dropped as `dns`. Every other gets exactly one answer and
-    /// one `net.dns`: FORMERR if it is not one plain query, NXDOMAIN if the
-    /// policy denies the name, else the upstream's answer, or SERVFAIL if
-    /// the query cannot be sent or waits too long.
+    /// one `net.dns`: REFUSED if it comes over the DNS rate (counted before
+    /// anything else is decided), FORMERR if it is not one plain query,
+    /// NXDOMAIN if the policy denies the name, else the upstream's answer,
+    /// or SERVFAIL if the query cannot be sent or waits too long.
     fn dns_query(&mut self, frame: &[u8], guest: SocketAddrV4, now: Instant) {
         let Some(message) = frame::udp_payload(frame) else {
             return self.drop_frame(DropReason::Other, now);
@@ -591,14 +597,25 @@ impl NetStack {
         let Ok(header) = parse::Header::parse(message) else {
             return self.drop_frame(DropReason::Dns, now);
         };
+        if self.dns_rate.as_mut().is_some_and(|rate| !rate.admit(now)) {
+            let (qname, qtype) = question_as_read(message, &header);
+            if let Some(reply) = dns::error_reply(message, dns::REFUSED) {
+                self.send_dns(guest, &reply, now);
+            }
+            return self.record(Payload::NetDns(NetDns {
+                txid: header.id,
+                qname,
+                qtype,
+                rcode: dns::REFUSED,
+                answers: Vec::new(),
+                verdict: Verdict::Deny,
+                rule: Some(rate::RULE.to_owned()),
+            }));
+        }
         let (txid, question) = match parse::parse_query(message) {
             Ok(query) => query,
             Err(_) => {
-                // Named in the record as well as it reads.
-                let (qname, qtype) = match parse::read_question(message) {
-                    Ok(q) if header.counts[0] == 1 => (parse::name_display(&q.name), q.qtype),
-                    _ => (String::new(), 0),
-                };
+                let (qname, qtype) = question_as_read(message, &header);
                 let (verdict, rule) = self.policy.load().dns_rule(&qname);
                 if let Some(reply) = dns::error_reply(message, dns::FORMERR) {
                     self.send_dns(guest, &reply, now);
@@ -725,6 +742,19 @@ impl NetStack {
         if let Some(counted) = self.drops.count(reason, now) {
             audit::try_emit(&self.sink, Payload::NetDrop(counted));
         }
+    }
+}
+
+/// The name and type of `message`'s question, as well as it reads, for its
+/// record: the query's own when it is one plain query (the name in
+/// lowercase), else its one question's as written, else none (`""`, 0).
+fn question_as_read(message: &[u8], header: &parse::Header) -> (String, u16) {
+    if let Ok((_, question)) = parse::parse_query(message) {
+        return (question.name, question.qtype);
+    }
+    match parse::read_question(message) {
+        Ok(q) if header.counts[0] == 1 => (parse::name_display(&q.name), q.qtype),
+        _ => (String::new(), 0),
     }
 }
 

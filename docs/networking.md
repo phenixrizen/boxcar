@@ -22,6 +22,12 @@ README's "Networking and policy".
   (`/etc/resolv.conf`, or `--dns`), with AAAA answers stripped, a 5 s
   timeout (SERVFAIL), a cache of 4096 answers that the policy's domain
   rules are matched against, and NXDOMAIN for a name the policy denies.
+  A policy file's `max_dns_qps` (`boxcar run --policy`) bounds the
+  queries: a burst of that many, then one each `1 s / max_dns_qps`; one
+  over the rate, malformed or not, is answered REFUSED before anything else
+  is decided, recorded `net.dns{verdict:"deny", rule:"dns_rate"}`, and goes
+  no further. The rate is the session's: `policy.update` replaces the
+  rules, never the rate.
 - TCP: the guest's SYN is decided before it is answered (`net.connect`); an
   allowed one starts a host connect, and only when that succeeds does the
   guest get its SYN-ACK. A connect that takes over 10 s, or fails, resets
@@ -88,6 +94,7 @@ README's "Networking and policy".
   the control socket work as usual.
 - Policy flags (`--allow`, `--deny`, `--policy-file`, `--dns`) are refused
   with `--no-fs` and no `--net`: there is no network to apply them to.
+  `--policy` is not: a policy file is about more than the network.
 - An attach client (`boxcar attach`, a `pty.attach` connection) that lets
   1 MiB of output pile up, or takes nothing for 30 s, is detached by the
   runtime (`pty.detached`, reason `slow`; `boxcar attach` exits 3). A
