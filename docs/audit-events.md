@@ -99,8 +99,20 @@ the first 4096 of them. The other names (`path_at_open`, `target_path`,
 | `fs.setattr` | `mount`, `path`, `set {mode, uid, gid, size, atime, mtime}` (each omitted when not asked), `result` |
 | `fs.fallocate` | `mount`, `path`, `offset`, `len`, `mode`, `result` |
 | `fs.xattr` | `mount`, `path`, `name`, `op` (`set` or `remove`), `result` |
-| `fs.denied` | `mount`, `path`, `op` (`lookup`, `access`, `open`, ...), `errno` |
+| `fs.denied` | `mount`, `path`, `op` (`lookup`, `access`, `open`, `exec` (an open to run a program), `create`, `rename`, `write`, `setattr`, `getattr`, ...), `errno`, `reason` (`policy`, or omitted), `rule` (or omitted) |
 | `fs.readdir` | `mount`, `path`, `result` |
+
+`fs.denied` is a refusal: of the host's own (`errno` as the host gave it,
+`reason` omitted), or of the session's policy (`reason` `policy`), made
+before the request reached the host, which then changed nothing and got no
+other record. A policy refusal is `EACCES` for a denied path (`[fs]
+denied`), a refused program (`[exec] deny`: any open of it, its rename,
+its link) or a node id the guest was never handed, and `EROFS` for a change
+outside `[fs] writable`; `rule` is the glob that refused it, also when the
+file was refused by its identity under another name (a hard link, a case
+variant), and is omitted for an `EROFS`, where no glob matched, and for a
+node id with no path (`path` is then `<ino:N>`). A `readdirplus` entry the
+policy denies is listed without its inode and recorded nowhere.
 
 `fs.close.hash_status`: `ok` (`blake3` is set), `raced` (the file changed
 while it was hashed), `gone`, `skipped_size` (over the hashing limit),
@@ -164,7 +176,8 @@ session's process (uid and gid as configured).
 | Type | Fields | When |
 |---|---|---|
 | `policy.loaded` | `source` (`profile`, `file` or `flags`), `name` (or null), `sha256` (or null), `egress_rules`, `fs_rules`, `exec_rules` | The policy the session started with: once, right after `vmm.start`, before anything else is recorded. `source` is `profile` for `boxcar run --policy NAME`, `file` for `--policy PATH` (a TOML policy file), `flags` for the line policy (`--policy-file`, `--deny`, `--allow`, `--inspect`, or none of them). `name` is the profile's name or the path as given to `--policy` or `--policy-file` (4096 bytes at most), `sha256` the SHA-256, lowercase hex, of the text the policy was read from; both null when there was none. `egress_rules` counts the allow, deny and inspect rules in force, the flags' included; `fs_rules` the policy file's `[fs]` globs (`writable`, its default `/workspace/**` included, `denied`, `indicators`) and `exec_rules` its `[exec] deny` globs, both 0 for a line policy. |
-| `policy.changed` | `by_pid`, `version` | A control client replaced the session's policy (`policy.update`): the network rules, the vsock allowlist, or both. `version` is 1 for the policy the VM started with, one more for each update; `policy.get` reports it. The flows the new policy denies end with `net.close{reason:"policy"}`. |
+| `policy.changed` | `by_pid`, `version` | A control client replaced the session's permanent policy (`policy.update`): the network rules, the vsock allowlist, or both; or, with `by_pid` 0, live exceptions expired. `version` is 1 for the policy the VM started with, one more for each update, grant and expiry; `policy.get` reports it. The flows the new policy denies end with `net.close{reason:"policy"}`. |
+| `policy.exception` | `id`, `rule`, `kind` (`egress`, `writable` or `exec`), `ttl_s`, `expires_ns`, `by_pid`, `version` | A control client granted a live exception (`policy.update` with `exception`): an egress target allowed after the permanent rules, a path glob writes may name, or a path glob programs may be run from despite `[exec] deny`, for `ttl_s` seconds. `id` counts from 1 for the session; `expires_ns` is when it goes, by the clock of `ts_host_ns` (it is kept by `CLOCK_BOOTTIME`, so a step of the wall clock does not move it); it goes with a `policy.changed{by_pid: 0}`. |
 
 ## `sync` (host, src `vmm`)
 
@@ -239,7 +252,7 @@ that span (`span.effects`, docs/reconciler.md).
 |---|---|---|
 | `llm.request` | `flow`, `stream`, `provider` (`anthropic`, `openai_chat`, `openai_responses`), `model`, `streaming`, `messages` (count), `system_b3`, `tools [string]` (names, at most 64), `max_tokens`, `body_bytes`, `body_b3`, `degraded` | A request's body ended; over WebSocket, a `response.create` message came. The `tool.close`s it carried follow it. |
 | `tool.close` | `flow`, `stream`, `tool_use_id`, `status` (`ok` or `error`), `result_bytes`, `result_b3`, `result_summary` (scrubbed by key when it is JSON, as free text otherwise) | The request carried a tool result (`tool_result`, a `role: tool` message, a `function_call_output`): the span closes. |
-| `tool.open` | `flow`, `stream`, `tool_use_id`, `tool_name`, `args_b3`, `args_summary`, `args` (the arguments as JSON when at most 8 KiB, omitted otherwise; both scrubbed by key and in their strings) | The model's reply asked for a tool: in a stream, as soon as the call's arguments are whole; in a document, at its end. The span opens. |
+| `tool.open` | `flow`, `stream`, `tool_use_id`, `tool_name`, `args_b3`, `args_summary`, `args` (the arguments as JSON when at most 8 KiB, omitted otherwise; both scrubbed by key and in their strings; with a policy file's `[spans] keep_tool_args = false`, `args` is omitted and `args_summary` is `[arguments not kept: keep_tool_args = false]`) | The model's reply asked for a tool: in a stream, as soon as the call's arguments are whole; in a document, at its end. The span opens. |
 | `llm.response` | `flow`, `stream`, `provider`, `model` (cut at 256 bytes, as `stop_reason` and `llm.request`'s `model` and `tools` names are), `stop_reason`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `text_bytes`, `text_b3`, `tool_uses`, `dur_ms`, `degraded` | The reply ended (the stream's end, the document's end, or over WebSocket the `response.completed`); `degraded` says what cut it short (`stream_unfinished`, `stream_error`, `block_unfinished`, `call_unfinished`, `event_json`, `response_json`, `body_truncated`, `flow_closed`, `stream_budget` (the reply's tool calls gathered more than 16 MiB, or more than 256 were under way at once: no call grew further), `observe_budget` (the observer's 256 MiB across every flow was spent), `sse_line`). A tool id over 256 bytes is kept as its first 128 bytes, `~b3:` and the hash of the whole id, an open and its close alike, and a tool name is cut at 1 KiB; a call whose arguments lost a piece for want of room carries none (`args_summary` `[arguments not kept whole]`). |
 
 ## `span.*` and `finding` (host, src `reconciler`)

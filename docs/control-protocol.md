@@ -29,7 +29,7 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
   events between responses.
 
 ```text
-<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings","spans"]}
+<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings","spans","policy.exception"]}
 -> {"v":1,"id":1,"op":"status"}
 <- {"v":1,"id":1,"ok":true,"result":{"state":"running",...}}
 -> {"v":1,"id":2,"op":"stop","mode":"graceful"}
@@ -44,9 +44,10 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
 `"boxcar.control"`, `versions` `[1]`, `server` `"boxcar/<version>"`,
 `session_id`, and `capabilities`: the op families served beyond `status`
 and `stop`, today
-`["pty","audit","policy.net","policy.inspect","findings","spans"]`
+`["pty","audit","policy.net","policy.inspect","findings","spans","policy.exception"]`
 (`policy.inspect`: the network policy carries `inspect` lines; `spans`:
-`span.list` is served).
+`span.list` is served; `policy.exception`: `policy.update` grants live
+exceptions and `policy.get` lists them).
 
 **Request**: `{"v":1,"id":N,"op":"<op>", ...}`. `id` is an unsigned
 64-bit integer the client chooses; every other field is a parameter of the
@@ -193,13 +194,16 @@ or has failed), `internal` (the log cannot be read).
 
 ### `policy.get`
 
-No parameters. The result is the policy in force:
+No parameters. The result is the permanent policy in force, and the live
+exceptions apart from it:
 
 ```json
 {"net":{"default":"deny","allow":["example.com:443","*.github.io"],"deny":["10.0.0.0/8"],
         "inspect":["api.anthropic.com:443"]},
  "vsock":{"allow_ports":[5000]},
- "version":1}
+ "version":3,
+ "exceptions":[{"id":1,"rule":"pypi.org:443","kind":"egress","ttl_s":600,
+                "expires_ns":1760000600000000000,"by_pid":4242}]}
 ```
 
 `net.default` is `allow` or `deny`; `net.allow` and `net.deny` are the
@@ -210,17 +214,32 @@ run --inspect`) the same way: destinations whose TLS the gate ends and
 whose traffic it observes once an allow rule admitted the connection; they
 decide no verdict, and a server from before them leaves the list out. `vsock.allow_ports` are the host ports a guest
 vsock connection may reach besides the VMM's own (1024 to 1026). `version`
-is 1 for the policy the VM started with, one more for each update. A VM
-without a network card or a vsock device reports that part empty.
+is 1 for the policy the VM started with, one more for each update, grant
+and expiry. A VM without a network card or a vsock device reports that
+part empty. `exceptions` lists the live exceptions by id (omitted when there
+are none): `kind` `egress`, `writable` or `exec`, `expires_ns` by the
+clock of a record's `ts_host_ns`. `net` never holds an exception, so a
+client that writes back what it read never makes one permanent.
 
 ### `policy.update`
 
 Parameters: `net` and `vsock`, each optional and in the shape `policy.get`
-reports, each replacing its whole policy. At least one must be given. The
-result is `{"policy_version":V}`, the version from now on, and the update is
-recorded as `policy.changed{by_pid, version}`. A policy file's DNS rate
-(`max_dns_qps`, `boxcar run --policy`) is no part of it: the rate stays as
-the session started.
+reports, each replacing its whole permanent policy (the live exceptions
+stay, with their expiries); or `exception` alone. At least one must be
+given. The result is `{"policy_version":V}`, the version from now on, and
+the update is recorded as `policy.changed{by_pid, version}`. A policy
+file's DNS rate (`max_dns_qps`, `boxcar run --policy`) and its path rules
+are no part of it: they stay as the session started.
+
+`{"exception":{"rule":"pypi.org:443","kind":"egress","ttl_s":600}}` grants
+a live exception for `ttl_s` seconds (1 to 86400), recorded as
+`policy.exception`: an `egress` target, written as for `--allow`, is
+allowed after the permanent rules (a permanent deny of it still wins); a
+`writable` glob (absolute, as a policy file's) is a path writes may name;
+an `exec` glob lifts `[exec] deny` for the programs it names. At most 64
+live at once. At its expiry the VMM removes it, as an update would
+(`policy.changed{by_pid: 0}`), and ends the flows it alone allowed. An
+`exception` beside `net` or `vsock` is refused.
 
 The network policy in force puts every deny before every allow, each list
 in the order given, as `boxcar run` orders `--deny` and `--allow`: the first
@@ -244,8 +263,12 @@ neither `net` nor `vsock`; over 4096 rules; a rule empty or over 512 bytes;
 over 1024 ports; a rule that does not parse, named as
 `net.allow[2] "exa_mple.com": ...` (a rule is one target: a space or a `#`
 in one is refused, not read as a comment); a port below 1027, named as
-`vsock.allow_ports[0]`), `invalid_state` (`net` on a VM without a network
-card, `vsock` on one without a vsock device).
+`vsock.allow_ports[0]`; an exception beside `net` or `vsock`; an exception
+whose rule is not one of its kind, named as `exception.rule "etc": ...`;
+a `ttl_s` out of range), `invalid_state` (`net`, or an egress exception, on
+a VM without a network card; `vsock` on one without a vsock device; a
+writable or exec exception on a VM without shares or a session without a
+`--policy` file's path rules), `busy` (64 exceptions live already).
 
 ### `span.list`
 
@@ -285,5 +308,5 @@ index. `boxcar spans [--active] [--json]` prints it.
 | A client that takes nothing (`pty.attach`, `audit.subscribe`) | 30 s |
 | `pty.attach` replay | 256 KiB scrollback; 64 KiB input queue; 1 MiB output backlog |
 | `audit.subscribe` | 4 a connection; 32 type prefixes of 1 to 64 bytes; 16384 live records queued a subscription |
-| `policy.update` | 4096 rules of 1 to 512 bytes; 1024 vsock ports, each 1027 or more |
+| `policy.update` | 4096 rules of 1 to 512 bytes; 1024 vsock ports, each 1027 or more; 64 live exceptions, each 1 to 86400 s |
 | `span.list` | 1024 entries, newest first |

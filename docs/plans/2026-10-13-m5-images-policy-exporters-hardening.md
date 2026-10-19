@@ -217,3 +217,16 @@ Made by Task 4 (`docs/plans/policy-files.md`), 2026-10-19:
 - **Absolute globs only, 1024 entries per list, 1 MiB of text** (read no further than one byte past it); a `--policy-file` line policy keeps having no limit and is read whole.
 - **`policy.loaded` for every session**, right after `vmm.start`: `flags` names the line policy, its `--policy-file` and the file's hash when there is one.
 - **The network half in force first.** Until Task 5 enforces `[fs]`, `[exec]`, `[spans]` and `[record]`, `boxcar run` names on stderr what a policy sets of them that would restrict (`agent-isolate` sets nothing of the kind; `agent-isolate-strict` its `writable` and `[exec] deny`).
+
+Made by Task 5 (`docs/plans/policy-enforcement.md`), 2026-10-20:
+
+- **Denied is held by identity as well as by name.** A boot scan of all the session's shares, as one set, finds the denied entries, the directories holding them and the refused programs. A create, unlink, rmdir and rename reads what its name is now. So no hard link, case-insensitive host or renamed parent reaches a denied file. A directory the scan cannot read, or more than 4,000,000 entries, fails the session before it boots.
+- **The node-id gate.** While rules are in force, a request on a node id the path map does not hold is refused: the guest kernel is not trusted to send only the ids it was given.
+- **A glob covers what lies beneath what it names, for `denied` and `writable` alike**, so moving a directory out to a writable place and back launders nothing. A denied glob's literal prefix is never renamed.
+- **`[exec] deny` refuses every open of the file, and its renames and links**, so the loader route, a copy and a hard link do not run it either. The strict profile also names `nc.openbsd`, `nc.traditional` and `netcat`, which Debian's `nc` resolves to.
+- **`readdirplus` lists a denied entry without its inode or attributes**, and records nothing. `opendir` passes on only a directory read's flags, with or without rules.
+- **`link` needs its source writable by every name**: a link changes the inode's link count.
+- **The default `writable` stays `/workspace/**`**, as section 3 binds it. A policy file that names no `writable` leaves `/tmp`, which is the root share's, read-only. Adding `/tmp/**` is the owner's call.
+- **An egress exception is an allow after the permanent rules**, so a permanent deny of its target still wins. **An exception comes alone in its `policy.update`**, and the 65th is `busy`.
+- **Exceptions expire by `CLOCK_BOOTTIME`**, recorded as realtime `expires_ns`. `policy.changed{by_pid: 0}` marks an expiry, and every policy record is made under the policy's lock, in version order.
+- **`keep_tool_args = false` drops the summary as well as the arguments**, and keeps `args_b3`.
