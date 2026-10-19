@@ -466,6 +466,133 @@ fn a_bad_policy_file_line_exits_2_naming_the_file_and_line() {
     assert!(!audit.exists(), "no session was started");
 }
 
+/// `boxcar run` with a rootfs and an audit directory in a fresh scratch,
+/// the kernel nowhere, and `extra`: what it printed and whether it made the
+/// audit directory.
+fn run_with_policy(extra: &[&str]) -> (Output, bool) {
+    let scratch = tempfile::tempdir().unwrap();
+    let rootfs = scratch.path().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    let audit = scratch.path().join("audit");
+    let mut args = vec![
+        "run",
+        "--kernel",
+        "/nonexistent/vmlinux",
+        "--rootfs",
+        rootfs.to_str().unwrap(),
+        "--audit-dir",
+        audit.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let output = boxcar(&args);
+    (output, audit.exists())
+}
+
+/// A policy file that does not parse exits 2 before a session starts,
+/// naming the file, the line and the column.
+#[test]
+fn a_policy_file_that_does_not_parse_exits_2_with_its_line_and_column() {
+    let scratch = tempfile::tempdir().unwrap();
+    let policy = scratch.path().join("team.toml");
+    std::fs::write(
+        &policy,
+        "version = 1\n[egress]\nallow = [\"example.com\", \"exa_mple.com\"]\n",
+    )
+    .unwrap();
+    let (output, made) = run_with_policy(&["--policy", policy.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!(
+            "error: --policy {}:3:25: [egress] allow: \"exa_mple.com\" is not a host name",
+            policy.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!made, "no session was started");
+
+    // TOML's own errors the same way, and a flag that does not parse after
+    // a good policy.
+    std::fs::write(&policy, "version = 1\n[egres]\n").unwrap();
+    let (output, made) = run_with_policy(&["--policy", policy.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!(
+            "error: --policy {}:2:2: unknown field `egres`",
+            policy.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!made);
+    let (output, made) = run_with_policy(&["--policy", "agent-isolate", "--allow", "a_b.test"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("error: --allow \"a_b.test\": "),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!made);
+}
+
+/// `--policy` and `--policy-file` are two ways to say one thing.
+#[test]
+fn policy_conflicts_with_policy_file() {
+    let (output, made) = run_with_policy(&["--policy", "agent-isolate", "--policy-file", "p"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("cannot be used with"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!made);
+}
+
+/// A profile's name is the profile, whatever files there are; anything
+/// else is a path, and one that cannot be read is an error naming it. The
+/// strict profile says what this build does not enforce of it.
+#[test]
+fn a_profile_is_taken_by_name_and_anything_else_as_a_path() {
+    let (output, _) = run_with_policy(&["--policy", "agent-isolate"]);
+    assert_reached_the_vmm(&output);
+    assert!(
+        !stderr(&output).contains("warning: --policy"),
+        "agent-isolate is all in force: {}",
+        stderr(&output)
+    );
+    let (output, _) = run_with_policy(&["--policy", "agent-isolate-strict"]);
+    assert_reached_the_vmm(&output);
+    assert!(
+        stderr(&output).contains(
+            "warning: --policy agent-isolate-strict: this build does not enforce \
+             [fs] writable, [exec] deny yet"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    let (output, made) = run_with_policy(&["--policy", "./agent-isolate"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--policy ./agent-isolate"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!made, "no session was started");
+}
+
+/// A policy file is more than the network: `--policy` is taken without
+/// one, where `--policy-file` is refused.
+#[test]
+fn policy_is_taken_without_a_network() {
+    let (output, _) = run_with_policy(&["--policy", "agent-isolate", "--no-net"]);
+    assert_reached_the_vmm(&output);
+    assert!(
+        !stderr(&output).contains("need --net"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// Without shares the VM has no network unless `--net` asks for one: the
 /// policy and DNS flags are then refused as a usage error, not ignored.
 #[test]

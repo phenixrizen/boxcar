@@ -262,6 +262,7 @@ dependencies = [
  "boxcar-audit",
  "boxcar-fs",
  "boxcar-net",
+ "boxcar-policy",
  "boxcar-proto",
  "boxcar-testreg",
  "boxcar-vmm",
