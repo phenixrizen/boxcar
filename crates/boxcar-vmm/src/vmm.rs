@@ -34,7 +34,7 @@ use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
 use boxcar_net::{InspectConfig, NetConfig, Policy};
-use boxcar_proto::{ArtifactRef, Hash, Payload, Ring, SessionId, ShareRef, VmmStart};
+use boxcar_proto::{ArtifactRef, Hash, ImageRef, Payload, Ring, SessionId, ShareRef, VmmStart};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{SlotAllocator, SlotError};
 use boxcar_vsock::VsockConfig;
@@ -239,6 +239,9 @@ pub struct VmConfig {
     /// carry their argv scrubbed, and the argvs that changed wait here, as
     /// run, for the reconciler.
     pub scrub_argv: Option<boxcar_audit::RawArgv>,
+    /// The image the session boots from (`boxcar run --image`), recorded in
+    /// `vmm.start`; none when the root share is a directory given as such.
+    pub image: Option<ImageRef>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -287,6 +290,7 @@ impl VmConfig {
             spans: None,
             dump: None,
             scrub_argv: None,
+            image: None,
         }
     }
 }
@@ -596,6 +600,7 @@ impl Vmm {
                 .inspect
                 .as_ref()
                 .map(|gate| gate.ca().fingerprint_sha256().to_owned()),
+            image: cfg.image.clone(),
         };
         tracing::debug!("vmm.start: {start:?}");
         cfg.audit.emit(Submission {

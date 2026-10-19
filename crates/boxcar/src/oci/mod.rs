@@ -8,10 +8,12 @@
 pub mod auth;
 pub mod client;
 pub mod decode;
+pub mod defaults;
 pub mod framer;
 pub mod manifest;
 pub mod pull;
 pub mod reference;
+pub mod session;
 pub mod store;
 pub mod unpack;
 

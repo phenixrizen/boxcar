@@ -68,11 +68,11 @@ mod tests {
 
     /// `m1` to `m4` are the milestones with gated tests.
     #[test]
-    fn test_kvm_takes_m1_to_m4() {
-        for milestone in ["m1", "m2", "m3", "m4"] {
+    fn test_kvm_takes_m1_to_m5() {
+        for milestone in ["m1", "m2", "m3", "m4", "m5"] {
             assert!(Cli::try_parse_from(["xtask", "test-kvm", milestone]).is_ok());
         }
-        for bad in [&["xtask", "test-kvm", "m5"][..], &["xtask", "test-kvm"]] {
+        for bad in [&["xtask", "test-kvm", "m6"][..], &["xtask", "test-kvm"]] {
             let error = Cli::try_parse_from(bad).err().unwrap();
             assert_eq!(error.exit_code(), 2, "{bad:?}: {error}");
         }

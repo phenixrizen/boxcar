@@ -382,14 +382,32 @@ pub struct RunArgs {
     )]
     pub vcpus: u8,
     /// The guest's root filesystem: a host directory shared over virtio-fs
-    /// as tag `root`. Required unless `--no-fs`.
+    /// as tag `root`. Required unless `--no-fs` or `--image`.
     #[arg(
         long,
         value_name = "DIR",
-        required_unless_present = "no_fs",
-        conflicts_with = "no_fs"
+        required_unless_present_any = ["no_fs", "image"],
+        conflicts_with_all = ["no_fs", "image"]
     )]
     pub rootfs: Option<PathBuf>,
+    /// Boot from an image: `[registry/]repository[:tag][@sha256:digest]`,
+    /// as Docker reads it (`alpine` is `docker.io/library/alpine:latest`),
+    /// pulled into the cache as `boxcar image pull` does and copied into
+    /// the session directory as the root share, so a session never writes
+    /// the cache. The image's Entrypoint and Cmd run when no command is
+    /// given, its Env comes before `--env`, its WorkingDir is the session's.
+    /// Needs the vsock session (not `--no-vsock`).
+    #[arg(long, value_name = "REF", conflicts_with_all = ["no_fs", "no_vsock"])]
+    pub image: Option<String>,
+    /// With `--image`, when to pull: `missing` (the default) pulls an image
+    /// the cache lacks, `always` asks the registry (an unchanged tag
+    /// fetches nothing but its manifest), `never` fails without it.
+    #[arg(long, value_name = "WHEN")]
+    pub pull: Option<PullArg>,
+    /// With `--image`, the image cache. $XDG_CACHE_HOME/boxcar, or
+    /// ~/.cache/boxcar.
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
     /// A host directory shared over virtio-fs as tag `workspace`, which the
     /// guest mounts at /workspace. Default: a new `workspace/` directory in
     /// the session's audit directory.
@@ -857,4 +875,12 @@ pub struct ImageRmArgs {
     pub target: String,
     #[command(flatten)]
     pub cache: CacheArgs,
+}
+
+/// `--pull` for `boxcar run --image`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PullArg {
+    Missing,
+    Always,
+    Never,
 }

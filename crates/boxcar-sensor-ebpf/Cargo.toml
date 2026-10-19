@@ -3,6 +3,13 @@
 # build.rs (aya-build) or by hand in this directory, and has its own lock
 # file. Its licence differs from the rest of the tree: see
 # docs/ebpf-license.md.
+# Its own workspace root, so that cargo stops looking upward here. Without
+# this, a checkout nested inside another (a work-issue worktree under
+# `.git/`) builds it against the outer checkout's manifest, whose exclude
+# does not name this path, and cargo refuses: "current package believes
+# it's in a workspace when it's not".
+[workspace]
+
 [package]
 name = "boxcar-sensor-ebpf"
 version = "0.1.0"

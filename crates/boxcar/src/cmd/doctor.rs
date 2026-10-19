@@ -9,9 +9,10 @@
 //! network at its caps. A final `doctor: <n> failed` line counts the
 //! FAIL lines, and the exit code is 1 when there are any.
 
+use std::env;
 use std::fmt;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use boxcar_vmm::kvm::{
@@ -19,6 +20,8 @@ use boxcar_vmm::kvm::{
 };
 
 use super::nofile::{self, Limit};
+use crate::oci::session;
+use crate::oci::store::Store;
 
 const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
 
@@ -95,6 +98,10 @@ pub fn run() -> anyhow::Result<ExitCode> {
     }
     checks.push(pahole_check());
     checks.push(nofile_check(nofile::current()));
+    checks.push(cache_check(
+        super::image::default_cache_dir(env::var_os("XDG_CACHE_HOME"), env::var_os("HOME")),
+        super::run::default_audit_dir(env::var_os("XDG_DATA_HOME"), env::var_os("HOME")),
+    ));
 
     let mut out = io::stdout().lock();
     let failed = write_report(&mut out, &checks)?;
@@ -243,6 +250,39 @@ fn pahole_check() -> Check {
 /// The open file limit `boxcar run` gives a VM with a network card (see
 /// [`nofile`]), from the process's limit now: missing, not failed, when it
 /// is below what the network needs at its caps.
+/// The image cache: missing until a pull makes it; otherwise how much it
+/// holds, and whether a session's copy of an image into the audit
+/// directory reflinks or costs a copy.
+fn cache_check(cache: Option<PathBuf>, audit: Option<PathBuf>) -> Check {
+    let Some(cache) = cache else {
+        return Check::missing(
+            "image cache",
+            "neither XDG_CACHE_HOME nor HOME is an absolute path",
+        );
+    };
+    let name = format!("image cache: {}", cache.display());
+    if !cache.is_dir() {
+        return Check::missing(name, "boxcar image pull REF makes it");
+    }
+    let listing = match Store::open(&cache).and_then(|store| store.list()) {
+        Ok(listing) => listing,
+        Err(error) => return Check::fail(name, error.to_string()),
+    };
+    let copies = match audit.filter(|dir| dir.is_dir()) {
+        Some(audit) => match session::reflinks(&cache, &audit) {
+            Ok(true) => "sessions reflink it",
+            Ok(false) => "sessions copy it",
+            Err(_) => "whether sessions reflink it is unknown",
+        },
+        None => "whether sessions reflink it is unknown until a session runs",
+    };
+    Check::ok(format!(
+        "{name} ({} images, {} tags; {copies})",
+        listing.images.len(),
+        listing.refs.len()
+    ))
+}
+
 fn nofile_check(limit: io::Result<Limit>) -> Check {
     match limit {
         Ok(limit) => {

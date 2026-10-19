@@ -193,3 +193,16 @@ Made by Task 2 (`docs/plans/oci-image-cache.md`), 2026-10-16:
 - **A multi-frame zstd adapter of our own** over ruzstd, which decodes one frame and only stores its checksum.
 - **`--cache-dir`**, so tests and the test box point the cache anywhere.
 - **The test registry is a crate**, `boxcar-testreg`: `boxcar` is a binary, and a test-only crate is the one place its unit tests and the gated suites can both reach.
+
+Made by Task 3 (`docs/plans/run-from-image.md`), 2026-10-17:
+
+- **The cache stores readable modes and `image.json` the true ones** (Task 2 amended): an owner cannot read their own `0o000` file, and a session's copy must read every entry without touching the cache; the copy gives the session the image's modes.
+- **Index digests are lookup mappings** (Task 2 amended): a reference by an index's digest is found offline through `_indexes` entries beside `_tags`, which go with their image; only tags keep an image from `prune`.
+- **`--image` needs the vsock session**: the console session carries only the command, so an image's environment and working directory would be silently lost.
+- **The environment is merged to one value per name**, boxcar's defaults, then the image's, then `--env`, the last winning: init keeps duplicates and takes the first `PATH`.
+- **The working directory is made where the guest will see it**: the guest's view is the copy with init's mounts applied where `mount(2)` puts them, at the places the image's `/workspace`, `/run`, `/dev`, `/proc` and `/sys` lead once their links are followed; the workspace's host directory is looked up beneath the workspace's place, nothing beneath a kernel filesystem's.
+- **Boot paths before modes**: the mount points, the working directory, `/etc/resolv.conf` and the trust store are made in the copy while every directory is still 0o700; modes come last, deepest first.
+- **The copy stays with the session as `rootfs`**, like the default workspace; reclaiming sessions is one decision for both. Times are not copied.
+- **Loopback registries are plain HTTP** (Docker's insecure-by-default rule for `localhost` and `127.0.0.0/8`), HTTPS when they decline it; redirects are followed by hand so a plain-HTTP redirect anywhere else is still refused.
+- **A given command replaces `Entrypoint` and `Cmd` both**; the image's defaults are bounded at 32 KiB.
+- **Whiteouts within a layer apply in archive order**, as Docker's applier does (pinned by Task 2's review, recorded here with Task 3).

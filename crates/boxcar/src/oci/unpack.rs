@@ -63,6 +63,10 @@ pub struct Unpacker {
     /// directory. A later entry for a directory wins, and a directory
     /// that goes is forgotten.
     dir_modes: BTreeMap<Vec<u8>, u32>,
+    /// The image's modes of the regular files stored with another (owner
+    /// read forced on), by the file's own path; forgotten as directory
+    /// modes are when the file goes.
+    file_modes: BTreeMap<Vec<u8>, u32>,
     skipped: Vec<String>,
     /// What may still be kept in memory, against [`MAX_METADATA`].
     metadata_left: u64,
@@ -70,7 +74,26 @@ pub struct Unpacker {
 
 /// What unpacking left out: devices and FIFOs, by path.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Skipped(pub Vec<String>);
+pub struct Finished {
+    /// Paths of the device nodes and FIFOs not made.
+    pub skipped: Vec<String>,
+    /// Paths whose mode in the tree is not the image's, with the image's:
+    /// the tree stores every entry readable by its owner (a file with
+    /// owner read, a directory with owner read, write and search), so a
+    /// copy can read it all without touching the tree. Sorted by path.
+    pub modes: Vec<(String, u32)>,
+}
+
+/// The mode a regular file is stored with: the image's, owner read forced.
+pub fn stored_file_mode(mode: u32) -> u32 {
+    mode | 0o400
+}
+
+/// The mode a directory is stored with: the image's, owner read, write
+/// and search forced.
+pub fn stored_dir_mode(mode: u32) -> u32 {
+    mode | 0o700
+}
 
 impl Unpacker {
     /// A tree at `root`, an existing empty directory.
@@ -85,6 +108,7 @@ impl Unpacker {
             root,
             root_path,
             dir_modes: BTreeMap::new(),
+            file_modes: BTreeMap::new(),
             skipped: Vec::new(),
             metadata_left: MAX_METADATA,
         })
@@ -129,34 +153,52 @@ impl Unpacker {
         Ok(())
     }
 
+    /// Records the image's mode of the file at `path`, stored readable.
+    fn remember_file_mode(&mut self, path: Vec<u8>, mode: u32) -> io::Result<()> {
+        if !self.file_modes.contains_key(&path) {
+            self.keep(path.len())?;
+        }
+        self.file_modes.insert(path, mode);
+        Ok(())
+    }
+
     /// Forgets the modes of everything beneath `path`, and of `path`
     /// itself when `itself`: what stood there is gone, and whatever takes
     /// the name (a link, say) must not inherit the mode. The work is in
     /// what is forgotten, not in what is kept.
     fn forget_modes(&mut self, path: &[u8], itself: bool) {
         let mut gone = Vec::new();
-        if itself && !path.is_empty() {
-            gone.extend(self.dir_modes.remove_entry(path));
-        }
-        if path.is_empty() {
-            gone.extend(std::mem::take(&mut self.dir_modes));
-        } else {
-            let mut from = path.to_vec();
-            from.push(b'/');
-            let mut to = path.to_vec();
-            to.push(b'/' + 1);
-            let keys: Vec<Vec<u8>> = self
-                .dir_modes
-                .range(from..to)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in keys {
-                gone.extend(self.dir_modes.remove_entry(&key));
+        for map in [&mut self.dir_modes, &mut self.file_modes] {
+            if itself && !path.is_empty() {
+                gone.extend(map.remove_entry(path));
+            }
+            if path.is_empty() {
+                gone.extend(std::mem::take(map));
+            } else {
+                let mut from = path.to_vec();
+                from.push(b'/');
+                let mut to = path.to_vec();
+                to.push(b'/' + 1);
+                let keys: Vec<Vec<u8>> = map.range(from..to).map(|(k, _)| k.clone()).collect();
+                for key in keys {
+                    gone.extend(map.remove_entry(&key));
+                }
             }
         }
         for (key, _) in gone {
             self.metadata_left += key.len() as u64 + ENTRY_COST;
         }
+    }
+
+    /// A new entry takes the name: a file's recorded mode there, if any,
+    /// is forgotten. Costs a lookup of the path only while there are
+    /// records to forget.
+    fn forget_file_mode(&mut self, parent_fd: &OwnedFd, name: &CStr) -> io::Result<()> {
+        if !self.file_modes.is_empty() {
+            let path = self.canonical_in(parent_fd, name)?;
+            self.forget_modes(&path, true);
+        }
+        Ok(())
     }
 
     /// The path of the directory `fd` is, from the root and through no
@@ -210,6 +252,8 @@ impl Unpacker {
                 Kind::Dir => {
                     let parent_fd = self.parent_fd(parent)?;
                     let path = self.canonical_in(&parent_fd, &name)?;
+                    // Something else stood there and went: its records go.
+                    // A directory that was there keeps its children's.
                     if make_dir(&parent_fd, &name)? {
                         self.forget_modes(&path, true);
                     }
@@ -220,6 +264,8 @@ impl Unpacker {
                     if replace_slot(&parent_fd, &name)? {
                         let path = self.canonical_in(&parent_fd, &name)?;
                         self.forget_modes(&path, true);
+                    } else {
+                        self.forget_file_mode(&parent_fd, &name)?;
                     }
                     let fd = openat(
                         &parent_fd,
@@ -233,7 +279,13 @@ impl Unpacker {
                     )?;
                     let mut file = File::from(fd);
                     io::copy(&mut framer.data(), &mut file)?;
-                    check(unsafe { libc::fchmod(file.as_raw_fd(), entry.mode as libc::mode_t) })?;
+                    let stored = stored_file_mode(entry.mode);
+                    check(unsafe { libc::fchmod(file.as_raw_fd(), stored as libc::mode_t) })?;
+                    self.forget_file_mode(&parent_fd, &name)?;
+                    if stored != entry.mode {
+                        let path = self.canonical_in(&parent_fd, &name)?;
+                        self.remember_file_mode(path, entry.mode)?;
+                    }
                 }
                 Kind::Symlink => {
                     let target = cstr(&entry.link)?;
@@ -241,6 +293,8 @@ impl Unpacker {
                     if replace_slot(&parent_fd, &name)? {
                         let path = self.canonical_in(&parent_fd, &name)?;
                         self.forget_modes(&path, true);
+                    } else {
+                        self.forget_file_mode(&parent_fd, &name)?;
                     }
                     check(unsafe {
                         libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), name.as_ptr())
@@ -275,6 +329,8 @@ impl Unpacker {
                     if replace_slot(&parent_fd, &name)? {
                         let path = self.canonical_in(&parent_fd, &name)?;
                         self.forget_modes(&path, true);
+                    } else {
+                        self.forget_file_mode(&parent_fd, &name)?;
                     }
                     check(unsafe {
                         libc::linkat(
@@ -285,6 +341,16 @@ impl Unpacker {
                             0,
                         )
                     })?;
+                    // The inode's image mode is the target's record; the
+                    // new name gets one too, so it survives the target's
+                    // replacement.
+                    if !self.file_modes.is_empty() {
+                        let target_path = self.canonical_in(&target_parent_fd, &target_name)?;
+                        if let Some(mode) = self.file_modes.get(&target_path).copied() {
+                            let path = self.canonical_in(&parent_fd, &name)?;
+                            self.remember_file_mode(path, mode)?;
+                        }
+                    }
                 }
                 Kind::CharDevice | Kind::BlockDevice | Kind::Fifo => {
                     let path = display(&comps);
@@ -297,8 +363,9 @@ impl Unpacker {
     }
 
     /// After the last layer: `tmp` and `workspace` at the root when
-    /// missing, directory modes deepest first. Answers what was skipped.
-    pub fn finish(mut self) -> io::Result<Skipped> {
+    /// missing, directory modes deepest first, each stored readable.
+    /// Answers what was skipped and the modes the tree does not show.
+    pub fn finish(mut self) -> io::Result<Finished> {
         for (name, mode) in [("tmp", 0o1777u32), ("workspace", IMPLIED_DIR_MODE)] {
             let cname = cstr(name.as_bytes())?;
             if stat_at(&self.root, &cname)?.is_none() {
@@ -311,6 +378,10 @@ impl Unpacker {
         let mut dirs: Vec<(Vec<u8>, u32)> =
             std::mem::take(&mut self.dir_modes).into_iter().collect();
         dirs.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
+        let mut modes: Vec<(String, u32)> = std::mem::take(&mut self.file_modes)
+            .into_iter()
+            .map(|(path, mode)| (String::from_utf8_lossy(&path).into_owned(), mode))
+            .collect();
         for (path, mode) in dirs {
             // The parent resolved in the root, then the name itself with
             // nothing followed: a later layer may have put a link there.
@@ -348,9 +419,17 @@ impl Unpacker {
                 }
                 Err(error) => return Err(error),
             };
-            chmod_fd(&fd, mode)?;
+            let stored = stored_dir_mode(mode);
+            chmod_fd(&fd, stored)?;
+            if stored != mode {
+                modes.push((String::from_utf8_lossy(&path).into_owned(), mode));
+            }
         }
-        Ok(Skipped(self.skipped))
+        modes.sort();
+        Ok(Finished {
+            skipped: self.skipped,
+            modes,
+        })
     }
 
     /// The directory `comps` names, resolved in the root; `O_PATH`.
@@ -436,7 +515,7 @@ impl Unpacker {
         let path = self.canonical(&dir)?;
         drop(dir);
         for child in children(readable)? {
-            remove_at(&self.open_dir(parent)?, &child)?;
+            let _ = remove_at(&self.open_dir(parent)?, &child)?;
         }
         self.forget_modes(&path, false);
         Ok(())
@@ -457,9 +536,13 @@ impl Unpacker {
             Err(error) => return Err(error),
         };
         let target = cstr(target)?;
-        if remove_at(&dir, &target)? {
-            let path = self.canonical_in(&dir, &target)?;
-            self.forget_modes(&path, true);
+        match remove_at(&dir, &target)? {
+            Removed::Nothing => {}
+            Removed::Dir => {
+                let path = self.canonical_in(&dir, &target)?;
+                self.forget_modes(&path, true);
+            }
+            Removed::File => self.forget_file_mode(&dir, &target)?,
         }
         Ok(())
     }
@@ -559,24 +642,33 @@ fn reopen(dir: &OwnedFd) -> io::Result<OwnedFd> {
 
 /// Removes `name` in `parent`: a directory whole, anything else unlinked,
 /// nothing when it is not there. Answers whether a directory went.
-fn remove_at(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
+fn remove_at(parent: &OwnedFd, name: &CStr) -> io::Result<Removed> {
     match stat_at(parent, name)? {
-        None => Ok(false),
+        None => Ok(Removed::Nothing),
         Some(mode) if mode & libc::S_IFMT == libc::S_IFDIR => {
             delete_tree_at(parent, name)?;
-            Ok(true)
+            Ok(Removed::Dir)
         }
         Some(_) => {
             check(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) })?;
-            Ok(false)
+            Ok(Removed::File)
         }
     }
+}
+
+/// What `remove_at` took away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removed {
+    Nothing,
+    /// A regular file, a link, or another non-directory.
+    File,
+    Dir,
 }
 
 /// Makes room for a new entry at `name`: whatever is there goes. Answers
 /// whether a directory went.
 fn replace_slot(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
-    remove_at(parent, name)
+    Ok(remove_at(parent, name)? == Removed::Dir)
 }
 
 /// A directory at `name`: made, or kept when one is there; anything else
@@ -595,7 +687,7 @@ fn make_dir(parent: &OwnedFd, name: &CStr) -> io::Result<bool> {
 }
 
 /// The names in the directory `dir` (consumed), `.` and `..` left out.
-fn children(dir: OwnedFd) -> io::Result<Vec<CString>> {
+pub(super) fn children(dir: OwnedFd) -> io::Result<Vec<CString>> {
     // SAFETY: fdopendir takes the descriptor over; closedir releases it.
     let stream = unsafe { libc::fdopendir(dir.into_raw_fd()) };
     if stream.is_null() {
@@ -792,7 +884,7 @@ mod tests {
 
     /// Applies `layers` in order into a fresh tree; the tree's directory
     /// and what unpacking skipped.
-    fn unpack(layers: &[Vec<u8>]) -> (tempfile::TempDir, Skipped) {
+    fn unpack(layers: &[Vec<u8>]) -> (tempfile::TempDir, Finished) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("rootfs");
         fs::create_dir(&root).unwrap();
@@ -800,7 +892,7 @@ mod tests {
         (tmp, skipped)
     }
 
-    fn unpack_into(root: &Path, layers: &[Vec<u8>]) -> io::Result<Skipped> {
+    fn unpack_into(root: &Path, layers: &[Vec<u8>]) -> io::Result<Finished> {
         let mut unpacker = Unpacker::new(root)?;
         let entries = Cell::new(u64::MAX);
         for layer in layers {
@@ -855,9 +947,11 @@ mod tests {
             l["etc/motd"]
         );
         assert_eq!(l["etc/motd"], l["etc/motd2"]);
-        assert_eq!(l["ro"], "dir 555");
+        // Stored with the owner's bits on; the image's mode is listed.
+        assert_eq!(l["ro"], "dir 755");
         assert!(l.contains_key("ro/inside"), "{l:?}");
-        assert_eq!(skipped, Skipped::default());
+        assert_eq!(skipped.skipped, Vec::<String>::new());
+        assert_eq!(skipped.modes, [("ro".to_owned(), 0o555)]);
         // The finish adds tmp (1777) and workspace.
         let all = listing(&root);
         assert_eq!(all["tmp"], "dir 1777");
@@ -1026,9 +1120,10 @@ mod tests {
         ]);
         let (tmp, skipped) = unpack(&[layer]);
         assert_eq!(
-            skipped,
-            Skipped(vec!["dev/null".into(), "dev/sda".into(), "run/fifo".into()])
+            skipped.skipped,
+            ["dev/null".to_owned(), "dev/sda".into(), "run/fifo".into()]
         );
+        assert_eq!(skipped.modes, Vec::<(String, u32)>::new());
         let l = without_defaults(&tmp.path().join("rootfs"));
         assert!(l.contains_key("ok"));
         assert!(!l.contains_key("dev/null"));
@@ -1071,7 +1166,7 @@ mod tests {
             dir("locked/deeper/", 0o555),
             file("locked/deeper/x", 0o644, b"x"),
         ]);
-        let (tmp, _) = unpack(&[layer]);
+        let (tmp, finished) = unpack(&[layer]);
         let root = tmp.path().join("rootfs");
         assert_eq!(
             fs::metadata(root.join("locked"))
@@ -1079,10 +1174,104 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o7777,
-            0
+            0o700
+        );
+        assert_eq!(
+            finished.modes,
+            [
+                ("locked".to_owned(), 0o000),
+                ("locked/deeper".to_owned(), 0o555)
+            ]
         );
         delete_tree(tmp.path(), "rootfs").unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn mode_records_survive_a_repeated_directory_and_follow_hardlinks_and_whiteouts() {
+        // A layer that repeats a directory keeps the children's records.
+        let lower = layer(&[
+            dir("d/", 0o755),
+            dir("d/sub/", 0o555),
+            file("d/f", 0o000, b"f"),
+        ]);
+        let upper = layer(&[dir("d/", 0o755)]);
+        let (tmp, finished) = unpack(&[lower, upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l["d/sub"], "dir 755");
+        assert_eq!(l["d/f"], "file 400 \"f\"");
+        assert_eq!(
+            finished.modes,
+            [("d/f".to_owned(), 0o000), ("d/sub".to_owned(), 0o555)]
+        );
+        // A hardlink to an unreadable file carries its record, so the mode
+        // survives the target's replacement.
+        let lower = layer(&[file("a", 0o000, b"x"), hardlink("b", "a")]);
+        let upper = layer(&[file("a", 0o644, b"y")]);
+        let (tmp, finished) = unpack(&[lower, upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l["a"], "file 644 \"y\"");
+        assert_eq!(l["b"], "file 400 \"x\"");
+        assert_eq!(finished.modes, [("b".to_owned(), 0o000)]);
+        // A whiteout of an unreadable file forgets its record, so a later
+        // directory of that name is not given the file's mode.
+        let lower = layer(&[file("a", 0o000, b"x")]);
+        let middle = layer(&[file(".wh.a", 0o644, b"")]);
+        let upper = layer(&[dir("a/", 0o755)]);
+        let (_tmp, finished) = unpack(&[lower.clone(), middle.clone()]);
+        assert_eq!(finished.modes, []);
+        let (tmp, finished) = unpack(&[lower, middle, upper]);
+        assert_eq!(finished.modes, []);
+        assert_eq!(without_defaults(&tmp.path().join("rootfs"))["a"], "dir 755");
+    }
+
+    #[test]
+    fn unreadable_entries_are_stored_readable_and_their_modes_listed() {
+        // A file no one may read, a directory no one may enter and one no
+        // one may search: stored with the owner's bits on, so a copy can
+        // read them, and listed with the image's modes.
+        let lower = layer(&[
+            file("etc/shadow", 0o000, b"root:*:"),
+            dir("locked/", 0o000),
+            file("locked/inside", 0o644, b"i"),
+            dir("nosearch/", 0o444),
+            file("nosearch/f", 0o200, b"w"),
+            file("gone", 0o000, b"g"),
+            file("under/x", 0o000, b"x"),
+        ]);
+        // A later layer replaces one with a readable file and whites out
+        // the other's directory: neither stays listed.
+        let upper = layer(&[file("gone", 0o644, b"g2"), file(".wh.under", 0o644, b"")]);
+        let (tmp, finished) = unpack(&[lower, upper]);
+        let l = without_defaults(&tmp.path().join("rootfs"));
+        assert_eq!(l["etc/shadow"], "file 400 \"root:*:\"");
+        assert_eq!(l["locked"], "dir 700");
+        assert_eq!(l["locked/inside"], "file 644 \"i\"");
+        assert_eq!(l["nosearch"], "dir 744");
+        assert_eq!(l["nosearch/f"], "file 600 \"w\"");
+        assert_eq!(l["gone"], "file 644 \"g2\"");
+        assert!(!l.contains_key("under"));
+        assert_eq!(
+            finished.modes,
+            [
+                ("etc/shadow".to_owned(), 0o000),
+                ("locked".to_owned(), 0o000),
+                ("nosearch".to_owned(), 0o444),
+                ("nosearch/f".to_owned(), 0o200),
+            ]
+        );
+        // The same tree twice gives the same list.
+        let (_, again) = unpack(&[layer(&[
+            file("etc/shadow", 0o000, b"root:*:"),
+            dir("locked/", 0o000),
+        ])]);
+        assert_eq!(
+            again.modes,
+            [
+                ("etc/shadow".to_owned(), 0o000),
+                ("locked".to_owned(), 0o000)
+            ]
+        );
     }
 
     #[test]

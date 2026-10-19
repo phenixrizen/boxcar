@@ -40,9 +40,16 @@ use boxcar_vmm::vmm::{
 use boxcar_vsock::VsockConfig;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{AuditLevelArg, RunArgs};
+use boxcar_proto::ImageRef;
+
+use crate::cli::{AuditLevelArg, PullArg, RunArgs};
 use crate::client;
-use crate::cmd::{nofile, tell};
+use crate::cmd::{image, nofile, tell};
+use crate::oci::client::{Client, ClientError};
+use crate::oci::defaults;
+use crate::oci::pull::{ensure, Found, PullError, PullMode};
+use crate::oci::reference::Reference;
+use crate::oci::session::{self, BootNeeds, Layout, Reflink};
 
 /// The exit code of a usage error, as clap's: a policy rule that does not
 /// parse.
@@ -62,7 +69,23 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // where the audit log and the control socket go, and the kernel command
     // line. clap requires --rootfs unless --no-fs, so the shares are known
     // here.
-    let net = net_enabled(args.rootfs.is_some(), args.net, args.no_net);
+    // --image is a root share too: the image's tree, copied per session.
+    let image = match &args.image {
+        Some(text) => match Reference::parse(text) {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                tell(&format!("error: --image {text}: {error}"));
+                return Ok(ExitCode::from(USAGE_EXIT));
+            }
+        },
+        None => None,
+    };
+    if image.is_none() && (args.pull.is_some() || args.cache_dir.is_some()) {
+        tell("error: --pull and --cache-dir need --image: without an image there is nothing to pull and no cache to read");
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let has_shares = args.rootfs.is_some() || image.is_some();
+    let net = net_enabled(has_shares, args.net, args.no_net);
     if !net && policy_flags_given(&args) {
         tell(
             "error: network policy flags need --net: without shares (--no-fs) the VM has no \
@@ -70,8 +93,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         );
         return Ok(ExitCode::from(USAGE_EXIT));
     }
-    let vsock = vsock_enabled(args.rootfs.is_some(), args.vsock, args.no_vsock);
-    if args.stdin && !(vsock && args.rootfs.is_some()) {
+    let vsock = vsock_enabled(has_shares, args.vsock, args.no_vsock);
+    if args.stdin && !(vsock && has_shares) {
         tell(
             "error: --stdin needs the vsock device: without it (--no-vsock, or no shares) the \
              session runs on the serial console, which takes no piped input",
@@ -123,6 +146,44 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let dump =
         dump_dir(args.dump.as_deref(), &named)?.map(|dir| dir.with_payloads(args.dump_payloads));
 
+    // The image, found in the cache or pulled, before the session exists;
+    // the cache stays locked shared until its tree is copied, so `rm` and
+    // `prune` wait and the image cannot go between the two.
+    let cache = match &image {
+        Some(_) => Some(image::open_cache(args.cache_dir.as_deref())?),
+        None => None,
+    };
+    let cache_lock = match &cache {
+        Some(store) => Some(store.lock_shared().context("cannot lock the image cache")?),
+        None => None,
+    };
+    let found = match (&image, &cache) {
+        (Some(reference), Some(store)) => match find_or_pull(store, reference, args.pull) {
+            Ok(found) => {
+                eprintln!(
+                    "image: {reference} {}{}",
+                    found.manifest,
+                    if found.pulled { "" } else { " (cached)" }
+                );
+                Some(found)
+            }
+            Err(PullError::NotCached) => {
+                tell(&format!("error: {reference}: {}", PullError::NotCached));
+                return Ok(ExitCode::from(1));
+            }
+            Err(error) => return Err(error).with_context(|| format!("pulling {reference}")),
+        },
+        _ => None,
+    };
+    let image_ref = match (&image, &found) {
+        (Some(reference), Some(found)) => Some(ImageRef {
+            reference: reference.to_string(),
+            manifest_digest: found.manifest.to_string(),
+            config_digest: found.json.config.to_string(),
+        }),
+        _ => None,
+    };
+
     let session_id = SessionId::new();
     // The tool spans the reconciler keeps and `boxcar spans` lists.
     let spans = SpanIndex::new();
@@ -143,8 +204,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => None,
     };
     let user = invoking_user();
-    // clap requires --rootfs unless --no-fs.
-    let has_shares = rootfs.is_some();
+    // clap requires --rootfs or --image unless --no-fs.
     let share_count = if has_shares { SHARE_COUNT } else { 0 };
     let mode = guest_mode(has_shares, vsock, user.0, user.1);
     let sensor = vsock && !args.no_sensor;
@@ -162,8 +222,25 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     );
     // The guest is told to trust the CA: the certificate, never the key.
     session.ca_pem = inspect.as_ref().map(|gate| gate.ca().pem().to_owned());
-    // --env, after the defaults: a later name wins in the guest.
-    session.env.extend(args.env.iter().cloned());
+    // What the session runs: the command line first, the image second,
+    // the defaults last; the environment one value per name.
+    let resolved = match defaults::resolve(
+        &args.command,
+        found.as_ref().map(|found| &found.json.defaults),
+        std::mem::take(&mut session.env),
+        &args.env,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tell(&format!("error: {error}"));
+            return Ok(ExitCode::from(1));
+        }
+    };
+    session.argv = resolved.argv.clone();
+    session.env = resolved.env.clone();
+    if has_shares {
+        session.cwd = resolved.cwd.clone();
+    }
     if mode == GuestMode::Vsock {
         session.validate()?;
     }
@@ -198,17 +275,32 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     eprintln!("session: {session_id}");
     eprintln!("audit: {}", writer.session_dir().display());
 
-    let fs_shares = match rootfs {
-        Some(rootfs) => {
-            let workspace = match workspace {
-                Some(dir) => dir,
-                None => new_workspace(writer.session_dir())?,
-            };
-            eprintln!("workspace: {}", workspace.display());
-            shares(rootfs, workspace)
-        }
-        None => Vec::new(),
+    let fs_shares = if has_shares {
+        let workspace = match workspace {
+            Some(dir) => dir,
+            None => new_workspace(writer.session_dir())?,
+        };
+        eprintln!("workspace: {}", workspace.display());
+        let root = match (&found, rootfs) {
+            // The session's own copy of the image's tree, prepared for the
+            // boot, in the session directory beside the workspace.
+            (Some(found), _) => session_rootfs(
+                found,
+                &writer.session_dir().join("rootfs"),
+                &workspace,
+                &resolved.cwd,
+                net,
+                inspect.is_some(),
+            )?,
+            (None, Some(rootfs)) => rootfs,
+            (None, None) => bail!("no root share"),
+        };
+        shares(root, workspace)
+    } else {
+        Vec::new()
     };
+    // The image is copied: the cache may change hands.
+    drop(cache_lock);
 
     let state_dir = sessions_root.join(session_id.as_str());
     let relayed = mode == GuestMode::Vsock;
@@ -260,6 +352,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         spans: Some(spans.clone()),
         dump,
         scrub_argv: raw_argv.clone(),
+        image: image_ref,
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -623,6 +716,75 @@ fn net_config(dns: &[SocketAddr]) -> NetConfig {
     cfg
 }
 
+/// The image `reference` names, in the cache, as `--pull` says: found
+/// there, or pulled with a client over the host's roots and the user's
+/// Docker config, with a line on stderr per layer.
+fn find_or_pull(
+    store: &crate::oci::store::Store,
+    reference: &Reference,
+    pull: Option<PullArg>,
+) -> Result<Found, PullError> {
+    let mode = match pull.unwrap_or(PullArg::Missing) {
+        PullArg::Missing => PullMode::Missing,
+        PullArg::Always => PullMode::Always,
+        PullArg::Never => PullMode::Never,
+    };
+    let make_client = || {
+        let setup = |error: anyhow::Error| ClientError::Setup(format!("{error:#}"));
+        let roots = image::native_roots().map_err(setup)?;
+        let config = image::docker_config().map_err(setup)?;
+        Client::new(reference, roots, config.as_ref())
+    };
+    ensure(
+        store,
+        reference,
+        mode,
+        make_client,
+        &mut image::report_progress,
+    )
+}
+
+/// The session's root share from the cached image `found`: its tree copied
+/// to `copy`, the boot paths made in it (and in `workspace`), its modes
+/// set last. A failure leaves nothing behind.
+fn session_rootfs(
+    found: &Found,
+    copy: &Path,
+    workspace: &Path,
+    cwd: &str,
+    net: bool,
+    inspect: bool,
+) -> anyhow::Result<PathBuf> {
+    let copied = session::copy_tree(&found.dir.join("rootfs"), copy, Reflink::Try)?;
+    if copied.skipped > 0 {
+        eprintln!(
+            "warning: {} entries of the image were not copied: not files, directories or links",
+            copied.skipped
+        );
+    }
+    let prepared = session::prepare_boot_paths(
+        &Layout {
+            root: copy,
+            workspace,
+        },
+        &BootNeeds { cwd, net, inspect },
+    )
+    .and_then(|()| session::set_modes(copy, &copied, &found.json.modes));
+    if let Err(error) = prepared {
+        if let (Some(parent), Some(name)) = (copy.parent(), copy.file_name()) {
+            let _ = crate::oci::unpack::delete_tree(parent, &name.to_string_lossy());
+        }
+        return Err(error.into());
+    }
+    let copy = copy
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", copy.display()))?;
+    if copy.to_str().is_none() {
+        bail!("{}: the path is not valid UTF-8", copy.display());
+    }
+    Ok(copy)
+}
+
 /// How many shares a run with `--rootfs` gives the VM ([`shares`]), for
 /// the size of its command line.
 const SHARE_COUNT: usize = FS_TAGS.len();
@@ -684,7 +846,10 @@ fn new_workspace(session_dir: &Path) -> anyhow::Result<PathBuf> {
 /// `$HOME/.local/share/boxcar` when `XDG_DATA_HOME` is unset, empty or
 /// relative (the XDG base directory spec says to ignore a relative one).
 /// `None` when `HOME` is not an absolute path either.
-fn default_audit_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+pub(crate) fn default_audit_dir(
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
     let absolute = |var: Option<OsString>| var.map(PathBuf::from).filter(|p| p.is_absolute());
     absolute(xdg_data_home)
         .map(|data| data.join("boxcar"))

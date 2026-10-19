@@ -183,6 +183,20 @@ pub fn start_env<'a>(
     command: &[&str],
     env: &[(&str, &Path)],
 ) -> Running<'a> {
+    let rootfs = guest.rootfs.to_str().unwrap();
+    start_with_root(guest, scratch, &["--rootfs", rootfs], flags, command, env)
+}
+
+/// [`start_env`] with the root share given by `root` (`--rootfs DIR`, or
+/// `--image REF` with its flags) instead of the guest's directory.
+pub fn start_with_root<'a>(
+    guest: &Guest,
+    scratch: &'a Scratch,
+    root: &[&str],
+    flags: &[&str],
+    command: &[&str],
+    env: &[(&str, &Path)],
+) -> Running<'a> {
     let child = Command::new(env!("CARGO_BIN_EXE_boxcar"))
         .envs(env.iter().map(|(name, value)| (*name, *value)))
         .arg("run")
@@ -190,8 +204,7 @@ pub fn start_env<'a>(
         .arg(&guest.kernel)
         .arg("--initramfs")
         .arg(&guest.initramfs)
-        .arg("--rootfs")
-        .arg(&guest.rootfs)
+        .args(root)
         .arg("--workspace")
         .arg(scratch.path("workspace"))
         .arg("--audit-dir")
@@ -199,8 +212,15 @@ pub fn start_env<'a>(
         .arg("--console-log")
         .arg(scratch.path("console.log"))
         .args(flags)
-        .arg("--")
-        .args(command)
+        // No command: the session's default (an image's Entrypoint and
+        // Cmd, or a shell); clap wants no bare `--` then.
+        .args(if command.is_empty() {
+            Vec::new()
+        } else {
+            let mut rest = vec!["--"];
+            rest.extend_from_slice(command);
+            rest
+        })
         .stdin(Stdio::null())
         .stdout(File::create(scratch.path("stdout.log")).unwrap())
         .stderr(File::create(scratch.path("stderr.log")).unwrap())
