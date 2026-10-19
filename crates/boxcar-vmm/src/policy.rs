@@ -603,7 +603,7 @@ impl BootTimer {
 
 /// Removes exceptions as they expire, on the VMM's main loop: a
 /// `CLOCK_BOOTTIME` timer armed for the earliest deadline (and at least
-/// every [`EXPIRY_RECHECK`] while any lives), re-armed at each grant
+/// every minute while any lives), re-armed at each grant
 /// through [`LivePolicy::expiry_wake`].
 pub struct ExpiryTimer {
     policy: Arc<LivePolicy>,
