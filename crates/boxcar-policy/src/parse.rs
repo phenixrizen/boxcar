@@ -8,7 +8,6 @@
 use std::ops::Range;
 
 use boxcar_net::{List, Policy, Verdict};
-use globset::GlobBuilder;
 use serde::Deserialize;
 use toml::Spanned;
 
@@ -222,8 +221,9 @@ fn list<'a>(
     Ok(entries.iter().collect())
 }
 
-/// A list of path globs, each absolute (starting `/` or `**/`) and one
-/// `globset` compiles with `literal_separator`.
+/// A list of path globs, each one [`boxcar_fs::rules::glob`] takes:
+/// absolute (starting `/` or `**/`) and one `globset` compiles with
+/// `literal_separator`.
 fn globs(
     raw: &Option<SpannedList>,
     name: &str,
@@ -232,17 +232,8 @@ fn globs(
     let mut out = Vec::new();
     for entry in list(raw, name, fail)? {
         let glob = entry.get_ref();
-        if !(glob.starts_with('/') || glob.starts_with("**/")) {
-            return Err(fail(
-                entry.span(),
-                format!("{name}: {glob:?} is relative; a path glob starts with / or **/"),
-            ));
-        }
-        if let Err(error) = GlobBuilder::new(glob).literal_separator(true).build() {
-            return Err(fail(
-                entry.span(),
-                format!("{name}: {glob:?} is not a glob: {}", error.kind()),
-            ));
+        if let Err(error) = boxcar_fs::rules::glob(glob) {
+            return Err(fail(entry.span(), format!("{name}: {error}")));
         }
         out.push(glob.clone());
     }
@@ -295,7 +286,14 @@ mod tests {
         assert!(!file.record.scrub_argv);
         assert_eq!(file.fs_rules(), 1);
         assert_eq!(file.exec_rules(), 0);
-        assert_eq!(file.not_in_force(), ["[fs] writable"]);
+        assert_eq!(
+            file.path_spec(),
+            boxcar_fs::PathSpec {
+                writable: vec!["/workspace/**".to_owned()],
+                denied: Vec::new(),
+                exec_deny: Vec::new(),
+            }
+        );
     }
 
     /// Every field, read as written.
@@ -343,17 +341,10 @@ scrub_argv = true
         assert!(file.record.scrub_argv);
         assert_eq!(file.fs_rules(), 6);
         assert_eq!(file.exec_rules(), 2);
-        assert_eq!(
-            file.not_in_force(),
-            [
-                "[fs] writable",
-                "[fs] denied",
-                "[fs] indicators",
-                "[exec] deny",
-                "[spans] keep_tool_args",
-                "[record] scrub_argv",
-            ]
-        );
+        let spec = file.path_spec();
+        assert_eq!(spec.writable, file.fs.writable);
+        assert_eq!(spec.denied, file.fs.denied);
+        assert_eq!(spec.exec_deny, file.exec.deny);
     }
 
     /// Each table may be empty, each list too; `writable = []` is nothing
@@ -366,12 +357,6 @@ scrub_argv = true
         assert_eq!(file.egress.policy, Policy::default());
         assert!(file.fs.writable.is_empty());
         assert_eq!(file.fs_rules(), 0);
-        // Writing everywhere, with only the reconciler's own indicators, is
-        // all in force already.
-        let open = ok(
-            "version = 1\n[fs]\nwritable = [\"/**\"]\nindicators = [\"/var/log/**\", \"**/.*_history\"]\n",
-        );
-        assert!(open.not_in_force().is_empty());
         // The same as inline tables.
         let inline = ok("version = 1\negress = { default = \"deny\", allow = [\"a.test\"] }\n");
         assert_eq!(

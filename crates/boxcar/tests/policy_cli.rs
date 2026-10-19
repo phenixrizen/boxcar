@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use boxcar_proto::control::{
-    to_line, ErrorBody, ErrorCode, Hello, NetPolicy, PolicyUpdateParams, PolicyUpdated, PolicyView,
-    Response, VsockPolicy,
+    to_line, ErrorBody, ErrorCode, ExceptionKind, ExceptionView, Hello, NetPolicy,
+    PolicyUpdateParams, PolicyUpdated, PolicyView, Response, VsockPolicy,
 };
 use boxcar_proto::Verdict;
 use serde_json::Value;
@@ -54,29 +54,38 @@ struct Served {
 /// `net` and `vsock` and moving the version on, unless `refuse` names the
 /// error to answer an update with. One connection, then it returns what it
 /// saw.
-fn fake_server(
+fn fake_server(path: &Path, policy: PolicyView, refuse: Option<ErrorBody>) -> JoinHandle<Served> {
+    fake_server_with(path, policy, refuse, &CAPABILITIES)
+}
+
+/// What a current server's hello lists.
+const CAPABILITIES: [&str; 7] = [
+    "pty",
+    "audit",
+    "policy.net",
+    "policy.inspect",
+    "findings",
+    "spans",
+    "policy.exception",
+];
+
+/// [`fake_server`] whose hello lists `capabilities`. A grant
+/// (`policy.update` with `exception`) adds the exception to the policy's
+/// list, with the next id.
+fn fake_server_with(
     path: &Path,
     mut policy: PolicyView,
     refuse: Option<ErrorBody>,
+    capabilities: &[&str],
 ) -> JoinHandle<Served> {
+    let capabilities = strings(capabilities);
     // A test may start a second server at the same path.
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path).unwrap();
     thread::spawn(move || {
         let mut served = Served::default();
         let (mut stream, _) = listener.accept().unwrap();
-        let hello = Hello::new(
-            "boxcar/fake",
-            SESSION,
-            strings(&[
-                "pty",
-                "audit",
-                "policy.net",
-                "policy.inspect",
-                "findings",
-                "spans",
-            ]),
-        );
+        let hello = Hello::new("boxcar/fake", SESSION, capabilities);
         stream.write_all(&to_line(&hello).unwrap()).unwrap();
         let reader = BufReader::new(stream.try_clone().unwrap());
         for line in reader.lines() {
@@ -96,6 +105,16 @@ fn fake_server(
                         }
                         if let Some(vsock) = params.vsock {
                             policy.vsock = vsock;
+                        }
+                        if let Some(grant) = params.exception {
+                            policy.exceptions.push(ExceptionView {
+                                id: policy.exceptions.len() as u32 + 1,
+                                rule: grant.rule,
+                                kind: grant.kind,
+                                ttl_s: grant.ttl_s,
+                                expires_ns: u64::MAX / 2,
+                                by_pid: 42,
+                            });
                         }
                         policy.version += 1;
                         Response::success(
@@ -394,4 +413,168 @@ fn policy_usage_errors_exit_2() {
         );
     }
     drop(UnixStream::pair());
+}
+
+/// `allow ... --ttl` grants an exception, alone in its update and of the
+/// kind its flag says, without reading the policy first.
+#[test]
+fn allow_with_a_ttl_grants_an_exception() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    for (args, rule, kind, ttl_s) in [
+        (
+            &["allow", "pypi.org:443", "--ttl", "10m"][..],
+            "pypi.org:443",
+            "egress",
+            600,
+        ),
+        (
+            &["allow", "--writable", "/etc/**", "--ttl", "90"][..],
+            "/etc/**",
+            "writable",
+            90,
+        ),
+        (
+            &["allow", "--exec", "/workspace/*", "--ttl", "1h"][..],
+            "/workspace/*",
+            "exec",
+            3600,
+        ),
+    ] {
+        let server = fake_server(&socket, starting_policy(), None);
+        let output = policy(&socket, args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            stdout(&output),
+            format!("policy version 2 ({kind} exception {rule} for {ttl_s} s)\n")
+        );
+        let served = server.join().unwrap();
+        assert_eq!(ops(&served), ["policy.update"]);
+        let update = &served.requests[0];
+        assert_eq!(
+            update["exception"],
+            serde_json::json!({"rule": rule, "kind": kind, "ttl_s": ttl_s})
+        );
+        assert!(update.get("net").is_none() && update.get("vsock").is_none());
+    }
+}
+
+/// What a grant needs: `--ttl` for a path exception, a rule that parses as
+/// its kind, a duration within a day: usage errors before any connection.
+#[test]
+fn an_exception_that_cannot_be_is_a_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("nobody.sock");
+    for args in [
+        &["allow", "--writable", "/etc/**"][..],
+        &["allow", "--writable", "etc/**", "--ttl", "60"][..],
+        &["allow", "--exec", "/usr/bin/[z-a]", "--ttl", "60"][..],
+        &["allow", "exa_mple.com", "--ttl", "60"][..],
+        &["allow", "pypi.org", "--ttl", "2d"][..],
+        &["allow", "pypi.org", "--ttl", "0"][..],
+        &["allow", "pypi.org", "--writable", "/x", "--ttl", "60"][..],
+        &["allow"][..],
+    ] {
+        let output = policy(&socket, args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+/// `exception ls` lists the live exceptions; with `--json`, the list as the
+/// server gave it.
+#[test]
+fn exception_ls_lists_the_live_exceptions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let mut live = starting_policy();
+    live.exceptions = vec![ExceptionView {
+        id: 3,
+        rule: "pypi.org:443".into(),
+        kind: ExceptionKind::Egress,
+        ttl_s: 600,
+        expires_ns: u64::MAX / 2,
+        by_pid: 42,
+    }];
+    let server = fake_server(&socket, live.clone(), None);
+    let output = policy(&socket, &["exception", "ls"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with("3    egress   pypi.org:443 ("),
+        "{}",
+        stdout(&output)
+    );
+    server.join().unwrap();
+
+    let server = fake_server(&socket, live.clone(), None);
+    let output = policy(&socket, &["exception", "ls", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&output)).unwrap(),
+        serde_json::to_value(&live.exceptions).unwrap()
+    );
+    server.join().unwrap();
+
+    let server = fake_server(&socket, starting_policy(), None);
+    let output = policy(&socket, &["exception", "ls"]);
+    assert_eq!(stdout(&output), "(none)\n");
+    server.join().unwrap();
+}
+
+/// A server whose hello lists no `policy.exception` is told so, and asked
+/// nothing.
+#[test]
+fn a_server_without_exceptions_is_not_asked_for_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let older = &CAPABILITIES[..6];
+    for args in [
+        &["allow", "pypi.org", "--ttl", "60"][..],
+        &["exception", "ls"][..],
+    ] {
+        let server = fake_server_with(&socket, starting_policy(), None, older);
+        let output = policy(&socket, args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("policy.exception"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(server.join().unwrap().requests.is_empty());
+    }
+}
+
+/// A permanent `allow` while an exception lives writes back the permanent
+/// rules it read, which never hold the exception.
+#[test]
+fn a_permanent_allow_never_writes_an_exception_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("control.sock");
+    let mut live = starting_policy();
+    live.exceptions = vec![ExceptionView {
+        id: 1,
+        rule: "pypi.org:443".into(),
+        kind: ExceptionKind::Egress,
+        ttl_s: 600,
+        expires_ns: u64::MAX / 2,
+        by_pid: 42,
+    }];
+    let server = fake_server(&socket, live, None);
+    let output = policy(&socket, &["allow", "new.test"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let net = updated_net(&server.join().unwrap());
+    assert_eq!(net.allow, ["a.test", "*.github.io:443", "new.test"]);
 }

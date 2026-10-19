@@ -549,27 +549,19 @@ fn policy_conflicts_with_policy_file() {
 }
 
 /// A profile's name is the profile, whatever files there are; anything
-/// else is a path, and one that cannot be read is an error naming it. The
-/// strict profile says what this build does not enforce of it.
+/// else is a path, and one that cannot be read is an error naming it.
+/// Every section is in force: nothing is warned of.
 #[test]
 fn a_profile_is_taken_by_name_and_anything_else_as_a_path() {
-    let (output, _) = run_with_policy(&["--policy", "agent-isolate"]);
-    assert_reached_the_vmm(&output);
-    assert!(
-        !stderr(&output).contains("warning: --policy"),
-        "agent-isolate is all in force: {}",
-        stderr(&output)
-    );
-    let (output, _) = run_with_policy(&["--policy", "agent-isolate-strict"]);
-    assert_reached_the_vmm(&output);
-    assert!(
-        stderr(&output).contains(
-            "warning: --policy agent-isolate-strict: this build does not enforce \
-             [fs] writable, [exec] deny yet"
-        ),
-        "{}",
-        stderr(&output)
-    );
+    for profile in ["agent-isolate", "agent-isolate-strict"] {
+        let (output, _) = run_with_policy(&["--policy", profile]);
+        assert_reached_the_vmm(&output);
+        assert!(
+            !stderr(&output).contains("warning: --policy"),
+            "{profile} is all in force: {}",
+            stderr(&output)
+        );
+    }
     let (output, made) = run_with_policy(&["--policy", "./agent-isolate"]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(

@@ -32,6 +32,8 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use boxcar_audit::{AuditSink, EmitError, Priority, Submission};
+use boxcar_fs::rules::{LiveRules, PathRules, PathSpec};
+use boxcar_fs::scan::scan;
 use boxcar_fs::{AuditFsOptions, FsShareConfig};
 use boxcar_net::{InspectConfig, NetConfig, Policy};
 use boxcar_proto::{
@@ -70,7 +72,7 @@ use crate::lifecycle::{
     MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
 use crate::memory::{create_guest_memory, initrd_load_addr};
-use crate::policy::LivePolicy;
+use crate::policy::{ExpiryTimer, LivePolicy};
 use crate::pty::PtyHub;
 use crate::sensor_ingest::SensorIngest;
 use crate::services::ServiceRegistry;
@@ -202,6 +204,10 @@ pub struct VmConfig {
     pub fs_shares: Vec<FsShareConfig>,
     /// How much the shares record.
     pub fs_audit: AuditFsOptions,
+    /// The shares' path rules, a policy file's `[fs]` and `[exec]`; `None`
+    /// checks nothing. When they deny or refuse anything, the shares are
+    /// scanned for it before the devices start (`boxcar_fs::scan`).
+    pub path_rules: Option<PathSpec>,
     /// The network card's stack, if the VM has one (slot 2): see
     /// `boxcar_net::NetStack`. The guest's addressing is fixed; the config
     /// gives the DNS upstreams and the relays' bounds.
@@ -298,6 +304,7 @@ impl VmConfig {
             scrub_argv: None,
             image: None,
             policy_loaded: None,
+            path_rules: None,
         }
     }
 }
@@ -354,6 +361,10 @@ pub enum VmmError {
     Slots(#[from] SlotError),
     #[error(transparent)]
     Device(#[from] DeviceError),
+    #[error("--policy: {0}")]
+    PathRules(#[from] boxcar_fs::rules::GlobError),
+    #[error("--policy: {0}")]
+    Scan(#[from] boxcar_fs::ScanError),
     #[error("cannot record vmm.start")]
     Audit(#[from] EmitError),
     #[error("cannot bind the control socket in {}", state_dir.display())]
@@ -475,6 +486,19 @@ impl Vmm {
         let set = DeviceSet::from_config(&cfg);
         let mut mmio = Bus::new();
         let mut slots = SlotAllocator::new()?;
+        // The path rules every share reads, and what the boot scan finds of
+        // them across the shares, as one set.
+        let path_rules = match &cfg.path_rules {
+            Some(spec) => PathRules::new(spec, &[], &[])?,
+            None => PathRules::allow_all(),
+        };
+        let shares: Vec<(&Path, &str)> = cfg
+            .fs_shares
+            .iter()
+            .map(|share| (share.host_dir.as_path(), share.guest_path.as_str()))
+            .collect();
+        let denied = Arc::new(scan(&shares, &path_rules)?);
+        let fs_rules: LiveRules = Arc::new(ArcSwap::from_pointee(path_rules));
         let fs = FsDevices::attach(
             &vm,
             &mem,
@@ -482,7 +506,7 @@ impl Vmm {
             &mut slots,
             &cfg.fs_shares,
             &cfg.audit,
-            FsOptions::for_vcpus(cfg.fs_audit, cfg.vcpus),
+            FsOptions::for_vcpus(cfg.fs_audit, cfg.vcpus).with_rules(Arc::clone(&fs_rules), denied),
         )?;
         let net = NetDevice::attach(
             &vm,
@@ -569,7 +593,13 @@ impl Vmm {
             Some(wake) => Some(wake.try_clone().map_err(setup("policy wake"))?),
             None => None,
         };
-        let live_policy = LivePolicy::new(Arc::clone(&cfg.policy), net_wake, vsock.allow_ports());
+        let mut live_policy =
+            LivePolicy::new(Arc::clone(&cfg.policy), net_wake, vsock.allow_ports())
+                .map_err(setup("exception wake"))?
+                .with_audit(cfg.audit.clone());
+        if !cfg.fs_shares.is_empty() {
+            live_policy = live_policy.with_paths(fs_rules, cfg.path_rules.clone());
+        }
         let info = Arc::new(VmInfo {
             session_id: cfg
                 .control
@@ -793,6 +823,10 @@ impl Vmm {
         );
         let fds = control.fds();
         add_subscriber(&mut main_loop, Box::new(control), &fds)?;
+        let expiry =
+            ExpiryTimer::new(Arc::clone(&self.info.policy)).map_err(setup("exception timer"))?;
+        let fds = expiry.fds();
+        add_subscriber(&mut main_loop, Box::new(expiry), &fds)?;
 
         let terminal = if self.interactive {
             let subscriber = StdinSubscriber::new(

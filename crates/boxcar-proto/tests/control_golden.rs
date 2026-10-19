@@ -118,7 +118,8 @@ fn every_golden_line_parses_as_what_it_is_and_everything_appears() {
                             "policy.net",
                             "policy.inspect",
                             "findings",
-                            "spans"
+                            "spans",
+                            "policy.exception"
                         ]
                     );
                 }

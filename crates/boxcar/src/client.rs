@@ -223,6 +223,8 @@ pub struct Client {
     /// in order: [`Client::next_message`] returns these first, so no event
     /// is lost to a request.
     pending: VecDeque<Message>,
+    /// What the server's hello said it can do.
+    capabilities: Vec<String>,
 }
 
 /// Sends requests on a [`Client`]'s connection without waiting for their
@@ -274,6 +276,7 @@ impl Client {
             path: path.to_owned(),
             next_id: Arc::new(AtomicU64::new(1)),
             pending: VecDeque::new(),
+            capabilities: Vec::new(),
         };
         let line = client.read_line()?.ok_or_else(|| {
             anyhow!(
@@ -293,7 +296,13 @@ impl Client {
                 hello.versions
             );
         }
+        client.capabilities = hello.capabilities;
         Ok(client)
+    }
+
+    /// Whether the server's hello listed `capability`.
+    pub fn can(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
     }
 
     /// How long a read waits; `None` waits forever.

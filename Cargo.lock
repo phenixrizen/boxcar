@@ -380,6 +380,7 @@ dependencies = [
 name = "boxcar-policy"
 version = "0.1.0"
 dependencies = [
+ "boxcar-fs",
  "boxcar-net",
  "globset",
  "serde",

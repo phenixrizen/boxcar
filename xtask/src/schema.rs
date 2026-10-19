@@ -442,6 +442,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
         "policy.inspect",
         "findings",
         "spans",
+        "policy.exception",
     ]
     .map(str::to_owned)
     .to_vec();

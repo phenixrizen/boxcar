@@ -89,7 +89,9 @@ const AGENT_ISOLATE_STRICT: &str = r#"# agent-isolate-strict: agent-isolate's ne
 #
 # [exec] deny refuses program files, not the names they are run by: a
 # BusyBox applet (/usr/bin/nc linking to /bin/busybox) is BusyBox, so these
-# stop a real nc binary but not the applet.
+# stop a real nc binary but not the applet. A refused program cannot be
+# opened at all, so a loader or a copy does not run it either; Debian's nc
+# leads to nc.openbsd or nc.traditional, named too.
 version = 1
 
 [egress]
@@ -133,7 +135,7 @@ writable = ["/workspace/**", "/tmp/**"]
 indicators = ["**/.*_history", "/var/log/**", "/etc/ld.so.preload", "/root/.ssh/**"]
 
 [exec]
-deny = ["**/nc", "**/ncat", "**/socat", "**/telnet"]
+deny = ["**/nc", "**/nc.openbsd", "**/nc.traditional", "**/netcat", "**/ncat", "**/socat", "**/telnet"]
 "#;
 
 #[cfg(test)]
@@ -193,8 +195,6 @@ inspect *.openai.com:443
         assert!(isolate.exec.deny.is_empty());
         assert!(isolate.spans.keep_tool_args);
         assert!(!isolate.record.scrub_argv);
-        // Nothing in it waits for the filesystem's enforcement.
-        assert!(isolate.not_in_force().is_empty());
     }
 
     /// The strict profile has the same network and indicators, and keeps
@@ -209,9 +209,16 @@ inspect *.openai.com:443
         assert_eq!(strict.fs.indicators, isolate.fs.indicators);
         assert_eq!(
             strict.exec.deny,
-            ["**/nc", "**/ncat", "**/socat", "**/telnet"]
+            [
+                "**/nc",
+                "**/nc.openbsd",
+                "**/nc.traditional",
+                "**/netcat",
+                "**/ncat",
+                "**/socat",
+                "**/telnet"
+            ]
         );
-        assert_eq!(strict.not_in_force(), ["[fs] writable", "[exec] deny"]);
     }
 
     /// Every name has a text, and no other name does.
@@ -278,12 +285,15 @@ inspect *.openai.com:443
             "/usr/local/bin/ncat",
             "/usr/bin/socat",
             "/workspace/tools/telnet",
+            "/bin/nc.openbsd",
+            "/bin/nc.traditional",
+            "/usr/bin/netcat",
         ] {
             assert!(programs.is_match(path), "{path}");
         }
         for path in [
             "/usr/bin/ncdu",
-            "/usr/bin/nc.openbsd",
+            "/usr/bin/nc.other",
             "/bin/busybox",
             "/usr/bin/telnetd",
         ] {

@@ -11,7 +11,12 @@ description = "boxcar's policy files: the TOML model, its parser with line and c
 [dependencies]
 # The line policy the egress compiles through.
 boxcar-net = { workspace = true }
+# The path rules: what a path glob is, and the rules the shares read.
+boxcar-fs = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-globset = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The profiles' globs, read as the shares read them.
+globset = { workspace = true }
