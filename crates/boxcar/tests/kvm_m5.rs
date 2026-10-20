@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use boxcar_testreg::{config, index, layer_tar, manifest, Auth, Faults, Registry};
 use kvm_harness::{
-    boxcar, boxcar_run, guest_or_skip, networked_guest_or_skip, of_kind, start_env,
+    boxcar, boxcar_run, guest_or_skip, networked_guest_or_skip, of_kind, start, start_env,
     start_with_root, text, Guest, Run, Scratch,
 };
 
@@ -1022,4 +1022,128 @@ fn a_seccomp_kill_is_a_crash() {
         .collect();
     assert_eq!(of_kind(&records, "vmm.start").len(), 1, "{records:?}");
     assert!(of_kind(&records, "vmm.stop").is_empty(), "{records:?}");
+}
+
+/// A session's log, after the run, exports in both forms: a trace whose
+/// session span names the session, and OCSF events that each point back to
+/// it, the workspace's new file among them.
+#[test]
+fn a_session_exports_to_otlp_and_ocsf() {
+    let Some(guest) = guest_or_skip("a_session_exports_to_otlp_and_ocsf") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &[],
+        &["sh", "-c", "echo exported > /workspace/e"],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    let dir = run.session_dir();
+    let session = dir.file_name().unwrap().to_str().unwrap().to_owned();
+    let export = |format: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_boxcar"))
+            .args(["audit", "export"])
+            .arg(&dir)
+            .args(["--format", format])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+
+    let trace: serde_json::Value = serde_json::from_str(&export("otlp")).unwrap();
+    let spans = trace["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let root = &spans[0];
+    assert_eq!(root["name"], "boxcar.session", "{root}");
+    assert_eq!(root["traceId"], session.replace('-', ""));
+
+    let events: Vec<serde_json::Value> = export("ocsf")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .all(|e| e["metadata"]["correlation_uid"] == session.as_str()),
+        "every event names the session"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["class_uid"] == 1001 && e["file"]["path"] == "/workspace/e"),
+        "the workspace's new file"
+    );
+}
+
+/// `boxcar audit verify --control` checks a running session's log against
+/// its audit writer's head, then again from past that head: the log has
+/// grown meanwhile, since the second connection is recorded
+/// (`control.connect`) before it asks. Once the run has ended, the whole
+/// log verifies on disk.
+#[test]
+fn a_running_sessions_log_verifies_against_its_writers_head() {
+    let Some(guest) = guest_or_skip("a_running_sessions_log_verifies_against_its_writers_head")
+    else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut running = start(
+        &guest,
+        &scratch,
+        &[],
+        &[
+            "sh",
+            "-c",
+            "echo UP; while [ ! -e /workspace/go ]; do sleep 1; done; echo DONE",
+        ],
+    );
+    let control = running.control();
+    running.until("the session to start", |run| run.stdout().contains("UP"));
+
+    let first = boxcar(&["audit", "verify", "--json"], &control);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}\n{}",
+        text(&first.stdout),
+        text(&first.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(summary["ok"], true, "{summary}");
+    assert_eq!(summary["from_seq"], 1, "{summary}");
+    let head = summary["head_seq"].as_u64().unwrap();
+    assert_eq!(summary["to_seq"], head, "{summary}");
+    assert!(head > 1, "{summary}");
+
+    let from = (head + 1).to_string();
+    let second = boxcar(&["audit", "verify", "--from-seq", &from], &control);
+    let said = text(&second.stdout);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{said}\n{}",
+        text(&second.stderr)
+    );
+    assert!(
+        said.starts_with(&format!("ok: verified seq {from}..")) && said.contains("b3:"),
+        "{said}"
+    );
+
+    fs::write(scratch.path("workspace").join("go"), "").unwrap();
+    let run = running.finish();
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(run.stdout.contains("DONE"), "{}", run.describe());
+    let verify = std::process::Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["audit", "verify"])
+        .arg(run.session_dir())
+        .output()
+        .unwrap();
+    assert_eq!(verify.status.code(), Some(0), "{}", text(&verify.stdout));
+    let records = run.records();
+    assert!(of_kind(&records, "control.connect").len() >= 2);
 }

@@ -175,6 +175,20 @@ pub struct Client {
     timeout: Duration,
 }
 
+/// TLS on rustls with the ring provider (the gate's), trusting `roots`:
+/// the registry client's, and the OTLP export's (`crate::otlp`).
+pub(crate) fn tls_config(roots: &[CertificateDer<'static>]) -> TlsConfig {
+    let roots: Vec<ureq::tls::Certificate<'static>> = roots
+        .iter()
+        .map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned())
+        .collect();
+    TlsConfig::builder()
+        .provider(TlsProvider::Rustls)
+        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .root_certs(RootCerts::new_with_certs(&roots))
+        .build()
+}
+
 impl Client {
     /// A client for `reference`'s repository, over HTTPS with `roots`;
     /// a registry on `localhost` or `127.0.0.0/8` is spoken to over plain
@@ -186,15 +200,7 @@ impl Client {
         roots: Vec<CertificateDer<'static>>,
         config: Option<&DockerConfig>,
     ) -> Result<Client, ClientError> {
-        let roots: Vec<ureq::tls::Certificate<'static>> = roots
-            .iter()
-            .map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned())
-            .collect();
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::Rustls)
-            .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .root_certs(RootCerts::new_with_certs(&roots))
-            .build();
+        let tls = tls_config(&roots);
         Client::build(reference, config, tls, is_loopback(reference.api_host()))
     }
 

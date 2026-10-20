@@ -8,9 +8,9 @@
 //! [`Ops::stop`] once its parameters parse; every other op goes to
 //! [`Ops::dispatch`]: the VMM's serves `pty.attach`, `pty.watch` and
 //! `pty.resize` (the hello's capability `pty`), `audit.subscribe` (the
-//! capability `audit`), and `policy.get` and `policy.update` (the
-//! capabilities `policy.net`, and `policy.inspect` for the `inspect`
-//! lines they carry).
+//! capability `audit`), `audit.verify` (the capability `audit.verify`), and
+//! `policy.get` and `policy.update` (the capabilities `policy.net`, and
+//! `policy.inspect` for the `inspect` lines they carry).
 //!
 //! ## `pty.attach`
 //!
@@ -99,6 +99,37 @@
 //! over 64 bytes), `busy` (4 subscriptions already), `invalid_state` (the
 //! audit log is closed or has failed), `internal` (the log cannot be read).
 //!
+//! ## `audit.verify`
+//!
+//! `{"v":1,"id":N,"op":"audit.verify","from_seq":S}` checks that the log on
+//! disk, from seq `S` (1 when absent, as is 0), is a valid chain up to the
+//! audit writer's head, a stretch per call. The op asks the writer for its
+//! head in band, as `audit.subscribe` subscribes: the writer flushes the log
+//! and answers with its last record's seq and hash. Then it walks the log
+//! ([`boxcar_audit::verify_range`]) from the last checkpoint listed before
+//! `S`, keeping the stored hashes of the records before `S` for that
+//! checkpoint's window, and hashing every record from `S` on again from
+//! its line: its `prev` link, each checkpoint's root and count, and the
+//! index line of each checkpoint. It reads nothing past the head, and stops
+//! after 50,000 records or 64 MiB of them, whichever comes first, or at the
+//! head. The response is `{"from_seq":S,"from_prev":"b3:...",
+//! "to_seq":T,"to_hash":"b3:...","head_seq":H,"head_hash":"b3:...",
+//! "checkpoints":C,"more":M}`: the records `S` to `T` verified, `from_prev`
+//! the hash the record before `S` stores (the genesis hash for 1), which a
+//! client that verified up to `S - 1` compares with the hash it holds, `C`
+//! checkpoints among them, and `M` true until `T` reaches the head, where
+//! the record must have the head's hash. A client asks again from `T + 1`
+//! until `more` is false.
+//!
+//! The walk runs on the connection's thread and looks at the connection's
+//! closing flag before each record, so the server's shutdown, which closes
+//! every connection, stops it at once. Errors: `bad_request` (parameters
+//! that do not parse, a `from_seq` past the head), `invalid_state` (the
+//! audit log is closed, or has failed: a failed writer has no head it can
+//! vouch for, and its log is `boxcar audit verify PATH`'s once the run
+//! ends; or the session is stopping), `internal` (the log is broken, or
+//! cannot be read: the verifier's message, cut to 512 bytes).
+//!
 //! ## `policy.get`
 //!
 //! `{"v":1,"id":N,"op":"policy.get"}` answers with the policy in force:
@@ -137,6 +168,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use boxcar_audit::RangeLimits;
 use boxcar_proto::control::{
     ErrorBody, ErrorCode, PolicyUpdateParams, PolicyUpdated, PtyAttachParams, PtyAttached,
     PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Request, SpanList, SpanListParams,
@@ -230,6 +262,11 @@ impl ConnEvents {
             .is_some_and(|conn| conn.send_paced(event, stall))
     }
 
+    /// The connection, while it is there.
+    pub(crate) fn conn(&self) -> Option<Arc<Conn>> {
+        self.conn.upgrade()
+    }
+
     /// Whether the connection is still there and not closing.
     pub(crate) fn is_open(&self) -> bool {
         self.conn.upgrade().is_some_and(|conn| !conn.is_closing())
@@ -289,6 +326,8 @@ impl fmt::Debug for RawUpgrade {
 pub struct VmmOps {
     handle: VmmHandle,
     audit: Limits,
+    /// The stretch one `audit.verify` checks.
+    verify: RangeLimits,
 }
 
 impl VmmOps {
@@ -296,7 +335,16 @@ impl VmmOps {
         VmmOps {
             handle,
             audit: Limits::default(),
+            verify: RangeLimits::default(),
         }
+    }
+
+    /// `audit.verify` stretches shorter than the defaults, so that a test
+    /// reaches their end.
+    #[cfg(test)]
+    pub(crate) fn with_verify_limits(mut self, limits: RangeLimits) -> VmmOps {
+        self.verify = limits;
+        self
     }
 
     /// Audit subscriptions with smaller limits than the defaults, so that
@@ -331,13 +379,15 @@ impl Ops for VmmOps {
     }
 
     /// `pty.attach`, `pty.watch`, `pty.resize`, `audit.subscribe`,
-    /// `policy.get` and `policy.update`: see the module docs.
+    /// `audit.verify`, `policy.get`, `policy.update` and `span.list`: see
+    /// the module docs.
     fn dispatch(&self, conn: &mut ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
         match req.op.as_str() {
             "pty.attach" => self.pty_attach(conn, req),
             "pty.watch" => self.pty_watch(conn, req),
             "pty.resize" => self.pty_resize(req),
             "audit.subscribe" => audit::subscribe(self.handle.audit(), conn, req, self.audit),
+            "audit.verify" => audit::verify(self.handle.audit(), conn, req, self.verify),
             "policy.get" => self.policy_get(),
             "policy.update" => self.policy_update(conn, req),
             "span.list" => self.span_list(req),
@@ -354,6 +404,7 @@ impl Ops for VmmOps {
             "findings".to_owned(),
             "spans".to_owned(),
             "policy.exception".to_owned(),
+            "audit.verify".to_owned(),
         ]
     }
 }
@@ -527,9 +578,11 @@ mod tests {
     use std::time::Duration;
 
     use boxcar_audit::{Priority, Submission};
-    use boxcar_proto::control::{to_line, ErrorCode, Hello, SpanEntry, VmState};
+    use boxcar_proto::control::{to_line, AuditVerify, ErrorCode, Hello, SpanEntry, VmState};
     use boxcar_proto::guest::HostMsg;
-    use boxcar_proto::{Attrib, FsIo, NetDrop, OpResult, Payload, Record, Ring, Subject, Verdict};
+    use boxcar_proto::{
+        genesis_prev, Attrib, FsIo, NetDrop, OpResult, Payload, Record, Ring, Subject, Verdict,
+    };
 
     use super::*;
     use crate::control::conn::{Conn, Session};
@@ -551,7 +604,8 @@ mod tests {
                 "policy.inspect",
                 "findings",
                 "spans",
-                "policy.exception"
+                "policy.exception",
+                "audit.verify"
             ]
         );
 
@@ -684,7 +738,8 @@ mod tests {
                 "policy.inspect",
                 "findings",
                 "spans",
-                "policy.exception"
+                "policy.exception",
+                "audit.verify"
             ])
         );
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
@@ -1018,7 +1073,8 @@ mod tests {
                 "policy.inspect",
                 "findings",
                 "spans",
-                "policy.exception"
+                "policy.exception",
+                "audit.verify"
             ])
         );
 
@@ -1278,7 +1334,8 @@ mod tests {
                 "policy.inspect",
                 "findings",
                 "spans",
-                "policy.exception"
+                "policy.exception",
+                "audit.verify"
             ])
         );
         let before = wire.request("policy.get", Value::Null);
@@ -1451,5 +1508,312 @@ mod tests {
             json!({"by_pid": 1, "version": 2}),
             "the first record is the good update's"
         );
+    }
+
+    /// The writer's head and the log on disk up to it, by a round trip
+    /// through the writer's channel: the session directory and the records.
+    fn log_of(fixture: &Fixture) -> (std::path::PathBuf, Vec<Record>) {
+        let head = fixture.handle.audit().head().unwrap();
+        let records = boxcar_audit::LogReader::open(&head.session_dir)
+            .unwrap()
+            .records()
+            .map(Result::unwrap)
+            .collect();
+        (head.session_dir, records)
+    }
+
+    /// The result of an `audit.verify` that succeeded.
+    fn verified(response: &Value) -> AuditVerify {
+        assert_eq!(response["ok"], true, "{response}");
+        serde_json::from_value(response["result"].clone()).expect("an audit.verify result")
+    }
+
+    /// The checkpoints among the records `from` to `to` of `log`.
+    fn checkpoints(log: &[Record], from: u64, to: u64) -> u64 {
+        log.iter()
+            .filter(|r| r.kind == "checkpoint" && (from..=to).contains(&r.seq))
+            .count() as u64
+    }
+
+    /// `audit.verify` on a live writer: from the start by default (or with
+    /// no parameters at all), to the writer's head, which the record there
+    /// carries, the checkpoints among them counted.
+    #[test]
+    fn verify_checks_a_live_log_to_the_writers_head() {
+        let fixture = Fixture::new();
+        let sink = fixture.handle.audit().clone();
+        for n in 0..1100 {
+            sink.emit(fs_event(n, 5, 0)).unwrap();
+        }
+        let mut wire = Wire::new(&fixture);
+        let reply = verified(&wire.request("audit.verify", json!({})));
+        // The log may have gone on since: a checkpoint on the writer's timer.
+        let (_, log) = log_of(&fixture);
+        assert!(reply.head_seq > 1100, "{reply:?}");
+        let at_head = &log[reply.head_seq as usize - 1];
+        assert_eq!(
+            reply,
+            AuditVerify {
+                from_seq: 1,
+                from_prev: genesis_prev(&log[0].session_id),
+                to_seq: reply.head_seq,
+                to_hash: at_head.hash,
+                head_seq: at_head.seq,
+                head_hash: at_head.hash,
+                checkpoints: checkpoints(&log, 1, reply.head_seq),
+                more: false,
+            }
+        );
+        assert!(reply.checkpoints >= 1, "{reply:?}");
+
+        let ops = VmmOps::new(fixture.handle.clone());
+        let bare = ops
+            .dispatch(
+                &mut ConnCtx::new(1, 0),
+                &Request::new(1, "audit.verify", Value::Null),
+            )
+            .unwrap();
+        let bare: AuditVerify = serde_json::from_value(bare).unwrap();
+        assert_eq!((bare.from_seq, bare.more), (1, false));
+    }
+
+    /// From a seq in a checkpoint's window, from a checkpoint and from the
+    /// record after one, `from_prev` is the hash the record before stores.
+    /// 0 is 1; past the head, or parameters that do not parse, is a bad
+    /// request.
+    #[test]
+    fn verify_from_a_seq_names_the_hash_of_the_record_before() {
+        let fixture = Fixture::new();
+        let sink = fixture.handle.audit().clone();
+        for n in 0..1100 {
+            sink.emit(fs_event(n, 5, 0)).unwrap();
+        }
+        let (_, log) = log_of(&fixture);
+        let checkpoint = log.iter().find(|r| r.kind == "checkpoint").unwrap().seq;
+        assert_eq!(checkpoint, 1025);
+        let mut wire = Wire::new(&fixture);
+        for from_seq in [2, 500, checkpoint - 1, checkpoint, checkpoint + 1, 1090] {
+            let reply = verified(&wire.request("audit.verify", json!({ "from_seq": from_seq })));
+            assert_eq!(reply.from_seq, from_seq);
+            assert_eq!(
+                reply.from_prev,
+                log[from_seq as usize - 2].hash,
+                "from {from_seq}"
+            );
+            assert_eq!((reply.to_seq, reply.more), (reply.head_seq, false));
+            let (_, log) = log_of(&fixture);
+            assert_eq!(
+                reply.checkpoints,
+                checkpoints(&log, from_seq, reply.head_seq),
+                "from {from_seq}"
+            );
+        }
+        let zero = verified(&wire.request("audit.verify", json!({"from_seq": 0})));
+        assert_eq!(zero.from_seq, 1);
+
+        let past = wire.request("audit.verify", json!({"from_seq": 1_000_000}));
+        assert_eq!(code(&past), "bad_request", "{past}");
+        assert!(
+            past["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("1000000"),
+            "{past}"
+        );
+        for params in [json!({"from_seq": -1}), json!({"from_seq": "2"})] {
+            let response = wire.request("audit.verify", params.clone());
+            assert_eq!(code(&response), "bad_request", "{params}: {response}");
+        }
+    }
+
+    /// A log longer than one stretch is answered `more`, up to where the
+    /// stretch stopped, by records or by bytes; a call from the next seq
+    /// finishes it, starting from the hash the first ended at.
+    #[test]
+    fn a_log_longer_than_a_stretch_takes_more_than_one_call() {
+        let fixture = Fixture::new();
+        let sink = fixture.handle.audit().clone();
+        for n in 0..1100 {
+            sink.emit(fs_event(n, 5, 0)).unwrap();
+        }
+        let by_records = RangeLimits {
+            records: 1000,
+            bytes: u64::MAX,
+        };
+        let ops = VmmOps::new(fixture.handle.clone()).with_verify_limits(by_records);
+        let mut wire = Wire::with_ops(&fixture, ops);
+        let first = verified(&wire.request("audit.verify", json!({})));
+        assert_eq!((first.from_seq, first.to_seq, first.more), (1, 1000, true));
+        assert_eq!(first.checkpoints, 0);
+        let second = verified(&wire.request("audit.verify", json!({"from_seq": 1001})));
+        assert_eq!(second.from_prev, first.to_hash);
+        assert_eq!((second.to_seq, second.more), (second.head_seq, false));
+        assert!(second.checkpoints >= 1, "{second:?}");
+
+        let by_bytes = RangeLimits {
+            records: u64::MAX,
+            bytes: 16 * 1024,
+        };
+        let ops = VmmOps::new(fixture.handle.clone()).with_verify_limits(by_bytes);
+        let mut wire = Wire::with_ops(&fixture, ops);
+        let first = verified(&wire.request("audit.verify", json!({})));
+        assert!(
+            first.more && first.to_seq > 1 && first.to_seq < 200,
+            "{first:?}"
+        );
+    }
+
+    /// Syncs nothing: every sync fails.
+    struct BrokenDisk;
+
+    impl boxcar_audit::Syncer for BrokenDisk {
+        fn sync(&self, _: &std::fs::File) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }
+    }
+
+    /// A closed log has no head to verify against, and a failed one none it
+    /// can vouch for: `invalid_state` both, the failure named.
+    #[test]
+    fn verify_refuses_a_closed_or_failed_log() {
+        let mut fixture = Fixture::new();
+        fixture.handle.audit().emit(fs_event(0, 1, 0)).unwrap();
+        let mut wire = Wire::new(&fixture);
+        assert_eq!(wire.request("audit.verify", json!({}))["ok"], true);
+        fixture.close_audit();
+        let closed = wire.request("audit.verify", json!({}));
+        assert_eq!(code(&closed), "invalid_state", "{closed}");
+        assert!(
+            closed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("closed"),
+            "{closed}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = boxcar_audit::WriterConfig::new(tmp.path(), boxcar_proto::SessionId::new());
+        let (sink, writer) = boxcar_audit::spawn_with_syncer(cfg, BrokenDisk).unwrap();
+        sink.emit(Submission {
+            priority: Priority::Critical,
+            ..fs_event(0, 1, 0)
+        })
+        .unwrap();
+        wait_until("the writer failed", || sink.has_failed());
+        let failure = sink.failure().unwrap();
+        let request = Request::new(1, "audit.verify", json!({}));
+        let error = audit::verify(&sink, &ConnCtx::new(1, 0), &request, RangeLimits::default())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidState);
+        assert!(
+            error.message.contains(&failure.to_string()),
+            "{}",
+            error.message
+        );
+        assert!(writer.close().is_err());
+    }
+
+    /// A record changed on disk, its stored hash kept, is a break: `internal`,
+    /// with the verifier's message. A stretch from after it does not see it.
+    #[test]
+    fn a_record_changed_on_disk_is_internal() {
+        use std::os::unix::fs::FileExt;
+
+        let fixture = Fixture::new();
+        let sink = fixture.handle.audit().clone();
+        for n in 0..20 {
+            sink.emit(fs_event(n, 5, 0)).unwrap();
+        }
+        let (dir, _) = log_of(&fixture);
+        let segment = dir.join("events.000001.jsonl");
+        // Seq 7's path, `/file-000006-`: one byte, written in place, so that
+        // the writer's appends meanwhile are not disturbed.
+        let at = std::fs::read_to_string(&segment)
+            .unwrap()
+            .find("/file-000006-")
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap()
+            .write_all_at(b"9", at as u64 + 6)
+            .unwrap();
+        let mut wire = Wire::new(&fixture);
+        let broken = wire.request("audit.verify", json!({}));
+        assert_eq!(code(&broken), "internal", "{broken}");
+        let message = broken["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("chain broken at seq 7:"), "{message}");
+        assert!(message.len() <= 512);
+        let after = verified(&wire.request("audit.verify", json!({"from_seq": 8})));
+        assert!(!after.more);
+    }
+
+    /// The walk looks at the connection's closing flag before each record:
+    /// on a connection that is closing it stops before the first, and the
+    /// server's shutdown, which closes every connection, stops a long walk
+    /// under way at once instead of waiting for it.
+    #[test]
+    fn the_servers_shutdown_stops_a_long_walk_at_once() {
+        let fixture = Fixture::new();
+        let sink = fixture.handle.audit().clone();
+        for n in 0..4000 {
+            sink.emit(fs_event(n, 5, 1000)).unwrap();
+        }
+        written(&sink);
+        let request = Request::new(1, "audit.verify", json!({}));
+        let ops = VmmOps::new(fixture.handle.clone());
+        // How long the whole walk takes here.
+        let started = std::time::Instant::now();
+        let whole: AuditVerify =
+            serde_json::from_value(ops.dispatch(&mut ConnCtx::new(1, 0), &request).unwrap())
+                .unwrap();
+        let walk = started.elapsed();
+        assert!(whole.to_seq > 4000, "{whole:?}");
+
+        let (server_end, _client) = UnixStream::pair().unwrap();
+        let hello = Hello::new("boxcar/test", "session", Vec::new());
+        let conn = Arc::new(Conn::new(server_end, &hello).unwrap());
+        conn.close();
+        let mut ctx = ConnCtx {
+            events: Some(ConnEvents::new(&conn)),
+            ..ConnCtx::new(1, 0)
+        };
+        let started = std::time::Instant::now();
+        let stopping = ops.dispatch(&mut ctx, &request).unwrap_err();
+        assert_eq!(
+            (stopping.code, stopping.message.as_str()),
+            (ErrorCode::InvalidState, "the session is stopping")
+        );
+        assert!(started.elapsed() < walk / 4, "{:?}", started.elapsed());
+
+        // The same walk over a served connection, and the server shut down
+        // under it.
+        let state = tempfile::tempdir().unwrap();
+        let ops: Arc<dyn Ops> = Arc::new(VmmOps::new(fixture.handle.clone()));
+        let (server, path) = crate::control::ControlServer::bind(
+            &state.path().join("session"),
+            fixture.handle.clone(),
+            ops,
+        )
+        .unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        client.set_read_timeout(Some(LIMIT)).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        (&client).write_all(&to_line(&request).unwrap()).unwrap();
+        thread::sleep(walk / 10);
+        let started = std::time::Instant::now();
+        server.shutdown();
+        let took = started.elapsed();
+        assert!(
+            took < walk / 2,
+            "the shutdown took {took:?}, the walk {walk:?}"
+        );
+        // The client hears the stop, and no verdict on the walk.
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        assert!(rest.contains("stopped"), "{rest}");
+        assert!(!rest.contains("\"ok\":true"), "{rest}");
     }
 }

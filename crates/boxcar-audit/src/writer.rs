@@ -25,6 +25,13 @@
 //! with `try_send`: the thread never waits for a subscriber, and drops one
 //! whose queue is full (see [`crate::subscribe`]).
 //!
+//! The chain's head: a request for it ([`AuditSink::head`]) travels in the
+//! channel too. Between two records the thread flushes the current segment
+//! and answers with the last record's seq and hash and the session
+//! directory ([`Head`]): every record up to the head, and every
+//! `checkpoints.jsonl` line for a checkpoint up to it, is then in the
+//! files a reader opens. A failure answers no head.
+//!
 //! Failure: the first I/O error, or a panic, ends the thread. It is
 //! published as a [`WriteFailure`] (the file, what was being done to it, and
 //! the seq being written) before anything else happens, so that from then on
@@ -123,6 +130,17 @@ pub struct CloseStats {
     pub dropped: u64,
     pub last_seq: u64,
     pub last_hash: Hash,
+}
+
+/// The chain's head, as [`AuditSink::head`] gets it from the writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Head {
+    /// The last record's seq; 0 for an empty log.
+    pub seq: u64,
+    /// The last record's hash; the genesis hash for an empty log.
+    pub hash: Hash,
+    /// `<data_dir>/sessions/<session_id>`.
+    pub session_dir: PathBuf,
 }
 
 /// Why the writer thread stopped: what it was doing, to which file, while
@@ -265,6 +283,7 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
         dropped_reported: 0,
         written: 0,
         consistent_len,
+        unanswered: None,
     };
     let thread = thread::Builder::new()
         .name("audit-writer".into())
@@ -303,6 +322,9 @@ struct Writer<S: Syncer> {
     /// consistent after: every checkpoint before it is listed in
     /// `checkpoints.jsonl`. A failure cuts the segment back to it.
     consistent_len: u64,
+    /// A head request whose flush failed: kept until the failure is
+    /// published, so that its requester hears a failure, not a close.
+    unanswered: Option<Sender<Head>>,
 }
 
 impl<S: Syncer> Writer<S> {
@@ -327,6 +349,7 @@ impl<S: Syncer> Writer<S> {
         };
         self.shared.fail(failure.clone());
         drop(held);
+        drop(self.unanswered.take());
         // The index first: killed between the two, the log is left as a
         // crash between a checkpoint's sync and its index line leaves it.
         self.index.roll_back();
@@ -390,7 +413,27 @@ impl<S: Syncer> Writer<S> {
         match msg {
             Msg::Event(submission) => self.write(submission),
             Msg::Subscribe(request) => self.subscribe(request),
+            Msg::Head(reply) => self.head(reply),
         }
+    }
+
+    /// Answers a head request between two records. The segment is flushed
+    /// first, so every record up to the head is in the file its reader
+    /// opens; a checkpoint's index line is appended before the checkpoint
+    /// is done, so those are there too.
+    fn head(&mut self, reply: Sender<Head>) -> FileResult<()> {
+        if let Err(error) = self.segments.flush() {
+            self.unanswered = Some(reply);
+            return Err(error);
+        }
+        let head = Head {
+            seq: self.chain.last_seq(),
+            hash: self.chain.last_hash(),
+            session_dir: self.session_dir.clone(),
+        };
+        // A requester that is gone before its answer needs none.
+        let _ = reply.send(head);
+        Ok(())
     }
 
     /// Registers a subscriber between two records. The segment is flushed

@@ -48,8 +48,9 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use boxcar_proto::limits::MAX_RECORD_BYTES;
 use boxcar_proto::{genesis_prev, Checkpoint, Hash, Record, SessionId};
@@ -57,6 +58,7 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 use crate::checkpoint::{IndexEntry, INDEX_FILE};
+use crate::reader::line_number;
 use crate::segment::{list_segments, numbered_from_one, read_meta, segment_name, META_FILE};
 
 /// The longest partial line a write cut short can leave: a record's line
@@ -235,6 +237,27 @@ pub enum VerifyError {
 /// `meta.json` and `checkpoints.jsonl` against it. A tail cut mid-write is
 /// reported in [`VerifyReport::incomplete`], with what verified before it.
 pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
+    walk_session(session_dir, Walk::new(None)).map(|(report, _)| report)
+}
+
+/// Verifies the log at `path` (a session directory, or one `.jsonl` file,
+/// as [`verify_session`] and [`verify_jsonl`] do) and returns, with the
+/// report, every record that verified, in seq order: up to the report's
+/// `last_seq`, a cut tail left out. The records are the very bytes that were
+/// hashed, parsed once, so nothing that changes the files afterwards can
+/// change them.
+pub fn read_verified(path: &Path) -> Result<(VerifyReport, Vec<Record>), VerifyError> {
+    let walk = Walk::new(None).keeping();
+    let (report, walk) = if path.is_dir() {
+        walk_session(path, walk)?
+    } else {
+        walk_jsonl(path, walk)?
+    };
+    Ok((report, walk.kept.unwrap_or_default()))
+}
+
+/// [`verify_session`]'s walk, with what `walk` keeps.
+fn walk_session(session_dir: &Path, walk: Walk) -> Result<(VerifyReport, Walk), VerifyError> {
     let io_err = |path: &Path| {
         let path = path.to_owned();
         move |e| VerifyError::Io(path, e)
@@ -270,7 +293,7 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
     // The segments meta.json lists hold the log: an extra one is empty.
     let listed = meta.segments.min(count);
 
-    let mut walk = Walk::new(Some(meta.session_id));
+    let mut walk = walk.for_session(meta.session_id);
     let mut partial = None;
     for n in 1..=listed {
         // Only the newest segment may end in a partial line, and not when
@@ -299,7 +322,8 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
             )));
         }
     }
-    Ok(walk.report(listed, cut.or(partial).or(unindexed)))
+    let report = walk.report(listed, cut.or(partial).or(unindexed));
+    Ok((report, walk))
 }
 
 /// Verifies one `.jsonl` file on its own, as a whole chain: its first record
@@ -308,14 +332,19 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
 /// the one cut tail told from a break is a partial last line
 /// ([`IncompleteKind::PartialLine`]).
 pub fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
-    let mut walk = Walk::new(None);
+    walk_jsonl(path, Walk::new(None)).map(|(report, _)| report)
+}
+
+/// [`verify_jsonl`]'s walk, with what `walk` keeps.
+fn walk_jsonl(path: &Path, mut walk: Walk) -> Result<(VerifyReport, Walk), VerifyError> {
     let partial = walk.segment(path, 1, true)?;
     if walk.next_seq == 1 {
         return Err(VerifyError::Layout {
             reason: format!("{}: no records", path.display()),
         });
     }
-    Ok(walk.report(1, partial))
+    let report = walk.report(1, partial);
+    Ok((report, walk))
 }
 
 /// Checks that `meta.json`, which lists `listed` segments, agrees with the
@@ -538,6 +567,8 @@ struct Walk {
     since: u64,
     /// The checkpoint records seen, as `checkpoints.jsonl` should list them.
     checkpoints: Vec<IndexEntry>,
+    /// The records that verified, when the walk keeps them.
+    kept: Option<Vec<Record>>,
 }
 
 impl Walk {
@@ -550,6 +581,22 @@ impl Walk {
             window: blake3::Hasher::new(),
             since: 0,
             checkpoints: Vec::new(),
+            kept: None,
+        }
+    }
+
+    /// The same walk, keeping each record once it has verified.
+    fn keeping(mut self) -> Self {
+        self.kept = Some(Vec::new());
+        self
+    }
+
+    /// The same walk, for the records of `session`, from its genesis.
+    fn for_session(self, session: SessionId) -> Self {
+        Walk {
+            prev: genesis_prev(&session),
+            session: Some(session),
+            ..self
         }
     }
 
@@ -678,6 +725,11 @@ impl Walk {
                 self.window.update(&raw.hash.0);
                 self.since += 1;
             }
+        }
+        if let Some(kept) = &mut self.kept {
+            let record: Record =
+                serde_json::from_slice(bytes).map_err(|e| parse(format!("not a record: {e}")))?;
+            kept.push(record);
         }
         self.next_seq += 1;
         self.prev = raw.hash;
@@ -837,6 +889,431 @@ fn mismatch(entry: &IndexEntry, record: &IndexEntry) -> Option<String> {
                 entry.seq
             )
         })
+}
+
+/// The most records [`verify_range`] checks in one call, by default.
+pub const RANGE_RECORDS: u64 = 50_000;
+/// The most bytes of records' lines [`verify_range`] checks in one call, by
+/// default: 64 MiB.
+pub const RANGE_BYTES: u64 = 64 << 20;
+
+/// How long a stretch [`verify_range`] checks: it stops after the record
+/// that reaches either limit, or at the head, whichever comes first. It
+/// always checks one record at least.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeLimits {
+    /// Records checked, from `from_seq` on.
+    pub records: u64,
+    /// Bytes of their lines, newlines included.
+    pub bytes: u64,
+}
+
+impl Default for RangeLimits {
+    /// [`RANGE_RECORDS`] and [`RANGE_BYTES`].
+    fn default() -> RangeLimits {
+        RangeLimits {
+            records: RANGE_RECORDS,
+            bytes: RANGE_BYTES,
+        }
+    }
+}
+
+/// The stretch of a log [`verify_range`] checked: the records from
+/// `from_seq` to `to_seq`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeReport {
+    pub from_seq: u64,
+    /// The hash the record before `from_seq` stores, which the record at
+    /// `from_seq` names as its `prev`: the genesis hash for seq 1. A client
+    /// that checked the log up to `from_seq - 1` compares it with the hash
+    /// it holds, and so chains one stretch to the next.
+    pub from_prev: Hash,
+    pub to_seq: u64,
+    pub to_hash: Hash,
+    /// The checkpoint records among them.
+    pub checkpoints: u64,
+    /// Whether the head is further on: `to_seq` is below it.
+    pub more: bool,
+}
+
+/// Why [`verify_range`] checked nothing, or stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum RangeError {
+    /// `from_seq` is past the head: there is no record there to check.
+    #[error("seq {from_seq} is past the head at seq {head_seq}")]
+    PastHead { from_seq: u64, head_seq: u64 },
+    /// The cancel flag was set: the walk stopped between two records.
+    #[error("the walk was cancelled")]
+    Cancelled,
+    /// The log is not what the writer wrote, or cannot be read.
+    #[error(transparent)]
+    Break(#[from] VerifyError),
+}
+
+/// Checks a stretch of a session's log against its writer's head, while
+/// the writer may still be appending: the records from `from_seq` (1 when
+/// 0) on, up to the head `(seq, hash)` at most, as [`AuditSink::head`]
+/// reports it, `limits` at a time.
+///
+/// The walk starts at the last checkpoint `checkpoints.jsonl` lists before
+/// `from_seq`, or at the log's start. A checkpoint's root covers the
+/// records since the one before it, so that gives the window `from_seq`
+/// sits in, also when `from_seq` is a checkpoint itself. The records
+/// before `from_seq` are read raw, and only the hashes they store are kept,
+/// for that window: a change to one of them that keeps its stored hash is
+/// not seen. From `from_seq` on, every record is checked as
+/// [`verify_session`] checks it: hashed again from its raw line, with no key
+/// twice, its `prev` link and its seq; each checkpoint's root and count;
+/// and the index line of each checkpoint checked. The records must reach
+/// the head, and the record at the head must have its hash.
+///
+/// No segment or index line past the head is read, so records and
+/// checkpoints the writer appends meanwhile change nothing. `cancel` is
+/// looked at before each record, and stops the walk at once.
+///
+/// [`AuditSink::head`]: crate::AuditSink::head
+pub fn verify_range(
+    session_dir: &Path,
+    from_seq: u64,
+    head: (u64, Hash),
+    limits: RangeLimits,
+    cancel: &AtomicBool,
+) -> Result<RangeReport, RangeError> {
+    let (head_seq, head_hash) = head;
+    let from_seq = from_seq.max(1);
+    if from_seq > head_seq {
+        return Err(RangeError::PastHead { from_seq, head_seq });
+    }
+    let cancelled = || cancel.load(Ordering::Acquire);
+    if cancelled() {
+        return Err(RangeError::Cancelled);
+    }
+    let session = read_meta(session_dir)
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => VerifyError::Layout {
+                reason: format!(
+                    "{}: no {META_FILE}, so not a session directory",
+                    session_dir.display()
+                ),
+            },
+            io::ErrorKind::InvalidData => VerifyError::Layout {
+                reason: e.to_string(),
+            },
+            _ => VerifyError::Io(session_dir.join(META_FILE), e),
+        })?
+        .session_id;
+    let index = index_to_head(session_dir, head_seq)?;
+    let start = index.iter().rev().find(|(_, entry)| entry.seq < from_seq);
+
+    let mut walk = Walk::new(Some(session.clone()));
+    let mut cursor = match start {
+        Some((_, entry)) => Cursor::new(session_dir, entry.segment, entry.offset),
+        None => Cursor::new(session_dir, 1, 0),
+    };
+    let ended = |walk: &Walk| VerifyError::Layout {
+        reason: format!(
+            "the log ends at seq {}, before the head at seq {head_seq}",
+            walk.last_seq()
+        ),
+    };
+
+    // The checkpoint the window starts after, read raw: the record the
+    // index names there must be that checkpoint.
+    if let Some(&(line, ref entry)) = start {
+        let Line {
+            segment,
+            offset,
+            bytes,
+        } = cursor.next_line()?.ok_or_else(|| ended(&walk))?;
+        let bad = |reason: String| VerifyError::CheckpointFile { line, reason };
+        let raw = RawLine::parse(bytes)
+            .map_err(|reason| bad(format!("names a line that is not a record: {reason}")))?;
+        let checkpoint = match raw.check_envelope(session.as_str()) {
+            Ok(Some(checkpoint)) if raw.seq == entry.seq => checkpoint,
+            _ => {
+                return Err(bad(format!(
+                    "names a checkpoint at seq {} at segment {segment} offset {offset}, \
+                     where the log has another record",
+                    entry.seq
+                ))
+                .into())
+            }
+        };
+        if let Some(reason) = mismatch(
+            entry,
+            &IndexEntry::new(raw.seq, segment, offset, &checkpoint),
+        ) {
+            return Err(bad(reason).into());
+        }
+        walk.next_seq = raw.seq + 1;
+        walk.prev = raw.hash;
+    }
+
+    // The rest of the window, up to `from_seq`: the stored hashes only.
+    while walk.next_seq < from_seq {
+        if cancelled() {
+            return Err(RangeError::Cancelled);
+        }
+        let Line {
+            segment,
+            offset,
+            bytes,
+        } = cursor.next_line()?.ok_or_else(|| ended(&walk))?;
+        let raw = RawLine::parse(bytes).map_err(|reason| {
+            numbered(
+                VerifyError::Parse {
+                    segment,
+                    line: 0,
+                    reason,
+                },
+                session_dir,
+                offset,
+            )
+        })?;
+        if raw.seq != walk.next_seq {
+            return Err(VerifyError::Gap {
+                expected_seq: walk.next_seq,
+                got_seq: raw.seq,
+            }
+            .into());
+        }
+        if raw.fields.get("type").and_then(Value::as_str) == Some("checkpoint") {
+            walk.window = blake3::Hasher::new();
+            walk.since = 0;
+        } else {
+            walk.window.update(&raw.hash.0);
+            walk.since += 1;
+        }
+        walk.next_seq += 1;
+        walk.prev = raw.hash;
+    }
+    let from_prev = walk.prev;
+
+    // From `from_seq` on, each record checked as `verify_session` checks it.
+    let (mut records, mut read) = (0u64, 0u64);
+    loop {
+        if cancelled() {
+            return Err(RangeError::Cancelled);
+        }
+        let Line {
+            segment,
+            offset,
+            bytes,
+        } = cursor.next_line()?.ok_or_else(|| ended(&walk))?;
+        walk.line(segment, 0, offset, bytes)
+            .map_err(|error| numbered(error, session_dir, offset))?;
+        records += 1;
+        read += bytes.len() as u64 + 1;
+        if walk.last_seq() == head_seq {
+            if walk.prev != head_hash {
+                return Err(VerifyError::Chain {
+                    seq: head_seq,
+                    expected: head_hash,
+                    got: walk.prev,
+                }
+                .into());
+            }
+            break;
+        }
+        if records >= limits.records || read >= limits.bytes {
+            break;
+        }
+    }
+    check_range_index(&index, from_seq, walk.last_seq(), &walk.checkpoints)?;
+    Ok(RangeReport {
+        from_seq,
+        from_prev,
+        to_seq: walk.last_seq(),
+        to_hash: walk.prev,
+        checkpoints: walk.checkpoints.len() as u64,
+        more: walk.last_seq() < head_seq,
+    })
+}
+
+/// The lines of a session's `checkpoints.jsonl` that list checkpoints up to
+/// `head_seq`, each with its line number. Every line up to there must
+/// parse, each naming a later checkpoint than the one before. The first
+/// line whose `seq` is past the head ends them, and is read no further,
+/// nor is anything after it, nor a partial last line (an append in
+/// progress). A missing file lists none.
+fn index_to_head(session_dir: &Path, head_seq: u64) -> Result<Vec<(u64, IndexEntry)>, VerifyError> {
+    #[derive(serde::Deserialize)]
+    struct Seq {
+        seq: u64,
+    }
+
+    let path = session_dir.join(INDEX_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(VerifyError::Io(path, e)),
+    };
+    let mut entries: Vec<(u64, IndexEntry)> = Vec::new();
+    for (line, text) in (1..).zip(bytes.split_inclusive(|&b| b == b'\n')) {
+        let Some(body) = text.strip_suffix(b"\n") else {
+            break;
+        };
+        let bad = |reason: String| VerifyError::CheckpointFile { line, reason };
+        let not_entry = |e: serde_json::Error| bad(format!("not a checkpoint entry: {e}"));
+        if serde_json::from_slice::<Seq>(body).map_err(not_entry)?.seq > head_seq {
+            break;
+        }
+        let entry: IndexEntry = serde_json::from_slice(body).map_err(not_entry)?;
+        if let Some((_, before)) = entries.last() {
+            if entry.seq <= before.seq {
+                return Err(bad(format!(
+                    "names a checkpoint at seq {}, after one at seq {}",
+                    entry.seq, before.seq
+                )));
+            }
+        }
+        entries.push((line, entry));
+    }
+    Ok(entries)
+}
+
+/// Checks that the index lines for seqs `from_seq` to `to_seq`, `index`
+/// being those up to the head, list exactly the checkpoints a range walk
+/// checked there, `checked`, in order and with the right fields. Lines past
+/// `to_seq` are left for the next stretch.
+fn check_range_index(
+    index: &[(u64, IndexEntry)],
+    from_seq: u64,
+    to_seq: u64,
+    checked: &[IndexEntry],
+) -> Result<(), VerifyError> {
+    let before = index
+        .iter()
+        .take_while(|(_, entry)| entry.seq < from_seq)
+        .count();
+    let listed = &index[before..];
+    for (n, record) in checked.iter().enumerate() {
+        let Some((line, entry)) = listed.get(n) else {
+            return Err(VerifyError::CheckpointFile {
+                line: (before + n) as u64 + 1,
+                reason: format!("the checkpoint at seq {} is not listed", record.seq),
+            });
+        };
+        if let Some(reason) = mismatch(entry, record) {
+            return Err(VerifyError::CheckpointFile {
+                line: *line,
+                reason,
+            });
+        }
+    }
+    match listed.get(checked.len()) {
+        Some((line, entry)) if entry.seq <= to_seq => Err(VerifyError::CheckpointFile {
+            line: *line,
+            reason: format!(
+                "names a checkpoint at seq {}, where the log has another record",
+                entry.seq
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `error`, with its line number when it is a [`VerifyError::Parse`] made
+/// without one (`line` 0): the number of the line at `offset` of its
+/// segment, counted only then, since a range walk starts mid-segment.
+fn numbered(error: VerifyError, session_dir: &Path, offset: u64) -> VerifyError {
+    match error {
+        VerifyError::Parse {
+            segment,
+            line: 0,
+            reason,
+        } => {
+            let path = session_dir.join(segment_name(segment));
+            match line_number(&path, offset) {
+                Ok(line) => VerifyError::Parse {
+                    segment,
+                    line,
+                    reason,
+                },
+                Err(e) => VerifyError::Io(path, e),
+            }
+        }
+        other => other,
+    }
+}
+
+/// A line a [`Cursor`] read, without its newline, and where it starts.
+struct Line<'a> {
+    segment: u32,
+    offset: u64,
+    bytes: &'a [u8],
+}
+
+/// The whole lines of a session's segments from a place on, as a range
+/// walk reads them: each with its segment and offset. When a segment ends
+/// the next one is opened; there being none ends the lines.
+struct Cursor {
+    dir: PathBuf,
+    segment: u32,
+    /// Where the next line starts.
+    offset: u64,
+    reader: Option<BufReader<File>>,
+    buf: Vec<u8>,
+}
+
+impl Cursor {
+    fn new(dir: &Path, segment: u32, offset: u64) -> Cursor {
+        Cursor {
+            dir: dir.to_owned(),
+            segment,
+            offset,
+            reader: None,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The next line, without its newline, and where it starts; `None` when
+    /// the log has no more segments. A segment that ends in a partial line
+    /// is a break: the walk reads only lines the writer had flushed whole.
+    fn next_line(&mut self) -> Result<Option<Line<'_>>, VerifyError> {
+        loop {
+            let path = self.dir.join(segment_name(self.segment));
+            let io_err = |e| VerifyError::Io(path.clone(), e);
+            let reader = match &mut self.reader {
+                Some(reader) => reader,
+                None => {
+                    let mut file = match File::open(&path) {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                        Err(e) => return Err(io_err(e)),
+                    };
+                    file.seek(SeekFrom::Start(self.offset)).map_err(io_err)?;
+                    self.reader.insert(BufReader::with_capacity(1 << 20, file))
+                }
+            };
+            self.buf.clear();
+            let n = reader.read_until(b'\n', &mut self.buf).map_err(io_err)?;
+            if self.buf.ends_with(b"\n") {
+                let at = self.offset;
+                self.offset += n as u64;
+                self.buf.pop();
+                return Ok(Some(Line {
+                    segment: self.segment,
+                    offset: at,
+                    bytes: &self.buf,
+                }));
+            }
+            if n > 0 {
+                return Err(numbered(
+                    VerifyError::Parse {
+                        segment: self.segment,
+                        line: 0,
+                        reason: "no newline at the end, before the head".into(),
+                    },
+                    &self.dir,
+                    self.offset,
+                ));
+            }
+            self.segment += 1;
+            self.offset = 0;
+            self.reader = None;
+        }
+    }
 }
 
 #[cfg(test)]

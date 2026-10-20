@@ -44,6 +44,9 @@ says otherwise). To check that its log is intact:
 cargo run -p boxcar -- audit verify ~/.local/share/boxcar/sessions/<session-id>
 ```
 
+While the session runs, `boxcar audit verify --control <socket>` checks
+the log so far against the audit writer's head.
+
 ### Rootfs persistence
 
 The guest owns the `--rootfs` directory and changes it in place: what a

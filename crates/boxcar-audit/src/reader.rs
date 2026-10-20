@@ -321,7 +321,7 @@ fn bad_line(dir: &Path, at: Position, reason: &str) -> io::Error {
 }
 
 /// The number, counting from 1, of the line that starts at `offset`.
-fn line_number(path: &Path, offset: u64) -> io::Result<u64> {
+pub(crate) fn line_number(path: &Path, offset: u64) -> io::Result<u64> {
     let mut prefix = File::open(path)?.take(offset);
     let mut buf = vec![0; 64 * 1024];
     let mut newlines = 0;

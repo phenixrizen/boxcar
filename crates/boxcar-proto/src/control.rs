@@ -31,7 +31,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::audit::{Record, Verdict};
+use crate::audit::{Hash, Record, Verdict};
 
 /// The `protocol` of the [`Hello`].
 pub const PROTOCOL: &str = "boxcar.control";
@@ -629,6 +629,47 @@ impl AuditLagged {
             resume_seq,
         }
     }
+}
+
+/// The longest message a break found by `audit.verify` is answered with,
+/// in bytes: the verifier's own, cut.
+pub const MAX_AUDIT_VERIFY_MESSAGE: usize = 512;
+
+/// The parameters of `audit.verify`: `{"from_seq":S}`, optional. The
+/// result is [`AuditVerify`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AuditVerifyParams {
+    /// The first seq to check: 1 when absent; 0 is the same. A client that
+    /// checked the log up to `S - 1` asks from `S`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_seq: Option<u64>,
+}
+
+/// The result of `audit.verify`: the records from `from_seq` to `to_seq`
+/// of the log on disk are a valid chain, checked against the writer's head
+/// at `head_seq`. A fixed shape: a few hundred bytes at most.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AuditVerify {
+    pub from_seq: u64,
+    /// The hash the record before `from_seq` stores, which the record at
+    /// `from_seq` names as its `prev` (the genesis hash for seq 1). A
+    /// client that checked up to `from_seq - 1` compares it with the hash
+    /// it holds: so one stretch chains to the next.
+    pub from_prev: Hash,
+    /// The last record checked, and its hash.
+    pub to_seq: u64,
+    pub to_hash: Hash,
+    /// The writer's head when the call began: its last record, flushed.
+    pub head_seq: u64,
+    pub head_hash: Hash,
+    /// How many checkpoint records were among the records checked.
+    pub checkpoints: u64,
+    /// `true` until `to_seq` reaches `head_seq`: ask again from
+    /// `to_seq + 1`. When it is `false`, the record at the head has the
+    /// head's hash.
+    pub more: bool,
 }
 
 /// The most rules (allows and denies together) a `policy.update` may give
@@ -1802,6 +1843,81 @@ mod tests {
             String::from_utf8(to_line(&AuditLagged::new(2, 16385)).unwrap()).unwrap(),
             "{\"v\":1,\"event\":\"audit.lagged\",\"sub\":2,\"resume_seq\":16385}\n"
         );
+    }
+
+    /// `audit.verify`'s parameter is optional; its result has one fixed
+    /// shape, which at its largest, every number at its maximum, is a few
+    /// hundred bytes; the error that carries a break, its message cut to
+    /// 512 bytes, stays under 4 KiB however that message escapes.
+    #[test]
+    fn audit_verify_messages_have_their_shape_and_fit_a_line() {
+        let none: AuditVerifyParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(none, AuditVerifyParams::default());
+        assert_eq!(serde_json::to_value(&none).unwrap(), json!({}));
+        let from: AuditVerifyParams =
+            serde_json::from_value(json!({"from_seq": 42, "extra": 1})).unwrap();
+        assert_eq!(from.from_seq, Some(42));
+        assert_eq!(
+            serde_json::to_value(&from).unwrap(),
+            json!({"from_seq": 42})
+        );
+        for bad in [json!({"from_seq": -1}), json!({"from_seq": "1"})] {
+            assert!(
+                serde_json::from_value::<AuditVerifyParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+
+        let hash = |byte: u8| Hash([byte; 32]);
+        let reply = AuditVerify {
+            from_seq: 1,
+            from_prev: hash(0x01),
+            to_seq: 9,
+            to_hash: hash(0x09),
+            head_seq: 12,
+            head_hash: hash(0x12),
+            checkpoints: 1,
+            more: true,
+        };
+        let wire = json!({
+            "from_seq": 1,
+            "from_prev": format!("b3:{}", "01".repeat(32)),
+            "to_seq": 9,
+            "to_hash": format!("b3:{}", "09".repeat(32)),
+            "head_seq": 12,
+            "head_hash": format!("b3:{}", "12".repeat(32)),
+            "checkpoints": 1,
+            "more": true,
+        });
+        assert_eq!(serde_json::to_value(&reply).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<AuditVerify>(wire).unwrap(), reply);
+
+        let largest = AuditVerify {
+            from_seq: u64::MAX,
+            from_prev: hash(0xff),
+            to_seq: u64::MAX,
+            to_hash: hash(0xff),
+            head_seq: u64::MAX,
+            head_hash: hash(0xff),
+            checkpoints: u64::MAX,
+            more: false,
+        };
+        let line = to_line(&Response::success(
+            u64::MAX,
+            serde_json::to_value(&largest).unwrap(),
+        ))
+        .unwrap();
+        assert!(line.len() < 512, "{}", line.len());
+        // Every byte of the message escaped as `\u0001`, six bytes each.
+        let message = "\u{1}".repeat(MAX_AUDIT_VERIFY_MESSAGE);
+        let error = to_line(&Response::failure(
+            u64::MAX,
+            ErrorBody::new(ErrorCode::Internal, message),
+        ))
+        .unwrap();
+        assert!(error.len() < 4096, "{}", error.len());
+        assert!(error.len() < MAX_LINE / 256);
+        assert_eq!(MAX_AUDIT_VERIFY_MESSAGE, 512);
     }
 
     /// The largest record the log holds (64 KiB) is nowhere near the line

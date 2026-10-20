@@ -21,6 +21,10 @@
 //! [`AuditSink::failure`] says why and [`AuditSink::failure_event`] is an
 //! eventfd to wait on. Both also refuse a [`Payload::Checkpoint`], which only
 //! the writer may make. A refusal is never counted as a drop.
+//!
+//! [`AuditSink::head`] asks the writer, in band, for the chain's head: the
+//! last record it made, flushed to the file, which a verifier then checks
+//! the log on disk against.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,7 +37,7 @@ use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use crate::reader::Filter;
 use crate::subscribe::{Attached, Closed, SubscribeRequest};
-use crate::writer::WriteFailure;
+use crate::writer::{Head, WriteFailure};
 
 /// How soon a record must be on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,14 +80,28 @@ pub enum EmitError {
     Checkpoint,
 }
 
-/// What travels in the writer's channel, in order: an event to record, or a
-/// request to register a subscriber (see [`crate::subscribe`]).
+/// Why [`AuditSink::head`] got no head.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HeadError {
+    /// The writer is closed.
+    #[error("the audit log writer is closed")]
+    Closed,
+    /// The writer thread failed. It published its failure before its
+    /// best-effort rollback, so it has no head it can vouch for.
+    #[error("the audit log writer failed: {0}")]
+    Failed(WriteFailure),
+}
+
+/// What travels in the writer's channel, in order: an event to record, a
+/// request to register a subscriber (see [`crate::subscribe`]), or a
+/// request for the chain's head.
 // The channel's slot was a `Submission` before this enum: boxing the event
 // would add an allocation to every record to save room for the rare request.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Msg {
     Event(Submission),
     Subscribe(SubscribeRequest),
+    Head(Sender<Head>),
 }
 
 /// What the sinks share with the writer.
@@ -188,6 +206,30 @@ impl AuditSink {
         })
     }
 
+    /// Asks the writer, between two records, for the chain's head, and
+    /// waits for its answer: the last record's seq and hash, every record
+    /// up to it flushed to the file, and the session directory. The request
+    /// is in order with the events this thread has sent. Like a
+    /// subscription it does not go through the closing gate: a writer that
+    /// takes it while it closes answers it. A writer that has failed
+    /// answers none, and one that fails before it answers is refused as
+    /// failed, not closed.
+    pub fn head(&self) -> Result<Head, HeadError> {
+        let refused = || match self.failure() {
+            Some(failure) => HeadError::Failed(failure),
+            None => HeadError::Closed,
+        };
+        if let Some(failure) = self.failure() {
+            return Err(HeadError::Failed(failure));
+        }
+        let (reply, answered) = bounded(1);
+        self.tx.send(Msg::Head(reply)).map_err(|_| refused())?;
+        // A request the writer never got to is dropped with the channel,
+        // and its reply end with it. A failing writer publishes its failure
+        // before it lets go of the channel.
+        answered.recv().map_err(|_| refused())
+    }
+
     /// Sends an event, waiting while the channel is full. For events that
     /// must never be dropped.
     pub fn emit(&self, s: Submission) -> Result<(), EmitError> {
@@ -285,7 +327,7 @@ mod tests {
     fn payload(msg: Msg) -> Payload {
         match msg {
             Msg::Event(s) => s.payload,
-            Msg::Subscribe(_) => panic!("not an event"),
+            Msg::Subscribe(_) | Msg::Head(_) => panic!("not an event"),
         }
     }
 

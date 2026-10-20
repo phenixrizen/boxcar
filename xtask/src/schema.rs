@@ -20,11 +20,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use boxcar_proto::audit::{Payload, Record};
 use boxcar_proto::control::{
-    self, to_line, AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, ErrorBody,
-    ErrorCode, ExceptionGrant, ExceptionKind, ExceptionView, Hello, NetPolicy, PolicyUpdateParams,
-    PolicyUpdated, PolicyView, PtyAttachParams, PtyAttached, PtyDetached, PtyMode, PtyResizeParams,
-    PtyWatchParams, Ready, Request, Response, SensorState, SensorStatus, SpanEntry, SpanList,
-    SpanListParams, StateEvent, Status, StopMode, StopParams, VmState, VsockPolicy,
+    self, to_line, AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, AuditVerify,
+    AuditVerifyParams, ErrorBody, ErrorCode, ExceptionGrant, ExceptionKind, ExceptionView, Hello,
+    NetPolicy, PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams, PtyAttached,
+    PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Ready, Request, Response, SensorState,
+    SensorStatus, SpanEntry, SpanList, SpanListParams, StateEvent, Status, StopMode, StopParams,
+    VmState, VsockPolicy,
 };
 use boxcar_proto::guest::{GuestMsg, HostMsg, SessionConfig};
 use boxcar_proto::sensor::SensorFrame;
@@ -129,6 +130,8 @@ pub fn control_schema() -> RootSchema {
         SchemaGenerator::subschema_for::<PtyResizeParams>,
         SchemaGenerator::subschema_for::<AuditSubscribeParams>,
         SchemaGenerator::subschema_for::<AuditSubscribed>,
+        SchemaGenerator::subschema_for::<AuditVerifyParams>,
+        SchemaGenerator::subschema_for::<AuditVerify>,
         SchemaGenerator::subschema_for::<PolicyView>,
         SchemaGenerator::subschema_for::<PolicyUpdateParams>,
         SchemaGenerator::subschema_for::<PolicyUpdated>,
@@ -443,6 +446,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
         "findings",
         "spans",
         "policy.exception",
+        "audit.verify",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -666,6 +670,24 @@ pub fn control_lines() -> Result<Vec<u8>> {
         })?,
     ))?;
     line(&Request::new(
+        18,
+        "audit.verify",
+        serde_json::to_value(AuditVerifyParams { from_seq: Some(5) })?,
+    ))?;
+    line(&Response::success(
+        18,
+        serde_json::to_value(AuditVerify {
+            from_seq: 5,
+            from_prev: Hash([0x44; 32]),
+            to_seq: 7,
+            to_hash: example_record().hash,
+            head_seq: 7,
+            head_hash: example_record().hash,
+            checkpoints: 0,
+            more: false,
+        })?,
+    ))?;
+    line(&Request::new(
         16,
         "stop",
         serde_json::to_value(StopParams {
@@ -721,6 +743,8 @@ mod tests {
             "PtyDetached",
             "AuditSubscribeParams",
             "AuditSubscribed",
+            "AuditVerifyParams",
+            "AuditVerify",
             "AuditLagged",
             "NetPolicy",
             "VsockPolicy",

@@ -241,3 +241,14 @@ Made by Task 7 (`docs/plans/vmm-hardening.md`), 2026-10-20:
 - **The `boot_*` tests run confined, each in a child of its test binary**, since a process-wide filter would bind libtest and every later test.
 - **A log cut mid-write is `incomplete`, cause unknown, exit code 4.** Verify cannot tell a crash from a deliberate cut; what a cut tail can hide is bounded by the index, as for a cut at a record boundary. The writer's rollback cuts the index before the segment, so a kill halfway leaves a state a crash can produce.
 - **Guest memory is `MADV_DONTDUMP`**, so a kill's core holds none of it.
+
+Made by Task 6 (`docs/plans/exporters.md`), 2026-10-20:
+
+- **An export reads the log once, in the verification walk** (`verify::read_verified`), so what it exports is what was hashed. Only the log and the running version shape it: no clock, host, environment or locale.
+- **OTLP's raw-text rule has named exceptions**: model and tool names, `tool_use_id`s and the image, which this plan names as attributes, each through `scrub_text`. OCSF carries what it exists to carry (paths, DNS names, URL hosts and paths), argv scrubbed as `--scrub-argv` scrubs it, and never the tools' arguments or summaries.
+- **The GenAI conventions renamed `gen_ai.system` to `gen_ai.provider.name`**: both are written, pinned to semantic-conventions-genai 547934a, with `gen_ai.request.stream`, `error.type` and cached input tokens counted in.
+- **A tool span is an occurrence `span.effects` defines, ended only by the close it names**; a null close stays open. Without `span.effects` the first close ends it, marked unconfirmed. A `tool_use_id` used again after eviction is a new span, its id hashed with its `opened_seq`.
+- **OCSF 1.9.0**, the `security_control` profile only where a verdict is, `net.udp` beside `net.connect`, API Activity as 99 with names, and only a thread group's exit as a process's termination. Every fixture event passed the OCSF server's 1.9.0 validator, and the fixture's trace was decoded whole by `otelcol-contrib` 0.163.1.
+- **An incomplete log exports its verified prefix and exits 4**, as verify does.
+- **`audit.verify` checks a bounded stretch of a live log per call against the writer's flushed head**, cancellable, refusing a failed writer; the CLI chains the stretches by `from_prev`.
+- **`--otlp-endpoint` takes `http://`**, never a user and password, with a 60 s deadline and a 64 KiB answer cap, and retries nothing.
