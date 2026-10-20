@@ -19,7 +19,8 @@ roadmap.
 ## Quick start
 
 On x86_64 Linux with KVM and Docker (see
-[CONTRIBUTING.md](CONTRIBUTING.md#kvm-on-the-dev-machine)):
+[CONTRIBUTING.md](CONTRIBUTING.md#kvm-on-the-dev-machine), and
+[docs/wsl2.md](docs/wsl2.md) under WSL2):
 
 ```bash
 cargo xtask kernel               # target/guest/vmlinux, built in Docker
