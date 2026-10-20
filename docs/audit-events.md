@@ -63,7 +63,7 @@ Common pieces:
 | Type | Fields | When |
 |---|---|---|
 | `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none), `inspect_ca_sha256` (omitted when the policy has no `inspect` rule), `image {reference, manifest_digest, config_digest}` (omitted unless the session boots from an image), `hardening {seccomp, landlock}` (omitted when the VM was built by another program than `boxcar run`, such as a test) | The VM was built and is about to run. `hardening` is how the VMM process is confined, both in force before the record is made: `seccomp` is `enforce` (a syscall off the allowlist kills the process: a crash, with no `vmm.stop`), `log` (the kernel logs such a call, which goes ahead) or `off` (`boxcar run --seccomp`); `landlock` is `full` (every right boxcar handles is enforced), `partial` (the kernel enforces some of them), `unsupported` (no usable Landlock: the process runs unconfined) or `off` (`--landlock off`). `image` names the image `--image` gave, normalized, and the manifest and config digests of the cached image whose tree the session's root share was copied from. `inspect_ca_sha256` is the SHA-256, lowercase hex, of the DER certificate of the session CA the guest was told to trust for the gate's certificates (`--inspect`). |
-| `vmm.stop` | `reason`, `exit_code` (or null), `console_dropped_bytes`, `stdin_dropped_bytes` | The VM stopped; the last record of a run (a closing checkpoint follows). `reason`: `guest_reset`, `guest_shutdown`, `signal`, `console_escape`, `stop_requested`, `vcpu_error`, `audit_failed`, `vmm_error`. The byte counts are console output the host never wrote out and console input it dropped (0 for a run without them). |
+| `vmm.stop` | `reason`, `exit_code` (or null), `console_dropped_bytes`, `stdin_dropped_bytes` | The VM stopped. What follows it is the reconciler's last records (its findings, and the `span.effects` of tool spans still open), then a closing checkpoint. `reason`: `guest_reset`, `guest_shutdown`, `signal`, `console_escape`, `stop_requested`, `vcpu_error`, `audit_failed`, `vmm_error`. The byte counts are console output the host never wrote out and console input it dropped (0 for a run without them). |
 | `checkpoint` | `records_since`, `dropped`, `root_hash` | The writer's summary of the records since the previous checkpoint: every 1024 records or 2 s, at a segment seal, and at close. `root_hash` is blake3 over the raw hashes of those records; `dropped` counts droppable events (`fs.read`, `net.drop`) the full channel dropped. |
 
 ## `fs.*` (host, src `fs`)
@@ -72,8 +72,10 @@ Every filesystem operation the guest performs on a share (`root`, or
 `workspace` at `/workspace`), seen by the virtio-fs device the VMM serves
 in-process. `mount` is the share's tag and `path` is within the share.
 `subject` carries the guest's pid, uid and gid from the FUSE header.
-Writes, creates, unlinks, renames, setattr and denials are never dropped;
-reads may be (and are counted in `checkpoint.dropped`).
+Creates, unlinks, renames, setattr, closes (with the bytes read and written)
+and denials are never dropped; the per-operation `fs.read`, `fs.write` and
+`fs.readdir` records of `--audit-level verbose` may be (and are counted in
+`checkpoint.dropped`).
 
 Every payload with a `path` has `path_b64` beside it, present only when
 the name was not valid UTF-8: `path` then holds the lossy text (`U+FFFD`
@@ -266,8 +268,10 @@ that span (`span.effects`, docs/reconciler.md).
 
 Records are chained in the order the single writer took them, which is the
 order their producers submitted them, across all sources. A `vmm.start`
-is first and `policy.loaded` second; `vmm.stop` and a closing `checkpoint`
-are last. A `net.connect`
+is first and `policy.loaded` second. `vmm.stop` is followed only by the
+reconciler's last records (the findings it makes once it reads the stop,
+and the `span.effects` of tool spans still open) and a closing
+`checkpoint`, which is last. A `net.connect`
 precedes its flow's `net.tls` and `net.close`; `net.tls{allow}` is in the
 log before the first held byte reaches the host; `net.udp{allow}` before
 its first datagram does. Every record is on disk by the next checkpoint

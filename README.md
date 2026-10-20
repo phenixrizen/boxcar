@@ -1,69 +1,138 @@
 # boxcar
 
-A microVM runtime for running AI coding agents in isolation, with a complete,
-tamper-evident record of everything the agent did.
+A microVM runtime for running AI coding agents in isolation, with a
+tamper-evident record of what the agent did.
 
-boxcar boots a small Linux guest on KVM from a directory, not a disk image.
-The root filesystem and the workspace are served by the runtime itself over
-virtio-fs, the guest's network is terminated by a user-mode stack inside the
-runtime, and the model API is reached through a gateway that holds the real
-key. Every file operation, connection, DNS query, process, and model tool call
-lands in one append-only, hash-chained log. A second, best-effort sensor
-inside the guest reports process lineage, and a reconciler flags where the
-two views, or the model's stated intent, disagree.
+boxcar boots a small Linux guest on KVM from an OCI image or a directory,
+never a disk image. The root filesystem and the workspace are served by the
+runtime itself over virtio-fs, the guest's network is terminated by a
+user-mode stack inside the runtime under a policy, and the model traffic can
+be inspected by a gate that ends the guest's TLS, relays every byte
+unchanged (the agent's own credential included; boxcar holds none) and
+records each model call and tool call. What the host sees of the guest
+(its file operations through the shares, its connections and DNS queries,
+its model calls and tool calls) lands in one append-only, hash-chained log,
+within the limits "What the log does and does not capture" sets out. A
+second, best-effort sensor inside the guest reports process lineage,
+and a reconciler flags where the two views, or the model's stated intent,
+disagree. The runtime confines itself too: a Landlock domain over the paths
+a session uses, and one seccomp allowlist for the whole process.
 
-Status: pre-alpha. See [docs/specs](docs/specs) for
-the design and [docs/plans](docs/plans) for the
-roadmap.
+Status: pre-alpha. See [docs/specs](docs/specs) for the design,
+[docs/plans](docs/plans) for the roadmap, and [Documentation](#documentation)
+below.
 
 ## Quick start
 
 On x86_64 Linux with KVM and Docker (see
 [CONTRIBUTING.md](CONTRIBUTING.md#kvm-on-the-dev-machine), and
-[docs/wsl2.md](docs/wsl2.md) under WSL2):
+[docs/wsl2.md](docs/wsl2.md) under WSL2), and with the eBPF toolchain the
+guest's sensor is built with (the pinned nightly, `rust-src` and
+`bpf-linker`: [CONTRIBUTING.md](CONTRIBUTING.md#the-ebpf-lane)), build the
+guest's kernel and initramfs, then run a command in a session booted from an
+image:
 
 ```bash
 cargo xtask kernel               # target/guest/vmlinux, built in Docker
 cargo xtask initramfs            # target/guest/initramfs.cpio
+cargo run --release -p boxcar -- run \
+    --kernel target/guest/vmlinux --initramfs target/guest/initramfs.cpio \
+    --image docker.io/library/alpine:3.22 --policy agent-isolate \
+    -- sh -c 'apk add curl && curl -sI https://dl-cdn.alpinelinux.org'
+```
+
+`--image` pulls the image without root, checks every blob against its
+digest, keeps it in a cache (`~/.cache/boxcar`), and boots the session from
+its own copy of the image's tree, so nothing a session writes reaches the
+cache ([docs/images.md](docs/images.md)). `--policy agent-isolate` lets the
+session reach the model providers (inspected), the package registries and
+the git hosts, and nothing else ([docs/policy.md](docs/policy.md)). The run
+exits with the command's exit code, and prints the session's id, its audit
+directory and its control socket on stderr (`audit: ...`, in
+`~/.local/share/boxcar/sessions/` unless `XDG_DATA_HOME` or `--audit-dir`
+says otherwise). Then:
+
+```bash
+./target/release/boxcar audit verify ~/.local/share/boxcar/sessions/<session-id>
+./target/release/boxcar audit export ~/.local/share/boxcar/sessions/<session-id> \
+    --format otlp --otlp-endpoint http://127.0.0.1:4318
+```
+
+`verify` checks every hash, link and checkpoint of the log; `export` sends
+it to an OpenTelemetry collector as one trace (the session, its model calls
+and tool spans, findings as events), or writes it as OCSF events with
+`--format ocsf` ([docs/export.md](docs/export.md)). While the session runs,
+`boxcar audit verify --control <socket>` checks the log so far against the
+audit writer's head.
+
+### From a release
+
+A release (`v*` tag) carries `boxcar` (x86_64 Linux), the guest's
+`vmlinux` and `initramfs.cpio`, and their `SHA256SUMS`:
+
+```bash
+sha256sum -c SHA256SUMS && chmod +x boxcar
+./boxcar run --kernel vmlinux --initramfs initramfs.cpio \
+    --image docker.io/library/alpine:3.22 --policy agent-isolate
+```
+
+### From a directory
+
+A directory can be the root filesystem instead of an image:
+
+```bash
 cargo xtask rootfs alpine        # target/guest/rootfs-alpine/
 cargo run -p boxcar -- run --kernel target/guest/vmlinux \
     --initramfs target/guest/initramfs.cpio --rootfs target/guest/rootfs-alpine
 ```
 
-The last command boots the guest into a login shell on a terminal of its
-own, relayed to yours, as your own uid and gid, with a fresh workspace at
-`/workspace` and a network card behind a policy that allows nothing yet;
-`exit` ends it (Ctrl-] twice stops the VM). Add `-- CMD [ARGS...]` to run a
-command instead, such as `-- /bin/sh -c 'echo hi > /workspace/a.txt'`; the
-run exits with the command's exit code. `boxcar run` prints the session's
-id, its audit directory and its control socket on stderr (`audit: ...`, in
-`~/.local/share/boxcar/sessions/` unless `XDG_DATA_HOME` or `--audit-dir`
-says otherwise). To check that its log is intact:
-
-```bash
-cargo run -p boxcar -- audit verify ~/.local/share/boxcar/sessions/<session-id>
-```
-
-While the session runs, `boxcar audit verify --control <socket>` checks
-the log so far against the audit writer's head.
+This boots the guest into a login shell on a terminal of its own, relayed
+to yours, as your own uid and gid, with a fresh workspace at `/workspace`
+and a network card behind a policy that allows nothing yet; `exit` ends it
+(Ctrl-] twice stops the VM). Add `-- CMD [ARGS...]` to run a command
+instead, such as `-- /bin/sh -c 'echo hi > /workspace/a.txt'`.
 
 ### Rootfs persistence
 
-The guest owns the `--rootfs` directory and changes it in place: what a
-session writes outside `/workspace` (a package installed, a file in `/tmp`
-or `/root`) is there for the next session that boots from the same
-directory. Sessions must not share one rootfs directory at the same time.
-Until the per-session overlay lands, give each session a fresh copy (for
-example `cp -a target/guest/rootfs-alpine /tmp/rootfs-1`), or run
-`cargo xtask rootfs alpine` again to start from a clean one. The session's
-`vmm.start` record names the host directory behind each share.
+The guest owns a `--rootfs` directory and changes it in place: what a
+session writes to its root share (a package installed, a file in `/tmp` or
+`/root`) is there for the next session that boots from the same directory.
+What it writes to the filesystems init mounts afresh (`/run`, `/dev/shm`)
+is not. Sessions must not share one rootfs directory at the same time.
+Give each session a fresh copy (for example
+`cp -a target/guest/rootfs-alpine /tmp/rootfs-1`), run
+`cargo xtask rootfs alpine` again, or boot from an image with `--image`,
+which gives every session its own copy. The session's `vmm.start` record
+names the host directory behind each share.
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md): the process, its threads,
+  and the two rings.
+- [docs/boot.md](docs/boot.md): from `boxcar run` to the agent's shell.
+- [docs/images.md](docs/images.md): sessions from OCI images, the cache.
+- [docs/policy.md](docs/policy.md): policy files, profiles, enforcement,
+  live exceptions.
+- [docs/export.md](docs/export.md): verifying a log, and exporting it to
+  OTLP and OCSF.
+- [docs/networking.md](docs/networking.md),
+  [docs/gate.md](docs/gate.md): the guest's network and the model traffic
+  gate.
+- [docs/reconciler.md](docs/reconciler.md): findings and tool spans.
+- [docs/audit-events.md](docs/audit-events.md): every record and its
+  fields.
+- [docs/control-protocol.md](docs/control-protocol.md): the control
+  socket.
+- [docs/wsl2.md](docs/wsl2.md), [docs/perf.md](docs/perf.md): running on
+  WSL2, and performance.
 
 ## What you get
 
 Every file operation the guest makes on its root filesystem and its
 workspace is a record in the session's hash-chained log
 (`events.000001.jsonl`, one JSON object per line), with the guest process
-that made it. The write above ends in this `fs.close`: the bytes written,
+that made it. The write `echo hi > /workspace/a.txt` (in "From a
+directory" above) ends in this `fs.close`: the bytes written,
 and the blake3 of the file as it was when it was closed. Each record's
 `hash` covers the record and the `prev` hash before it, so
 `boxcar audit verify` finds a record that was changed, removed or moved.
