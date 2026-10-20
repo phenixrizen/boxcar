@@ -313,9 +313,9 @@ Then:
 - **Landlock** is `run`'s, so the `boot_*` tests cover seccomp, and `kvm_m*` covers both.
 
 **New:**
-- **`boot_reset.rs`** (in-process, confined, with the guest session as root, which `SessionConfig::for_user(argv, 0, 0)` allows): each device is unbound and bound again through the guest's sysfs, one at a time, and then used:
-  - the net card, then a DNS lookup and a TCP connection through the stack;
-  - the workspace's virtio-fs, unmounted first, then mounted again and written;
+- **`boot_reset.rs`** (in-process, confined, with the guest session as root, which `SessionConfig::for_user(argv, 0, 0)` allows): each device is unbound and bound again through the guest's sysfs, one at a time. A session has no capability, uid 0 included: init empties its bounding set (`boxcar-init session.rs:486-494`). So it cannot bring an interface up or mount a share again, and the box's first run under `log` showed exactly that. What the test shows instead is the guest's driver finding each device again, which needs the VMM's reset and reactivation, under the filter:
+  - the net card: `eth0` is back;
+  - the workspace's virtio-fs, unbound while mounted: its tag is back;
   - the vsock device: the session's channel goes and the session ends (`ctl.rs:17`), and the VMM must stop cleanly, recording `vmm.stop`, not die by `SIGSYS`.
 - **`kvm_m5`**:
   - `a_session_runs_confined`: `vmm.start.hardening` is what the run's lane asks: `BOXCAR_SECCOMP`, else `enforce`, and `full` or `partial` as the kernel allows.
@@ -352,7 +352,7 @@ Codex (`codex exec`, read-only, reasoning effort xhigh) reviewed the first draft
 6. **The rollback's order, and recovery** (MEDIUM): the rollback cuts the index first, so a kill halfway leaves state 3. Recovery never runs for `boxcar run`. The kill tests arm their limits after setup and assert the signal (section 4).
 7. **"A crash" claims too much** (MEDIUM): verify now says "incomplete … cause unknown" and exits 4 (section 4).
 8. **`vmm.start` recorded an intent** (MEDIUM): the filter goes in before the record (section 3).
-9. **The reset test** (MEDIUM): resetting vsock ends the session by design. The test is now in-process with a root guest session, one device at a time, each used afterwards; for vsock, a clean stop is what it proves (section 7).
+9. **The reset test** (MEDIUM): resetting vsock ends the session by design. The test is now in-process with a root guest session, one device at a time. Using a device again from the session turned out impossible, since sessions hold no capability. So the test shows the guest's driver finding it again; for vsock, a clean stop is what it proves (section 7).
 10. **Who removes pre-made directories** (LOW): `run` owns them through a guard on every way out (section 2).
 11. **The `log` lane contradicts tests that need `enforce`** (LOW): those tests say `--seccomp enforce` themselves, the flag wins over the variable, and `test-kvm` refuses `off` and prints its modes (sections 5 and 7).
 

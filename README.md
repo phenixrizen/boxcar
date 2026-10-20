@@ -131,6 +131,13 @@ and the blake3 of the file as it was when it was closed. Each record's
   last checkpoint it lists. A deliberate cut can leave the same tail, and
   verify cannot tell the two apart. A log cut at a record boundary
   verifies as intact; only the missing `vmm.stop` tells.
+- The VMM runs confined (`vmm.start`'s `hardening`): a Landlock domain over
+  the paths the session uses, and a seccomp allowlist on every thread. A
+  syscall off the list kills `boxcar run` by `SIGSYS` (`--seccomp
+  enforce`, the default): a crash like any other, so the log may end
+  incomplete and has no `vmm.stop`. `--seccomp log` lets such a call go
+  ahead and has the kernel log it; `--seccomp off` and `--landlock off`
+  are the ways out if a session needs what the confinement refuses.
 
 ## Networking and policy
 
