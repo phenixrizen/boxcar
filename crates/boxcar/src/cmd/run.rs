@@ -864,6 +864,15 @@ fn open_console_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Files glibc reads on its own, which the Landlock domain lets it read:
+/// measured over the gated suites (the domain's denials, traced on the test
+/// box).
+const GLIBC_READS: &[&str] = &[
+    "/sys/devices/system/cpu/online",
+    "/proc/stat",
+    "/proc/sys/vm/overcommit_memory",
+];
+
 /// What the session uses by path, for its Landlock domain.
 struct SessionPaths<'a> {
     /// The audit log's directory for this session, which holds the image's
@@ -918,6 +927,13 @@ fn landlock_rules(paths: &SessionPaths) -> Vec<Rule> {
         rules.push(Rule::new(initramfs, Reach::ReadFile));
     }
     rules.push(Rule::new("/dev/kvm", Reach::Device));
+    // What glibc reads by itself: the CPU count (`get_nprocs`) and malloc's
+    // view of overcommit. Denied, they would quietly give other answers.
+    rules.extend(
+        GLIBC_READS
+            .iter()
+            .map(|&file| Rule::new(file, Reach::ReadFile)),
+    );
     if paths.net {
         rules.push(Rule::new("/etc/resolv.conf", Reach::ReadFile));
     }
@@ -1600,6 +1616,53 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|&a| a.to_owned()).collect()
+    }
+
+    /// The domain names each path the session uses with the reach it
+    /// needs, and nothing else: the resolver's file only with a network,
+    /// the mount table only with shares.
+    #[test]
+    fn the_landlock_domain_names_what_the_session_uses() {
+        let rule = |path: &str, reach| Rule::new(path, reach);
+        let paths = |net, fs| SessionPaths {
+            session_dir: Path::new("/a/sessions/s"),
+            sessions_root: Path::new("/a/sessions"),
+            state_dir: Path::new("/run/b/s"),
+            runtime_root: Path::new("/run/b"),
+            shares: vec![Path::new("/root"), Path::new("/ws")],
+            image_tree: Some(PathBuf::from("/c/images/i/rootfs")),
+            console: Some(Path::new("/log/console")),
+            dump: Some(Path::new("/dump")),
+            kernel: Path::new("/k/vmlinux"),
+            initramfs: Some(Path::new("/k/initramfs")),
+            net,
+            fs,
+        };
+        let mut want = vec![
+            rule("/a/sessions/s", Reach::Tree),
+            rule("/a/sessions", Reach::RemoveDir),
+            rule("/run/b/s", Reach::Tree),
+            rule("/run/b", Reach::RemoveDir),
+            rule("/root", Reach::Tree),
+            rule("/ws", Reach::Tree),
+            rule("/c/images/i/rootfs", Reach::ReadTree),
+            rule("/log/console", Reach::WriteFile),
+            rule("/dump", Reach::Tree),
+            rule("/k/vmlinux", Reach::ReadFile),
+            rule("/k/initramfs", Reach::ReadFile),
+            rule("/dev/kvm", Reach::Device),
+        ];
+        want.extend(GLIBC_READS.iter().map(|&file| rule(file, Reach::ReadFile)));
+        assert_eq!(landlock_rules(&paths(false, false)), want);
+        let all = landlock_rules(&paths(true, true));
+        assert_eq!(all[..want.len()], want[..]);
+        assert_eq!(
+            all[want.len()..],
+            [
+                rule("/etc/resolv.conf", Reach::ReadFile),
+                rule("/proc/self/mountinfo", Reach::ReadFile),
+            ]
+        );
     }
 
     #[test]
