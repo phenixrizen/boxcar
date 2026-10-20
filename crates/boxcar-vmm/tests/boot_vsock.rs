@@ -267,6 +267,8 @@ fn the_guest_probes_the_vsock_device_and_resets_a_host_connect_to_a_closed_port(
     assert!(!uds.exists(), "the socket outlived the VM");
 
     let report = verify_session(&session_dir).unwrap();
+
+    assert_eq!(report.incomplete, None, "{report:?}");
     eprintln!("{TEST}: {report:?}");
     let records: Vec<Record> = LogReader::open(&session_dir)
         .unwrap()

@@ -147,6 +147,7 @@ impl Run {
     pub fn records(&self) -> Vec<Record> {
         let dir = self.session_dir();
         let report = verify_session(&dir).unwrap();
+        assert_eq!(report.incomplete, None, "{report:?}");
         eprintln!("verify: {report:?}");
         LogReader::open(&dir)
             .unwrap()

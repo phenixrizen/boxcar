@@ -200,6 +200,8 @@ fn a_guest_downloads_what_the_policy_allows_and_resolves_nothing_else() {
     );
 
     let report = verify_session(&session_dir).unwrap();
+
+    assert_eq!(report.incomplete, None, "{report:?}");
     eprintln!("{TEST}: {report:?}");
     let records: Vec<Record> = LogReader::open(&session_dir)
         .unwrap()

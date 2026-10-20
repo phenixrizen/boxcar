@@ -144,6 +144,7 @@ impl Run {
     /// The session's records, once the log is verified.
     fn records(&self) -> Vec<Record> {
         let report = verify_session(&self.session_dir).unwrap();
+        assert_eq!(report.incomplete, None, "{report:?}");
         eprintln!("{TEST}: {report:?}");
         LogReader::open(&self.session_dir)
             .unwrap()

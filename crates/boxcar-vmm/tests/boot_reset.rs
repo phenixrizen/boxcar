@@ -137,6 +137,7 @@ fn run_to_a_stop(vmm: Vmm) -> VmExit {
 /// The session's records, once its log is verified.
 fn records(session_dir: &Path) -> Vec<Record> {
     let report = verify_session(session_dir).unwrap();
+    assert_eq!(report.incomplete, None, "{report:?}");
     eprintln!("{TEST}: {report:?}");
     LogReader::open(session_dir)
         .unwrap()

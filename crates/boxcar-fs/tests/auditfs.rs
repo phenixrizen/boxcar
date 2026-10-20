@@ -135,7 +135,12 @@ impl Share {
         self.fs.flush_hashes();
         let session = self.writer.session_dir().to_owned();
         self.writer.close().expect("close the audit writer");
-        verify_session(&session).expect("the session verifies");
+        assert_eq!(
+            verify_session(&session)
+                .expect("the session verifies")
+                .incomplete,
+            None
+        );
         let records = LogReader::open(&session)
             .unwrap()
             .records()
@@ -936,7 +941,7 @@ fn dropping_the_filesystem_closes_the_handles_left_open() {
     drop(fs);
     let session = writer.session_dir().to_owned();
     writer.close().unwrap();
-    verify_session(&session).unwrap();
+    assert_eq!(verify_session(&session).unwrap().incomplete, None);
     let events: Vec<(Payload, Option<Subject>)> = LogReader::open(&session)
         .unwrap()
         .records()

@@ -63,6 +63,7 @@ fn guest_or_skip(test: &str) -> Option<(PathBuf, PathBuf)> {
 /// The session's record types, in order, after checking the log verifies.
 fn record_kinds(session_dir: &Path) -> Vec<String> {
     let report = verify_session(session_dir).unwrap();
+    assert_eq!(report.incomplete, None, "{report:?}");
     assert!(report.records >= 2, "{report:?}");
     LogReader::open(session_dir)
         .unwrap()

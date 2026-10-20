@@ -174,6 +174,8 @@ fn a_session_command_writes_a_file_the_audit_hashes() {
     assert_eq!(fs::read(workspace.join("a.txt")).unwrap(), b"hi\n");
 
     let report = verify_session(&session_dir).unwrap();
+
+    assert_eq!(report.incomplete, None, "{report:?}");
     eprintln!("{TEST}: {report:?}");
     let closes: Vec<Record> = LogReader::open(&session_dir)
         .unwrap()
