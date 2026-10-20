@@ -19,7 +19,8 @@ roadmap.
 ## Quick start
 
 On x86_64 Linux with KVM and Docker (see
-[CONTRIBUTING.md](CONTRIBUTING.md#kvm-on-the-dev-machine)):
+[CONTRIBUTING.md](CONTRIBUTING.md#kvm-on-the-dev-machine), and
+[docs/wsl2.md](docs/wsl2.md) under WSL2):
 
 ```bash
 cargo xtask kernel               # target/guest/vmlinux, built in Docker
@@ -121,6 +122,22 @@ and the blake3 of the file as it was when it was closed. Each record's
 - `boxcar audit verify` proves that the chain is intact and complete up to
   its last record: nothing was changed, removed or reordered. It does not
   prove that the session ended cleanly; look for its `vmm.stop`.
+- A crash can leave the log cut mid-write: a partial last line, a last
+  checkpoint not yet in `checkpoints.jsonl`, or another of the tails a
+  process killed while writing leaves (`docs/audit-events.md`). Then
+  `boxcar audit verify` prints `incomplete: N records verified, ...; the
+  tail is cut (...), cause unknown` and exits 4: the records before the cut
+  verify, and the checkpoint index still proves every record up to the
+  last checkpoint it lists. A deliberate cut can leave the same tail, and
+  verify cannot tell the two apart. A log cut at a record boundary
+  verifies as intact; only the missing `vmm.stop` tells.
+- The VMM runs confined (`vmm.start`'s `hardening`): a Landlock domain over
+  the paths the session uses, and a seccomp allowlist on every thread. A
+  syscall off the list kills `boxcar run` by `SIGSYS` (`--seccomp
+  enforce`, the default): a crash like any other, so the log may end
+  incomplete and has no `vmm.stop`. `--seccomp log` lets such a call go
+  ahead and has the kernel log it; `--seccomp off` and `--landlock off`
+  are the ways out if a session needs what the confinement refuses.
 
 ## Networking and policy
 

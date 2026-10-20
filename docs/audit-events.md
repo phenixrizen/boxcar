@@ -62,7 +62,7 @@ Common pieces:
 
 | Type | Fields | When |
 |---|---|---|
-| `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none), `inspect_ca_sha256` (omitted when the policy has no `inspect` rule), `image {reference, manifest_digest, config_digest}` (omitted unless the session boots from an image) | The VM was built and is about to run. `image` names the image `--image` gave, normalized, and the manifest and config digests of the cached image whose tree the session's root share was copied from. `inspect_ca_sha256` is the SHA-256, lowercase hex, of the DER certificate of the session CA the guest was told to trust for the gate's certificates (`--inspect`). |
+| `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none), `inspect_ca_sha256` (omitted when the policy has no `inspect` rule), `image {reference, manifest_digest, config_digest}` (omitted unless the session boots from an image), `hardening {seccomp, landlock}` (omitted when the VM was built by another program than `boxcar run`, such as a test) | The VM was built and is about to run. `hardening` is how the VMM process is confined, both in force before the record is made: `seccomp` is `enforce` (a syscall off the allowlist kills the process: a crash, with no `vmm.stop`), `log` (the kernel logs such a call, which goes ahead) or `off` (`boxcar run --seccomp`); `landlock` is `full` (every right boxcar handles is enforced), `partial` (the kernel enforces some of them), `unsupported` (no usable Landlock: the process runs unconfined) or `off` (`--landlock off`). `image` names the image `--image` gave, normalized, and the manifest and config digests of the cached image whose tree the session's root share was copied from. `inspect_ca_sha256` is the SHA-256, lowercase hex, of the DER certificate of the session CA the guest was told to trust for the gate's certificates (`--inspect`). |
 | `vmm.stop` | `reason`, `exit_code` (or null), `console_dropped_bytes`, `stdin_dropped_bytes` | The VM stopped; the last record of a run (a closing checkpoint follows). `reason`: `guest_reset`, `guest_shutdown`, `signal`, `console_escape`, `stop_requested`, `vcpu_error`, `audit_failed`, `vmm_error`. The byte counts are console output the host never wrote out and console input it dropped (0 for a run without them). |
 | `checkpoint` | `records_since`, `dropped`, `root_hash` | The writer's summary of the records since the previous checkpoint: every 1024 records or 2 s, at a segment seal, and at close. `root_hash` is blake3 over the raw hashes of those records; `dropped` counts droppable events (`fs.read`, `net.drop`) the full channel dropped. |
 
@@ -275,3 +275,30 @@ its first datagram does. Every record is on disk by the next checkpoint
 more are `fdatasync`ed at once. A writer that fails
 stops the VM (`boxcar run` exits 3) and cuts the log back to its last
 consistent record; `boxcar audit verify` accepts what is left.
+
+A crash can end the log mid-write: a process killed while it writes keeps
+every `write(2)` that completed and loses the rest. A log cut at a record
+boundary verifies as intact, and only its missing `vmm.stop` and closing
+`checkpoint` tell. Any other cut leaves the tail in one of these states,
+and `boxcar audit verify` reports the log as *incomplete*, exit code 4,
+with what verified before the cut (`--json`: `incomplete {kind, segment,
+offset, bytes}`):
+
+| `kind` | The tail | `segment`, `offset`, `bytes` |
+|---|---|---|
+| `partial_line` | The newest segment ends in a partial line, no longer than a record (64 KiB): a write cut short. | Where the line starts, and its length. |
+| `unindexed_checkpoint` | The last record is a checkpoint, the newest segment's last line, which `checkpoints.jsonl` does not list; it lists every checkpoint before it. Cut between the checkpoint's sync and its index line. | Where the checkpoint's line starts; 0. |
+| `partial_index_line` | The same, but `checkpoints.jsonl` ends in the first bytes of that checkpoint's index line, byte for byte: its append cut short. | Where the checkpoint's line starts, and how many bytes of its index line there are. |
+| `rotation` | The newest segment file is empty, and `meta.json` does not list it yet; the one before ends in a checkpoint the index lists. | The empty segment; 0, 0. |
+| `no_segment` | `meta.json` lists one segment, and there is none: a new session cut before its first record. | 1; 0, 0. |
+
+Exactly one of them, at the very end. Two at once, or one anywhere else,
+is a break (exit code 1): a partial line in a segment before the newest,
+an index line naming a checkpoint past the end, an extra segment that is
+not empty, a partial index line that does not start its checkpoint's
+line. The writer's own rollback after a failure cuts `checkpoints.jsonl`
+before the segment, so a crash in the middle of it leaves one of these
+states too. A deliberate cut can leave the same tails, so verify cannot
+tell a crash from one, and says `cause unknown`. An incomplete log hides
+no more than a cut at a record boundary can: `checkpoints.jsonl` still
+proves every record up to the last checkpoint it lists.

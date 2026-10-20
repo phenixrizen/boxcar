@@ -342,7 +342,18 @@ pub struct PolicyRuleArgs {
 #[derive(Debug, Subcommand)]
 pub enum AuditCommand {
     /// Check that a log is intact: every hash, link, sequence number and
-    /// checkpoint. Exits 0 when it is, 1 at the first break.
+    /// checkpoint.
+    ///
+    /// A log whose tail was cut mid-write is incomplete: what is there
+    /// verifies, and the tail is one a process killed while writing leaves
+    /// (a partial last line, a last checkpoint that checkpoints.jsonl lists
+    /// only in part or not at all, a new segment meta.json does not list
+    /// yet, a new session with no segment yet). It prints `incomplete: ...`
+    /// and where the tail is cut. A deliberate cut can leave the same tail,
+    /// so the cause is unknown.
+    ///
+    /// Exits 0 when the log is intact, 1 at the first break, 2 on a usage
+    /// error, and 4 when it is incomplete.
     Verify(VerifyArgs),
 }
 
@@ -350,7 +361,9 @@ pub enum AuditCommand {
 pub struct VerifyArgs {
     /// A session directory, or a single `.jsonl` log file.
     pub path: PathBuf,
-    /// Print the report, or the first break, as one JSON object.
+    /// Print the report, or the first break, as one JSON object. An
+    /// incomplete log's has `ok: false` and `incomplete`: its `kind`, and
+    /// the `segment`, `offset` and `bytes` that say where the tail is cut.
     #[arg(long)]
     pub json: bool,
 }
@@ -631,6 +644,37 @@ pub struct RunArgs {
     /// in memory only.
     #[arg(long)]
     pub scrub_argv: bool,
+    /// The VMM process's seccomp filter, on every thread once the VM is
+    /// built: `enforce` kills the process at a syscall off its allowlist (a
+    /// crash: no `vmm.stop`, and `boxcar audit verify` may find the log's
+    /// tail cut); `log` has the kernel log such a call and lets it go
+    /// ahead, for finding a call the list lacks; `off` installs none.
+    /// `vmm.start` records it. Also read from `BOXCAR_SECCOMP`; the flag
+    /// wins.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        env = "BOXCAR_SECCOMP",
+        default_value_t = SeccompArg::Enforce
+    )]
+    pub seccomp: SeccompArg,
+    /// The VMM process's Landlock domain, applied before its first thread:
+    /// `enforce` confines it to the paths the session uses (the shares, the
+    /// session's and the state directories, the kernel, the initramfs,
+    /// `/dev/kvm`, a dump directory); `off` leaves it unconfined, a way out
+    /// when a path a session needs is missing from the domain. A kernel
+    /// without Landlock (or with only its first version) runs the session
+    /// unconfined either way. `vmm.start` records which. Also read from
+    /// `BOXCAR_LANDLOCK`; the flag wins.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        env = "BOXCAR_LANDLOCK",
+        default_value_t = LandlockArg::Enforce
+    )]
+    pub landlock: LandlockArg,
     /// Set NAME to VALUE in the session's environment, after the defaults
     /// (PATH, HOME, TERM, LANG, BOXCAR_SESSION_ID). Repeatable. For what
     /// an agent inside needs, such as CLAUDE_CODE_OAUTH_TOKEN: the value
@@ -736,6 +780,21 @@ pub fn parse_env(text: &str) -> Result<(String, String), String> {
 pub enum AuditLevelArg {
     Normal,
     Verbose,
+}
+
+/// `--seccomp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SeccompArg {
+    Enforce,
+    Log,
+    Off,
+}
+
+/// `--landlock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LandlockArg {
+    Enforce,
+    Off,
 }
 
 #[cfg(test)]

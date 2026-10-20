@@ -39,6 +39,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -168,6 +171,7 @@ impl Run {
     /// The session's records, once the log is verified.
     fn records(&self) -> Vec<Record> {
         let report = verify_session(&self.session_dir).unwrap();
+        assert_eq!(report.incomplete, None, "{report:?}");
         eprintln!("{TEST}: {report:?}");
         LogReader::open(&self.session_dir)
             .unwrap()
@@ -219,6 +223,7 @@ fn run(options: Options<'_>, during: impl FnOnce(VmmHandle) + Send + 'static) ->
             state_dir: state.clone(),
             session_id: SessionId::new(),
         }),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -270,6 +275,7 @@ fn wait_for_sensor(
 
 #[test]
 fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
+    confine!();
     let (seen_tx, seen) = mpsc::channel();
     let Some(run) = run(
         Options {
@@ -400,6 +406,7 @@ fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
 
 #[test]
 fn a_root_session_cannot_signal_the_sensor_and_its_bpf_is_recorded() {
+    confine!();
     let Some(sensor) = sensor_binary_or_skip() else {
         return;
     };
@@ -460,6 +467,7 @@ fn a_root_session_cannot_signal_the_sensor_and_its_bpf_is_recorded() {
 
 #[test]
 fn bpf_from_an_unprivileged_session_is_refused_and_recorded() {
+    confine!();
     let Some(sensor) = sensor_binary_or_skip() else {
         return;
     };
@@ -495,6 +503,7 @@ fn bpf_from_an_unprivileged_session_is_refused_and_recorded() {
 
 #[test]
 fn no_sensor_means_no_ring_1() {
+    confine!();
     let (seen_tx, seen) = mpsc::channel();
     let Some(run) = run(
         Options {

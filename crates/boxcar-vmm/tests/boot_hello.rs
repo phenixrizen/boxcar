@@ -15,6 +15,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -60,6 +63,7 @@ fn guest_or_skip(test: &str) -> Option<(PathBuf, PathBuf)> {
 /// The session's record types, in order, after checking the log verifies.
 fn record_kinds(session_dir: &Path) -> Vec<String> {
     let report = verify_session(session_dir).unwrap();
+    assert_eq!(report.incomplete, None, "{report:?}");
     assert!(report.records >= 2, "{report:?}");
     LogReader::open(session_dir)
         .unwrap()
@@ -70,6 +74,7 @@ fn record_kinds(session_dir: &Path) -> Vec<String> {
 
 #[test]
 fn hello_init_prints_its_marker_and_resets_the_guest() {
+    confine!();
     let Some((kernel, initramfs)) = guest_or_skip(TEST) else {
         return;
     };
@@ -85,6 +90,7 @@ fn hello_init_prints_its_marker_and_resets_the_guest() {
         cmdline_extra: vec!["boxcar.mode=hello".into()],
         console: ConsoleOut::File(console.clone()),
         initramfs: Some(initramfs),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -132,6 +138,7 @@ fn hello_init_prints_its_marker_and_resets_the_guest() {
 /// it ends. `--debug-boot`'s kernel messages show the probe.
 #[test]
 fn hello_boots_with_the_root_and_workspace_shares_attached() {
+    confine!();
     const TEST: &str = "boot_hello_with_shares";
     let Some((kernel, initramfs)) = guest_or_skip(TEST) else {
         return;
@@ -160,6 +167,7 @@ fn hello_boots_with_the_root_and_workspace_shares_attached() {
             share("root", rootfs, "/", CachePolicyKind::Always),
             share("workspace", workspace, "/workspace", CachePolicyKind::Auto),
         ],
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -210,6 +218,7 @@ fn hello_boots_with_the_root_and_workspace_shares_attached() {
 /// probe.
 #[test]
 fn hello_boots_with_no_shares_and_probes_no_virtio_device() {
+    confine!();
     const TEST: &str = "boot_hello_no_virtio";
     let Some((kernel, initramfs)) = guest_or_skip(TEST) else {
         return;
@@ -225,6 +234,7 @@ fn hello_boots_with_no_shares_and_probes_no_virtio_device() {
         debug_boot: true,
         console: ConsoleOut::File(console.clone()),
         initramfs: Some(initramfs),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -271,6 +281,7 @@ fn hello_boots_with_no_shares_and_probes_no_virtio_device() {
 /// one running and one parked, must both be kicked out when the handle asks.
 #[test]
 fn request_stop_ends_a_guest_that_never_stops() {
+    confine!();
     const TEST: &str = "request_stop";
     let Some((kernel, initramfs)) = guest_or_skip(TEST) else {
         return;
@@ -286,6 +297,7 @@ fn request_stop_ends_a_guest_that_never_stops() {
         cmdline_extra: vec!["rdinit=/none".into(), "panic=0".into()],
         console: ConsoleOut::File(console.clone()),
         initramfs: Some(initramfs),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();

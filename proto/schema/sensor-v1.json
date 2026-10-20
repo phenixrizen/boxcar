@@ -849,6 +849,22 @@
         }
       }
     },
+    "Hardening": {
+      "description": "How the VMM process is confined (`vmm.start.hardening`): its seccomp filter and its Landlock domain, both in force before the record is made.",
+      "type": "object",
+      "required": [
+        "landlock",
+        "seccomp"
+      ],
+      "properties": {
+        "landlock": {
+          "$ref": "#/definitions/LandlockStatus"
+        },
+        "seccomp": {
+          "$ref": "#/definitions/SeccompMode"
+        }
+      }
+    },
     "Hash": {
       "description": "A blake3 digest: `b3:` followed by 64 lowercase hex digits.",
       "type": "string",
@@ -1102,6 +1118,39 @@
           "type": "string"
         }
       }
+    },
+    "LandlockStatus": {
+      "description": "The process's Landlock domain (`boxcar run --landlock`).",
+      "oneOf": [
+        {
+          "description": "Every right boxcar handles is enforced, on every thread.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        },
+        {
+          "description": "The kernel enforces only some of the rights boxcar handles.",
+          "type": "string",
+          "enum": [
+            "partial"
+          ]
+        },
+        {
+          "description": "The kernel has no usable Landlock (none, or only ABI 1): the process runs without a domain.",
+          "type": "string",
+          "enum": [
+            "unsupported"
+          ]
+        },
+        {
+          "description": "`--landlock off`.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        }
+      ]
     },
     "LlmRequest": {
       "description": "`llm.request`: a request to a model API the gate knows, read from an inspected flow once its body ended.",
@@ -3346,6 +3395,32 @@
         1
       ]
     },
+    "SeccompMode": {
+      "description": "The process's seccomp filter (`boxcar run --seccomp`).",
+      "oneOf": [
+        {
+          "description": "A syscall off the allowlist kills the process.",
+          "type": "string",
+          "enum": [
+            "enforce"
+          ]
+        },
+        {
+          "description": "A syscall off the allowlist is logged by the kernel and goes ahead.",
+          "type": "string",
+          "enum": [
+            "log"
+          ]
+        },
+        {
+          "description": "No filter.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        }
+      ]
+    },
     "SensorFrame": {
       "description": "One record from the sensor: the guest's clock when it happened, the process it is about, and the record's `type` and `data`.",
       "type": "object",
@@ -4812,6 +4887,17 @@
       "properties": {
         "cmdline": {
           "type": "string"
+        },
+        "hardening": {
+          "description": "How the VMM process is confined. Omitted when the VMM was built inside another program (its tests) rather than by `boxcar run`, and read as none when absent.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Hardening"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "image": {
           "description": "The image the session booted from (`--image`). Omitted when the root share is a directory given with `--rootfs`, and read as none when absent.",

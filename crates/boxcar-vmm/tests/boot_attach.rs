@@ -27,6 +27,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -305,6 +308,7 @@ fn run<T: Send + 'static>(
             state_dir: state.clone(),
             session_id: SessionId::new(),
         }),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -355,6 +359,7 @@ struct Typed {
 /// and ends the session with `exit`: the VM exits 0.
 #[test]
 fn an_attached_client_types_into_the_session_and_resizes_it() {
+    confine!();
     let Some((run, saw)) = run(&["/bin/sh", "-l"], |beside| {
         let mut saw = Typed::default();
         let attached = Attached::new(&beside.control, "rw", 0);
@@ -424,6 +429,7 @@ struct Two {
 /// read-write one from when it attached, and what it types is discarded.
 #[test]
 fn a_second_read_only_attach_sees_the_same_bytes_and_cannot_type() {
+    confine!();
     let Some((run, saw)) = run(&["/bin/sh", "-l"], |beside| {
         let rw = Attached::new(&beside.control, "rw", 0);
         let ro = Attached::new(&beside.control, "ro", 0);

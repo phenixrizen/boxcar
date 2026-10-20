@@ -125,7 +125,7 @@ impl Share {
         drop(self.sink);
         let session = self.writer.session_dir().to_owned();
         self.writer.close().unwrap();
-        verify_session(&session).unwrap();
+        assert_eq!(verify_session(&session).unwrap().incomplete, None);
         LogReader::open(&session)
             .unwrap()
             .records()

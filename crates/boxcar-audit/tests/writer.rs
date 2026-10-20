@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{
-    spawn, spawn_with_syncer, verify_session, EmitError, LogReader, Priority, Submission, Syncer,
-    VerifyError, WriteFailure, WriterConfig,
+    spawn, spawn_with_syncer, verify_session, EmitError, Incomplete, IncompleteKind, LogReader,
+    Priority, Submission, Syncer, VerifyError, VerifyReport, WriteFailure, WriterConfig,
 };
 use boxcar_proto::{
     Attrib, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject,
@@ -128,6 +128,13 @@ fn parse(line: &[u8]) -> Record {
     serde_json::from_slice(line).unwrap()
 }
 
+/// Verifies a session, which must be intact: not even its tail cut.
+fn intact(session_dir: &Path) -> VerifyReport {
+    let report = verify_session(session_dir).unwrap();
+    assert_eq!(report.incomplete, None, "{}", session_dir.display());
+    report
+}
+
 fn meta(session_dir: &Path) -> Value {
     serde_json::from_slice(&fs::read(session_dir.join("meta.json")).unwrap()).unwrap()
 }
@@ -228,7 +235,7 @@ fn seq_is_gap_free_under_eight_concurrent_producers() {
     assert_eq!(stats.last_hash, records.last().unwrap().hash);
     assert_eq!(stats.dropped, 0);
 
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.records, records.len() as u64);
     assert_eq!(report.segments, 1);
     assert_eq!(report.checkpoints as usize, checkpoints.len());
@@ -287,7 +294,7 @@ fn rotation_keeps_one_chain_across_segments() {
     assert_eq!(records.iter().filter(|r| !is_checkpoint(r)).count(), 10_000);
     check_checkpoints(&records);
 
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.segments as usize, files.len());
     assert_eq!(report.records, records.len() as u64);
     assert_eq!(
@@ -309,7 +316,7 @@ fn a_flipped_byte_fails_verification_at_that_record() {
         sink.emit(event(n)).unwrap();
     }
     writer.close().unwrap();
-    verify_session(&dir).unwrap();
+    intact(&dir);
 
     // An event record in the middle of a middle segment.
     let files = segment_files(&dir);
@@ -374,7 +381,7 @@ fn every_one_byte_flip_of_a_record_is_caught_at_that_record() {
         }
     }
     fs::write(&file, &original).unwrap();
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 // (d) Torn tail.
@@ -423,7 +430,7 @@ fn a_torn_tail_is_cut_and_the_chain_resumes() {
     // were written before the cut but after the last surviving checkpoint.
     check_checkpoints(&records);
 
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.last_seq, stats.last_seq);
     assert_eq!(report.last_hash, stats.last_hash);
 }
@@ -490,7 +497,7 @@ fn recovery_does_not_keep_a_complete_but_corrupted_record() {
         .map(event_number)
         .collect();
     assert_eq!(events, (0..19).chain(100..103).collect::<Vec<_>>());
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 #[test]
@@ -528,7 +535,7 @@ fn recovery_does_not_keep_a_record_with_a_duplicated_key() {
         .map(event_number)
         .collect();
     assert_eq!(events, (0..19).chain(100..103).collect::<Vec<_>>());
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 #[test]
@@ -567,7 +574,7 @@ fn a_torn_first_line_resumes_from_the_previous_segment() {
         .collect();
     assert_eq!(tail, (100..110).collect::<Vec<_>>());
     check_checkpoints(&records);
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 #[test]
@@ -583,16 +590,23 @@ fn a_lost_checkpoint_line_is_rebuilt_on_reopen() {
     writer.close().unwrap();
 
     // As if the process died after the checkpoint record was synced but
-    // before its line reached checkpoints.jsonl.
+    // before its line reached checkpoints.jsonl: an incomplete log.
     let index = dir.join("checkpoints.jsonl");
     let text = fs::read_to_string(&index).unwrap();
     let kept: String = text.lines().take(2).map(|l| format!("{l}\n")).collect();
     assert_eq!(text.lines().count(), 3);
     fs::write(&index, kept).unwrap();
-    assert!(matches!(
-        verify_session(&dir),
-        Err(VerifyError::CheckpointFile { .. })
-    ));
+    let (offset, last) = lines_with_offsets(&segment_files(&dir)[0]).pop().unwrap();
+    assert!(is_checkpoint(&parse(&last)));
+    assert_eq!(
+        verify_session(&dir).unwrap().incomplete,
+        Some(Incomplete {
+            kind: IncompleteKind::UnindexedCheckpoint,
+            segment: 1,
+            offset,
+            bytes: 0,
+        })
+    );
 
     let (sink, writer) = spawn(cfg).unwrap();
     for n in 25..30 {
@@ -601,7 +615,7 @@ fn a_lost_checkpoint_line_is_rebuilt_on_reopen() {
     writer.close().unwrap();
 
     assert_eq!(meta(&dir)["recovered_from_seq"], Value::Null, "nothing cut");
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.checkpoints, 4);
 }
 
@@ -665,7 +679,7 @@ fn a_critical_record_is_synced_on_its_own() {
         "one fdatasync right after each critical record (seq 4 and 7), while the \
          file still ended with it; none for normal records; one for the final checkpoint"
     );
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 // (f) Checkpoints.
@@ -717,7 +731,7 @@ fn checkpoints_fall_every_n_records_and_cover_them() {
         }
     }
 
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.checkpoints, 4);
 }
 
@@ -746,7 +760,7 @@ fn a_checkpoint_follows_the_interval_without_waiting_for_close() {
 
     writer.close().unwrap();
     check_checkpoints(&read_records(&dir));
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 // Back-pressure: droppable events count their drops, never-drop events wait.
@@ -849,7 +863,7 @@ fn droppable_events_count_drops_and_never_drop_events_wait() {
     assert_eq!(sink.emit(event(9)), Err(EmitError::Closed));
     assert!(!sink.try_emit(event(10)));
     assert_eq!(sink.dropped(), 3);
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 // A writer that fails.
@@ -950,7 +964,7 @@ fn a_failed_sync_stops_the_writer_and_says_where() {
     assert_eq!(sink.emit(event(6)), Err(EmitError::Failed));
 
     // What the writer left verifies, up to the last record it wrote.
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.last_seq, 4);
     assert_eq!(report.checkpoints, 0);
 }
@@ -979,7 +993,7 @@ fn a_checkpoint_that_cannot_be_synced_is_taken_back() {
     // The checkpoint at 8 is neither synced nor listed in
     // checkpoints.jsonl, so the writer took it back out of the segment:
     // the log ends at 7 and agrees with its index.
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.last_seq, 7);
     assert_eq!(report.checkpoints, 1);
     let records = read_records(&dir);
@@ -1019,7 +1033,7 @@ fn a_segment_that_cannot_be_created_fails_the_writer_with_its_name() {
     assert_eq!(failure.errno, Some(libc::EACCES));
     assert!(writer.close().is_err());
 
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(
         (report.segments, report.last_seq, report.checkpoints),
         (1, 2, 1)
@@ -1053,7 +1067,7 @@ fn a_writer_that_panics_fails_closed() {
     assert_eq!(sink.emit(event(2)), Err(EmitError::Failed));
     let error = writer.close().unwrap_err();
     assert_eq!(failure_of(&error), Some(&failure));
-    let report = verify_session(&dir).unwrap();
+    let report = intact(&dir);
     assert_eq!(report.last_seq, 2);
 }
 
@@ -1135,7 +1149,7 @@ fn a_submitted_checkpoint_is_refused_at_the_sink() {
     assert_eq!(records.len(), 2, "the event and the final checkpoint");
     assert_eq!(event_number(&records[0]), 1);
     assert_eq!(check_checkpoints(&records), [2]);
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 #[test]
@@ -1152,7 +1166,7 @@ fn dropping_the_handle_finishes_the_log() {
     let records = read_records(&dir);
     assert_eq!(records.len(), 6);
     assert!(is_checkpoint(&records[5]));
-    verify_session(&dir).unwrap();
+    intact(&dir);
 }
 
 // The reader.

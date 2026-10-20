@@ -43,13 +43,14 @@ mod payloads;
 pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
     FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
-    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, HttpRequest,
-    HttpResponse, ImageRef, LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns,
-    NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, PolicyException, PolicyLoaded,
-    ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
-    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus,
-    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen,
-    Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hardening, HashStatus,
+    HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest, LlmResponse, NetClose,
+    NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged,
+    PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach,
+    ProcTlsIo, ProgramStatus, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr,
+    ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose,
+    VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -794,6 +795,10 @@ mod tests {
                         manifest_digest: format!("sha256:{}", "cd".repeat(32)),
                         config_digest: format!("sha256:{}", "ef".repeat(32)),
                     }),
+                    hardening: Some(Hardening {
+                        seccomp: SeccompMode::Enforce,
+                        landlock: LandlockStatus::Partial,
+                    }),
                 }),
                 json!({
                     "version": "0.1.0",
@@ -812,6 +817,7 @@ mod tests {
                         "manifest_digest": format!("sha256:{}", "cd".repeat(32)),
                         "config_digest": format!("sha256:{}", "ef".repeat(32)),
                     },
+                    "hardening": {"seccomp": "enforce", "landlock": "partial"},
                 }),
             ),
             (
@@ -1935,6 +1941,7 @@ mod tests {
                     shares: Vec::new(),
                     inspect_ca_sha256: None,
                     image: None,
+                    hardening: None,
                 }),
                 json!({
                     "version": "0.1.0",
@@ -2224,13 +2231,15 @@ mod tests {
             Payload::VmmStart(start) => {
                 assert!(start.shares.is_empty());
                 assert_eq!(start.image, None, "no image either");
+                assert_eq!(start.hardening, None, "nor hardening");
             }
             other => panic!("not a vmm.start: {other:?}"),
         }
     }
 
     /// `image` came with M5: the largest reference (255 bytes) and both
-    /// digests round-trip, and a record carrying them fits its limit.
+    /// digests round-trip, and a record carrying them and `hardening` at its
+    /// longest fits its limit.
     #[test]
     fn a_vmm_start_carries_the_largest_image() {
         let reference = format!(
@@ -2256,6 +2265,10 @@ mod tests {
                 reference,
                 manifest_digest: format!("sha256:{}", "1".repeat(64)),
                 config_digest: format!("sha256:{}", "2".repeat(64)),
+            }),
+            hardening: Some(Hardening {
+                seccomp: SeccompMode::Enforce,
+                landlock: LandlockStatus::Unsupported,
             }),
         };
         let payload = Payload::VmmStart(start.clone());

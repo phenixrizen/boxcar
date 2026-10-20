@@ -605,7 +605,12 @@ fn compare(
     drop(audited);
     let session = writer.session_dir().to_owned();
     writer.close().unwrap();
-    verify_session(&session).expect("the decorator's session verifies");
+    assert_eq!(
+        verify_session(&session)
+            .expect("the decorator's session verifies")
+            .incomplete,
+        None
+    );
 
     assert_eq!(
         reference.len(),

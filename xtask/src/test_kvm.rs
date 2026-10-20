@@ -19,6 +19,14 @@
 //! `m1` exports `BOXCAR_TEST_NET=0`, so the tests that reach example.com
 //! skip, and `m2` exports `BOXCAR_TEST_NET=1` when this host resolves
 //! example.com, `0` otherwise.
+//!
+//! The `boxcar run`s the tests start are confined as `boxcar run` is by
+//! default: `--seccomp enforce` and `--landlock enforce`, and the
+//! `boxcar-vmm` tests build their VMs under `enforce` in a child each. A
+//! whole run can take `BOXCAR_SECCOMP=log` instead, to find a call the
+//! allowlist lacks without a kill; `off` for either is refused, so that a
+//! setting left in the environment cannot quietly run the suites
+//! unconfined. The modes are printed first.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -113,6 +121,11 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
         println!("skipping test-kvm {}: {reason}", args.milestone.name());
         return Ok(());
     }
+    let modes = hardening_modes(
+        std::env::var("BOXCAR_SECCOMP").ok().as_deref(),
+        std::env::var("BOXCAR_LANDLOCK").ok().as_deref(),
+    )?;
+    println!("test-kvm {}: {modes}", args.milestone.name());
     let net = args.milestone.net_env();
     if args.milestone != Milestone::M1 && net == "0" {
         println!("test-kvm m2: this host does not resolve example.com; the network tests skip");
@@ -130,6 +143,23 @@ pub fn run(args: &TestKvmArgs) -> Result<()> {
         args.milestone.name()
     );
     Ok(())
+}
+
+/// The seccomp and Landlock modes a run's `boxcar run`s take from the
+/// environment, said as a line; `off` for either is refused.
+fn hardening_modes(seccomp: Option<&str>, landlock: Option<&str>) -> Result<String> {
+    for (name, value) in [("BOXCAR_SECCOMP", seccomp), ("BOXCAR_LANDLOCK", landlock)] {
+        ensure!(
+            value != Some("off"),
+            "{name}=off would run the gated suites unconfined; unset it (or use \
+             BOXCAR_SECCOMP=log to find a call the allowlist lacks)"
+        );
+    }
+    Ok(format!(
+        "seccomp {}, landlock {}",
+        seccomp.unwrap_or("enforce"),
+        landlock.unwrap_or("enforce")
+    ))
 }
 
 /// The arguments after `cargo` that run `milestone`'s gated tests.
@@ -227,6 +257,22 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// The suites run under the defaults, or `log` for seccomp; `off` for
+    /// either is refused.
+    #[test]
+    fn the_suites_never_run_unconfined() {
+        assert_eq!(
+            hardening_modes(None, None).unwrap(),
+            "seccomp enforce, landlock enforce"
+        );
+        assert_eq!(
+            hardening_modes(Some("log"), None).unwrap(),
+            "seccomp log, landlock enforce"
+        );
+        assert!(hardening_modes(Some("off"), None).is_err());
+        assert!(hardening_modes(None, Some("off")).is_err());
+    }
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()

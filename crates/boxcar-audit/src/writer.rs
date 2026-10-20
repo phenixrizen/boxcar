@@ -33,9 +33,16 @@
 //! for room, and the failure eventfd ([`AuditSink::failure_event`]) becomes
 //! readable. Then the thread drops what it still buffers and cuts the
 //! current segment back to the end of the last record the log is
-//! consistent after: a checkpoint that could not be synced, and so is not
-//! in `checkpoints.jsonl`, is taken back out, as is a line only partly
-//! written. What is left verifies.
+//! consistent after: a checkpoint that could not be synced or listed, and
+//! so is not in `checkpoints.jsonl`, is taken back out, as is a line only
+//! partly written. What is left verifies.
+//!
+//! The rollback cuts a partial line off `checkpoints.jsonl` first, then
+//! the segment. A process killed between the two leaves a segment that ends
+//! in a checkpoint the index does not list, as a crash between a
+//! checkpoint's sync and its index line does, which the verifier reports
+//! as incomplete. The other order would leave an index line whose
+//! checkpoint is gone, which no crash leaves.
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -218,8 +225,8 @@ pub fn spawn(cfg: WriterConfig) -> io::Result<(AuditSink, WriterHandle)> {
     spawn_with_syncer(cfg, Fdatasync)
 }
 
-/// [`spawn`], with `syncer` making the segment files durable in place of
-/// `fdatasync`.
+/// [`spawn`], with `syncer` making the log durable in place of
+/// [`Fdatasync`]: every segment sync and every directory sync.
 pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
     cfg: WriterConfig,
     syncer: S,
@@ -230,7 +237,12 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
         .join(crate::SESSIONS_DIR)
         .join(cfg.session_id.as_str());
     let (segments, resume) = SegmentWriter::open_or_create(&session_dir, &cfg.session_id, syncer)?;
-    let index = CheckpointIndex::open(&session_dir, segments.segment(), &resume.checkpoints)?;
+    let index = CheckpointIndex::open(
+        &session_dir,
+        segments.segment(),
+        &resume.checkpoints,
+        segments.syncer(),
+    )?;
 
     let (tx, rx) = bounded::<Msg>(cfg.channel_capacity);
     let (stop, stopped) = bounded(0);
@@ -315,8 +327,10 @@ impl<S: Syncer> Writer<S> {
         };
         self.shared.fail(failure.clone());
         drop(held);
-        let kept = self.segments.roll_back(self.consistent_len);
+        // The index first: killed between the two, the log is left as a
+        // crash between a checkpoint's sync and its index line leaves it.
         self.index.roll_back();
+        let kept = self.segments.roll_back(self.consistent_len);
         tracing::error!(
             session = %self.session_id,
             segment = %self.segments.path().display(),

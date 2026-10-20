@@ -79,7 +79,7 @@ fn session_files_are_private_under_umask_zero() {
         sink.emit(event(n)).unwrap();
     }
     writer.close().unwrap();
-    verify_session(&session).unwrap();
+    assert_eq!(verify_session(&session).unwrap().incomplete, None);
 
     // Every directory the writer created, down to the session.
     for dir in [&data_dir, &data_dir.join("sessions"), &session] {

@@ -87,6 +87,45 @@ pub struct ImageRef {
     pub config_digest: String,
 }
 
+/// How the VMM process is confined (`vmm.start.hardening`): its seccomp
+/// filter and its Landlock domain, both in force before the record is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Hardening {
+    pub seccomp: SeccompMode,
+    pub landlock: LandlockStatus,
+}
+
+/// The process's seccomp filter (`boxcar run --seccomp`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SeccompMode {
+    /// A syscall off the allowlist kills the process.
+    Enforce,
+    /// A syscall off the allowlist is logged by the kernel and goes ahead.
+    Log,
+    /// No filter.
+    #[default]
+    Off,
+}
+
+/// The process's Landlock domain (`boxcar run --landlock`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LandlockStatus {
+    /// Every right boxcar handles is enforced, on every thread.
+    Full,
+    /// The kernel enforces only some of the rights boxcar handles.
+    Partial,
+    /// The kernel has no usable Landlock (none, or only ABI 1): the process
+    /// runs without a domain.
+    Unsupported,
+    /// `--landlock off`.
+    Off,
+}
+
 /// `vmm.start`: the VM was built and is about to run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -113,6 +152,11 @@ pub struct VmmStart {
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageRef>,
+    /// How the VMM process is confined. Omitted when the VMM was built
+    /// inside another program (its tests) rather than by `boxcar run`, and
+    /// read as none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardening: Option<Hardening>,
 }
 
 /// `vmm.stop`: the VM stopped.

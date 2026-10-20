@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use boxcar_proto::{Checkpoint, Hash};
 use serde::{Deserialize, Serialize};
 
-use crate::segment::{on, sync_dir, FileResult, FILE_MODE};
+use crate::segment::{on, FileResult, Syncer, FILE_MODE};
 
 pub(crate) const INDEX_FILE: &str = "checkpoints.jsonl";
 
@@ -108,7 +108,8 @@ pub(crate) struct CheckpointIndex {
 impl CheckpointIndex {
     /// Opens the index of the session in `dir` and makes it agree with the
     /// log, whose last segment is `segment` and holds the checkpoint records
-    /// `in_last_segment` (found by recovery, in order).
+    /// `in_last_segment` (found by recovery, in order). A new index's name
+    /// is made durable through `syncer`.
     ///
     /// Lines for earlier segments are kept up to the first one that does not
     /// parse; the writer made them durable before it started `segment`.
@@ -119,6 +120,7 @@ impl CheckpointIndex {
         dir: &Path,
         segment: u32,
         in_last_segment: &[IndexEntry],
+        syncer: &impl Syncer,
     ) -> io::Result<Self> {
         let path = dir.join(INDEX_FILE);
         let (existing, created) = match fs::read(&path) {
@@ -153,7 +155,7 @@ impl CheckpointIndex {
             .mode(FILE_MODE)
             .open(&path)?;
         if created {
-            sync_dir(dir)?;
+            syncer.sync_dir(dir)?;
         }
         if wanted != existing {
             file.set_len(keep as u64)?;

@@ -23,6 +23,9 @@
 //! the umask to 0 for the whole process, and the log must not become
 //! writable by others once a share is imported.
 //!
+//! Every sync, of a segment or of a directory, goes through the session's
+//! [`Syncer`].
+//!
 //! An I/O error while writing is a [`FileError`]: the error, what was being
 //! done, and to which file. After one the writer stops, and
 //! [`SegmentWriter::roll_back`] cuts the segment back to the end of the last
@@ -79,13 +82,24 @@ impl From<FileError> for io::Error {
     }
 }
 
-/// Makes a segment's written bytes durable. The writer calls it for every
-/// segment sync, so a test can observe exactly when the log is synced.
+/// Makes the log durable. The writer calls [`sync`](Self::sync) for every
+/// segment sync and [`sync_dir`](Self::sync_dir) for every directory sync,
+/// so a test can observe exactly when the log is synced, or stop the
+/// process right there.
 pub trait Syncer {
+    /// Makes a segment's written bytes durable.
     fn sync(&self, file: &File) -> io::Result<()>;
+
+    /// Makes the names in `dir` durable: the entries created, renamed or
+    /// removed in it. The default `fsync`s the directory, as [`Fdatasync`]
+    /// does.
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
 }
 
-/// The real [`Syncer`]: `fdatasync(2)`.
+/// The real [`Syncer`]: `fdatasync(2)` for a segment, `fsync(2)` for a
+/// directory.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Fdatasync;
 
@@ -146,8 +160,8 @@ pub(crate) fn read_meta(dir: &Path) -> io::Result<Meta> {
 }
 
 /// Replaces `meta.json` atomically: a temporary file, synced, renamed over
-/// the old one, then the directory synced.
-fn write_meta(dir: &Path, meta: &Meta) -> FileResult<()> {
+/// the old one, then the directory synced through `syncer`.
+fn write_meta(dir: &Path, meta: &Meta, syncer: &impl Syncer) -> FileResult<()> {
     let path = dir.join(META_FILE);
     let replace = on("replace", &path);
     let mut bytes = serde_json::to_vec(meta).map_err(|e| replace(e.into()))?;
@@ -165,12 +179,7 @@ fn write_meta(dir: &Path, meta: &Meta) -> FileResult<()> {
         });
     written.map_err(on("replace", &path))?;
     fs::rename(&tmp, &path).map_err(on("replace", &path))?;
-    sync_dir(dir).map_err(on("sync", dir))
-}
-
-/// Makes the directory's entries (new, renamed or removed names) durable.
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    syncer.sync_dir(dir).map_err(on("sync", dir))
 }
 
 pub(crate) fn invalid_data(message: String) -> io::Error {
@@ -270,7 +279,7 @@ impl<S: Syncer> SegmentWriter<S> {
                 .mode(DIR_MODE)
                 .create(dir)?;
             if let Some(parent) = dir.parent() {
-                sync_dir(parent)?;
+                syncer.sync_dir(parent)?;
             }
         }
         let lock = File::open(dir)?;
@@ -323,8 +332,8 @@ impl<S: Syncer> SegmentWriter<S> {
             segments: 1,
             recovered_from_seq: None,
         };
-        write_meta(dir, &meta)?;
-        let file = create_segment(dir, 1)?;
+        write_meta(dir, &meta, &syncer)?;
+        let file = create_segment(dir, 1, &syncer)?;
         let writer = SegmentWriter::new(dir, meta, syncer, 1, file, 0, lock);
         let resume = Resume {
             last_seq: 0,
@@ -354,7 +363,7 @@ impl<S: Syncer> SegmentWriter<S> {
         // without its first segment. Anything else is not the writer's doing.
         let number = match found {
             0 if meta.segments == 1 => {
-                create_segment(dir, 1)?;
+                create_segment(dir, 1, &syncer)?;
                 1
             }
             n if n > 0 && (n == meta.segments || n == meta.segments + 1) => n,
@@ -438,7 +447,7 @@ impl<S: Syncer> SegmentWriter<S> {
         }
         meta.segments = number;
         if rewrite_meta {
-            write_meta(dir, &meta)?;
+            write_meta(dir, &meta, &syncer)?;
         }
 
         let writer = SegmentWriter::new(dir, meta, syncer, number, file, kept, lock);
@@ -530,6 +539,11 @@ impl<S: Syncer> SegmentWriter<S> {
         &self.path
     }
 
+    /// What makes the log durable.
+    pub(crate) fn syncer(&self) -> &S {
+        &self.syncer
+    }
+
     /// Syncs the current segment and starts the next one. The caller seals
     /// the segment with a checkpoint first. If the next segment cannot be
     /// listed in `meta.json`, it is removed again, so the log stays as it
@@ -537,12 +551,12 @@ impl<S: Syncer> SegmentWriter<S> {
     pub(crate) fn rotate(&mut self) -> FileResult<()> {
         self.sync()?;
         let next = self.number + 1;
-        let file = create_segment(&self.dir, next)?;
+        let file = create_segment(&self.dir, next, &self.syncer)?;
         let meta = Meta {
             segments: next,
             ..self.meta.clone()
         };
-        if let Err(e) = write_meta(&self.dir, &meta) {
+        if let Err(e) = write_meta(&self.dir, &meta, &self.syncer) {
             // A failure after the rename leaves meta.json listing the new
             // segment, which then belongs to the log.
             if !read_meta(&self.dir).is_ok_and(|m| m.segments == next) {
@@ -594,8 +608,9 @@ impl<S: Syncer> SegmentWriter<S> {
 }
 
 /// Creates segment `n`, which must not exist yet, and makes its name
-/// durable. If the name cannot be made durable, the file is removed again.
-fn create_segment(dir: &Path, n: u32) -> FileResult<File> {
+/// durable through `syncer`. If the name cannot be made durable, the file
+/// is removed again.
+fn create_segment(dir: &Path, n: u32, syncer: &impl Syncer) -> FileResult<File> {
     let path = dir.join(segment_name(n));
     let file = OpenOptions::new()
         .append(true)
@@ -603,7 +618,7 @@ fn create_segment(dir: &Path, n: u32) -> FileResult<File> {
         .mode(FILE_MODE)
         .open(&path)
         .map_err(on("create", &path))?;
-    if let Err(error) = sync_dir(dir) {
+    if let Err(error) = syncer.sync_dir(dir) {
         remove_quietly(&path);
         return Err(on("create", &path)(error));
     }

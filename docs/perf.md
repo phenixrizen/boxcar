@@ -1,6 +1,6 @@
 # virtio-fs throughput: one request queue against four
 
-Measured 2026-10-02 for Task 14 of M2, on the development machine (WSL2,
+Measured 2026-10-02 for Task 14 of M2, on the development machine ([WSL2](wsl2.md),
 Linux 6.18, KVM), with a **debug build** of `boxcar` (`target/debug`), the
 Alpine 3.22 minirootfs as the guest, 1 GiB of guest memory, no network
 card, the audit log at its normal level (every `fs.create` and `fs.close`
@@ -58,7 +58,7 @@ the guest does not use it.
 
 # The gate's cost on an inspected download
 
-Measured 2026-10-06 for Task 7 of M4, on the development machine (WSL2,
+Measured 2026-10-06 for Task 7 of M4, on the development machine ([WSL2](wsl2.md),
 Linux 6.18, KVM), with a **debug build** of `boxcar` built with
 `--features boxcar/kvm-tests` (so that `BOXCAR_TEST_UPSTREAM_ROOTS` is
 read), the Alpine 3.22 minirootfs as the guest, one vCPU, and a TLS

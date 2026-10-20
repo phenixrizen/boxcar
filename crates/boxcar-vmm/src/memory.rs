@@ -21,7 +21,9 @@
 //! Guest RAM: one region below the 32-bit MMIO hole at 3 GiB, and a second
 //! from 4 GiB for whatever does not fit below it.
 
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap};
+use std::io;
+
+use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 use crate::arch::x86_64::layout::{FIRST_ADDR_PAST_32BITS, GUEST_PAGE_SIZE, MMIO32_MEM_START};
 use crate::arch::{Error, Result};
@@ -51,6 +53,23 @@ pub fn create_guest_memory(size: u64) -> Result<GuestMemoryMmap> {
         return Err(Error::ZeroMemorySize);
     }
     GuestMemoryMmap::from_ranges(&arch_memory_regions(size)).map_err(Error::GuestMemory)
+}
+
+/// Marks every region of `mem` `MADV_DONTDUMP`, so that a core dump of
+/// the VMM (a seccomp kill makes one where the limits allow) holds none of
+/// the guest's memory: it may hold an agent's secrets, and it is as large as
+/// the guest's RAM.
+pub fn exclude_from_core_dumps(mem: &GuestMemoryMmap) -> io::Result<()> {
+    for region in mem.iter() {
+        let len = usize::try_from(region.len()).map_err(io::Error::other)?;
+        // SAFETY: the range is the region's own mapping, which lives as
+        // long as `mem`; MADV_DONTDUMP changes only what a core dump holds.
+        let res = unsafe { libc::madvise(region.as_ptr().cast(), len, libc::MADV_DONTDUMP) };
+        if res != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Returns the memory address where the initrd could be loaded: as high as
@@ -90,6 +109,29 @@ mod tests {
     const GIB: u64 = 1 << 30;
     /// A kernel loaded at 1 MiB that ends at 16 MiB.
     const KERNEL_END: GuestAddress = GuestAddress(16 * MIB);
+
+    /// After [`exclude_from_core_dumps`], the kernel lists each region's
+    /// mapping as one a core dump leaves out (`dd` in its `VmFlags`).
+    #[test]
+    fn guest_memory_is_left_out_of_core_dumps() {
+        let mem = create_guest_memory(4 * MIB).unwrap();
+        exclude_from_core_dumps(&mem).unwrap();
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        for region in mem.iter() {
+            let start = region.as_ptr() as usize;
+            let header = format!("{start:x}-");
+            let block = smaps
+                .split_inclusive('\n')
+                .skip_while(|line| !line.starts_with(&header))
+                .take_while(|line| line.starts_with(&header) || !line.contains('-'))
+                .collect::<String>();
+            let flags = block
+                .lines()
+                .find(|line| line.starts_with("VmFlags:"))
+                .unwrap_or_else(|| panic!("no mapping at {start:x}"));
+            assert!(flags.split_whitespace().any(|flag| flag == "dd"), "{flags}");
+        }
+    }
 
     #[test]
     fn regions_lt_4gb() {
