@@ -59,7 +59,7 @@ fn fake_server(path: &Path, policy: PolicyView, refuse: Option<ErrorBody>) -> Jo
 }
 
 /// What a current server's hello lists.
-const CAPABILITIES: [&str; 7] = [
+const CAPABILITIES: [&str; 8] = [
     "pty",
     "audit",
     "policy.net",
@@ -67,6 +67,7 @@ const CAPABILITIES: [&str; 7] = [
     "findings",
     "spans",
     "policy.exception",
+    "audit.verify",
 ];
 
 /// [`fake_server`] whose hello lists `capabilities`. A grant

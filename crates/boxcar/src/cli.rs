@@ -352,7 +352,16 @@ pub enum AuditCommand {
     /// and where the tail is cut. A deliberate cut can leave the same tail,
     /// so the cause is unknown.
     ///
-    /// Exits 0 when the log is intact, 1 at the first break, 2 on a usage
+    /// With `--control`, a running session's log: its VMM checks the log on
+    /// disk against the audit writer's head (its last record, flushed), a
+    /// stretch of at most 50,000 records at a time (`audit.verify`), until
+    /// the head; each stretch must start from the hash the one before ended
+    /// at. Prints `ok: verified seq <from>..<head> against the writer's
+    /// head <hash>`.
+    ///
+    /// Exits 0 when the log is intact, 1 at the first break (and with
+    /// `--control` when the session cannot verify its log: its writer has
+    /// closed or failed, or it is older than `audit.verify`), 2 on a usage
     /// error, and 4 when it is incomplete.
     Verify(VerifyArgs),
     /// Export a log, once it verifies, as one OpenTelemetry trace in
@@ -399,7 +408,15 @@ pub enum ExportFormat {
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
     /// A session directory, or a single `.jsonl` log file.
-    pub path: PathBuf,
+    #[arg(required_unless_present = "control", conflicts_with = "control")]
+    pub path: Option<PathBuf>,
+    /// A running session's control socket: verify its log as it runs.
+    #[arg(long, value_name = "PATH")]
+    pub control: Option<PathBuf>,
+    /// With `--control`, the first seq to verify: the one after the last a
+    /// verify before checked. Default: 1.
+    #[arg(long, value_name = "N", conflicts_with = "path")]
+    pub from_seq: Option<u64>,
     /// Print the report, or the first break, as one JSON object. An
     /// incomplete log's has `ok: false` and `incomplete`: its `kind`, and
     /// the `segment`, `offset` and `bytes` that say where the tail is cut.
@@ -1029,6 +1046,46 @@ mod tests {
     fn other_subcommands_parse_as_before() {
         let cli = Cli::try_parse_args(["boxcar", "audit", "verify", "--", "log.jsonl"]).unwrap();
         assert!(matches!(cli.command, Command::Audit(_)));
+    }
+
+    fn verify_args(args: &[&str]) -> Result<VerifyArgs, clap::Error> {
+        let base = ["boxcar", "audit", "verify"];
+        match Cli::try_parse_args(base.iter().chain(args))?.command {
+            Command::Audit(AuditCommand::Verify(args)) => Ok(args),
+            _ => panic!("not an audit verify"),
+        }
+    }
+
+    /// `audit verify` takes a log's PATH or a running session's
+    /// `--control`, one of the two; `--from-seq` only with `--control`.
+    #[test]
+    fn audit_verify_takes_a_path_or_a_control_socket() {
+        let path = verify_args(&["log.jsonl"]).unwrap();
+        assert_eq!(path.path.as_deref(), Some(Path::new("log.jsonl")));
+        assert!(path.control.is_none() && path.from_seq.is_none());
+        let live = verify_args(&["--control", "c.sock", "--from-seq", "9", "--json"]).unwrap();
+        assert_eq!(live.control.as_deref(), Some(Path::new("c.sock")));
+        assert_eq!((live.from_seq, live.json, live.path), (Some(9), true, None));
+        for (args, kind) in [
+            (&[][..], ErrorKind::MissingRequiredArgument),
+            (
+                &["log.jsonl", "--control", "c.sock"][..],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["log.jsonl", "--from-seq", "9"][..],
+                ErrorKind::ArgumentConflict,
+            ),
+            (&["--from-seq", "9"][..], ErrorKind::MissingRequiredArgument),
+            (
+                &["--control", "c.sock", "--from-seq", "x"][..],
+                ErrorKind::ValueValidation,
+            ),
+        ] {
+            let error = verify_args(args).err().unwrap();
+            assert_eq!(error.kind(), kind, "{args:?}: {error}");
+            assert_eq!(error.exit_code(), 2);
+        }
     }
 }
 
