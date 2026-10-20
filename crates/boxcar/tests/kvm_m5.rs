@@ -1147,3 +1147,114 @@ fn a_running_sessions_log_verifies_against_its_writers_head() {
     let records = run.records();
     assert!(of_kind(&records, "control.connect").len() >= 2);
 }
+
+/// What a collector was sent: the request's path and body.
+fn collect_one_post(listener: std::net::TcpListener) -> (String, Vec<u8>) {
+    use std::io::{BufRead, BufReader};
+    let (stream, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+    let mut length = 0usize;
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let header = line.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    let mut stream = stream;
+    let answer = br#"{"partialSuccess":{}}"#;
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        answer.len()
+    )
+    .unwrap();
+    stream.write_all(answer).unwrap();
+    (path, body)
+}
+
+/// The M5 demo, against the test registry: a session from an image under
+/// `agent-isolate` installs a package with apk and runs it, its log
+/// verifies, and its OTLP export, sent to a collector (a minimal OTLP/HTTP
+/// receiver on the loopback), is one trace whose session span and resource
+/// name the session and the image. The demo against Docker Hub and the
+/// OpenTelemetry Collector is recorded in the pull request that finished
+/// M5.
+#[test]
+fn the_m5_demo_runs_against_the_test_registry() {
+    let Some(guest) = guest_or_skip("the_m5_demo_runs_against_the_test_registry") else {
+        return;
+    };
+    let image = publish(&guest.rootfs);
+    let scratch = Scratch::new();
+    let run = run_image(
+        &guest,
+        &scratch,
+        &image.by_tag,
+        &["--policy", "agent-isolate"],
+        &[
+            "/bin/sh",
+            "-c",
+            "apk add --allow-untrusted --no-network /tmp/boxcar-test-1.0-r0.apk && boxcar-test",
+        ],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(run.stdout.contains(MARKER), "{}", run.describe());
+    let dir = run.session_dir();
+    let session = dir.file_name().unwrap().to_str().unwrap().to_owned();
+
+    let verify = std::process::Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["audit", "verify"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(verify.status.code(), Some(0), "{}", text(&verify.stdout));
+    assert!(text(&verify.stdout).starts_with("ok: "));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let collector = std::thread::spawn(move || collect_one_post(listener));
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["audit", "export"])
+        .arg(&dir)
+        .args(["--format", "otlp", "--otlp-endpoint", &url])
+        .output()
+        .unwrap();
+    let (path, body) = collector.join().unwrap();
+    assert_eq!(export.status.code(), Some(0), "{}", text(&export.stderr));
+    assert_eq!(path, "/v1/traces");
+    let trace: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let resource = &trace["resourceSpans"][0]["resource"]["attributes"];
+    let attribute = |key: &str| {
+        resource
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|kv| kv["key"] == key)
+            .map(|kv| kv["value"]["stringValue"].clone())
+    };
+    assert_eq!(attribute("boxcar.session.id"), Some(session.clone().into()));
+    assert!(
+        attribute("boxcar.image.reference")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .is_some_and(|r| r.ends_with("/library/alpine:3.22")),
+        "{resource}"
+    );
+    assert!(attribute("boxcar.policy.sha256").is_some(), "{resource}");
+    let spans = trace["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    assert_eq!(spans[0]["name"], "boxcar.session");
+    assert_eq!(spans[0]["traceId"], session.replace('-', ""));
+}

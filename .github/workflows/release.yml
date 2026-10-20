@@ -1,0 +1,116 @@
+name: Release
+
+# A `v*` tag builds a release and drafts it on GitHub: the `boxcar`
+# binary (x86_64 Linux, glibc), the guest kernel and the guest initramfs
+# (its init and sensor, the sensor's eBPF programs built), with their
+# SHA-256 sums. The tag must name boxcar's version (`v0.1.0`, or a
+# pre-release of it such as `v0.1.0-rc.1`, which is marked as one). The
+# release stays a draft until the owner publishes it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      # Actions are pinned to commits (the tag they stand for in the
+      # comment), as in ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Read toolchain channel from rust-toolchain.toml
+        id: toolchain
+        run: echo "channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-unknown-linux-musl
+
+      # The sensor's programs, as ci.yml's `ebpf` job builds them. Keep in
+      # step with crates/boxcar-sensor-ebpf/rust-toolchain.toml and
+      # CONTRIBUTING.md.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10
+        with:
+          toolchain: nightly-2026-06-01
+          components: rust-src
+
+      - name: Install bpf-linker
+        run: |
+          curl -fsSL -o cargo-binstall.tgz https://github.com/cargo-bins/cargo-binstall/releases/download/v1.25.1/cargo-binstall-x86_64-unknown-linux-musl.tgz
+          echo "8e06c41af972f9922f28c6ae467e41ffa9b0688d563d0aabd0dcbd5244ab849b  cargo-binstall.tgz" | sha256sum -c -
+          tar -xzf cargo-binstall.tgz -C "$HOME/.cargo/bin" cargo-binstall
+          cargo binstall --no-confirm bpf-linker@0.11.1
+          bpf-linker --version
+
+      - name: The tag names boxcar's version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "boxcar") | .version')
+          tag=${GITHUB_REF_NAME#v}
+          case "$tag" in
+            "$version") echo "prerelease=" >> "$GITHUB_OUTPUT" ;;
+            "$version"-*) echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::tag $GITHUB_REF_NAME does not name boxcar $version"; exit 1 ;;
+          esac
+
+      # From clean sources: no cache carries anything into a release.
+      - name: The guest kernel, built in Docker from guest/kernel/VERSION
+        run: cargo xtask kernel
+
+      - name: The guest initramfs, its sensor's eBPF programs built
+        run: cargo xtask initramfs
+
+      - name: boxcar
+        run: cargo build --release --locked -p boxcar
+
+      - name: Assets and their sums
+        run: |
+          mkdir dist
+          cp target/release/boxcar dist/boxcar
+          cp target/guest/vmlinux dist/vmlinux
+          cp target/guest/initramfs.cpio dist/initramfs.cpio
+          (cd dist && sha256sum boxcar vmlinux initramfs.cpio > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Release notes
+        run: |
+          glibc=$(objdump -T dist/boxcar | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          . guest/kernel/VERSION
+          {
+            echo "boxcar $GITHUB_REF_NAME, built from $GITHUB_SHA."
+            echo
+            echo "- \`boxcar\`: x86_64 Linux, needs glibc $glibc or later and KVM."
+            echo "- \`vmlinux\`: the guest kernel, Linux $KERNEL_VERSION with boxcar's configuration."
+            echo "- \`initramfs.cpio\`: the guest's init and sensor."
+            echo "- \`SHA256SUMS\`: check them with \`sha256sum -c SHA256SUMS\`."
+            echo
+            echo "Run a session from an image:"
+            echo
+            echo '```'
+            echo 'chmod +x boxcar'
+            echo './boxcar run --kernel vmlinux --initramfs initramfs.cpio \'
+            echo '    --image docker.io/library/alpine:3.22 --policy agent-isolate'
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft ${{ steps.version.outputs.prerelease }} \
+            --title "boxcar $GITHUB_REF_NAME" --notes-file notes.md \
+            dist/boxcar dist/vmlinux dist/initramfs.cpio dist/SHA256SUMS

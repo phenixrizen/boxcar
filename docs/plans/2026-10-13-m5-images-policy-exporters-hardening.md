@@ -252,3 +252,12 @@ Made by Task 6 (`docs/plans/exporters.md`), 2026-10-20:
 - **An incomplete log exports its verified prefix and exits 4**, as verify does.
 - **`audit.verify` checks a bounded stretch of a live log per call against the writer's flushed head**, cancellable, refusing a failed writer; the CLI chains the stretches by `from_prev`.
 - **`--otlp-endpoint` takes `http://`**, never a user and password, with a 60 s deadline and a 64 KiB answer cap, and retries nothing.
+
+Made by Task 8 (#30), 2026-10-20:
+
+- **A release is a draft from a tag that names boxcar's version**, `vX.Y.Z` or a pre-release `vX.Y.Z-rc.N` (marked as one). Its assets are `boxcar`, `vmlinux`, `initramfs.cpio` and `SHA256SUMS`, built from clean sources, with no cache. The notes give the glibc the binary needs and the kernel's version.
+- **The demo ran in two parts on the test box**: the command this plan gives, and the same flow with Claude Code from npm in `docker.io/library/node:22` under `agent-isolate`. A session without an agent has no model calls or tool spans, and the trace's shape this plan asks to record needs both. The gated test runs the plan's commands against the test registry, and sends the export to a minimal OTLP/HTTP receiver on the loopback.
+- **The docs were checked against the code by Codex before the merge**, and the errors it found were fixed. The README now says what the log sees, within its stated limits, rather than "everything".
+- **Two defects found on the way have issues of their own:**
+  - #58: the gate records no `tool.close` when Claude Code 2.1.304 puts a system message after the `tool_result`;
+  - #60: small gaps between the exporters plan and the code.
