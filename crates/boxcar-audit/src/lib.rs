@@ -33,6 +33,7 @@ pub const SESSIONS_DIR: &str = "sessions";
 
 pub mod chain;
 mod checkpoint;
+pub mod export;
 pub mod reader;
 pub mod reconcile;
 mod segment;
@@ -51,7 +52,8 @@ pub use segment::{Fdatasync, Syncer};
 pub use sink::{AuditSink, EmitError, Priority, Submission};
 pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE, REPLAY_YIELD};
 pub use verify::{
-    verify_jsonl, verify_session, Incomplete, IncompleteKind, VerifyError, VerifyReport,
+    read_verified, verify_jsonl, verify_session, Incomplete, IncompleteKind, VerifyError,
+    VerifyReport,
 };
 pub use writer::{spawn, spawn_with_syncer, CloseStats, WriteFailure, WriterConfig, WriterHandle};
 

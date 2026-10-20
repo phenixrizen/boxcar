@@ -235,6 +235,27 @@ pub enum VerifyError {
 /// `meta.json` and `checkpoints.jsonl` against it. A tail cut mid-write is
 /// reported in [`VerifyReport::incomplete`], with what verified before it.
 pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
+    walk_session(session_dir, Walk::new(None)).map(|(report, _)| report)
+}
+
+/// Verifies the log at `path` (a session directory, or one `.jsonl` file,
+/// as [`verify_session`] and [`verify_jsonl`] do) and returns, with the
+/// report, every record that verified, in seq order: up to the report's
+/// `last_seq`, a cut tail left out. The records are the very bytes that were
+/// hashed, parsed once, so nothing that changes the files afterwards can
+/// change them.
+pub fn read_verified(path: &Path) -> Result<(VerifyReport, Vec<Record>), VerifyError> {
+    let walk = Walk::new(None).keeping();
+    let (report, walk) = if path.is_dir() {
+        walk_session(path, walk)?
+    } else {
+        walk_jsonl(path, walk)?
+    };
+    Ok((report, walk.kept.unwrap_or_default()))
+}
+
+/// [`verify_session`]'s walk, with what `walk` keeps.
+fn walk_session(session_dir: &Path, walk: Walk) -> Result<(VerifyReport, Walk), VerifyError> {
     let io_err = |path: &Path| {
         let path = path.to_owned();
         move |e| VerifyError::Io(path, e)
@@ -270,7 +291,7 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
     // The segments meta.json lists hold the log: an extra one is empty.
     let listed = meta.segments.min(count);
 
-    let mut walk = Walk::new(Some(meta.session_id));
+    let mut walk = walk.for_session(meta.session_id);
     let mut partial = None;
     for n in 1..=listed {
         // Only the newest segment may end in a partial line, and not when
@@ -299,7 +320,8 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
             )));
         }
     }
-    Ok(walk.report(listed, cut.or(partial).or(unindexed)))
+    let report = walk.report(listed, cut.or(partial).or(unindexed));
+    Ok((report, walk))
 }
 
 /// Verifies one `.jsonl` file on its own, as a whole chain: its first record
@@ -308,14 +330,19 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
 /// the one cut tail told from a break is a partial last line
 /// ([`IncompleteKind::PartialLine`]).
 pub fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
-    let mut walk = Walk::new(None);
+    walk_jsonl(path, Walk::new(None)).map(|(report, _)| report)
+}
+
+/// [`verify_jsonl`]'s walk, with what `walk` keeps.
+fn walk_jsonl(path: &Path, mut walk: Walk) -> Result<(VerifyReport, Walk), VerifyError> {
     let partial = walk.segment(path, 1, true)?;
     if walk.next_seq == 1 {
         return Err(VerifyError::Layout {
             reason: format!("{}: no records", path.display()),
         });
     }
-    Ok(walk.report(1, partial))
+    let report = walk.report(1, partial);
+    Ok((report, walk))
 }
 
 /// Checks that `meta.json`, which lists `listed` segments, agrees with the
@@ -538,6 +565,8 @@ struct Walk {
     since: u64,
     /// The checkpoint records seen, as `checkpoints.jsonl` should list them.
     checkpoints: Vec<IndexEntry>,
+    /// The records that verified, when the walk keeps them.
+    kept: Option<Vec<Record>>,
 }
 
 impl Walk {
@@ -550,6 +579,22 @@ impl Walk {
             window: blake3::Hasher::new(),
             since: 0,
             checkpoints: Vec::new(),
+            kept: None,
+        }
+    }
+
+    /// The same walk, keeping each record once it has verified.
+    fn keeping(mut self) -> Self {
+        self.kept = Some(Vec::new());
+        self
+    }
+
+    /// The same walk, for the records of `session`, from its genesis.
+    fn for_session(self, session: SessionId) -> Self {
+        Walk {
+            prev: genesis_prev(&session),
+            session: Some(session),
+            ..self
         }
     }
 
@@ -678,6 +723,11 @@ impl Walk {
                 self.window.update(&raw.hash.0);
                 self.since += 1;
             }
+        }
+        if let Some(kept) = &mut self.kept {
+            let record: Record =
+                serde_json::from_slice(bytes).map_err(|e| parse(format!("not a record: {e}")))?;
+            kept.push(record);
         }
         self.next_seq += 1;
         self.prev = raw.hash;

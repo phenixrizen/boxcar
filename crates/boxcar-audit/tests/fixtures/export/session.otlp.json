@@ -1,0 +1,1578 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "boxcar"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "0.5.0"
+            }
+          },
+          {
+            "key": "boxcar.session.id",
+            "value": {
+              "stringValue": "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
+            }
+          },
+          {
+            "key": "boxcar.image.reference",
+            "value": {
+              "stringValue": "registry.example/agent:1"
+            }
+          },
+          {
+            "key": "boxcar.image.manifest_digest",
+            "value": {
+              "stringValue": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            }
+          },
+          {
+            "key": "boxcar.hardening.seccomp",
+            "value": {
+              "stringValue": "enforce"
+            }
+          },
+          {
+            "key": "boxcar.hardening.landlock",
+            "value": {
+              "stringValue": "partial"
+            }
+          },
+          {
+            "key": "boxcar.policy.sha256",
+            "value": {
+              "stringValue": "abababababababababababababababababababababababababababababababab"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "boxcar",
+            "version": "0.5.0"
+          },
+          "spans": [
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "8e24776336db56ef",
+              "name": "boxcar.session",
+              "kind": 1,
+              "startTimeUnixNano": "1792000000001000000",
+              "endTimeUnixNano": "1792000000051000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:593e4c58d53f7355e14b7c0a180010b5e788d2d5016eb0cd64d5b930a3b25994"
+                  }
+                },
+                {
+                  "key": "boxcar.vmm.stop.reason",
+                  "value": {
+                    "stringValue": "guest_reset"
+                  }
+                },
+                {
+                  "key": "boxcar.vmm.exit_code",
+                  "value": {
+                    "intValue": "0"
+                  }
+                }
+              ],
+              "events": [
+                {
+                  "timeUnixNano": "1792000000026000000",
+                  "name": "boxcar.finding",
+                  "attributes": [
+                    {
+                      "key": "boxcar.finding.category",
+                      "value": {
+                        "stringValue": "network_anomaly"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.score",
+                      "value": {
+                        "intValue": "30"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.rule",
+                      "value": {
+                        "stringValue": "dns"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.summary",
+                      "value": {
+                        "stringValue": "a lookup failed"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.evidence",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "intValue": "6"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.low_confidence",
+                      "value": {
+                        "boolValue": false
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.seq",
+                      "value": {
+                        "intValue": "26"
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.hash",
+                      "value": {
+                        "stringValue": "b3:f93a266a12928f8b56e5297376d2ef7e5a03e27e5bd7d72172d92d302a519a90"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "timeUnixNano": "1792000000027000000",
+                  "name": "boxcar.finding",
+                  "attributes": [
+                    {
+                      "key": "boxcar.finding.category",
+                      "value": {
+                        "stringValue": "orphaned_work"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.score",
+                      "value": {
+                        "intValue": "50"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.rule",
+                      "value": {
+                        "stringValue": "orphaned_work"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.summary",
+                      "value": {
+                        "stringValue": "work after an absent span"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.evidence",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "intValue": "14"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.low_confidence",
+                      "value": {
+                        "boolValue": false
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.span_id",
+                      "value": {
+                        "stringValue": "toolu_ABSENT"
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.seq",
+                      "value": {
+                        "intValue": "27"
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.hash",
+                      "value": {
+                        "stringValue": "b3:5b17589de0d236fb390ca3ce60a5c2d8d199a878f632a3d405753b686d534dc6"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "67d56f53ce280d9f",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat claude-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000010000000",
+              "endTimeUnixNano": "1792000000013000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "10"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:f07933eb1330b806b0b18a299302eee60d44654d879089225ab88bad51950f3d"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "tool_use"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "125"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.cache_read.input_tokens",
+                  "value": {
+                    "intValue": "25"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "50"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "13"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:792afa1add1c3eb2df34f8a7c700d5ab731d6da680ff25b376c18c3d4cb984be"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "ae8e5d78984dadee",
+              "parentSpanId": "67d56f53ce280d9f",
+              "name": "execute_tool bash",
+              "kind": 1,
+              "startTimeUnixNano": "1792000000011000000",
+              "endTimeUnixNano": "1792000000023000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "11"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:b16987a77f15c1a279320426b3f7579f856d4daf317b242d27bc1450822bcd5d"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_tool"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "bash"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.id",
+                  "value": {
+                    "stringValue": "toolu_A"
+                  }
+                },
+                {
+                  "key": "boxcar.tool.args_b3",
+                  "value": {
+                    "stringValue": "b3:84effe35d0b0a453757673ba3c14efac47ec8b4e37567c2c1f9df3dcb77a47d8"
+                  }
+                },
+                {
+                  "key": "boxcar.span.procs",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "intValue": "100"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "boxcar.span.effects",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "intValue": "15"
+                        },
+                        {
+                          "intValue": "16"
+                        },
+                        {
+                          "intValue": "17"
+                        },
+                        {
+                          "intValue": "18"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "boxcar.span.executor_tgid",
+                  "value": {
+                    "intValue": "100"
+                  }
+                },
+                {
+                  "key": "boxcar.span.truncated",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "boxcar.close.seq",
+                  "value": {
+                    "intValue": "23"
+                  }
+                }
+              ],
+              "events": [
+                {
+                  "timeUnixNano": "1792000000025000000",
+                  "name": "boxcar.finding",
+                  "attributes": [
+                    {
+                      "key": "boxcar.finding.category",
+                      "value": {
+                        "stringValue": "intent_effect_mismatch"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.score",
+                      "value": {
+                        "intValue": "75"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.rule",
+                      "value": {
+                        "stringValue": "argv"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.summary",
+                      "value": {
+                        "stringValue": "finding-summary-marker"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.evidence",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "intValue": "14"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.low_confidence",
+                      "value": {
+                        "boolValue": false
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.seq",
+                      "value": {
+                        "intValue": "25"
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.hash",
+                      "value": {
+                        "stringValue": "b3:33365d5cab31973ae4d95d95f8073942f08be2e5d58171f7c71d335c62d9bb2d"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "df88749edb7d95cc",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat claude-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000022000000",
+              "endTimeUnixNano": "1792000000028000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "22"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:1caa4c3b635bec7ffc68c0f940d0fa74a1999c99e0c4b00ab2532ca2592589b2"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "end_turn"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "20"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "28"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:114133d18687f48ba9b97046db63f5d4a6892909cb1edd2ca18d635827adc189"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "f8be3b24ba9b47c2",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat claude-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000031000000",
+              "endTimeUnixNano": "1792000000031000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "31"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:ec0ed5144d43a7b9c98dd0bc31d733a7c74c5977f6003dc8a1a7b5f3bdc6f9cc"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "7"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "8a9a7a752add493c",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat [redacted]",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000033000000",
+              "endTimeUnixNano": "1792000000036000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "33"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:15ac944f1d16c7e2852493398502d1a15010e2ebcf537a19522c3f74bf55959d"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "[redacted]"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "openai_responses"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "[redacted]"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "end_turn"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "9"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "6"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "36"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:a8cbb9490447fb675a5fb0ac0ba98f1bda36b72a8d35de3b6815e8091ab2748e"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "4af70fa1d3733254",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat gpt-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000034000000",
+              "endTimeUnixNano": "1792000000035000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "34"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:3350c02e2701abf9f5e3628ce7c969c2794841514467743a7ef8aaa92c2f777d"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "openai_responses"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "end_turn"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "7"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "5"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "35"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:6077a8d50e7e38fe217128863da6aa0610a77fe490ce3719818a0766adf9e701"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "62aeffb8b6ed3cfb",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat claude-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000037000000",
+              "endTimeUnixNano": "1792000000039000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "37"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:b5f8ad3cff335d66a5df615e04d4a6d820c2dc472491fef897d9f193e1fcbc4f"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "9"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "end_turn"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "39"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:ac4449f521162c56ef6cc252923ca92d75ffb48c04a157354ec6709d21000d01"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "da01e66dd05fd33c",
+              "parentSpanId": "62aeffb8b6ed3cfb",
+              "name": "execute_tool [redacted]",
+              "kind": 1,
+              "startTimeUnixNano": "1792000000038000000",
+              "endTimeUnixNano": "1792000000051000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "38"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:d72822748914cc265e4573db14df170b3b4f1958e2086948e051232b830ec74f"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_tool"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "[redacted]"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.id",
+                  "value": {
+                    "stringValue": "toolu_B"
+                  }
+                },
+                {
+                  "key": "boxcar.tool.args_b3",
+                  "value": {
+                    "stringValue": "b3:84effe35d0b0a453757673ba3c14efac47ec8b4e37567c2c1f9df3dcb77a47d8"
+                  }
+                },
+                {
+                  "key": "boxcar.span.procs",
+                  "value": {
+                    "arrayValue": {
+                      "values": []
+                    }
+                  }
+                },
+                {
+                  "key": "boxcar.span.effects",
+                  "value": {
+                    "arrayValue": {
+                      "values": []
+                    }
+                  }
+                },
+                {
+                  "key": "boxcar.span.executor_tgid",
+                  "value": {
+                    "intValue": "100"
+                  }
+                },
+                {
+                  "key": "boxcar.span.truncated",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "boxcar.span.open",
+                  "value": {
+                    "boolValue": true
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "0fb3b4f9c48e5849",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat claude-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000042000000",
+              "endTimeUnixNano": "1792000000044000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "42"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:1503896af2b1b75ac7896b4fe49ba6e9d949d8f7298b89bfff1a266f4821032f"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "13"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "end_turn"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "4"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "4"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "44"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:55debff0a485d91bb743bd859fa234175015670455cd549e297351245dc01da0"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "1d64e61c8656b994",
+              "parentSpanId": "0fb3b4f9c48e5849",
+              "name": "execute_tool bash",
+              "kind": 1,
+              "startTimeUnixNano": "1792000000043000000",
+              "endTimeUnixNano": "1792000000045000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "43"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:218ba3e7ba50ecc0b3acb76165a51166dac6186bd9a139593688c40811942ce4"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_tool"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "bash"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.id",
+                  "value": {
+                    "stringValue": "toolu_A"
+                  }
+                },
+                {
+                  "key": "boxcar.tool.args_b3",
+                  "value": {
+                    "stringValue": "b3:84effe35d0b0a453757673ba3c14efac47ec8b4e37567c2c1f9df3dcb77a47d8"
+                  }
+                },
+                {
+                  "key": "boxcar.span.procs",
+                  "value": {
+                    "arrayValue": {
+                      "values": []
+                    }
+                  }
+                },
+                {
+                  "key": "boxcar.span.effects",
+                  "value": {
+                    "arrayValue": {
+                      "values": []
+                    }
+                  }
+                },
+                {
+                  "key": "boxcar.span.executor_tgid",
+                  "value": {
+                    "intValue": "100"
+                  }
+                },
+                {
+                  "key": "boxcar.span.truncated",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "boxcar.close.seq",
+                  "value": {
+                    "intValue": "45"
+                  }
+                }
+              ],
+              "events": [
+                {
+                  "timeUnixNano": "1792000000052000000",
+                  "name": "boxcar.finding",
+                  "attributes": [
+                    {
+                      "key": "boxcar.finding.category",
+                      "value": {
+                        "stringValue": "unattributed_effect"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.score",
+                      "value": {
+                        "intValue": "90"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.rule",
+                      "value": {
+                        "stringValue": "phantom_write"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.summary",
+                      "value": {
+                        "stringValue": "a late write"
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.evidence",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "intValue": "18"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "boxcar.finding.low_confidence",
+                      "value": {
+                        "boolValue": false
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.seq",
+                      "value": {
+                        "intValue": "52"
+                      }
+                    },
+                    {
+                      "key": "boxcar.record.hash",
+                      "value": {
+                        "stringValue": "b3:6e99e4a41052d0cbee2ae57d9167d76de0c3b0a81b6f883de2bcc0c7564e16c6"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "019a2b3c4d5e7f608a9b0c1d2e3f4a5b",
+              "spanId": "e532cc814131a965",
+              "parentSpanId": "8e24776336db56ef",
+              "name": "chat claude-test",
+              "kind": 3,
+              "startTimeUnixNano": "1792000000047000000",
+              "endTimeUnixNano": "1792000000048000000",
+              "attributes": [
+                {
+                  "key": "boxcar.record.seq",
+                  "value": {
+                    "intValue": "47"
+                  }
+                },
+                {
+                  "key": "boxcar.record.hash",
+                  "value": {
+                    "stringValue": "b3:79b7e73c762b6322832b4be4e6a876f6141919362dea01c0c20930fc8f15fee1"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "boxcar.llm.api",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "boxcar.net.flow",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "boxcar.http.stream",
+                  "value": {
+                    "intValue": "17"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-test"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "end_turn"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "stringValue": "18446744073709551615"
+                  }
+                },
+                {
+                  "key": "boxcar.llm.tool_uses",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "boxcar.response.seq",
+                  "value": {
+                    "intValue": "48"
+                  }
+                },
+                {
+                  "key": "boxcar.response.hash",
+                  "value": {
+                    "stringValue": "b3:6bc01abf070e6be5b2a93bed90054804079d561c1a57a10897f5f67e0a547582"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
