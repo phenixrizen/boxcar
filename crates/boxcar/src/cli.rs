@@ -342,7 +342,18 @@ pub struct PolicyRuleArgs {
 #[derive(Debug, Subcommand)]
 pub enum AuditCommand {
     /// Check that a log is intact: every hash, link, sequence number and
-    /// checkpoint. Exits 0 when it is, 1 at the first break.
+    /// checkpoint.
+    ///
+    /// A log whose tail was cut mid-write is incomplete: what is there
+    /// verifies, and the tail is one a process killed while writing leaves
+    /// (a partial last line, a last checkpoint that checkpoints.jsonl lists
+    /// only in part or not at all, a new segment meta.json does not list
+    /// yet, a new session with no segment yet). It prints `incomplete: ...`
+    /// and where the tail is cut. A deliberate cut can leave the same tail,
+    /// so the cause is unknown.
+    ///
+    /// Exits 0 when the log is intact, 1 at the first break, 2 on a usage
+    /// error, and 4 when it is incomplete.
     Verify(VerifyArgs),
 }
 
@@ -350,7 +361,9 @@ pub enum AuditCommand {
 pub struct VerifyArgs {
     /// A session directory, or a single `.jsonl` log file.
     pub path: PathBuf,
-    /// Print the report, or the first break, as one JSON object.
+    /// Print the report, or the first break, as one JSON object. An
+    /// incomplete log's has `ok: false` and `incomplete`: its `kind`, and
+    /// the `segment`, `offset` and `bytes` that say where the tail is cut.
     #[arg(long)]
     pub json: bool,
 }

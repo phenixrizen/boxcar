@@ -176,6 +176,7 @@ fn golden_text() -> String {
 #[test]
 fn the_golden_session_verifies() {
     let report = verify_jsonl(&golden_path()).unwrap();
+    assert_eq!(report.incomplete, None);
     assert_eq!(report.records, 6);
     assert_eq!(report.segments, 1);
     assert_eq!(report.checkpoints, 1);

@@ -122,6 +122,15 @@ and the blake3 of the file as it was when it was closed. Each record's
 - `boxcar audit verify` proves that the chain is intact and complete up to
   its last record: nothing was changed, removed or reordered. It does not
   prove that the session ended cleanly; look for its `vmm.stop`.
+- A crash can leave the log cut mid-write: a partial last line, a last
+  checkpoint not yet in `checkpoints.jsonl`, or another of the tails a
+  process killed while writing leaves (`docs/audit-events.md`). Then
+  `boxcar audit verify` prints `incomplete: N records verified, ...; the
+  tail is cut (...), cause unknown` and exits 4: the records before the cut
+  verify, and the checkpoint index still proves every record up to the
+  last checkpoint it lists. A deliberate cut can leave the same tail, and
+  verify cannot tell the two apart. A log cut at a record boundary
+  verifies as intact; only the missing `vmm.stop` tells.
 
 ## Networking and policy
 

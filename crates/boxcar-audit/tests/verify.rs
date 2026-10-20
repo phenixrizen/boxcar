@@ -4,14 +4,19 @@
 //! The verifier against tampered logs. Each test writes a real session (or
 //! chains a standalone file with `Chainer`), alters it the way an attacker or
 //! a broken disk would, and checks that the verifier names the first break.
+//! The tails a crash leaves are incomplete, not broken (`tests/crash.rs`);
+//! the tests here also check that a tail which only looks like one, or
+//! two of them at once, stays a break.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use boxcar_audit::{
-    spawn, verify_jsonl, verify_session, Chainer, PartialRecord, Priority, Submission, VerifyError,
-    WriterConfig,
+    spawn, verify_jsonl, verify_session, Chainer, Incomplete, IncompleteKind, PartialRecord,
+    Priority, Submission, VerifyError, WriterConfig,
 };
+use boxcar_proto::limits::MAX_RECORD_BYTES;
 use boxcar_proto::{
     genesis_prev, Attrib, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId,
     Subject,
@@ -53,13 +58,51 @@ fn session(tmp: &TempDir, events: u64, tune: impl FnOnce(&mut WriterConfig)) -> 
         sink.emit(event(n)).unwrap();
     }
     writer.close().unwrap();
-    verify_session(&dir).unwrap();
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
     dir
 }
 
 fn segment(dir: &Path, n: u32) -> PathBuf {
     dir.join(format!("events.{n:06}.jsonl"))
 }
+
+/// The number of segment files in a session.
+fn segment_count(dir: &Path) -> u32 {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter(|e| {
+            let name = e.as_ref().unwrap().file_name();
+            name.to_str().unwrap().starts_with("events.")
+        })
+        .count() as u32
+}
+
+fn append(path: &Path, bytes: &[u8]) {
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
+/// Where the last line of a file that ends in a newline starts.
+fn last_line_start(bytes: &[u8]) -> usize {
+    let body = bytes.strip_suffix(b"\n").unwrap();
+    body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)
+}
+
+fn incomplete(kind: IncompleteKind, segment: u32, offset: u64, bytes: u64) -> Option<Incomplete> {
+    Some(Incomplete {
+        kind,
+        segment,
+        offset,
+        bytes,
+    })
+}
+
+/// The start of a record's line, as a write cut short leaves it.
+const PARTIAL: &[u8] = br#"{"v":1,"seq":7"#;
 
 fn read_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
@@ -142,7 +185,7 @@ fn a_duplicated_key_is_not_a_record() {
             other => panic!("{what}: expected a parse error at line 5, got {other:?}"),
         }
     }
-    verify_session(&dir).unwrap();
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
 }
 
 #[test]
@@ -180,7 +223,7 @@ fn an_injected_key_or_null_breaks_the_chain() {
     let obj: Value = serde_json::from_str(&lines[4]).unwrap();
     lines[4] = obj.to_string();
     write_lines(&file, &lines);
-    verify_session(&dir).unwrap();
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
 }
 
 #[test]
@@ -342,8 +385,10 @@ fn checkpoints_jsonl_must_match_the_chain() {
             entry["root_hash"] = json!(Hash([7; 32]).to_string());
             lines[0] = entry.to_string();
         }),
-        ("a line lost", 3, |lines| {
-            lines.pop();
+        // Not the last line: without it, the log ends in a checkpoint the
+        // index does not list, as a crash leaves it (tests/crash.rs).
+        ("a line lost", 2, |lines| {
+            lines.remove(1);
         }),
         ("a line added", 4, |lines| {
             let last = lines.last().unwrap().clone();
@@ -360,7 +405,7 @@ fn checkpoints_jsonl_must_match_the_chain() {
             other => panic!("{what}: expected a checkpoints.jsonl error, got {other:?}"),
         }
     }
-    verify_session(&dir).unwrap();
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
 }
 
 #[test]
@@ -407,24 +452,291 @@ fn missing_segments_and_meta_are_layout_errors() {
             other => panic!("{what} removed: expected a layout error, got {other:?}"),
         }
     }
-    verify_session(&dir).unwrap();
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
 }
 
 #[test]
-fn an_unterminated_last_line_fails() {
+fn an_unterminated_last_line_is_incomplete_only_at_the_end_of_the_newest_segment() {
+    let tmp = TempDir::new().unwrap();
+    let dir = session(&tmp, 100, |cfg| cfg.segment_max_bytes = 4096);
+    let count = segment_count(&dir);
+    assert!(count > 2);
+    let newest = segment(&dir, count);
+    let len = fs::metadata(&newest).unwrap().len();
+
+    // At the end of the newest segment: a write cut short.
+    for bytes in [1, PARTIAL.len(), MAX_RECORD_BYTES] {
+        let _restore = Restore::new(&newest);
+        let mut partial = PARTIAL.to_vec();
+        partial.resize(bytes, b'x');
+        append(&newest, &partial);
+        let report = verify_session(&dir).unwrap();
+        assert_eq!(
+            report.incomplete,
+            incomplete(IncompleteKind::PartialLine, count, len, bytes as u64),
+            "{bytes} bytes"
+        );
+    }
+
+    // Longer than any record, or in a segment before the newest: a break.
+    for (file, line, bytes) in [
+        (
+            count,
+            read_lines(&newest).len() as u64 + 1,
+            MAX_RECORD_BYTES + 1,
+        ),
+        (
+            1,
+            read_lines(&segment(&dir, 1)).len() as u64 + 1,
+            PARTIAL.len(),
+        ),
+        (
+            count - 1,
+            read_lines(&segment(&dir, count - 1)).len() as u64 + 1,
+            1,
+        ),
+    ] {
+        let path = segment(&dir, file);
+        let _restore = Restore::new(&path);
+        let mut partial = PARTIAL.to_vec();
+        partial.resize(bytes, b'x');
+        append(&path, &partial);
+        match verify_session(&dir) {
+            Err(VerifyError::Parse {
+                segment,
+                line: at,
+                reason,
+            }) => {
+                assert_eq!((segment, at), (file, line), "{reason}");
+                assert!(reason.contains("no newline"), "{reason}");
+            }
+            other => panic!("segment {file}: expected a parse error, got {other:?}"),
+        }
+    }
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
+}
+
+#[test]
+fn verify_jsonl_reports_a_partial_last_line() {
     let tmp = TempDir::new().unwrap();
     let dir = session(&tmp, 5, |_| {});
     let file = segment(&dir, 1);
-    let mut bytes = fs::read(&file).unwrap();
-    bytes.extend_from_slice(br#"{"v":1,"seq":7"#);
-    fs::write(&file, bytes).unwrap();
+    let len = fs::metadata(&file).unwrap().len();
+    append(&file, PARTIAL);
+    let report = verify_jsonl(&file).unwrap();
+    assert_eq!(
+        report.incomplete,
+        incomplete(IncompleteKind::PartialLine, 1, len, PARTIAL.len() as u64)
+    );
+    assert_eq!((report.records, report.last_seq), (6, 6));
+
+    // A partial line and nothing before it names no session to check.
+    let alone = tmp.path().join("partial.jsonl");
+    fs::write(&alone, PARTIAL).unwrap();
+    assert!(matches!(
+        verify_jsonl(&alone),
+        Err(VerifyError::Layout { .. })
+    ));
+}
+
+#[test]
+fn two_cut_tails_at_once_are_a_break() {
+    let tmp = TempDir::new().unwrap();
+    let dir = session(&tmp, 100, |cfg| cfg.segment_max_bytes = 4096);
+    let count = segment_count(&dir);
+    let newest = segment(&dir, count);
+    let extra = segment(&dir, count + 1);
+    let index = dir.join("checkpoints.jsonl");
+    let lines = fs::read(&index).unwrap();
+    let last = last_line_start(&lines);
+
+    type Cut = fn(&Path, &Path, &Path, &[u8], usize);
+    let cuts: [(&str, Cut); 5] = [
+        (
+            "a partial line, and the last checkpoint unindexed",
+            |newest, _, index, lines, last| {
+                append(newest, PARTIAL);
+                fs::write(index, &lines[..last]).unwrap();
+            },
+        ),
+        (
+            "a partial line, and a partial index line",
+            |newest, _, index, lines, last| {
+                append(newest, PARTIAL);
+                fs::write(index, &lines[..last + 5]).unwrap();
+            },
+        ),
+        (
+            "a rotation cut short, and the last checkpoint unindexed",
+            |_, extra, index, lines, last| {
+                fs::write(extra, "").unwrap();
+                fs::write(index, &lines[..last]).unwrap();
+            },
+        ),
+        (
+            "a rotation cut short, and a partial index line",
+            |_, extra, index, lines, last| {
+                fs::write(extra, "").unwrap();
+                fs::write(index, &lines[..last + 5]).unwrap();
+            },
+        ),
+        (
+            "a rotation cut short, and a partial line before it",
+            |newest, extra, _, _, _| {
+                fs::write(extra, "").unwrap();
+                append(newest, PARTIAL);
+            },
+        ),
+    ];
+    for (what, cut) in cuts {
+        let _restore = (Restore::new(&newest), Restore::new(&index));
+        cut(&newest, &extra, &index, &lines, last);
+        let result = verify_session(&dir);
+        let _ = fs::remove_file(&extra);
+        match result {
+            Err(VerifyError::CheckpointFile { .. } | VerifyError::Parse { .. }) => {}
+            other => panic!("{what}: expected a break, got {other:?}"),
+        }
+    }
+    assert_eq!(verify_session(&dir).unwrap().incomplete, None);
+}
+
+#[test]
+fn a_partial_index_line_must_start_its_checkpoint_s_line() {
+    let tmp = TempDir::new().unwrap();
+    let dir = session(&tmp, 20, |cfg| cfg.checkpoint_every = 5);
+    let index = dir.join("checkpoints.jsonl");
+    let lines = fs::read(&index).unwrap();
+    let last = last_line_start(&lines);
+    let _restore = Restore::new(&index);
+
+    // The start of the last checkpoint's line, with one byte changed.
+    let mut changed = lines[..last + 30].to_vec();
+    changed[last + 10] ^= 0x01;
+    fs::write(&index, &changed).unwrap();
     match verify_session(&dir) {
-        Err(VerifyError::Parse {
-            segment: 1,
-            line: 7,
-            ..
-        }) => {}
-        other => panic!("expected a parse error at line 7, got {other:?}"),
+        Err(VerifyError::CheckpointFile { reason, .. }) => {
+            assert!(reason.contains("not the start of the line"), "{reason}")
+        }
+        other => panic!("expected a checkpoints.jsonl error, got {other:?}"),
+    }
+
+    // A partial line after every checkpoint's line: there is none for it
+    // to start.
+    let mut extra = lines.clone();
+    extra.extend_from_slice(&lines[last..last + 30]);
+    fs::write(&index, &extra).unwrap();
+    match verify_session(&dir) {
+        Err(VerifyError::CheckpointFile { reason, .. }) => {
+            assert!(reason.contains("no newline"), "{reason}")
+        }
+        other => panic!("expected a checkpoints.jsonl error, got {other:?}"),
+    }
+}
+
+#[test]
+fn only_the_last_line_of_the_newest_segment_may_be_an_unindexed_checkpoint() {
+    let tmp = TempDir::new().unwrap();
+    // Checkpoints at seq 6, 12, and the final one at 15.
+    let dir = session(&tmp, 12, |cfg| cfg.checkpoint_every = 5);
+    let index = dir.join("checkpoints.jsonl");
+    let lines = read_lines(&index);
+
+    // Not the last checkpoint: the index skips one.
+    {
+        let _restore = Restore::new(&index);
+        write_lines(&index, &[lines[0].clone(), lines[2].clone()]);
+        assert!(matches!(
+            verify_session(&dir),
+            Err(VerifyError::CheckpointFile { line: 2, .. })
+        ));
+    }
+    // Two checkpoints unlisted.
+    {
+        let _restore = Restore::new(&index);
+        write_lines(&index, &lines[..1]);
+        match verify_session(&dir) {
+            Err(VerifyError::CheckpointFile { line: 2, reason }) => {
+                assert!(reason.contains("seq 12 is not listed"), "{reason}")
+            }
+            other => panic!("expected a checkpoints.jsonl error, got {other:?}"),
+        }
+    }
+    // The last checkpoint, but a later segment exists and meta.json lists
+    // it: a seal lists its checkpoint before it makes the next segment.
+    let meta_path = dir.join("meta.json");
+    let _restore = (Restore::new(&index), Restore::new(&meta_path));
+    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    meta["segments"] = json!(2);
+    fs::write(&meta_path, meta.to_string()).unwrap();
+    fs::write(segment(&dir, 2), "").unwrap();
+    assert_eq!(
+        verify_session(&dir).unwrap().incomplete,
+        None,
+        "a rotation done"
+    );
+    write_lines(&index, &lines[..2]);
+    let result = verify_session(&dir);
+    fs::remove_file(segment(&dir, 2)).unwrap();
+    match result {
+        Err(VerifyError::CheckpointFile { line: 3, reason }) => {
+            assert!(reason.contains("seq 15 is not listed"), "{reason}")
+        }
+        other => panic!("expected a checkpoints.jsonl error, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_extra_segment_must_be_empty() {
+    let tmp = TempDir::new().unwrap();
+    let dir = session(&tmp, 100, |cfg| cfg.segment_max_bytes = 4096);
+    let count = segment_count(&dir);
+    let extra = segment(&dir, count + 1);
+
+    fs::write(&extra, "").unwrap();
+    let report = verify_session(&dir).unwrap();
+    assert_eq!(
+        report.incomplete,
+        incomplete(IncompleteKind::Rotation, count + 1, 0, 0)
+    );
+    assert_eq!(report.segments, count);
+
+    // Anything in it, even a line that continues the chain, is a break, as
+    // is a second extra segment.
+    let last = read_lines(&segment(&dir, count)).pop().unwrap();
+    for (what, content) in [("a byte", "x".to_owned()), ("a line", format!("{last}\n"))] {
+        fs::write(&extra, &content).unwrap();
+        match verify_session(&dir) {
+            Err(VerifyError::Layout { reason }) => {
+                assert!(reason.contains("not empty"), "{what}: {reason}")
+            }
+            other => panic!("{what}: expected a layout error, got {other:?}"),
+        }
+    }
+    fs::write(&extra, "").unwrap();
+    fs::write(segment(&dir, count + 2), "").unwrap();
+    assert!(matches!(
+        verify_session(&dir),
+        Err(VerifyError::Layout { .. })
+    ));
+}
+
+#[test]
+fn an_index_line_past_the_end_stays_a_break() {
+    let tmp = TempDir::new().unwrap();
+    let dir = session(&tmp, 20, |_| {});
+    let file = segment(&dir, 1);
+    let bytes = fs::read(&file).unwrap();
+
+    // Cut inside the final checkpoint's line, which the index lists: a
+    // partial line, but the index names a record that is not there.
+    let last = last_line_start(&bytes);
+    fs::write(&file, &bytes[..last + 20]).unwrap();
+    match verify_session(&dir) {
+        Err(VerifyError::CheckpointFile { line: 1, reason }) => {
+            assert!(reason.contains("past the end"), "{reason}")
+        }
+        other => panic!("expected a checkpoints.jsonl error, got {other:?}"),
     }
 }
 

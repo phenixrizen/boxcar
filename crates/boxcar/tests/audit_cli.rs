@@ -2,7 +2,8 @@
 // Copyright 2026 The boxcar Authors
 
 //! `boxcar audit verify`, run as a subprocess against sessions written with
-//! the library: exit codes and stdout for intact and damaged logs.
+//! the library: exit codes and stdout for intact, incomplete and damaged
+//! logs.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -10,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use boxcar_audit::{spawn, CloseStats, Priority, Submission, WriterConfig};
-use boxcar_proto::{Attrib, FsIo, OpResult, Payload, Ring, SessionId};
-use serde_json::Value;
+use boxcar_proto::{genesis_prev, Attrib, FsIo, OpResult, Payload, Ring, SessionId};
+use serde_json::{json, Value};
 
 /// A scratch directory under Cargo's per-target test tmpdir, removed on drop.
 struct Scratch(PathBuf);
@@ -194,6 +195,123 @@ fn a_missing_record_prints_the_gap_and_exits_1() {
     assert_eq!(error["error"], "gap");
     assert_eq!(error["expected_seq"], 10);
     assert_eq!(error["got_seq"], 11);
+}
+
+/// The offset of the last line of a file that ends in a newline.
+fn last_line_offset(path: &Path) -> u64 {
+    let bytes = fs::read(path).unwrap();
+    let body = bytes.strip_suffix(b"\n").unwrap();
+    body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) as u64
+}
+
+/// Each tail a crash can leave, made by editing a written session's files:
+/// `verify` prints how much verified and what is cut, exits 4, and says the
+/// same as one JSON object.
+#[test]
+fn an_incomplete_log_says_where_it_is_cut_and_exits_4() {
+    /// Cuts the session in `dir`; returns the words for the cut and its
+    /// `incomplete` object.
+    type Cut = fn(&Path) -> (String, Value);
+    let cuts: [Cut; 5] = [
+        |dir| {
+            let offset = fs::metadata(segment_1(dir)).unwrap().len();
+            let mut bytes = fs::read(segment_1(dir)).unwrap();
+            bytes.extend_from_slice(br#"{"v":1,"seq":22"#);
+            fs::write(segment_1(dir), bytes).unwrap();
+            (
+                format!("a partial line of 15 bytes at segment 1 offset {offset}"),
+                json!({"kind": "partial_line", "segment": 1, "offset": offset, "bytes": 15}),
+            )
+        },
+        |dir| {
+            fs::write(dir.join("checkpoints.jsonl"), "").unwrap();
+            let offset = last_line_offset(&segment_1(dir));
+            (
+                format!(
+                    "the checkpoint at segment 1 offset {offset} has no line in checkpoints.jsonl"
+                ),
+                json!({"kind": "unindexed_checkpoint", "segment": 1, "offset": offset, "bytes": 0}),
+            )
+        },
+        |dir| {
+            let index = dir.join("checkpoints.jsonl");
+            let bytes = fs::read(&index).unwrap();
+            fs::write(&index, &bytes[..10]).unwrap();
+            let offset = last_line_offset(&segment_1(dir));
+            (
+                format!(
+                    "checkpoints.jsonl ends in 10 bytes of the line for the checkpoint at \
+                     segment 1 offset {offset}"
+                ),
+                json!({"kind": "partial_index_line", "segment": 1, "offset": offset, "bytes": 10}),
+            )
+        },
+        |dir| {
+            fs::write(dir.join("events.000002.jsonl"), "").unwrap();
+            (
+                "events.000002.jsonl is empty and not in meta.json".to_owned(),
+                json!({"kind": "rotation", "segment": 2, "offset": 0, "bytes": 0}),
+            )
+        },
+        |dir| {
+            fs::remove_file(segment_1(dir)).unwrap();
+            fs::remove_file(dir.join("checkpoints.jsonl")).unwrap();
+            (
+                "meta.json lists events.000001.jsonl, which does not exist".to_owned(),
+                json!({"kind": "no_segment", "segment": 1, "offset": 0, "bytes": 0}),
+            )
+        },
+    ];
+
+    for (i, cut) in cuts.into_iter().enumerate() {
+        let scratch = Scratch::new(&format!("incomplete-{i}"));
+        let (dir, stats) = write_session(&scratch);
+        let (what, incomplete) = cut(&dir);
+        let kind = incomplete["kind"].clone();
+        // What verified: the whole session, but none of it without a
+        // segment.
+        let (records, segments, checkpoints, last_hash) = if kind == "no_segment" {
+            let session: SessionId = dir.file_name().unwrap().to_str().unwrap().parse().unwrap();
+            (0, 0, 0, genesis_prev(&session))
+        } else {
+            (21, 1, 1, stats.last_hash)
+        };
+
+        let output = boxcar([OsStr::new("audit"), "verify".as_ref(), dir.as_os_str()]);
+        assert_eq!(output.status.code(), Some(4), "{kind}: {output:?}");
+        assert_eq!(
+            stdout(&output),
+            format!(
+                "incomplete: {records} records verified, {segments} segments, last seq \
+                 {records}; the tail is cut ({what}), cause unknown\n"
+            ),
+            "{kind}"
+        );
+
+        let output = boxcar([
+            OsStr::new("audit"),
+            "verify".as_ref(),
+            dir.as_os_str(),
+            "--json".as_ref(),
+        ]);
+        assert_eq!(output.status.code(), Some(4), "{kind}: {output:?}");
+        let text = stdout(&output);
+        assert_eq!(text.lines().count(), 1, "{kind}: {text}");
+        let report: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            report,
+            json!({
+                "ok": false,
+                "incomplete": incomplete,
+                "records": records,
+                "segments": segments,
+                "checkpoints": checkpoints,
+                "last_seq": records,
+                "last_hash": last_hash,
+            }),
+            "{kind}"
+        );
+    }
 }
 
 #[test]

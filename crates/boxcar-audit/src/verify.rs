@@ -29,20 +29,42 @@
 //! while a reader that keeps the first would see the injected value.
 //!
 //! For a session directory it also checks `meta.json` against the segment
-//! files, and `checkpoints.jsonl` against the checkpoint records: that is
-//! what catches a log cut off cleanly at a record boundary.
+//! files, and `checkpoints.jsonl` against the checkpoint records. The index
+//! is what catches a log cut at a record boundary before a checkpoint it
+//! lists; a log cut at a record boundary after its last listed checkpoint
+//! verifies, since nothing tells it from a log that ended there.
+//!
+//! A process killed while it writes the log keeps every `write(2)` that
+//! completed and loses the rest. The tails such a kill leaves, and only
+//! those, make the report [`incomplete`](VerifyReport::incomplete) rather
+//! than an error: a partial last line in the newest segment, a last
+//! checkpoint the index does not list yet, the index's last line cut within
+//! that checkpoint's line, a new segment not yet in `meta.json`, or a new
+//! session with no segment yet ([`IncompleteKind`]). Exactly one of them,
+//! at the very end; two of them, or one anywhere else, is a break. A
+//! deliberate cut can leave the same tails, so an incomplete log says where
+//! it stops, not why. It hides no more than a cut at a record boundary can:
+//! the index still proves every record up to the last checkpoint it lists.
 
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use boxcar_proto::limits::MAX_RECORD_BYTES;
 use boxcar_proto::{genesis_prev, Checkpoint, Hash, Record, SessionId};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 use crate::checkpoint::{IndexEntry, INDEX_FILE};
 use crate::segment::{list_segments, numbered_from_one, read_meta, segment_name, META_FILE};
+
+/// The longest partial line a write cut short can leave: a record's line
+/// without its newline, which the design caps at [`MAX_RECORD_BYTES`]
+/// (`docs/audit-events.md`, *Limits*). The writer does not check the cap
+/// as it writes; each record type keeps within it, and has a test that
+/// says so. A longer partial line is no cut write, and stays a break.
+const MAX_PARTIAL_LINE: u64 = MAX_RECORD_BYTES as u64;
 
 /// What a verified log holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +78,111 @@ pub struct VerifyReport {
     pub last_seq: u64,
     /// The last record's hash; the genesis hash for an empty log.
     pub last_hash: Hash,
+    /// Set when the log's tail was cut mid-write: the other fields then
+    /// describe what verified, up to the cut. `None` for an intact log.
+    pub incomplete: Option<Incomplete>,
+}
+
+/// A log whose tail was cut mid-write. Everything before the cut verifies,
+/// and the tail is in exactly one of the states a process killed while
+/// writing leaves. A deliberate cut can leave the same tail, so this says
+/// where the log stops, not why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Incomplete {
+    pub kind: IncompleteKind,
+    /// A segment's number; what it names depends on `kind`.
+    pub segment: u32,
+    /// A byte offset in that segment; what it names depends on `kind`.
+    pub offset: u64,
+    /// A length in bytes; what it counts depends on `kind`.
+    pub bytes: u64,
+}
+
+/// How a log's tail was cut, and what [`Incomplete`]'s `segment`, `offset`
+/// and `bytes` say for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncompleteKind {
+    /// The newest segment ends in a partial line, no longer than a record
+    /// can be: a write cut short. `segment` and `offset` say where the line
+    /// starts, `bytes` how much of it there is.
+    PartialLine,
+    /// The log's last record is a checkpoint, the last line of the newest
+    /// segment, and `checkpoints.jsonl` lists every checkpoint but that one:
+    /// cut between the checkpoint's sync and its line in the index.
+    /// `segment` and `offset` say where the checkpoint's line starts;
+    /// `bytes` is 0: none of its index line is there.
+    UnindexedCheckpoint,
+    /// As [`UnindexedCheckpoint`](Self::UnindexedCheckpoint), but
+    /// `checkpoints.jsonl` ends in a partial line, the first `bytes` bytes
+    /// of the line that lists the checkpoint: its append was cut short.
+    PartialIndexLine,
+    /// The newest segment file, `segment`, is empty and `meta.json` lists
+    /// only the ones before it: a rotation cut before `meta.json` was
+    /// replaced. The segment before it ends in a checkpoint the index lists.
+    /// `offset` and `bytes` are 0.
+    Rotation,
+    /// `meta.json` lists one segment and there is none: a new session cut
+    /// before its first segment was made. `segment` is 1, `offset` and
+    /// `bytes` are 0.
+    NoSegment,
+}
+
+impl IncompleteKind {
+    /// The kind's name: `partial_line`, `unindexed_checkpoint`,
+    /// `partial_index_line`, `rotation` or `no_segment`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IncompleteKind::PartialLine => "partial_line",
+            IncompleteKind::UnindexedCheckpoint => "unindexed_checkpoint",
+            IncompleteKind::PartialIndexLine => "partial_index_line",
+            IncompleteKind::Rotation => "rotation",
+            IncompleteKind::NoSegment => "no_segment",
+        }
+    }
+}
+
+impl fmt::Display for IncompleteKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for Incomplete {
+    /// What was cut, in words: `a partial line of 87 bytes at segment 1
+    /// offset 2048`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Incomplete {
+            segment,
+            offset,
+            bytes,
+            ..
+        } = self;
+        match self.kind {
+            IncompleteKind::PartialLine => write!(
+                f,
+                "a partial line of {bytes} bytes at segment {segment} offset {offset}"
+            ),
+            IncompleteKind::UnindexedCheckpoint => write!(
+                f,
+                "the checkpoint at segment {segment} offset {offset} has no line in {INDEX_FILE}"
+            ),
+            IncompleteKind::PartialIndexLine => write!(
+                f,
+                "{INDEX_FILE} ends in {bytes} bytes of the line for the checkpoint at segment \
+                 {segment} offset {offset}"
+            ),
+            IncompleteKind::Rotation => write!(
+                f,
+                "{} is empty and not in {META_FILE}",
+                segment_name(*segment)
+            ),
+            IncompleteKind::NoSegment => write!(
+                f,
+                "{META_FILE} lists {}, which does not exist",
+                segment_name(*segment)
+            ),
+        }
+    }
 }
 
 /// The first thing wrong with a log.
@@ -105,7 +232,8 @@ pub enum VerifyError {
 }
 
 /// Verifies a session directory: every segment in order as one chain, then
-/// `meta.json` and `checkpoints.jsonl` against it.
+/// `meta.json` and `checkpoints.jsonl` against it. A tail cut mid-write is
+/// reported in [`VerifyReport::incomplete`], with what verified before it.
 pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
     let io_err = |path: &Path| {
         let path = path.to_owned();
@@ -138,33 +266,92 @@ pub fn verify_session(session_dir: &Path) -> Result<VerifyReport, VerifyError> {
         return Err(layout(format!("{} is missing", segment_name(missing))));
     }
     let count = segments.len() as u32;
-    if count == 0 || count != meta.segments {
-        return Err(layout(format!(
-            "{META_FILE} lists {} segments, the directory has {count}",
-            meta.segments
-        )));
-    }
+    let cut = layout_cut(session_dir, meta.segments, count)?;
+    // The segments meta.json lists hold the log: an extra one is empty.
+    let listed = meta.segments.min(count);
 
     let mut walk = Walk::new(Some(meta.session_id));
-    for n in 1..=count {
-        walk.segment(&session_dir.join(segment_name(n)), n)?;
+    let mut partial = None;
+    for n in 1..=listed {
+        // Only the newest segment may end in a partial line, and not when
+        // another segment was made after it.
+        let newest = n == listed && cut.is_none();
+        partial = walk.segment(&session_dir.join(segment_name(n)), n, newest)?;
     }
-    check_index(session_dir, &walk)?;
-    Ok(walk.report(count))
+    let unindexed = check_index(
+        session_dir,
+        &walk,
+        listed,
+        cut.is_none() && partial.is_none(),
+    )?;
+    if cut.is_some_and(|c| c.kind == IncompleteKind::Rotation) {
+        // A seal lists the segment's last checkpoint in the index before it
+        // makes the next segment.
+        let sealed = walk
+            .checkpoints
+            .last()
+            .is_some_and(|c| c.segment == listed && c.seq == walk.last_seq());
+        if !sealed {
+            return Err(layout(format!(
+                "{} is not in {META_FILE}, and {} does not end in a checkpoint",
+                segment_name(count),
+                segment_name(listed)
+            )));
+        }
+    }
+    Ok(walk.report(listed, cut.or(partial).or(unindexed)))
 }
 
 /// Verifies one `.jsonl` file on its own, as a whole chain: its first record
 /// must be seq 1 of the session it names, starting from that session's
-/// genesis hash. There is no `meta.json` or `checkpoints.jsonl` to check.
+/// genesis hash. There is no `meta.json` or `checkpoints.jsonl` to check, so
+/// the one cut tail told from a break is a partial last line
+/// ([`IncompleteKind::PartialLine`]).
 pub fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
     let mut walk = Walk::new(None);
-    walk.segment(path, 1)?;
+    let partial = walk.segment(path, 1, true)?;
     if walk.next_seq == 1 {
         return Err(VerifyError::Layout {
             reason: format!("{}: no records", path.display()),
         });
     }
-    Ok(walk.report(1))
+    Ok(walk.report(1, partial))
+}
+
+/// Checks that `meta.json`, which lists `listed` segments, agrees with the
+/// `found` segment files, or disagrees only as a cut rotation or a cut new
+/// session leaves them, which is returned. The writer makes a segment
+/// before `meta.json` lists it, and a new session's `meta.json` before its
+/// first segment.
+fn layout_cut(
+    session_dir: &Path,
+    listed: u32,
+    found: u32,
+) -> Result<Option<Incomplete>, VerifyError> {
+    let cut = |kind, segment| Incomplete {
+        kind,
+        segment,
+        offset: 0,
+        bytes: 0,
+    };
+    if found == listed && found > 0 {
+        return Ok(None);
+    }
+    if found == 0 && listed == 1 {
+        return Ok(Some(cut(IncompleteKind::NoSegment, 1)));
+    }
+    let mut reason = format!("{META_FILE} lists {listed} segments, the directory has {found}");
+    if listed > 0 && found == listed + 1 {
+        let path = session_dir.join(segment_name(found));
+        let len = fs::metadata(&path)
+            .map_err(|e| VerifyError::Io(path.clone(), e))?
+            .len();
+        if len == 0 {
+            return Ok(Some(cut(IncompleteKind::Rotation, found)));
+        }
+        reason = format!("{reason}, and {} is not empty", segment_name(found));
+    }
+    Err(VerifyError::Layout { reason })
 }
 
 /// One line of a log as its bytes say, before any check against its
@@ -366,8 +553,15 @@ impl Walk {
         }
     }
 
-    /// Walks the lines of one segment file, numbered `segment`.
-    fn segment(&mut self, path: &Path, segment: u32) -> Result<(), VerifyError> {
+    /// Walks the lines of one segment file, numbered `segment`. The newest
+    /// segment may end in a partial line no longer than a record, a write
+    /// cut short: that is returned.
+    fn segment(
+        &mut self,
+        path: &Path,
+        segment: u32,
+        newest: bool,
+    ) -> Result<Option<Incomplete>, VerifyError> {
         let io_err = |e| VerifyError::Io(path.to_owned(), e);
         let mut reader = BufReader::with_capacity(1 << 20, File::open(path).map_err(io_err)?);
         let mut buf = Vec::new();
@@ -379,16 +573,32 @@ impl Walk {
                 break;
             }
             let Some(body) = buf.strip_suffix(b"\n") else {
+                // read_until stops short of a newline only at the end of the
+                // file, so this is its last line.
+                let bytes = n as u64;
+                if newest && bytes <= MAX_PARTIAL_LINE {
+                    return Ok(Some(Incomplete {
+                        kind: IncompleteKind::PartialLine,
+                        segment,
+                        offset,
+                        bytes,
+                    }));
+                }
+                let reason = if newest {
+                    format!("no newline at the end, and {bytes} bytes: longer than any record")
+                } else {
+                    "no newline at the end of a segment that is not the newest".into()
+                };
                 return Err(VerifyError::Parse {
                     segment,
                     line,
-                    reason: "no newline at the end: a torn write, or a cut file".into(),
+                    reason,
                 });
             };
             self.line(segment, line, offset, body)?;
             offset += n as u64;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn line(
@@ -474,13 +684,19 @@ impl Walk {
         Ok(())
     }
 
-    fn report(&self, segments: u32) -> VerifyReport {
+    /// The last record's seq; 0 before the first.
+    fn last_seq(&self) -> u64 {
+        self.next_seq - 1
+    }
+
+    fn report(&self, segments: u32, incomplete: Option<Incomplete>) -> VerifyReport {
         VerifyReport {
-            records: self.next_seq - 1,
+            records: self.last_seq(),
             segments,
             checkpoints: self.checkpoints.len() as u32,
-            last_seq: self.next_seq - 1,
+            last_seq: self.last_seq(),
             last_hash: self.prev,
+            incomplete,
         }
     }
 }
@@ -488,22 +704,33 @@ impl Walk {
 /// Checks that `checkpoints.jsonl` lists exactly the checkpoint records the
 /// walk saw, in order, with the right segment, offset and fields. A missing
 /// file lists none.
-fn check_index(session_dir: &Path, walk: &Walk) -> Result<(), VerifyError> {
+///
+/// With `open_tail`, one more state is a cut, which is returned: the log's
+/// last record is a checkpoint, the last line of segment `newest`, and the
+/// index lists every checkpoint before it, then ends in nothing or in a
+/// partial line that starts the line it would have, byte for byte.
+fn check_index(
+    session_dir: &Path,
+    walk: &Walk,
+    newest: u32,
+    open_tail: bool,
+) -> Result<Option<Incomplete>, VerifyError> {
     let path = session_dir.join(INDEX_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(VerifyError::Io(path, e)),
     };
+    // The whole lines, and what follows the last newline.
+    let whole = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let (whole, partial) = bytes.split_at(whole);
     let seen = &walk.checkpoints;
-    let last_seq = walk.next_seq - 1;
+    let last_seq = walk.last_seq();
     let mut lines = 0;
-    for (line, text) in (1..).zip(bytes.split_inclusive(|&b| b == b'\n')) {
+    for (line, text) in (1..).zip(whole.split_inclusive(|&b| b == b'\n')) {
         lines = line;
         let bad = |reason: String| VerifyError::CheckpointFile { line, reason };
-        let body = text
-            .strip_suffix(b"\n")
-            .ok_or_else(|| bad("no newline at the end".into()))?;
+        let body = text.strip_suffix(b"\n").unwrap_or(text);
         let entry: IndexEntry = serde_json::from_slice(body)
             .map_err(|e| bad(format!("not a checkpoint entry: {e}")))?;
         let Some(record) = seen.get(line as usize - 1) else {
@@ -524,12 +751,45 @@ fn check_index(session_dir: &Path, walk: &Walk) -> Result<(), VerifyError> {
             return Err(bad(reason));
         }
     }
-    match seen.get(lines as usize) {
-        Some(missing) => Err(VerifyError::CheckpointFile {
-            line: lines + 1,
-            reason: format!("the checkpoint at seq {} is not listed", missing.seq),
-        }),
-        None => Ok(()),
+
+    let line = lines + 1;
+    let bad = |reason: String| VerifyError::CheckpointFile { line, reason };
+    let unlisted = seen.get(lines as usize..).unwrap_or_default();
+    if let [last] = unlisted {
+        if open_tail && last.seq == last_seq && last.segment == newest {
+            let cut = |kind, bytes| Incomplete {
+                kind,
+                segment: last.segment,
+                offset: last.offset,
+                bytes,
+            };
+            if partial.is_empty() {
+                return Ok(Some(cut(IncompleteKind::UnindexedCheckpoint, 0)));
+            }
+            let mut wanted = serde_json::to_vec(last).map_err(|e| bad(e.to_string()))?;
+            wanted.push(b'\n');
+            if !wanted.starts_with(partial) {
+                return Err(bad(format!(
+                    "no newline at the end, and not the start of the line for the checkpoint \
+                     at seq {}",
+                    last.seq
+                )));
+            }
+            return Ok(Some(cut(
+                IncompleteKind::PartialIndexLine,
+                partial.len() as u64,
+            )));
+        }
+    }
+    if !partial.is_empty() {
+        return Err(bad("no newline at the end".into()));
+    }
+    match unlisted.first() {
+        Some(missing) => Err(bad(format!(
+            "the checkpoint at seq {} is not listed",
+            missing.seq
+        ))),
+        None => Ok(None),
     }
 }
 
