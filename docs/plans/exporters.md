@@ -49,7 +49,7 @@ What the read decides:
 - **A broken chain** (`VerifyError`) exports nothing.
 - **An intact log** is exported whole.
 - **An incomplete log** (Task 7) exports the records that verified, up to its `last_seq`. The export then exits 4, as verify does, and says why on stderr.
-- **No records at all** (incomplete as `no_segment`, or an empty `.jsonl`): OTLP gives `{"resourceSpans": []}` and OCSF nothing, with the same exit code.
+- **No records at all** (incomplete as `no_segment`): OTLP gives `{"resourceSpans": []}` and OCSF nothing, with the same exit code. An empty `.jsonl` is no log, as verify says.
 - **A kind this build does not know** is skipped and counted.
 - **A known kind whose `data` does not parse** stops the export with exit 1: the log verified, so this is a log boxcar cannot read, not a cut.
 
@@ -197,11 +197,11 @@ With both `--out` and `--otlp-endpoint`, the file is written first. Without `--o
 - **`device`** (required by 1001 and 1007): `{type_id: 6, type: "Virtual", uid: <session id>}`.
 - **`actor`** (required by 1001, 1007 and 6003):
   - `{process: {pid}, user: {uid}}` from the record's `subject`;
-  - else `{app_name: "boxcar"}`.
+  - else `{application: {name: "boxcar"}}` (1.9.0 deprecates `app_name` for it).
 - **`src_endpoint` and `dst_endpoint`:**
   - the flow's addresses, joined by `flow` from its `net.connect` or `net.udp`;
   - where the log has none for the record (DNS, or an unjoined flow), `src_endpoint` = `{name: "guest", uid: <session id>}` and `dst_endpoint` = `{name: "boxcar"}`. Both satisfy the object's "at least one of" constraint.
-- **`file`:** `name` and `type_id` (1 regular file, 2 folder, 3 symbolic link, 0 unknown) are always there, and `path` when the record has one.
+- **`file`:** `name` and `type_id` (1 regular file, 2 folder, 7 symbolic link, a node's type from its mode, 0 unknown) are always there, and `path` when the record has one.
 - **A share's path** becomes a guest path through the `fs.mount` records (tag to guest path), as the reconciler joins them.
 
 **What each kind becomes:**
@@ -219,9 +219,9 @@ With both `--out` and `--otlp-endpoint`, the file is written first. Without `--o
 | `fs.setattr`, `fs.xattr` | 1001 | 6 Set Attributes | `file` |
 | `fs.mount` | 1001 | 12 Mount | `file {name, path: guest path, type_id: 2}` |
 | `fs.denied` | 1001 | its `op`'s activity (lookup and getattr: 8 Get Attributes), else 99 (`Denied`) | `file`, `status_id` 2; when `reason` is `policy`, `action_id` 2 and `disposition_id` 2; `reason` and `rule` in `status_detail` |
-| `proc.exec` | Process Activity 1007 (1) | 1 Launch | `process {pid: tgid, tid, file {name, path, type_id: 1}, cmd_line, user {uid}, parent_process {pid: ppid}}`; `cmd_line` is the argv scrubbed as `--scrub-argv` scrubs it |
+| `proc.exec` | Process Activity 1007 (1) | 1 Launch | `process {pid: tgid, ptid: tid, file {name, path, type_id: 1}, cmd_line, user {uid}, parent_process {pid: ppid}}` (1.6 deprecated `tid` for `ptid`); `cmd_line` is the argv scrubbed as `--scrub-argv` scrubs it |
 | `proc.exit` with `group_dead` | 1007 | 2 Terminate | `process {pid: tgid}`; `exit_code` when it exited, the signal in `status_detail` |
-| `net.connect`, `net.udp` | Network Activity 4001 (4) | 1 Open | `src_endpoint {ip, port}`, `dst_endpoint {ip, port, hostname}`, `connection_info {protocol_name, uid: flow}`, the verdict |
+| `net.connect`, `net.udp` | Network Activity 4001 (4) | 1 Open | `src_endpoint {ip, port}`, `dst_endpoint {ip, port, hostname}`, `connection_info {protocol_name, uid: flow, direction_id: 2}` (outbound; the object requires a direction), the verdict |
 | `net.close` | 4001 | 2 Close | the flow's endpoints, `traffic {bytes_out, bytes_in}`; `dur_ms` and `reason` in `unmapped` |
 | `net.dns` | DNS Activity 4003 (4) | 6 Traffic | `query {hostname, type}`, `answers [{rdata}]`, `rcode_id`, `rcode`; `status_id` from the `rcode`; the verdict |
 | `http.request` | HTTP Activity 4002 (4) | its method (3 Get, 6 Post, ...; else 99 with the method) | `http_request {http_method, url {hostname, path, url_string}, user_agent, version}`, the flow's endpoints |
@@ -313,7 +313,7 @@ A session directory or `.jsonl`, as now, verifies a log on disk.
   - a third whose `tool_use_id` repeats after eviction, with its own `span.effects`;
 - **the end:** a token count above `i64::MAX`, `net.close`, a `checkpoint`, `vmm.stop`, a finding after `vmm.stop`, and a record of a kind no build knows (`x.future`).
 
-`fixtures/export/session.otlp.json` and `session.ocsf.jsonl` are its blessed exports. The fixture's model name, tool name and URL carry secret-looking values, to show the scrubbing.
+`fixtures/export/session.otlp.json` and `session.ocsf.jsonl` are its blessed exports. The fixture's argv, a model name and a tool name carry secret-looking values, to show the scrubbing.
 
 **Tests (`boxcar-audit/tests/export.rs`):**
 - the fixture verifies;
@@ -383,6 +383,10 @@ A session directory or `.jsonl`, as now, verifies a log on disk.
 **By hand, recorded as decisions:**
 - **On the test box:** the fixture's OTLP export POSTed to `otelcol-contrib` 0.163.1 (the OTLP receiver on `127.0.0.1:4318`, the `debug` exporter with detailed verbosity), which decodes every span and event.
 - **OCSF:** each of the fixture's OCSF events sent to the OCSF server's validator for 1.9.0, with no error.
+
+Both were done on 2026-10-20:
+- **The collector:** `otelcol-contrib` 0.163.1 answered the fixture's export `200 {"partialSuccess":{}}`, and its debug exporter decoded all 12 spans and 4 span events, with no error or warning.
+- **The validator** (`POST schema.ocsf.io/api/v2/validate`) passed all 44 of the fixture's events, with no error. Its only warnings, on a first run, named `actor.app_name` and `process.tid` as deprecated in 1.9.0; they became `actor.application.name` and `process.ptid`, and a second run had no warning either.
 
 ## 8. Out of scope
 
