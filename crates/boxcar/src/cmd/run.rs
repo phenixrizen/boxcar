@@ -1732,13 +1732,14 @@ mod tests {
                 name: Some(path.display().to_string()),
                 sha256: Some(sha256_hex(text)),
                 egress_rules: 1,
-                fs_rules: 1,
+                // The default writable's two globs.
+                fs_rules: 2,
                 exec_rules: 1,
             }
         );
         assert_eq!(file.max_dns_qps, None);
         let paths = file.settings.paths.as_ref().unwrap();
-        assert_eq!(paths.writable, ["/workspace/**"]);
+        assert_eq!(paths.writable, ["/workspace/**", "/tmp/**"]);
         assert_eq!(paths.exec_deny, ["**/nc"]);
         assert!(file.settings.keep_tool_args && !file.settings.scrub_argv);
 

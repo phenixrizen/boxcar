@@ -22,8 +22,9 @@ pub const MAX_ENTRIES: usize = 1024;
 /// The highest `max_dns_qps`.
 pub const MAX_DNS_QPS: u32 = 10_000;
 
-/// The `writable` of a file that gives none.
-const DEFAULT_WRITABLE: &str = "/workspace/**";
+/// The `writable` of a file that gives none: the workspace, and `/tmp`,
+/// which is the root share's (init mounts no tmpfs on it).
+const DEFAULT_WRITABLE: [&str; 2] = ["/workspace/**", "/tmp/**"];
 
 /// Why a policy file was refused, and where: the line and the column, both
 /// from 1, of what is wrong.
@@ -171,7 +172,7 @@ pub fn parse(text: &str) -> Result<PolicyFile, ParseError> {
 
     let writable = match &raw.fs.writable {
         Some(_) => globs(&raw.fs.writable, "[fs] writable", &fail)?,
-        None => vec![DEFAULT_WRITABLE.to_owned()],
+        None => DEFAULT_WRITABLE.map(str::to_owned).to_vec(),
     };
     let fs = FsRules {
         writable,
@@ -278,18 +279,18 @@ mod tests {
         let file = ok("version = 1\n");
         assert_eq!(file.egress.policy, Policy::default());
         assert_eq!(file.egress.max_dns_qps, None);
-        assert_eq!(file.fs.writable, ["/workspace/**"]);
+        assert_eq!(file.fs.writable, ["/workspace/**", "/tmp/**"]);
         assert!(file.fs.denied.is_empty());
         assert!(file.fs.indicators.is_empty());
         assert!(file.exec.deny.is_empty());
         assert!(file.spans.keep_tool_args);
         assert!(!file.record.scrub_argv);
-        assert_eq!(file.fs_rules(), 1);
+        assert_eq!(file.fs_rules(), 2);
         assert_eq!(file.exec_rules(), 0);
         assert_eq!(
             file.path_spec(),
             boxcar_fs::PathSpec {
-                writable: vec!["/workspace/**".to_owned()],
+                writable: vec!["/workspace/**".to_owned(), "/tmp/**".to_owned()],
                 denied: Vec::new(),
                 exec_deny: Vec::new(),
             }
@@ -363,6 +364,20 @@ scrub_argv = true
             inline.egress.policy,
             Policy::parse(&["allow a.test"]).unwrap()
         );
+    }
+
+    /// The default `writable` is the file's when it names none, whatever
+    /// else `[fs]` gives; a `writable` it names replaces the default whole.
+    #[test]
+    fn writable_is_the_default_until_the_file_names_one() {
+        let default = ["/workspace/**", "/tmp/**"];
+        assert_eq!(ok("version = 1\n[fs]\n").fs.writable, default);
+        let denied = ok("version = 1\n[fs]\ndenied = [\"/workspace/.env\"]\n");
+        assert_eq!(denied.fs.writable, default);
+        assert_eq!(denied.fs_rules(), 3);
+        let named = ok("version = 1\n[fs]\nwritable = [\"/workspace/**\"]\n");
+        assert_eq!(named.fs.writable, ["/workspace/**"]);
+        assert_eq!(named.fs_rules(), 1);
     }
 
     /// A deny of a target wins over an allow of it, whatever the order of

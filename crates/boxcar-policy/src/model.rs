@@ -29,8 +29,8 @@ pub struct Egress {
 /// `[fs]`: globs of guest paths, as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsRules {
-    /// What a mutating operation must match: `/workspace/**` when the file
-    /// gives no `writable`.
+    /// What a mutating operation must match: `/workspace/**` and `/tmp/**`
+    /// when the file gives no `writable`.
     pub writable: Vec<String>,
     /// What may not be looked up, opened or changed.
     pub denied: Vec<String>,

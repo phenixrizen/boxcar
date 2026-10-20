@@ -124,7 +124,7 @@ The sets are fixed for the session. `denied` has no exceptions and no update, no
 
 ### `[fs] writable`'s default
 
-A file that gives no `writable` keeps the M5 plan's default, `/workspace/**`. Init mounts no tmpfs on `/tmp`, so `/tmp` belongs to the root share, and a policy file without `writable` makes it read-only. The strict profile lists `/tmp/**`. Whether the default should add `/tmp/**` is a change to a binding constraint, and is put to the owner on the pull request rather than made here.
+A file that gives no `writable` gets `["/workspace/**", "/tmp/**"]`. Init mounts no tmpfs on `/tmp`, so `/tmp` belongs to the root share, and with the M5 plan's default of `/workspace/**` alone a policy file without `writable` would make it read-only. That breaks `mktemp`, compilers and package builds. The strict profile lists `/tmp/**` too. This changes a binding constraint of the M5 plan, so it was put to the owner on the pull request, who approved it; the M5 plan's section 3 and section 8 say so. A tmpfs on `/tmp` was the other way: it was refused because what is written there would be neither recorded nor policed. A `writable` the file names replaces the default whole, `[]` included.
 
 ## 3. Indicators, spans, argv
 
@@ -240,7 +240,7 @@ The clock is a small trait (`PolicyClock`: boottime and realtime nanoseconds). S
 - **`readdirplus` lists a denied entry without its inode or its attributes**, as `readdir` would. Names stay visible, so the listing is unchanged and only the inode is withheld.
 - **`opendir` takes only a directory read's flags**, with or without rules.
 - **`link` needs its source writable by every name**: a link changes the inode's link count, and a read-only file stays read-only under any new name.
-- **The default `writable` stays `/workspace/**`**, as the M5 plan binds it. Adding `/tmp/**` is the owner's call.
+- **The default `writable` is `/workspace/**` and `/tmp/**`**, a change to the M5 plan's section 3 the owner approved: `/tmp` is the root share's.
 - **An egress exception is an allow after the permanent rules**: it opens what the default denies, never what the policy denies by name.
 - **An exception comes alone in its `policy.update`**: an update is either a whole permanent part or one exception. A whole-policy update never carries an exception, so nothing a client reads back can make one permanent.
 - **The 65th exception is `busy`**: the request is sound, and it fits once one expires.
@@ -257,7 +257,7 @@ An adversarial review of the first draft (9c55f4a) against the code found the fo
 3. **`unlink` and `rmdir` by name only** (a case variant removes a denied file): the existing-entry check.
 4. **Renames laundering `writable` and `[exec] deny`**: the ancestor rule for `writable`; exec-denied files cannot be renamed or linked.
 5. **`[exec] deny` defeated by the loader and by a copy**, and Debian's `nc` resolving to `nc.openbsd`: every open refused; the strict profile's names.
-6. **Departures from the M5 plan**: the draft's table had only write and exec opens (now every open and the gate); the default `writable` (kept as bound, put to the owner); the gated hard link (added).
+6. **Departures from the M5 plan**: the draft's table had only write and exec opens (now every open and the gate); the default `writable` (kept as bound and put to the owner, who approved adding `/tmp/**` after a second opinion from Codex); the gated hard link (added).
 7. **The scan**: unreadable directories (fail the session), one set across shares, host-made trees (the literal-prefix guard; the rest out of scope).
 8. **The clock**: `CLOCK_BOOTTIME` deadlines, records under the lock.
 9. **`policy.get` reading the compiled view**: the permanent part is held apart and read; the CLI's read-modify-write is tested.

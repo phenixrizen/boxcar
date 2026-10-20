@@ -839,6 +839,8 @@ fn agent_isolate_strict_holds_in_a_session() {
 /// A writable exception granted during a run lets the guest write what it
 /// names, and once it expires the same write is refused; the log has the
 /// grant (`policy.exception`) and the expiry (`policy.changed{by_pid: 0}`).
+/// The policy file names no `writable`, so the default's `/tmp` is
+/// writable, and what is written there is recorded.
 #[test]
 fn a_writable_exception_expires_during_a_run() {
     let Some(guest) = guest_or_skip("a_writable_exception_expires_during_a_run") else {
@@ -847,12 +849,9 @@ fn a_writable_exception_expires_during_a_run() {
     let (_registry, reference) = publish_strict(&guest.rootfs);
     let scratch = Scratch::new();
     let policy = scratch.path("policy.toml");
-    fs::write(
-        &policy,
-        "version = 1\n[fs]\nwritable = [\"/workspace/**\", \"/tmp/**\"]\n",
-    )
-    .unwrap();
+    fs::write(&policy, "version = 1\n").unwrap();
     let script = "\
+        t=$(mktemp) && echo t > \"$t\" && echo TMP_WROTE; \
         (echo a > /etc/x) 2>/dev/null && echo FIRST_WROTE || echo FIRST_REFUSED; \
         while [ ! -e /workspace/go ]; do sleep 1; done; \
         (echo b > /etc/x) 2>/dev/null && echo SECOND_WROTE || echo SECOND_REFUSED; \
@@ -896,7 +895,12 @@ fn a_writable_exception_expires_during_a_run() {
     fs::write(scratch.path("workspace").join("go2"), "").unwrap();
     let run = running.finish();
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
-    for line in ["FIRST_REFUSED", "SECOND_WROTE", "THIRD_REFUSED"] {
+    for line in [
+        "TMP_WROTE",
+        "FIRST_REFUSED",
+        "SECOND_WROTE",
+        "THIRD_REFUSED",
+    ] {
         assert!(run.stdout.contains(line), "{line}: {}", run.describe());
     }
     let records = run.records();
@@ -925,5 +929,15 @@ fn a_writable_exception_expires_during_a_run() {
     assert!(
         refused.iter().any(|seq| *seq > changed[0].seq),
         "{refused:?}"
+    );
+    // The default's `/tmp`, written and recorded as any other share path.
+    let creates = of_kind(&records, "fs.create");
+    assert!(
+        creates.iter().any(|r| r.data["mount"] == "root"
+            && r.data["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("/tmp/"))
+            && r.data["result"]["ok"] == true),
+        "{creates:?}"
     );
 }
