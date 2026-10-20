@@ -7,6 +7,7 @@ mod cli;
 mod client;
 mod cmd;
 mod oci;
+mod otlp;
 
 use std::process::ExitCode;
 

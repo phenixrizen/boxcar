@@ -6,21 +6,129 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use std::fs;
+
+use boxcar_audit::export::{ocsf, otlp, ExportError, Log};
 use boxcar_audit::{verify_jsonl, verify_session, VerifyError, VerifyReport};
 use serde_json::{json, Value};
 
-use crate::cli::{AuditCommand, VerifyArgs};
+use crate::cli::{AuditCommand, ExportArgs, ExportFormat, VerifyArgs};
+use crate::cmd::image::native_roots;
+use crate::otlp::{post, Endpoint, Outcome, DEADLINE};
 
 /// `boxcar audit verify`'s exit code for a broken log.
 const BROKEN_EXIT: u8 = 1;
 /// `boxcar audit verify`'s exit code for an incomplete log: what is there
 /// verifies, but its tail was cut mid-write.
 const INCOMPLETE_EXIT: u8 = 4;
+/// A usage error.
+const USAGE_EXIT: u8 = 2;
 
 pub fn run(command: AuditCommand) -> anyhow::Result<ExitCode> {
     match command {
         AuditCommand::Verify(args) => verify(&args),
+        AuditCommand::Export(args) => export(&args),
     }
+}
+
+/// `boxcar audit export PATH --format otlp|ocsf [--out FILE]
+/// [--otlp-endpoint URL]`: the export to FILE, stdout, or a collector; a
+/// summary line on stderr.
+fn export(args: &ExportArgs) -> anyhow::Result<ExitCode> {
+    let endpoint = match (&args.otlp_endpoint, args.format) {
+        (None, _) => None,
+        (Some(_), ExportFormat::Ocsf) => {
+            super::tell("error: --otlp-endpoint needs --format otlp");
+            return Ok(ExitCode::from(USAGE_EXIT));
+        }
+        (Some(url), ExportFormat::Otlp) => match Endpoint::parse(url) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                super::tell(&format!("error: {error}"));
+                return Ok(ExitCode::from(USAGE_EXIT));
+            }
+        },
+    };
+    let log = match Log::read(&args.path) {
+        Ok(log) => log,
+        Err(ExportError::Verify(error)) => {
+            // stdout carries the export alone.
+            super::tell(&format!("fail: {error}"));
+            return Ok(ExitCode::from(BROKEN_EXIT));
+        }
+        Err(error) => {
+            super::tell(&format!("error: {error}"));
+            return Ok(ExitCode::from(BROKEN_EXIT));
+        }
+    };
+    let (bytes, summary) = match args.format {
+        ExportFormat::Otlp => {
+            let (bytes, s) = otlp::export(&log);
+            let unpaired = if s.unpaired > 0 {
+                format!(" ({} unpaired)", s.unpaired)
+            } else {
+                String::new()
+            };
+            let traces = usize::from(s.spans > 0);
+            let summary = format!(
+                "otlp: {traces} trace, {} spans, {} events from {} records{unpaired}",
+                s.spans, s.events, s.records
+            );
+            (bytes, summary)
+        }
+        ExportFormat::Ocsf => {
+            let (bytes, s) = ocsf::export(&log);
+            let summary = format!(
+                "ocsf: {} events from {} records, {} skipped ({})",
+                s.events,
+                s.records,
+                s.skipped.total(),
+                s.skipped
+            );
+            (bytes, summary)
+        }
+    };
+    if let Some(cut) = &log.report.incomplete {
+        super::tell(&format!(
+            "incomplete: the log's tail is cut ({cut}); exported the {} records that verified",
+            log.report.records
+        ));
+    }
+    match &args.out {
+        Some(path) => {
+            fs::write(path, &bytes).map_err(|e| anyhow::anyhow!("--out {}: {e}", path.display()))?
+        }
+        None if endpoint.is_none() => {
+            let mut out = io::stdout().lock();
+            out.write_all(&bytes)?;
+            out.flush()?;
+        }
+        None => {}
+    }
+    super::tell(&summary);
+    if let Some(endpoint) = endpoint {
+        let roots = native_roots()?;
+        match post(&endpoint, &bytes, &roots, DEADLINE) {
+            Ok(Outcome::Accepted(None)) => super::tell(&format!("sent to {}", endpoint.as_str())),
+            Ok(Outcome::Accepted(Some(message))) => super::tell(&format!(
+                "sent to {}; the collector says: {message}",
+                endpoint.as_str()
+            )),
+            Ok(Outcome::Refused(why)) => {
+                super::tell(&format!("error: {}: {why}", endpoint.as_str()));
+                return Ok(ExitCode::from(BROKEN_EXIT));
+            }
+            Err(error) => {
+                super::tell(&format!("error: {}: {error}", endpoint.as_str()));
+                return Ok(ExitCode::from(BROKEN_EXIT));
+            }
+        }
+    }
+    Ok(if log.report.incomplete.is_some() {
+        ExitCode::from(INCOMPLETE_EXIT)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// `boxcar audit verify <path> [--json]`. A directory is verified as a

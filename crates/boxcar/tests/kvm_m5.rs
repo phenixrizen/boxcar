@@ -1023,3 +1023,59 @@ fn a_seccomp_kill_is_a_crash() {
     assert_eq!(of_kind(&records, "vmm.start").len(), 1, "{records:?}");
     assert!(of_kind(&records, "vmm.stop").is_empty(), "{records:?}");
 }
+
+/// A session's log, after the run, exports in both forms: a trace whose
+/// session span names the session, and OCSF events that each point back to
+/// it, the workspace's new file among them.
+#[test]
+fn a_session_exports_to_otlp_and_ocsf() {
+    let Some(guest) = guest_or_skip("a_session_exports_to_otlp_and_ocsf") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &[],
+        &["sh", "-c", "echo exported > /workspace/e"],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    let dir = run.session_dir();
+    let session = dir.file_name().unwrap().to_str().unwrap().to_owned();
+    let export = |format: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_boxcar"))
+            .args(["audit", "export"])
+            .arg(&dir)
+            .args(["--format", format])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+
+    let trace: serde_json::Value = serde_json::from_str(&export("otlp")).unwrap();
+    let spans = trace["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let root = &spans[0];
+    assert_eq!(root["name"], "boxcar.session", "{root}");
+    assert_eq!(root["traceId"], session.replace('-', ""));
+
+    let events: Vec<serde_json::Value> = export("ocsf")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .all(|e| e["metadata"]["correlation_uid"] == session.as_str()),
+        "every event names the session"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["class_uid"] == 1001 && e["file"]["path"] == "/workspace/e"),
+        "the workspace's new file"
+    );
+}

@@ -355,6 +355,45 @@ pub enum AuditCommand {
     /// Exits 0 when the log is intact, 1 at the first break, 2 on a usage
     /// error, and 4 when it is incomplete.
     Verify(VerifyArgs),
+    /// Export a log, once it verifies, as one OpenTelemetry trace in
+    /// OTLP/JSON (the session, its model calls and its tool spans, findings
+    /// as span events) or as OCSF 1.9.0 events in JSON lines.
+    ///
+    /// Each span, event and OCSF event carries the seq and hash of its
+    /// record. The same log exports to the same bytes. An OTLP export holds
+    /// none of the log's raw text but the findings' summaries; identifiers
+    /// (model and tool names, tool call ids) are scrubbed of anything that
+    /// looks like a secret. A one-line summary goes to stderr.
+    ///
+    /// Exits 0 when exported, 1 for a broken log (nothing is exported), a
+    /// record it cannot read, or a POST that failed, 2 on a usage error,
+    /// and 4 when the log is incomplete: what verified was exported.
+    Export(ExportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// A session directory, or a single `.jsonl` log file.
+    pub path: PathBuf,
+    /// `otlp` (one OTLP/JSON trace) or `ocsf` (OCSF events, one per line).
+    #[arg(long, value_enum)]
+    pub format: ExportFormat,
+    /// Write the export to FILE; without it, to stdout, unless it is sent
+    /// to `--otlp-endpoint`.
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+    /// POST the OTLP export to URL/v1/traces, a collector's OTLP/HTTP
+    /// receiver (`http://127.0.0.1:4318`, say). No user, password or
+    /// query in it; nothing is retried. Needs `--format otlp`.
+    #[arg(long, value_name = "URL")]
+    pub otlp_endpoint: Option<String>,
+}
+
+/// `boxcar audit export --format`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    Otlp,
+    Ocsf,
 }
 
 #[derive(Debug, Args)]
