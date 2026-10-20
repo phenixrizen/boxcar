@@ -8,7 +8,6 @@
 use std::ops::Range;
 
 use boxcar_net::{List, Policy, Verdict};
-use globset::GlobBuilder;
 use serde::Deserialize;
 use toml::Spanned;
 
@@ -23,8 +22,9 @@ pub const MAX_ENTRIES: usize = 1024;
 /// The highest `max_dns_qps`.
 pub const MAX_DNS_QPS: u32 = 10_000;
 
-/// The `writable` of a file that gives none.
-const DEFAULT_WRITABLE: &str = "/workspace/**";
+/// The `writable` of a file that gives none: the workspace, and `/tmp`,
+/// which is the root share's (init mounts no tmpfs on it).
+const DEFAULT_WRITABLE: [&str; 2] = ["/workspace/**", "/tmp/**"];
 
 /// Why a policy file was refused, and where: the line and the column, both
 /// from 1, of what is wrong.
@@ -172,7 +172,7 @@ pub fn parse(text: &str) -> Result<PolicyFile, ParseError> {
 
     let writable = match &raw.fs.writable {
         Some(_) => globs(&raw.fs.writable, "[fs] writable", &fail)?,
-        None => vec![DEFAULT_WRITABLE.to_owned()],
+        None => DEFAULT_WRITABLE.map(str::to_owned).to_vec(),
     };
     let fs = FsRules {
         writable,
@@ -222,8 +222,9 @@ fn list<'a>(
     Ok(entries.iter().collect())
 }
 
-/// A list of path globs, each absolute (starting `/` or `**/`) and one
-/// `globset` compiles with `literal_separator`.
+/// A list of path globs, each one [`boxcar_fs::rules::glob`] takes:
+/// absolute (starting `/` or `**/`) and one `globset` compiles with
+/// `literal_separator`.
 fn globs(
     raw: &Option<SpannedList>,
     name: &str,
@@ -232,17 +233,8 @@ fn globs(
     let mut out = Vec::new();
     for entry in list(raw, name, fail)? {
         let glob = entry.get_ref();
-        if !(glob.starts_with('/') || glob.starts_with("**/")) {
-            return Err(fail(
-                entry.span(),
-                format!("{name}: {glob:?} is relative; a path glob starts with / or **/"),
-            ));
-        }
-        if let Err(error) = GlobBuilder::new(glob).literal_separator(true).build() {
-            return Err(fail(
-                entry.span(),
-                format!("{name}: {glob:?} is not a glob: {}", error.kind()),
-            ));
+        if let Err(error) = boxcar_fs::rules::glob(glob) {
+            return Err(fail(entry.span(), format!("{name}: {error}")));
         }
         out.push(glob.clone());
     }
@@ -287,15 +279,22 @@ mod tests {
         let file = ok("version = 1\n");
         assert_eq!(file.egress.policy, Policy::default());
         assert_eq!(file.egress.max_dns_qps, None);
-        assert_eq!(file.fs.writable, ["/workspace/**"]);
+        assert_eq!(file.fs.writable, ["/workspace/**", "/tmp/**"]);
         assert!(file.fs.denied.is_empty());
         assert!(file.fs.indicators.is_empty());
         assert!(file.exec.deny.is_empty());
         assert!(file.spans.keep_tool_args);
         assert!(!file.record.scrub_argv);
-        assert_eq!(file.fs_rules(), 1);
+        assert_eq!(file.fs_rules(), 2);
         assert_eq!(file.exec_rules(), 0);
-        assert_eq!(file.not_in_force(), ["[fs] writable"]);
+        assert_eq!(
+            file.path_spec(),
+            boxcar_fs::PathSpec {
+                writable: vec!["/workspace/**".to_owned(), "/tmp/**".to_owned()],
+                denied: Vec::new(),
+                exec_deny: Vec::new(),
+            }
+        );
     }
 
     /// Every field, read as written.
@@ -343,17 +342,10 @@ scrub_argv = true
         assert!(file.record.scrub_argv);
         assert_eq!(file.fs_rules(), 6);
         assert_eq!(file.exec_rules(), 2);
-        assert_eq!(
-            file.not_in_force(),
-            [
-                "[fs] writable",
-                "[fs] denied",
-                "[fs] indicators",
-                "[exec] deny",
-                "[spans] keep_tool_args",
-                "[record] scrub_argv",
-            ]
-        );
+        let spec = file.path_spec();
+        assert_eq!(spec.writable, file.fs.writable);
+        assert_eq!(spec.denied, file.fs.denied);
+        assert_eq!(spec.exec_deny, file.exec.deny);
     }
 
     /// Each table may be empty, each list too; `writable = []` is nothing
@@ -366,18 +358,26 @@ scrub_argv = true
         assert_eq!(file.egress.policy, Policy::default());
         assert!(file.fs.writable.is_empty());
         assert_eq!(file.fs_rules(), 0);
-        // Writing everywhere, with only the reconciler's own indicators, is
-        // all in force already.
-        let open = ok(
-            "version = 1\n[fs]\nwritable = [\"/**\"]\nindicators = [\"/var/log/**\", \"**/.*_history\"]\n",
-        );
-        assert!(open.not_in_force().is_empty());
         // The same as inline tables.
         let inline = ok("version = 1\negress = { default = \"deny\", allow = [\"a.test\"] }\n");
         assert_eq!(
             inline.egress.policy,
             Policy::parse(&["allow a.test"]).unwrap()
         );
+    }
+
+    /// The default `writable` is the file's when it names none, whatever
+    /// else `[fs]` gives; a `writable` it names replaces the default whole.
+    #[test]
+    fn writable_is_the_default_until_the_file_names_one() {
+        let default = ["/workspace/**", "/tmp/**"];
+        assert_eq!(ok("version = 1\n[fs]\n").fs.writable, default);
+        let denied = ok("version = 1\n[fs]\ndenied = [\"/workspace/.env\"]\n");
+        assert_eq!(denied.fs.writable, default);
+        assert_eq!(denied.fs_rules(), 3);
+        let named = ok("version = 1\n[fs]\nwritable = [\"/workspace/**\"]\n");
+        assert_eq!(named.fs.writable, ["/workspace/**"]);
+        assert_eq!(named.fs_rules(), 1);
     }
 
     /// A deny of a target wins over an allow of it, whatever the order of

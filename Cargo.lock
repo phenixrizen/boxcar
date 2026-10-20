@@ -293,6 +293,7 @@ dependencies = [
  "blake3",
  "boxcar-proto",
  "crossbeam-channel",
+ "globset",
  "libc",
  "proptest",
  "serde",
@@ -307,6 +308,7 @@ dependencies = [
 name = "boxcar-fs"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64",
  "blake3",
  "boxcar-audit",
@@ -315,6 +317,7 @@ dependencies = [
  "crossbeam-channel",
  "event-manager",
  "fuse-backend-rs",
+ "globset",
  "libc",
  "serde_json",
  "tempfile",
@@ -377,6 +380,7 @@ dependencies = [
 name = "boxcar-policy"
 version = "0.1.0"
 dependencies = [
+ "boxcar-fs",
  "boxcar-net",
  "globset",
  "serde",

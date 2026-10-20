@@ -1216,6 +1216,8 @@ fn refused_lookups_are_recorded_as_denied() {
                 path_b64: None,
                 op: "lookup".into(),
                 errno: libc::EACCES,
+                reason: None,
+                rule: None,
             });
         }
         if matches!(level, AuditLevel::Verbose) {
@@ -1225,6 +1227,8 @@ fn refused_lookups_are_recorded_as_denied() {
                 path_b64: None,
                 op: "lookup".into(),
                 errno: libc::ENOENT,
+                reason: None,
+                rule: None,
             });
         }
         let got: Vec<FsDenied> = events

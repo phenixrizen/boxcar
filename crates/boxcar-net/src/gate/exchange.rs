@@ -270,6 +270,13 @@ impl Observation {
         self
     }
 
+    /// Whether `tool.open` keeps a call's arguments (see
+    /// [`Tracker::with_keep_args`](crate::model::track::Tracker::with_keep_args)).
+    pub fn with_keep_args(mut self, keep: bool) -> Observation {
+        self.model = self.model.with_keep_args(keep);
+        self
+    }
+
     /// Writes one side of an exchange to the dump, if there is one. A
     /// failure is the dump's alone.
     fn dump_side(&self, exchange: &Exchange, request: bool) {

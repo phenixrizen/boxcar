@@ -134,6 +134,19 @@ fn is_dot(name: &[u8]) -> bool {
     name == b"." || name == b".."
 }
 
+/// The path the names from the root down make: `/` for none.
+fn rooted(parts: &[&[u8]]) -> Vec<u8> {
+    if parts.is_empty() {
+        return b"/".to_vec();
+    }
+    let mut path = Vec::new();
+    for part in parts {
+        path.push(b'/');
+        path.extend_from_slice(part);
+    }
+    path
+}
+
 /// Where walking up from an inode ended.
 enum Walk<'a> {
     /// At the root; the names from the root down.
@@ -344,15 +357,7 @@ impl PathMap {
     /// The bytes of [`path`](Self::path), before any conversion.
     fn raw_path(&self, ino: u64) -> Vec<u8> {
         match self.walk(ino) {
-            Walk::Rooted(parts) if parts.is_empty() => b"/".to_vec(),
-            Walk::Rooted(parts) => {
-                let mut path = Vec::new();
-                for part in parts {
-                    path.push(b'/');
-                    path.extend_from_slice(part);
-                }
-                path
-            }
+            Walk::Rooted(parts) => rooted(&parts),
             Walk::Unknown(unknown, parts) => {
                 let mut path = format!("<ino:{unknown}>").into_bytes();
                 for part in parts {
@@ -376,6 +381,48 @@ impl PathMap {
             return None;
         }
         Some(parts.join(&b'/'))
+    }
+
+    /// `ino`'s share-relative path from `/`, as raw bytes, never cut; `None`
+    /// when it is not fully known (an unknown ancestor, too deep).
+    pub fn rooted_path(&self, ino: u64) -> Option<Vec<u8>> {
+        let Walk::Rooted(parts) = self.walk(ino) else {
+            return None;
+        };
+        Some(rooted(&parts))
+    }
+
+    /// The share-relative path of `name` in `parent` from `/`, as raw
+    /// bytes; `None` when the parent's is not fully known.
+    pub fn rooted_child(&self, parent: u64, name: &[u8]) -> Option<Vec<u8>> {
+        let mut path = self.rooted_path(parent)?;
+        if path != b"/" {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+        Some(path)
+    }
+
+    /// Every share-relative path `ino` is known by, from `/`: its name and
+    /// each alias (a hard link the guest looked up). `None` when the map
+    /// does not hold `ino`, or one of its paths is not fully known, so that
+    /// a check by them fails closed.
+    pub fn known_paths(&self, ino: u64) -> Option<Vec<Vec<u8>>> {
+        if ino == ROOT_INO {
+            return Some(vec![b"/".to_vec()]);
+        }
+        let node = self.nodes.get(&ino)?;
+        let mut paths = vec![self.rooted_path(ino)?];
+        for (parent, name) in &node.aliases {
+            paths.push(self.rooted_child(*parent, name)?);
+        }
+        Some(paths)
+    }
+
+    /// Whether the map holds `ino`: the kernel was handed it and has not
+    /// forgotten it. The root always.
+    pub fn contains(&self, ino: u64) -> bool {
+        self.nodes.contains_key(&ino)
     }
 
     /// Every inode the map knows, the root included, in ascending order.
@@ -682,6 +729,26 @@ mod tests {
         map.insert(ROOT_INO, b"again", G);
         assert!(!map.is_deleted(G));
         assert_eq!(map.path(G), "/again");
+    }
+
+    /// Every path a node is known by, aliases included, as raw bytes; none
+    /// for a node the map does not hold or whose way up is not known.
+    #[test]
+    fn known_paths_are_every_name() {
+        let mut map = tree();
+        assert_eq!(map.known_paths(ROOT_INO), Some(vec![b"/".to_vec()]));
+        assert_eq!(map.known_paths(F), Some(vec![b"/d/f".to_vec()]));
+        map.insert(G, b"\xfflink", F);
+        assert_eq!(
+            map.known_paths(F),
+            Some(vec![b"/d/f".to_vec(), b"/g/\xfflink".to_vec()])
+        );
+        assert_eq!(map.rooted_child(D, b"new"), Some(b"/d/new".to_vec()));
+        assert_eq!(map.rooted_child(ROOT_INO, b"x"), Some(b"/x".to_vec()));
+        assert_eq!(map.known_paths(99), None);
+        assert_eq!(map.rooted_child(99, b"x"), None);
+        map.insert(77, b"orphan", 78);
+        assert_eq!(map.known_paths(78), None);
     }
 
     #[test]

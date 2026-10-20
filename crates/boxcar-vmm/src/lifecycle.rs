@@ -863,7 +863,9 @@ pub(crate) fn test_handle(dir: &std::path::Path) -> (VmmHandle, boxcar_audit::Wr
         )),
         Some(EventFd::new(EFD_NONBLOCK).expect("the policy wake")),
         Some(Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()))),
-    );
+    )
+    .expect("the exception wake")
+    .with_audit(sink.clone());
     let info = VmInfo {
         session_id: session_id.to_string(),
         built: Instant::now(),

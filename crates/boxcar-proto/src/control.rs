@@ -639,6 +639,10 @@ pub const MAX_POLICY_RULES: usize = 4096;
 pub const MAX_POLICY_RULE_LEN: usize = 512;
 /// The most ports a `policy.update` may allowlist for vsock.
 pub const MAX_VSOCK_ALLOW_PORTS: usize = 1024;
+/// The most live exceptions a session holds at once.
+pub const MAX_EXCEPTIONS: usize = 64;
+/// The longest an exception lives, in seconds: a day.
+pub const MAX_EXCEPTION_TTL_S: u32 = 86_400;
 
 /// The network policy as `policy.get` reports it and `policy.update` takes
 /// it: `{"default":"deny","allow":["example.com:443"],"deny":["10.0.0.0/8"],
@@ -736,9 +740,91 @@ impl VsockPolicy {
     }
 }
 
-/// The result of `policy.get`: `{"net":{...},"vsock":{...},"version":N}`,
-/// the policy in force and its version (1 for the one the VM started with,
-/// one more for each `policy.update`).
+/// What a live exception opens: an egress target, a path glob writes may
+/// name, or a path glob programs may be run from despite `[exec] deny`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ExceptionKind {
+    Egress,
+    Writable,
+    Exec,
+}
+
+impl ExceptionKind {
+    /// The kind's wire word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExceptionKind::Egress => "egress",
+            ExceptionKind::Writable => "writable",
+            ExceptionKind::Exec => "exec",
+        }
+    }
+}
+
+/// An exception to grant, in `policy.update`: `{"rule":"api.example.com:443",
+/// "kind":"egress","ttl_s":600}`. `rule` is a target as `--allow` takes it
+/// for `egress`, an absolute path glob for `writable` and `exec`. It lives
+/// `ttl_s` seconds (1 to [`MAX_EXCEPTION_TTL_S`]) on top of the permanent
+/// policy, which it never becomes part of.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExceptionGrant {
+    pub rule: String,
+    pub kind: ExceptionKind,
+    pub ttl_s: u32,
+}
+
+impl ExceptionGrant {
+    /// Whether the grant is within the limits: a rule of 1 to
+    /// [`MAX_POLICY_RULE_LEN`] bytes on one line, a TTL of 1 to
+    /// [`MAX_EXCEPTION_TTL_S`] seconds. What the rule says is for the
+    /// server to parse.
+    pub fn check(&self) -> Result<(), String> {
+        if self.rule.is_empty() || self.rule.len() > MAX_POLICY_RULE_LEN {
+            return Err(format!(
+                "exception.rule: a rule is 1 to {MAX_POLICY_RULE_LEN} bytes, not {}",
+                self.rule.len()
+            ));
+        }
+        if self.rule.contains(['\n', '#']) {
+            return Err(format!(
+                "exception.rule {:?}: a rule is one target or glob, with no newline or #",
+                self.rule
+            ));
+        }
+        if !(1..=MAX_EXCEPTION_TTL_S).contains(&self.ttl_s) {
+            return Err(format!(
+                "exception.ttl_s {}: an exception lives 1 to {MAX_EXCEPTION_TTL_S} seconds",
+                self.ttl_s
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A live exception as `policy.get` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExceptionView {
+    /// The session's number for it, from 1.
+    pub id: u32,
+    pub rule: String,
+    pub kind: ExceptionKind,
+    pub ttl_s: u32,
+    /// When it expires: the host's realtime clock, in nanoseconds since the
+    /// epoch (the clock of a record's `ts_host_ns`).
+    pub expires_ns: u64,
+    /// The process id of the client that granted it.
+    pub by_pid: u32,
+}
+
+/// The result of `policy.get`: `{"net":{...},"vsock":{...},"version":N,
+/// "exceptions":[...]}`, the policy in force and its version (1 for the one
+/// the VM started with, one more for each `policy.update` and each
+/// exception's grant or expiry). `net` and `vsock` are the permanent policy;
+/// the live exceptions are listed apart, by id, and never in `net`, so a
+/// client that writes back what it read cannot make one permanent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyView {
@@ -747,12 +833,18 @@ pub struct PolicyView {
     /// 0 when a server did not say.
     #[serde(default)]
     pub version: u64,
+    /// The live exceptions, by id; omitted when there are none, and absent
+    /// in older servers' views.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<ExceptionView>,
 }
 
 /// The parameters of `policy.update`: `{"net":{...},"vsock":{...}}`, each
-/// optional and each replacing its whole policy when given. The response
-/// is [`PolicyUpdated`]; the server records `policy.changed`. A rule that
-/// does not parse is a `bad_request` naming it, and nothing changes.
+/// optional and each replacing its whole permanent policy when given, or
+/// `{"exception":{...}}` alone, granting one live exception. The response
+/// is [`PolicyUpdated`]; the server records `policy.changed`, or
+/// `policy.exception` for a grant. A rule that does not parse is a
+/// `bad_request` naming it, and nothing changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PolicyUpdateParams {
@@ -760,15 +852,26 @@ pub struct PolicyUpdateParams {
     pub net: Option<NetPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock: Option<VsockPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exception: Option<ExceptionGrant>,
 }
 
 impl PolicyUpdateParams {
-    /// Whether the parameters are within the limits ([`NetPolicy::check`]
-    /// and [`VsockPolicy::check`]) and change something: at least one of
-    /// `net` and `vsock` is given.
+    /// Whether the parameters are within the limits ([`NetPolicy::check`],
+    /// [`VsockPolicy::check`], [`ExceptionGrant::check`]) and change
+    /// something: `net`, `vsock` or both, or an `exception` alone.
     pub fn check(&self) -> Result<(), String> {
+        if let Some(exception) = &self.exception {
+            if self.net.is_some() || self.vsock.is_some() {
+                return Err(
+                    "an exception comes alone: give net and vsock in an update of their own"
+                        .to_owned(),
+                );
+            }
+            return exception.check();
+        }
         if self.net.is_none() && self.vsock.is_none() {
-            return Err("nothing to update: give net, vsock or both".to_owned());
+            return Err("nothing to update: give net, vsock or both, or an exception".to_owned());
         }
         if let Some(net) = &self.net {
             net.check()?;
@@ -1334,6 +1437,7 @@ mod tests {
                 allow_ports: vec![5000],
             },
             version: 3,
+            exceptions: Vec::new(),
         };
         let wire = json!({
             "net": {"default": "deny", "allow": ["example.com:443", "*.github.io"], "deny": ["10.0.0.0/8"], "inspect": ["example.com:443"]},
@@ -1466,6 +1570,95 @@ mod tests {
             serde_json::to_value(PolicyUpdated { policy_version: 2 }).unwrap(),
             json!({"policy_version": 2})
         );
+    }
+
+    /// An exception is granted alone, within its limits, and listed apart
+    /// from the permanent policy in `policy.get`.
+    #[test]
+    fn exception_messages_have_their_documented_shape_and_limits() {
+        let grant: PolicyUpdateParams = serde_json::from_value(json!({
+            "exception": {"rule": "/etc/**", "kind": "writable", "ttl_s": 600}
+        }))
+        .unwrap();
+        assert_eq!(grant.check(), Ok(()));
+        let exception = grant.exception.clone().unwrap();
+        assert_eq!(exception.kind, ExceptionKind::Writable);
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap(),
+            json!({"exception": {"rule": "/etc/**", "kind": "writable", "ttl_s": 600}})
+        );
+        for kind in ["egress", "writable", "exec"] {
+            let parsed: ExceptionKind = serde_json::from_value(json!(kind)).unwrap();
+            assert_eq!(parsed.as_str(), kind);
+        }
+        assert!(serde_json::from_value::<ExceptionKind>(json!("denied")).is_err());
+
+        // Alone: never beside a whole permanent part.
+        let with_net = PolicyUpdateParams {
+            net: Some(NetPolicy {
+                default: Verdict::Deny,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                inspect: Vec::new(),
+            }),
+            ..grant.clone()
+        };
+        assert!(with_net.check().unwrap_err().contains("alone"));
+        let with_vsock = PolicyUpdateParams {
+            vsock: Some(VsockPolicy::default()),
+            ..grant.clone()
+        };
+        assert!(with_vsock.check().unwrap_err().contains("alone"));
+
+        let limits = |rule: &str, ttl_s: u32| ExceptionGrant {
+            rule: rule.to_owned(),
+            kind: ExceptionKind::Egress,
+            ttl_s,
+        };
+        assert_eq!(limits("a.test", 1).check(), Ok(()));
+        assert_eq!(limits("a.test", MAX_EXCEPTION_TTL_S).check(), Ok(()));
+        assert!(limits("a.test", 0).check().unwrap_err().contains("ttl_s 0"));
+        assert!(limits("a.test", MAX_EXCEPTION_TTL_S + 1).check().is_err());
+        assert!(limits("", 60).check().is_err());
+        assert!(limits(&"x".repeat(MAX_POLICY_RULE_LEN + 1), 60)
+            .check()
+            .is_err());
+        assert!(limits("a.test # x", 60).check().is_err());
+        assert!(limits("a\nb", 60).check().is_err());
+
+        let view = PolicyView {
+            net: NetPolicy {
+                default: Verdict::Deny,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                inspect: Vec::new(),
+            },
+            vsock: VsockPolicy::default(),
+            version: 4,
+            exceptions: vec![ExceptionView {
+                id: 1,
+                rule: "api.example.com:443".into(),
+                kind: ExceptionKind::Egress,
+                ttl_s: 600,
+                expires_ns: 1_760_000_600_000_000_000,
+                by_pid: 4242,
+            }],
+        };
+        let wire = json!({
+            "net": {"default": "deny", "allow": [], "deny": [], "inspect": []},
+            "vsock": {"allow_ports": []},
+            "version": 4,
+            "exceptions": [{
+                "id": 1,
+                "rule": "api.example.com:443",
+                "kind": "egress",
+                "ttl_s": 600,
+                "expires_ns": 1_760_000_600_000_000_000u64,
+                "by_pid": 4242,
+            }],
+        });
+        assert_eq!(serde_json::to_value(&view).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<PolicyView>(wire).unwrap(), view);
     }
 
     #[test]

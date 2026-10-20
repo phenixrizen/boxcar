@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_audit::AuditSink;
-use boxcar_fs::{AuditFsOptions, FsError, FsShareConfig, VirtioFs};
+use boxcar_fs::rules::LiveRules;
+use boxcar_fs::{AuditFsOptions, DeniedIds, FsError, FsShareConfig, VirtioFs};
 use boxcar_virtio::bus::{Bus, BusError};
 use boxcar_virtio::{
     DeviceContext, MmioSlot, MmioTransport, SlotAllocator, SlotError, VirtioDevice,
@@ -147,23 +148,38 @@ pub fn request_queues(vcpus: u8) -> u16 {
     u16::from(vcpus).clamp(1, boxcar_fs::MAX_REQUEST_QUEUES)
 }
 
-/// How the shares' devices are built: what they record, and how many
-/// request queues each has.
-#[derive(Clone, Copy, Debug)]
+/// How the shares' devices are built: what they record, how many request
+/// queues each has, and the path rules they put in force.
+#[derive(Clone, Debug)]
 pub struct FsOptions {
     pub audit: AuditFsOptions,
     /// 1 to [`boxcar_fs::MAX_REQUEST_QUEUES`]: see [`request_queues`].
     pub request_queues: u16,
+    /// The rules every share reads.
+    pub rules: LiveRules,
+    /// What the session's boot scan found of them.
+    pub denied: Arc<DeniedIds>,
 }
 
 impl FsOptions {
     /// Devices recording as `audit` says, with [`request_queues`] for
-    /// `vcpus` vCPUs.
+    /// `vcpus` vCPUs, and no path rules.
     pub fn for_vcpus(audit: AuditFsOptions, vcpus: u8) -> FsOptions {
         FsOptions {
             audit,
             request_queues: request_queues(vcpus),
+            rules: Arc::new(arc_swap::ArcSwap::from_pointee(
+                boxcar_fs::PathRules::allow_all(),
+            )),
+            denied: Arc::default(),
         }
+    }
+
+    /// The same, with `rules` in force and `denied` from the boot scan.
+    pub fn with_rules(mut self, rules: LiveRules, denied: Arc<DeniedIds>) -> FsOptions {
+        self.rules = rules;
+        self.denied = denied;
+        self
     }
 }
 
@@ -195,11 +211,13 @@ impl FsDevices {
             let tag = || share.tag.clone();
             let wiring = |source| DeviceError::Wiring { tag: tag(), source };
             let slot = reserve_slot(slots, id, &share.tag)?;
-            let device = VirtioFs::new(
+            let device = VirtioFs::with_rules(
                 share.clone(),
                 audit.clone(),
                 options.audit,
                 options.request_queues,
+                Arc::clone(&options.rules),
+                Arc::clone(&options.denied),
             )
             .map_err(|source| DeviceError::Fs { tag: tag(), source })?;
             let ctx = DeviceContext::new(slot, device.num_queues()).map_err(wiring)?;

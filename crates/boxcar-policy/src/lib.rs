@@ -14,7 +14,7 @@
 //! max_dns_qps = 20                # optional, 1 to 10000
 //!
 //! [fs]
-//! writable = ["/workspace/**"]    # the default when absent
+//! writable = ["/workspace/**", "/tmp/**"]  # the default when absent
 //! denied = ["/workspace/.env"]
 //! indicators = ["/var/log/**"]
 //!
@@ -42,13 +42,17 @@
 //!
 //! The path lists are globs of guest paths (`globset`, with
 //! `literal_separator`: `*` stays within a component, `**` crosses them),
-//! absolute: each starts with `/` or `**/`. `[fs] writable` is what a
-//! mutating operation must match, `/workspace/**` unless the file says;
+//! absolute: each starts with `/` or `**/` ([`boxcar_fs::rules::glob`]),
+//! and each covers what it names and all beneath it. `[fs] writable` is
+//! what a change must name: `/workspace/**` and `/tmp/**` unless the file
+//! says, so a file without it leaves the rest of the root share read-only;
 //! `denied` is what may not be looked up, opened or changed at all;
 //! `indicators` adds to the reconciler's `indicator_removal` paths;
-//! `[exec] deny` is the program files that may not be run. Task 5 of M5
-//! puts these, `[spans]` and `[record]` into force; until then
-//! [`PolicyFile::not_in_force`] names what a file sets of them.
+//! `[exec] deny` is the program files that may not be run, or opened at
+//! all.
+//! [`PolicyFile::path_spec`] is what the shares put in force
+//! ([`boxcar_fs::rules`]); `[spans] keep_tool_args` goes to the gate, and
+//! `[record] scrub_argv` is `boxcar run --scrub-argv`.
 //!
 //! [`profiles`] holds the built-in policies, by name.
 

@@ -63,6 +63,9 @@ pub struct InspectConfig {
     client: ClientConfig,
     provider: Arc<CryptoProvider>,
     declared: Option<DeclaredArgs>,
+    /// Whether `tool.open` keeps a call's arguments inline (a policy
+    /// file's `[spans] keep_tool_args`, true by default).
+    keep_tool_args: bool,
 }
 
 impl std::fmt::Debug for InspectConfig {
@@ -90,6 +93,7 @@ impl InspectConfig {
             client,
             provider,
             declared: None,
+            keep_tool_args: true,
         })
     }
 
@@ -102,6 +106,19 @@ impl InspectConfig {
 
     pub fn declared(&self) -> Option<&DeclaredArgs> {
         self.declared.as_ref()
+    }
+
+    /// Whether `tool.open` keeps a call's arguments (`args`, and the
+    /// summary made from them): a policy file's `[spans] keep_tool_args`.
+    /// Without them it keeps `args_b3`; the reconciler still compares the
+    /// arguments as sent, which `declared` holds in memory.
+    pub fn with_keep_tool_args(mut self, keep: bool) -> InspectConfig {
+        self.keep_tool_args = keep;
+        self
+    }
+
+    pub fn keep_tool_args(&self) -> bool {
+        self.keep_tool_args
     }
 
     /// The host's own trust store, with `extra` added: what the upstream

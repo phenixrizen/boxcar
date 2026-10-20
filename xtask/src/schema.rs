@@ -21,10 +21,10 @@ use anyhow::{Context, Result};
 use boxcar_proto::audit::{Payload, Record};
 use boxcar_proto::control::{
     self, to_line, AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, ErrorBody,
-    ErrorCode, Hello, NetPolicy, PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams,
-    PtyAttached, PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Ready, Request, Response,
-    SensorState, SensorStatus, SpanEntry, SpanList, SpanListParams, StateEvent, Status, StopMode,
-    StopParams, VmState, VsockPolicy,
+    ErrorCode, ExceptionGrant, ExceptionKind, ExceptionView, Hello, NetPolicy, PolicyUpdateParams,
+    PolicyUpdated, PolicyView, PtyAttachParams, PtyAttached, PtyDetached, PtyMode, PtyResizeParams,
+    PtyWatchParams, Ready, Request, Response, SensorState, SensorStatus, SpanEntry, SpanList,
+    SpanListParams, StateEvent, Status, StopMode, StopParams, VmState, VsockPolicy,
 };
 use boxcar_proto::guest::{GuestMsg, HostMsg, SessionConfig};
 use boxcar_proto::sensor::SensorFrame;
@@ -442,6 +442,7 @@ pub fn control_lines() -> Result<Vec<u8>> {
         "policy.inspect",
         "findings",
         "spans",
+        "policy.exception",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -551,6 +552,14 @@ pub fn control_lines() -> Result<Vec<u8>> {
             allow_ports: vec![5000],
         },
         version: 1,
+        exceptions: vec![ExceptionView {
+            id: 1,
+            rule: "/etc/**".to_owned(),
+            kind: ExceptionKind::Writable,
+            ttl_s: 600,
+            expires_ns: 1_760_000_600_000_000_000,
+            by_pid: 4242,
+        }],
     };
     line(&Response::success(6, serde_json::to_value(&view)?))?;
     line(&Request::new(
@@ -566,11 +575,28 @@ pub fn control_lines() -> Result<Vec<u8>> {
                 inspect: vec!["api.anthropic.com:443".to_owned()],
             }),
             vsock: None,
+            exception: None,
         })?,
     ))?;
     line(&Response::success(
         7,
         serde_json::to_value(PolicyUpdated { policy_version: 2 })?,
+    ))?;
+    line(&Request::new(
+        8,
+        "policy.update",
+        serde_json::to_value(PolicyUpdateParams {
+            exception: Some(ExceptionGrant {
+                rule: "pypi.org:443".to_owned(),
+                kind: ExceptionKind::Egress,
+                ttl_s: 600,
+            }),
+            ..PolicyUpdateParams::default()
+        })?,
+    ))?;
+    line(&Response::success(
+        8,
+        serde_json::to_value(PolicyUpdated { policy_version: 3 })?,
     ))?;
 
     // Every error code once.
@@ -701,6 +727,9 @@ mod tests {
             "PolicyView",
             "PolicyUpdateParams",
             "PolicyUpdated",
+            "ExceptionGrant",
+            "ExceptionView",
+            "ExceptionKind",
             "SpanListParams",
             "SpanList",
             "SpanEntry",

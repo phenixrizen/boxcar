@@ -37,6 +37,32 @@
 //! [`Generations`](crate::hasher)), so a close whose hash is still queued
 //! when another handle changes the file is `raced`.
 //!
+//! The session's path rules ([`crate::rules`], a policy file's `[fs]` and
+//! `[exec]` with the live exceptions on top) are checked before a request
+//! reaches the wrapped filesystem, by guest path and by host identity
+//! (what the boot scan found, [`crate::scan`]):
+//!
+//! - a request naming a denied path, or on an inode any of whose known
+//!   names, or whose identity, is denied, is refused with EACCES; a
+//!   `lookup`, `create` or `readdirplus` reply never hands the kernel a
+//!   denied inode, by any name (a `readdirplus` entry for one carries no
+//!   inode);
+//! - a change naming a path that is not writable, or on an inode not
+//!   writable by every known name, is refused with EROFS;
+//! - any open of a file one of whose names, or whose identity, an
+//!   `[exec] deny` glob names, and its rename or link, is refused with
+//!   EACCES, unless an exec exception matches the name;
+//! - `create`, `unlink`, `rmdir` and `rename` first read what the name is
+//!   now (beneath the share's root): a denied file, a directory holding
+//!   denied entries, or a refused program cannot be reached through
+//!   another name; a denied glob's literal prefix is never renamed;
+//! - while rules are in force, a request on a node id the path map does
+//!   not hold is refused: the guest kernel is not trusted to send only
+//!   the ids it was handed.
+//!
+//! Each refusal is one `fs.denied{reason: "policy", rule}` and nothing
+//! else. `opendir` passes on only the flags that read a directory.
+//!
 //! Once the audit log has failed (`Events::log_failed`), every method
 //! that changes the share (`create`, `write`, `unlink`, `rmdir`, `rename`,
 //! `mkdir`, `mknod`, `symlink`, `link`, `setattr`, `fallocate`,
@@ -45,22 +71,26 @@
 //! cannot record does not happen. Reads, lookups and releases are still
 //! served. A log closed cleanly, as the VM stops, refuses nothing.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
 use boxcar_proto::{
     Attrib, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod, FsMount,
     FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, HashStatus, Payload, SetAttr,
     Subject,
 };
-use fuse_backend_rs::abi::fuse_abi::{stat64, CreateIn, WRITE_CACHE};
+use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64, CreateIn, WRITE_CACHE};
 use fuse_backend_rs::api::filesystem::{
-    Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, SetattrValid, ZeroCopyReader,
-    ZeroCopyWriter,
+    Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
+    SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 
 use crate::events::{
@@ -70,6 +100,8 @@ use crate::forward::squash;
 use crate::handles::{HandleEntry, HandleTable};
 use crate::hasher::{hash_file, FileKey, Generations, HashFn, HashJob, HashWorker};
 use crate::path_map::{FileId, PathMap, PathText};
+use crate::rules::{guest_path, LiveRules, PathRules};
+use crate::scan::DeniedIds;
 use crate::share::FsShareConfig;
 
 /// `init` options the guest never gets. The write-back cache would let the
@@ -125,7 +157,64 @@ pub struct AuditFs<F: FileSystem<Inode = u64, Handle = u64>> {
     events: Arc<Events>,
     hasher: HashWorker,
     generations: Arc<Generations>,
+    /// The path rules in force, read once per request.
+    rules: LiveRules,
+    /// What the boot scan found denied, by host identity.
+    denied_ids: Arc<DeniedIds>,
 }
+
+/// A request the path rules refuse: its errno, and the glob that refused it
+/// (none for a change outside `writable`, or a path not known whole).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Refusal {
+    errno: i32,
+    rule: Option<String>,
+}
+
+impl Refusal {
+    /// EACCES, by `glob`: a denied path, a program not to be run.
+    fn by(glob: &str) -> Refusal {
+        Refusal {
+            errno: libc::EACCES,
+            rule: Some(glob.to_owned()),
+        }
+    }
+
+    /// EROFS: a change outside `writable`.
+    fn read_only() -> Refusal {
+        Refusal {
+            errno: libc::EROFS,
+            rule: None,
+        }
+    }
+
+    /// A node whose path is not known whole, under rules that would have
+    /// to read it: refused, EROFS for a change and EACCES otherwise.
+    fn unknown(change: bool) -> Refusal {
+        Refusal {
+            errno: if change { libc::EROFS } else { libc::EACCES },
+            rule: None,
+        }
+    }
+}
+
+/// Whether `name` is `.` or `..`, which a lookup may name.
+fn is_dot(name: &[u8]) -> bool {
+    name == b"." || name == b".."
+}
+
+/// What an existing entry is checked for, besides being denied.
+#[derive(Clone, Copy)]
+struct Existing {
+    /// A directory holding denied entries (a rename, an rmdir).
+    holding: bool,
+    /// A refused program (a rename, a create that would open it).
+    programs: bool,
+}
+
+/// The open flags that read a directory: what `opendir` passes on.
+const OPENDIR_FLAGS: u32 =
+    (libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOATIME | libc::O_LARGEFILE) as u32;
 
 impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
     /// Wraps `inner`, which serves `share`. `host_root_fd` is an open
@@ -169,7 +258,17 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
             events,
             hasher,
             generations: Arc::default(),
+            rules: Arc::new(ArcSwap::from_pointee(PathRules::allow_all())),
+            denied_ids: Arc::default(),
         }
+    }
+
+    /// Puts `rules` in force on this share, with `denied`, the host
+    /// identities the boot scan found denied in it ([`crate::scan`]).
+    pub fn with_rules(mut self, rules: LiveRules, denied: Arc<DeniedIds>) -> Self {
+        self.rules = rules;
+        self.denied_ids = denied;
+        self
     }
 
     /// Returns once every close queued for hashing has been recorded.
@@ -279,8 +378,211 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
             path_b64: path.path_b64,
             op: op.to_owned(),
             errno,
+            reason: None,
+            rule: None,
         });
         self.events.record(Some(subject(ctx)), payload);
+    }
+
+    /// Records `refusal` of `op` on `path` and returns its error. The
+    /// request never reached the wrapped filesystem.
+    fn refuse(&self, ctx: &Context, op: &str, path: PathText, refusal: Refusal) -> io::Error {
+        let payload = Payload::FsDenied(FsDenied {
+            mount: self.events.mount(),
+            path: path.path,
+            path_b64: path.path_b64,
+            op: op.to_owned(),
+            errno: refusal.errno,
+            reason: Some("policy".to_owned()),
+            rule: refusal.rule,
+        });
+        self.events.record(Some(subject(ctx)), payload);
+        io::Error::from_raw_os_error(refusal.errno)
+    }
+
+    /// The guest path of a share-relative path.
+    fn guest(&self, relative: &[u8]) -> Vec<u8> {
+        guest_path(&self.guest_path, relative)
+    }
+
+    /// A request naming `name` in `parent`: refused when the path is
+    /// denied, or, for a `change`, not writable.
+    fn check_name(
+        &self,
+        rules: &PathRules,
+        parent: u64,
+        name: &[u8],
+        change: bool,
+    ) -> Result<(), Refusal> {
+        if !rules.enforcing() {
+            return Ok(());
+        }
+        let Some(relative) = self.read_paths().rooted_child(parent, name) else {
+            return Err(Refusal::unknown(change));
+        };
+        let path = self.guest(&relative);
+        if let Some(glob) = rules.denied(&path) {
+            return Err(Refusal::by(glob));
+        }
+        if change && !rules.writable(&path) {
+            return Err(Refusal::read_only());
+        }
+        Ok(())
+    }
+
+    /// A request on `ino`: refused when any name the map knows for it, or
+    /// its identity, is denied; for `programs`, when one of its names or
+    /// its identity is a refused program no exec exception lifts; for a
+    /// `change`, when any name is not writable.
+    fn check_inode(
+        &self,
+        rules: &PathRules,
+        ino: u64,
+        change: bool,
+        programs: bool,
+    ) -> Result<(), Refusal> {
+        if !rules.enforcing() {
+            return Ok(());
+        }
+        let (known, id) = {
+            let paths = self.read_paths();
+            (paths.known_paths(ino), paths.host_id(ino))
+        };
+        let Some(known) = known else {
+            return Err(Refusal::unknown(change));
+        };
+        let paths: Vec<Vec<u8>> = known.iter().map(|relative| self.guest(relative)).collect();
+        for path in &paths {
+            if let Some(glob) = rules.denied(path) {
+                return Err(Refusal::by(glob));
+            }
+        }
+        if let Some(glob) = id.and_then(|id| self.denied_ids.denied(id)) {
+            return Err(Refusal::by(glob));
+        }
+        if programs {
+            for path in &paths {
+                if let Some(glob) = rules.exec_denied(path) {
+                    return Err(Refusal::by(glob));
+                }
+            }
+            if let Some(glob) = id.and_then(|id| self.denied_ids.exec(id)) {
+                if !paths.iter().any(|path| rules.exec_lifted(path)) {
+                    return Err(Refusal::by(glob));
+                }
+            }
+        }
+        if change && !paths.iter().all(|path| rules.writable(path)) {
+            return Err(Refusal::read_only());
+        }
+        Ok(())
+    }
+
+    /// A reply about to hand the kernel `entry`: refused when its host
+    /// identity is denied, or, for `.` and `..`, when its path is.
+    fn check_reply(&self, rules: &PathRules, entry: &Entry, dot: bool) -> Result<(), Refusal> {
+        if entry.inode == 0 {
+            return Ok(());
+        }
+        if let Some(glob) = self.denied_ids.denied(host_id(&entry.attr)) {
+            return Err(Refusal::by(glob));
+        }
+        if dot && rules.enforcing() {
+            if let Some(relative) = self.read_paths().rooted_path(entry.inode) {
+                if let Some(glob) = rules.denied(&self.guest(&relative)) {
+                    return Err(Refusal::by(glob));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What `name` in `parent` is now, read beneath the share's root with
+    /// no symlink followed: refused when it is denied by its identity, or
+    /// as `what` asks, a directory holding denied entries or a refused
+    /// program no exec exception lifts by this name. Nothing to read when
+    /// the scan found nothing.
+    fn check_existing(
+        &self,
+        rules: &PathRules,
+        parent: u64,
+        name: &[u8],
+        what: Existing,
+    ) -> Result<(), Refusal> {
+        if self.denied_ids.is_empty() {
+            return Ok(());
+        }
+        let Some(relative) = self.read_paths().rooted_child(parent, name) else {
+            return Err(Refusal::unknown(true));
+        };
+        let host = Path::new(&self.host_root).join(OsStr::from_bytes(&relative[1..]));
+        let Ok(meta) = std::fs::symlink_metadata(host) else {
+            // Nothing there yet.
+            return Ok(());
+        };
+        let id = FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        if let Some(glob) = self.denied_ids.denied(id) {
+            return Err(Refusal::by(glob));
+        }
+        if what.holding {
+            if let Some(glob) = self.denied_ids.holds(id) {
+                return Err(Refusal::by(glob));
+            }
+        }
+        if what.programs && !rules.exec_lifted(&self.guest(&relative)) {
+            if let Some(glob) = self.denied_ids.exec(id) {
+                return Err(Refusal::by(glob));
+            }
+        }
+        Ok(())
+    }
+
+    /// A rename's name `name` in `parent`, beyond the checks of any change:
+    /// refused when it is a denied glob's literal prefix or an ancestor of
+    /// one, or a refused program by its name.
+    fn check_moved(&self, rules: &PathRules, parent: u64, name: &[u8]) -> Result<(), Refusal> {
+        if !rules.enforcing() {
+            return Ok(());
+        }
+        let Some(relative) = self.read_paths().rooted_child(parent, name) else {
+            return Err(Refusal::unknown(true));
+        };
+        let path = self.guest(&relative);
+        if let Some(glob) = rules.holds_prefix(&path) {
+            return Err(Refusal::by(glob));
+        }
+        if let Some(glob) = rules.exec_denied(&path) {
+            return Err(Refusal::by(glob));
+        }
+        Ok(())
+    }
+
+    /// Whether anything is checked: rules in force, or what the scan found.
+    fn policing(&self) -> bool {
+        self.rules.load().enforcing() || !self.denied_ids.is_empty()
+    }
+
+    /// The node-id gate: while rules are in force, a request on an id the
+    /// map does not hold, or on one whose identity is denied, is refused.
+    fn gate(&self, ctx: &Context, op: &str, ino: u64) -> io::Result<()> {
+        if !self.policing() {
+            return Ok(());
+        }
+        let held = {
+            let paths = self.read_paths();
+            paths.contains(ino).then(|| paths.host_id(ino))
+        };
+        let refusal = match held {
+            None => Refusal::unknown(false),
+            Some(id) => match id.and_then(|id| self.denied_ids.denied(id)) {
+                Some(glob) => Refusal::by(glob),
+                None => return Ok(()),
+            },
+        };
+        Err(self.refuse(ctx, op, self.path(ino), refusal))
     }
 
     /// Tracks a handle an open or create returned. Without one (a
@@ -383,6 +685,20 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
 }
 
 /// The host identity in a reply's attributes.
+/// A `readdirplus` entry with node id 0: a name, and nothing of the file,
+/// its attributes included.
+fn bare_entry() -> Entry {
+    Entry {
+        inode: 0,
+        generation: 0,
+        // SAFETY: stat64 is plain data; all-zero is a valid value.
+        attr: unsafe { std::mem::zeroed() },
+        attr_flags: 0,
+        attr_timeout: Duration::ZERO,
+        entry_timeout: Duration::ZERO,
+    }
+}
+
 fn host_id(attr: &stat64) -> FileId {
     FileId {
         dev: attr.st_dev,
@@ -456,9 +772,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         lookup: audited,
         forget: audited,
         batch_forget: audited,
-        getattr: forward,
+        getattr: audited,
         setattr: audited,
-        readlink: forward,
+        readlink: audited,
         symlink: audited,
         mknod: audited,
         mkdir: audited,
@@ -474,12 +790,12 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         fsync: forward,
         fallocate: audited,
         release: audited,
-        statfs: forward,
+        statfs: audited,
         setxattr: audited,
-        getxattr: forward,
-        listxattr: forward,
+        getxattr: audited,
+        listxattr: audited,
         removexattr: audited,
-        opendir: forward,
+        opendir: audited,
         readdir: audited,
         readdirplus: audited,
         fsyncdir: forward,
@@ -520,7 +836,21 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn lookup(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+        let rules = self.rules.load();
+        let dot = is_dot(name.to_bytes());
+        if !dot {
+            if let Err(refusal) = self.check_name(&rules, parent, name.to_bytes(), false) {
+                return Err(self.refuse(ctx, "lookup", self.child(parent, name), refusal));
+            }
+        }
         let result = self.inner.lookup(&squash(ctx), parent, name);
+        if let Ok(entry) = &result {
+            if let Err(refusal) = self.check_reply(&rules, entry, dot) {
+                // The kernel never gets the inode: its lookup goes back.
+                self.inner.forget(&squash(ctx), entry.inode, 1);
+                return Err(self.refuse(ctx, "lookup", self.child(parent, name), refusal));
+            }
+        }
         match &result {
             Ok(entry) => self.remember(parent, name.to_bytes(), entry),
             Err(e) => {
@@ -532,6 +862,55 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
             }
         }
         result
+    }
+
+    fn getattr(
+        &self,
+        ctx: &Context,
+        inode: u64,
+        handle: Option<u64>,
+    ) -> io::Result<(stat64, Duration)> {
+        self.gate(ctx, "getattr", inode)?;
+        self.inner.getattr(&squash(ctx), inode, handle)
+    }
+
+    fn readlink(&self, ctx: &Context, inode: u64) -> io::Result<Vec<u8>> {
+        self.gate(ctx, "readlink", inode)?;
+        self.inner.readlink(&squash(ctx), inode)
+    }
+
+    fn statfs(&self, ctx: &Context, inode: u64) -> io::Result<statvfs64> {
+        self.gate(ctx, "statfs", inode)?;
+        self.inner.statfs(&squash(ctx), inode)
+    }
+
+    fn getxattr(
+        &self,
+        ctx: &Context,
+        inode: u64,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        self.gate(ctx, "getxattr", inode)?;
+        self.inner.getxattr(&squash(ctx), inode, name, size)
+    }
+
+    fn listxattr(&self, ctx: &Context, inode: u64, size: u32) -> io::Result<ListxattrReply> {
+        self.gate(ctx, "listxattr", inode)?;
+        self.inner.listxattr(&squash(ctx), inode, size)
+    }
+
+    fn opendir(
+        &self,
+        ctx: &Context,
+        inode: u64,
+        flags: u32,
+    ) -> io::Result<(Option<u64>, OpenOptions)> {
+        self.gate(ctx, "opendir", inode)?;
+        // Only what reads a directory: never O_TMPFILE or a write mode,
+        // which would make an unnamed host file no record names.
+        self.inner
+            .opendir(&squash(ctx), inode, flags & OPENDIR_FLAGS)
     }
 
     fn forget(&self, ctx: &Context, inode: u64, count: u64) {
@@ -559,6 +938,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<(stat64, Duration)> {
         self.refuse_if_log_failed()?;
         let path = self.path(inode);
+        if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
+            return Err(self.refuse(ctx, "setattr", path, refusal));
+        }
         let result = self.inner.setattr(&squash(ctx), inode, attr, handle, valid);
         if result.is_ok() && valid.contains(SetattrValid::SIZE) {
             self.content_changed(inode);
@@ -587,6 +969,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<Entry> {
         self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
+        if let Err(refusal) = self.check_name(&self.rules.load(), parent, name.to_bytes(), true) {
+            return Err(self.refuse(ctx, "symlink", path, refusal));
+        }
         let result = self.inner.symlink(&squash(ctx), linkname, parent, name);
         if let Ok(entry) = &result {
             self.remember(parent, name.to_bytes(), entry);
@@ -613,6 +998,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<Entry> {
         self.refuse_if_log_failed()?;
         let path = self.child(inode, name);
+        if let Err(refusal) = self.check_name(&self.rules.load(), inode, name.to_bytes(), true) {
+            return Err(self.refuse(ctx, "mknod", path, refusal));
+        }
         let result = self
             .inner
             .mknod(&squash(ctx), inode, name, mode, rdev, umask);
@@ -641,6 +1029,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<Entry> {
         self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
+        if let Err(refusal) = self.check_name(&self.rules.load(), parent, name.to_bytes(), true) {
+            return Err(self.refuse(ctx, "mkdir", path, refusal));
+        }
         let result = self.inner.mkdir(&squash(ctx), parent, name, mode, umask);
         if let Ok(entry) = &result {
             self.remember(parent, name.to_bytes(), entry);
@@ -659,6 +1050,17 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     fn unlink(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
+        let rules = self.rules.load();
+        let plain = Existing {
+            holding: false,
+            programs: false,
+        };
+        let checked = self
+            .check_name(&rules, parent, name.to_bytes(), true)
+            .and_then(|()| self.check_existing(&rules, parent, name.to_bytes(), plain));
+        if let Err(refusal) = checked {
+            return Err(self.refuse(ctx, "unlink", path, refusal));
+        }
         let result = self.inner.unlink(&squash(ctx), parent, name);
         if result.is_ok() {
             self.write_paths().mark_deleted(parent, name.to_bytes());
@@ -676,6 +1078,17 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     fn rmdir(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
+        let rules = self.rules.load();
+        let holding = Existing {
+            holding: true,
+            programs: false,
+        };
+        let checked = self
+            .check_name(&rules, parent, name.to_bytes(), true)
+            .and_then(|()| self.check_existing(&rules, parent, name.to_bytes(), holding));
+        if let Err(refusal) = checked {
+            return Err(self.refuse(ctx, "rmdir", path, refusal));
+        }
         let result = self.inner.rmdir(&squash(ctx), parent, name);
         if result.is_ok() {
             self.write_paths().mark_deleted(parent, name.to_bytes());
@@ -702,6 +1115,25 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         self.refuse_if_log_failed()?;
         let from = self.child(olddir, oldname);
         let to = self.child(newdir, newname);
+        let rules = self.rules.load();
+        let (old, new) = (oldname.to_bytes(), newname.to_bytes());
+        // Both names change, and with RENAME_EXCHANGE each is moved: a
+        // directory holding denied entries, a literal prefix and a refused
+        // program move neither way.
+        let both = Existing {
+            holding: true,
+            programs: true,
+        };
+        let checked = self
+            .check_name(&rules, olddir, old, true)
+            .and_then(|()| self.check_name(&rules, newdir, new, true))
+            .and_then(|()| self.check_moved(&rules, olddir, old))
+            .and_then(|()| self.check_moved(&rules, newdir, new))
+            .and_then(|()| self.check_existing(&rules, olddir, old, both))
+            .and_then(|()| self.check_existing(&rules, newdir, new, both));
+        if let Err(refusal) = checked {
+            return Err(self.refuse(ctx, "rename", from, refusal));
+        }
         let result = self
             .inner
             .rename(&squash(ctx), olddir, oldname, newdir, newname, flags);
@@ -729,6 +1161,16 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         self.refuse_if_log_failed()?;
         let target_path = self.path(inode).path;
         let path = self.child(newparent, newname);
+        let rules = self.rules.load();
+        // The new name, and the inode itself: a link changes its link
+        // count, so every name it has must be writable, and a refused
+        // program gets no new name.
+        let checked = self
+            .check_name(&rules, newparent, newname.to_bytes(), true)
+            .and_then(|()| self.check_inode(&rules, inode, true, true));
+        if let Err(refusal) = checked {
+            return Err(self.refuse(ctx, "link", path, refusal));
+        }
         let result = self.inner.link(&squash(ctx), inode, newparent, newname);
         if let Ok(entry) = &result {
             self.remember(newparent, newname.to_bytes(), entry);
@@ -752,10 +1194,17 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         fuse_flags: u32,
     ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
         let truncates = flags & libc::O_TRUNC as u32 != 0;
-        if opens_for_writing(flags) || truncates {
+        let changes = opens_for_writing(flags) || truncates;
+        if changes {
             self.refuse_if_log_failed()?;
         }
         let path = self.path(inode);
+        // Any open of a refused program: to run it, or to read it for a
+        // loader or a copy.
+        if let Err(refusal) = self.check_inode(&self.rules.load(), inode, changes, true) {
+            let op = if is_exec(flags) { "exec" } else { "open" };
+            return Err(self.refuse(ctx, op, path, refusal));
+        }
         let result = self.inner.open(&squash(ctx), inode, flags, fuse_flags);
         let fh = match &result {
             Ok((handle, _, _)) => handle.unwrap_or(0),
@@ -802,7 +1251,39 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
         self.refuse_if_log_failed()?;
         let path = self.child(parent, name);
+        let rules = self.rules.load();
+        // An existing file is opened, and may be truncated, before any reply
+        // could be checked: what the name is now is read first.
+        let opens = Existing {
+            holding: false,
+            programs: true,
+        };
+        let checked = self
+            .check_name(&rules, parent, name.to_bytes(), true)
+            .and_then(|()| self.check_existing(&rules, parent, name.to_bytes(), opens));
+        if let Err(refusal) = checked {
+            return Err(self.refuse(ctx, "create", path, refusal));
+        }
         let result = self.inner.create(&squash(ctx), parent, name, args);
+        if let Ok((entry, handle, _, _)) = &result {
+            // Creating an existing file opens it: under another name it may
+            // be one the scan found denied.
+            if let Err(refusal) = self.check_reply(&rules, entry, false) {
+                if let Some(handle) = handle {
+                    let _ = self.inner.release(
+                        &squash(ctx),
+                        entry.inode,
+                        args.flags,
+                        *handle,
+                        false,
+                        false,
+                        None,
+                    );
+                }
+                self.inner.forget(&squash(ctx), entry.inode, 1);
+                return Err(self.refuse(ctx, "create", path, refusal));
+            }
+        }
         let fh = match &result {
             Ok((_, handle, _, _)) => handle.unwrap_or(0),
             Err(_) => 0,
@@ -901,6 +1382,11 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         fuse_flags: u32,
     ) -> io::Result<usize> {
         self.refuse_if_log_failed()?;
+        // Checked at every write, not only at the open: a handle opened
+        // under a writable exception stops writing when it expires.
+        if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
+            return Err(self.refuse(ctx, "write", self.path(inode), refusal));
+        }
         let result = self.inner.write(
             &squash(ctx),
             inode,
@@ -958,6 +1444,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<()> {
         self.refuse_if_log_failed()?;
         let path = self.path(inode);
+        if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
+            return Err(self.refuse(ctx, "fallocate", path, refusal));
+        }
         let result = self
             .inner
             .fallocate(&squash(ctx), inode, handle, mode, offset, length);
@@ -1017,6 +1506,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<()> {
         self.refuse_if_log_failed()?;
         let path = self.path(inode);
+        if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
+            return Err(self.refuse(ctx, "setxattr", path, refusal));
+        }
         let result = self.inner.setxattr(&squash(ctx), inode, name, value, flags);
         let payload = Payload::FsXattr(FsXattr {
             mount: self.events.mount(),
@@ -1033,6 +1525,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     fn removexattr(&self, ctx: &Context, inode: u64, name: &CStr) -> io::Result<()> {
         self.refuse_if_log_failed()?;
         let path = self.path(inode);
+        if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
+            return Err(self.refuse(ctx, "removexattr", path, refusal));
+        }
         let result = self.inner.removexattr(&squash(ctx), inode, name);
         let payload = Payload::FsXattr(FsXattr {
             mount: self.events.mount(),
@@ -1075,7 +1570,12 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     ) -> io::Result<()> {
         // The kernel counts a lookup for every entry that makes it into the
         // reply, except `.` and `..`, and forgets them later like any other.
+        // An entry the path rules deny, by its path or its identity, goes in
+        // with node id 0, a name without attributes, as `readdir` gives it:
+        // the kernel never gets its inode, and its lookup goes back here.
+        let rules = self.rules.load();
         let mut returned: Vec<(Box<[u8]>, Entry)> = Vec::new();
+        let mut withheld: Vec<u64> = Vec::new();
         let result = self.inner.readdirplus(
             &squash(ctx),
             inode,
@@ -1083,14 +1583,29 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
             size,
             offset,
             &mut |dirent, entry| {
+                let dot = is_dot(dirent.name);
+                let hide = !dot
+                    && entry.inode != 0
+                    && (self.check_name(&rules, inode, dirent.name, false).is_err()
+                        || self.check_reply(&rules, &entry, false).is_err());
+                if hide {
+                    let added = add_entry(dirent, bare_entry())?;
+                    if added > 0 {
+                        withheld.push(entry.inode);
+                    }
+                    return Ok(added);
+                }
                 let added = add_entry(dirent, entry)?;
                 // 0: the reply is full and the entry was not added.
-                if added > 0 && dirent.name != b"." && dirent.name != b".." {
+                if added > 0 && !dot {
                     returned.push((dirent.name.into(), entry));
                 }
                 Ok(added)
             },
         );
+        for withheld in withheld {
+            self.inner.forget(&squash(ctx), withheld, 1);
+        }
         // An error reply carries no entries.
         if result.is_ok() && !returned.is_empty() {
             let mut paths = self.write_paths();
@@ -1106,6 +1621,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     }
 
     fn access(&self, ctx: &Context, inode: u64, mask: u32) -> io::Result<()> {
+        self.gate(ctx, "access", inode)?;
         let result = self.inner.access(&squash(ctx), inode, mask);
         if let Err(e) = &result {
             if errno(e) == libc::EACCES {

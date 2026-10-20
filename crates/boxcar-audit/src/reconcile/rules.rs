@@ -451,18 +451,31 @@ pub fn observe(
         // Ring 0: the filesystem.
         Payload::FsDenied(denied) => {
             state.last_effect_ts = Some(ts);
-            out.push(policy_denial(
-                state,
-                record.seq,
-                format!(
+            let summary = match (denied.reason.as_deref(), denied.rule.as_deref()) {
+                (Some("policy"), Some(rule)) if denied.op == "exec" => format!(
+                    "exec of {} was refused by the policy ([exec] deny {rule})",
+                    denied.path
+                ),
+                (Some("policy"), Some(rule)) => format!(
+                    "{} of {} was refused by the policy ([fs] denied {rule})",
+                    denied.op, denied.path
+                ),
+                (Some("policy"), None) => format!(
+                    "{} of {} was refused by the policy (outside [fs] writable)",
+                    denied.op, denied.path
+                ),
+                _ => format!(
                     "{} of {} was refused ({})",
                     denied.op, denied.path, denied.errno
                 ),
-            ));
+            };
+            out.push(policy_denial(state, record.seq, summary));
         }
         Payload::FsUnlink(op) if op.result.ok => {
             state.last_effect_ts = Some(ts);
-            out.extend(indicator_removal(state, cfg, record, &op.path, "removed"));
+            out.extend(indicator_removal(
+                state, cfg, record, &op.mount, &op.path, "removed",
+            ));
             out.extend(effect(state, cfg, record, &op.path));
             spans.effect(
                 state,
@@ -476,6 +489,7 @@ pub fn observe(
                 state,
                 cfg,
                 record,
+                &rename.mount,
                 &rename.from,
                 "renamed away",
             ));
@@ -499,6 +513,7 @@ pub fn observe(
                     state,
                     cfg,
                     record,
+                    &setattr.mount,
                     &setattr.path,
                     "truncated",
                 ));
@@ -758,13 +773,22 @@ fn policy_denial(state: &State, seq: u64, what: String) -> Finding {
 
 fn indicator_removal(
     state: &State,
-    _cfg: &ReconcileConfig,
+    cfg: &ReconcileConfig,
     record: &Record,
+    mount: &str,
     path: &str,
     how: &str,
 ) -> Vec<Finding> {
-    let Some(indicator) = indicator(path) else {
-        return Vec::new();
+    let what = match indicator(path) {
+        Some(indicator) => indicator.describe().to_owned(),
+        None => match cfg
+            .indicators
+            .as_ref()
+            .and_then(|watched| watched.matching(mount, path))
+        {
+            Some(glob) => format!("a path the policy watches ([fs] indicators {glob})"),
+            None => return Vec::new(),
+        },
     };
     let who = match record.subject {
         Some(subject) => describe_tid(state, subject.pid, record.ts_host_ns),
@@ -774,7 +798,7 @@ fn indicator_removal(
         FindingCategory::IndicatorRemoval,
         90,
         "indicator_removal",
-        format!("{who} {how} {path}, {}", indicator.describe()),
+        format!("{who} {how} {path}, {what}"),
     )
     .evidence(match record.subject {
         Some(subject) => evidence_for_tid(state, subject.pid, record.ts_host_ns, record.seq),

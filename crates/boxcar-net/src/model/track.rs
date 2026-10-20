@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use super::{
     anthropic, openai_chat, openai_responses, Provider, RequestInfo, ResponseInfo, ToolClose,
-    ToolOpen,
+    ToolOpen, ARGS_NOT_KEPT,
 };
 use crate::gate::exchange::{Emit, Exchange};
 use crate::gate::Direction;
@@ -101,6 +101,8 @@ pub struct Tracker {
     streams: HashMap<u32, Tracked>,
     /// Where the calls' arguments as sent go, for the reconciler.
     declared: Option<DeclaredArgs>,
+    /// Whether `tool.open` keeps the arguments, inline and summarized.
+    keep_args: bool,
     /// The observer's retained-byte budget, which streams draw on.
     retained: Retained,
 }
@@ -114,6 +116,7 @@ impl Tracker {
             trace_id,
             streams: HashMap::new(),
             declared: None,
+            keep_args: true,
             retained: Retained::default(),
         }
     }
@@ -439,6 +442,15 @@ impl Tracker {
         self
     }
 
+    /// Whether `tool.open` keeps a call's arguments: `false` (a policy
+    /// file's `[spans] keep_tool_args = false`) records `args_b3` alone,
+    /// with no `args` and [`ARGS_NOT_KEPT`] for the summary, which is made
+    /// from them. The reconciler's copy is kept either way.
+    pub fn with_keep_args(mut self, keep: bool) -> Tracker {
+        self.keep_args = keep;
+        self
+    }
+
     /// Streams draw on the observer's `retained` budget.
     pub fn with_retained(mut self, retained: Retained) -> Tracker {
         self.retained = retained;
@@ -450,6 +462,11 @@ impl Tracker {
             declared.put(&open.tool_use_id, raw, len);
         }
         let span = self.span(&open.tool_use_id);
+        let (args_summary, args) = if self.keep_args {
+            (open.args_summary, open.args)
+        } else {
+            (ARGS_NOT_KEPT.to_owned(), None)
+        };
         Emit::in_span(
             Payload::ToolOpen(ToolOpenPayload {
                 flow: self.flow,
@@ -457,8 +474,8 @@ impl Tracker {
                 tool_use_id: open.tool_use_id,
                 tool_name: open.tool_name,
                 args_b3: open.args_b3,
-                args_summary: open.args_summary,
-                args: open.args,
+                args_summary,
+                args,
             }),
             span,
         )
@@ -612,11 +629,20 @@ mod tests {
     }
 
     /// A tool call's arguments go to the reconciler's store as sent, while
-    /// the record keeps them scrubbed.
+    /// the record keeps them scrubbed; with `keep_tool_args = false` the
+    /// record keeps only their hash, and the store still gets them.
     #[test]
     fn a_calls_arguments_are_kept_as_sent_for_the_reconciler() {
+        for keep in [true, false] {
+            calls_arguments_kept(keep);
+        }
+    }
+
+    fn calls_arguments_kept(keep: bool) {
         let declared = boxcar_audit::DeclaredArgs::new();
-        let mut obs = observation().with_declared(Some(declared.clone()));
+        let mut obs = observation()
+            .with_declared(Some(declared.clone()))
+            .with_keep_args(keep);
         let mut out = Vec::new();
         let t0 = Instant::now();
         let request =
@@ -653,7 +679,14 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(!open.args.unwrap().to_string().contains("k-sent-1"));
+        assert!(open.args_b3.is_some());
+        if keep {
+            assert!(!open.args.unwrap().to_string().contains("k-sent-1"));
+            assert_ne!(open.args_summary, super::ARGS_NOT_KEPT);
+        } else {
+            assert_eq!(open.args, None);
+            assert_eq!(open.args_summary, super::ARGS_NOT_KEPT);
+        }
         assert_eq!(
             declared.take("toolu_k"),
             Some(boxcar_audit::Declared::Json(

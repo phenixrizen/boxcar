@@ -18,10 +18,10 @@ use std::{env, fs, io};
 use anyhow::{bail, Context};
 use arc_swap::ArcSwap;
 use boxcar_audit::{
-    AuditSink, DeclaredArgs, RawArgv, ReconcileConfig, Reconciler, SpanIndex, SystemClock,
-    WriterConfig, WriterHandle,
+    AuditSink, DeclaredArgs, PolicyIndicators, RawArgv, ReconcileConfig, Reconciler, SpanIndex,
+    SystemClock, WriterConfig, WriterHandle,
 };
-use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig};
+use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig, PathSpec};
 use boxcar_net::{DumpDir, InspectConfig, List, NetConfig, Policy, SessionCa};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
@@ -113,7 +113,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         net: policy,
         max_dns_qps,
         record: policy_loaded,
-        mut not_in_force,
+        settings,
     } = match load_policy(&args)? {
         Ok(loaded) => loaded,
         Err(message) => {
@@ -121,16 +121,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(USAGE_EXIT));
         }
     };
-    // `--scrub-argv` puts `[record] scrub_argv` into force itself.
-    not_in_force.retain(|setting| !(args.scrub_argv && *setting == "[record] scrub_argv"));
-    if !not_in_force.is_empty() {
-        eprintln!(
-            "warning: --policy {}: this build does not enforce {} yet, only the policy's \
-             [egress] and DNS rate; the rest is recorded in policy.loaded",
-            policy_loaded.name.as_deref().unwrap_or_default(),
-            not_in_force.join(", ")
-        );
-    }
     let ready = args.ready_fd.map(ReadyFd::take).transpose()?;
     let rootfs = args
         .rootfs
@@ -206,16 +196,26 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // The model calls' arguments as sent: the gate puts them, the
     // reconciler compares what ran with them. In memory only.
     let declared = DeclaredArgs::new();
-    // With --scrub-argv, the argvs the log records scrubbed, as run: the
-    // sensor's ingest puts them, the reconciler takes them. In memory only.
-    let raw_argv = args.scrub_argv.then(RawArgv::new);
+    // With --scrub-argv, or a policy file's `[record] scrub_argv`, the
+    // argvs the log records scrubbed, as run: the sensor's ingest puts
+    // them, the reconciler takes them. In memory only.
+    let raw_argv = (args.scrub_argv || settings.scrub_argv).then(RawArgv::new);
+    let indicators = if settings.indicators.is_empty() {
+        None
+    } else {
+        Some(
+            PolicyIndicators::new(&settings.indicators)
+                .map_err(|error| anyhow::anyhow!("--policy: [fs] indicators: {error}"))?,
+        )
+    };
     // A session that inspects has a CA, whose key stays in this process,
     // and a trust store for the real hosts: the host's own.
     let inspect = match session_ca(&policy, &session_id)? {
         Some(ca) => Some(Arc::new(
             InspectConfig::new(ca, InspectConfig::host_roots(&test_upstream_roots()))
                 .context("cannot set up the gate")?
-                .with_declared(declared.clone()),
+                .with_declared(declared.clone())
+                .with_keep_tool_args(settings.keep_tool_args),
         )),
         None => None,
     };
@@ -370,6 +370,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         scrub_argv: raw_argv.clone(),
         image: image_ref,
         policy_loaded: Some(policy_loaded),
+        path_rules: settings.paths,
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -390,6 +391,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             spans: Some(spans),
             declared: Some(declared),
             raw_argv,
+            indicators,
         },
     )
     .context("cannot start the reconciler")?;
@@ -595,8 +597,33 @@ struct Loaded {
     max_dns_qps: Option<u32>,
     /// What `policy.loaded` records of it.
     record: PolicyLoaded,
-    /// What a policy file sets that this build does not enforce yet.
-    not_in_force: Vec<&'static str>,
+    /// What a policy file sets besides its egress.
+    settings: Settings,
+}
+
+/// A policy file's `[fs]`, `[exec]`, `[spans]` and `[record]`, as the
+/// session puts them in force; a line policy has none of them.
+struct Settings {
+    /// The shares' path rules; `None` checks nothing.
+    paths: Option<PathSpec>,
+    /// `[fs] indicators`, for the reconciler.
+    indicators: Vec<String>,
+    /// `[spans] keep_tool_args`.
+    keep_tool_args: bool,
+    /// `[record] scrub_argv`, as `--scrub-argv`.
+    scrub_argv: bool,
+}
+
+impl Settings {
+    /// A line policy's: no path rules, the defaults.
+    fn none() -> Settings {
+        Settings {
+            paths: None,
+            indicators: Vec::new(),
+            keep_tool_args: true,
+            scrub_argv: false,
+        }
+    }
 }
 
 /// The policy of `--policy` (a profile or a policy file) or `--policy-file`
@@ -633,7 +660,7 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
             net,
             max_dns_qps: None,
             record,
-            not_in_force: Vec::new(),
+            settings: Settings::none(),
         }));
     };
     // A profile's name is the profile; anything else is a path.
@@ -667,7 +694,12 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
         net,
         max_dns_qps: file.egress.max_dns_qps,
         record,
-        not_in_force: file.not_in_force(),
+        settings: Settings {
+            paths: Some(file.path_spec()),
+            indicators: file.fs.indicators.clone(),
+            keep_tool_args: file.spans.keep_tool_args,
+            scrub_argv: file.record.scrub_argv,
+        },
     }))
 }
 
@@ -1679,7 +1711,12 @@ mod tests {
             }
         );
         assert_eq!(profile.max_dns_qps, Some(20));
-        assert!(profile.not_in_force.is_empty());
+        let paths = profile.settings.paths.as_ref().unwrap();
+        assert_eq!(paths.writable, ["/**"]);
+        assert!(paths.denied.is_empty() && paths.exec_deny.is_empty());
+        assert_eq!(profile.settings.indicators.len(), 4);
+        assert!(profile.settings.keep_tool_args);
+        assert!(!profile.settings.scrub_argv);
         assert_eq!(profile.net.rules.last().unwrap().text, "allow x.test");
         assert_eq!(profile.net.inspect.len(), 5);
 
@@ -1695,12 +1732,26 @@ mod tests {
                 name: Some(path.display().to_string()),
                 sha256: Some(sha256_hex(text)),
                 egress_rules: 1,
-                fs_rules: 1,
+                // The default writable's two globs.
+                fs_rules: 2,
                 exec_rules: 1,
             }
         );
         assert_eq!(file.max_dns_qps, None);
-        assert_eq!(file.not_in_force, ["[fs] writable", "[exec] deny"]);
+        let paths = file.settings.paths.as_ref().unwrap();
+        assert_eq!(paths.writable, ["/workspace/**", "/tmp/**"]);
+        assert_eq!(paths.exec_deny, ["**/nc"]);
+        assert!(file.settings.keep_tool_args && !file.settings.scrub_argv);
+
+        // `[spans]` and `[record]` reach the session as the flags would.
+        let settings = dir.path().join("s.toml");
+        let text = "version = 1\n[fs]\nindicators = [\"/opt/audit/**\"]\n\
+                    [spans]\nkeep_tool_args = false\n[record]\nscrub_argv = true\n";
+        fs::write(&settings, text).unwrap();
+        let set = loaded(&["--policy", settings.to_str().unwrap()]).settings;
+        assert!(!set.keep_tool_args);
+        assert!(set.scrub_argv);
+        assert_eq!(set.indicators, ["/opt/audit/**"]);
 
         let lines = dir.path().join("team.policy");
         let text = "allow a.test\ninspect a.test:443\n";
@@ -1718,6 +1769,10 @@ mod tests {
             }
         );
         assert_eq!(flags.max_dns_qps, None);
+        assert!(
+            flags.settings.paths.is_none(),
+            "a line policy checks no paths"
+        );
 
         let none = loaded(&[]);
         assert_eq!(

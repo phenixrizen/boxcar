@@ -142,12 +142,11 @@ use boxcar_proto::control::{
     PtyDetached, PtyMode, PtyResizeParams, PtyWatchParams, Request, SpanList, SpanListParams,
     Status, StopMode, StopParams, PTY_SESSION,
 };
-use boxcar_proto::{Payload, PolicyChanged};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use super::audit::{self, AuditSubs, Limits};
-use super::conn::{record, Conn};
+use super::conn::Conn;
 use crate::guest_ctl::SendError;
 use crate::lifecycle::{StopReason, VmmHandle, GRACEFUL_STOP_MARGIN};
 use crate::policy::UpdateError;
@@ -354,6 +353,7 @@ impl Ops for VmmOps {
             "policy.inspect".to_owned(),
             "findings".to_owned(),
             "spans".to_owned(),
+            "policy.exception".to_owned(),
         ]
     }
 }
@@ -467,27 +467,31 @@ impl VmmOps {
             .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
     }
 
-    /// `policy.update`: checked and swapped by [`crate::policy::LivePolicy`],
-    /// then recorded as `policy.changed`, attributed to the client.
+    /// `policy.update`: checked, swapped or granted, and recorded
+    /// (`policy.changed`, or `policy.exception` for a grant, attributed to
+    /// the client) by [`crate::policy::LivePolicy`], under its lock.
     fn policy_update(&self, conn: &ConnCtx, req: &Request) -> Result<Value, ErrorBody> {
         let params: PolicyUpdateParams = params(req)?;
         params
             .check()
             .map_err(|message| ErrorBody::new(ErrorCode::BadRequest, message))?;
-        let version = self.handle.policy().update(&params).map_err(|error| {
-            let code = match error {
-                UpdateError::Rule { .. } => ErrorCode::BadRequest,
-                UpdateError::NoNetDevice | UpdateError::NoVsockDevice => ErrorCode::InvalidState,
-            };
-            ErrorBody::new(code, error.to_string())
-        })?;
-        record(
-            self.handle.audit(),
-            Payload::PolicyChanged(PolicyChanged {
-                by_pid: conn.peer_pid,
-                version,
-            }),
-        );
+        let version = self
+            .handle
+            .policy()
+            .update(&params, conn.peer_pid)
+            .map_err(|error| {
+                let code = match error {
+                    UpdateError::Rule { .. } | UpdateError::Exception { .. } => {
+                        ErrorCode::BadRequest
+                    }
+                    UpdateError::NoNetDevice
+                    | UpdateError::NoVsockDevice
+                    | UpdateError::NoShares
+                    | UpdateError::NoPathRules => ErrorCode::InvalidState,
+                    UpdateError::TooManyExceptions => ErrorCode::Busy,
+                };
+                ErrorBody::new(code, error.to_string())
+            })?;
         serde_json::to_value(PolicyUpdated {
             policy_version: version,
         })
@@ -546,7 +550,8 @@ mod tests {
                 "policy.net",
                 "policy.inspect",
                 "findings",
-                "spans"
+                "spans",
+                "policy.exception"
             ]
         );
 
@@ -678,7 +683,8 @@ mod tests {
                 "policy.net",
                 "policy.inspect",
                 "findings",
-                "spans"
+                "spans",
+                "policy.exception"
             ])
         );
         let response = wire.request_then("pty.attach", attach("rw", 100), b"early ");
@@ -1011,7 +1017,8 @@ mod tests {
                 "policy.net",
                 "policy.inspect",
                 "findings",
-                "spans"
+                "spans",
+                "policy.exception"
             ])
         );
 
@@ -1270,7 +1277,8 @@ mod tests {
                 "policy.net",
                 "policy.inspect",
                 "findings",
-                "spans"
+                "spans",
+                "policy.exception"
             ])
         );
         let before = wire.request("policy.get", Value::Null);

@@ -4,8 +4,6 @@
 //! A policy file as read and checked: the compiled egress, the path and
 //! program globs as written, and the two settings.
 
-use crate::profiles::RECONCILER_INDICATORS;
-
 /// A policy file, read and checked (see [`crate::parse`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyFile {
@@ -31,8 +29,8 @@ pub struct Egress {
 /// `[fs]`: globs of guest paths, as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsRules {
-    /// What a mutating operation must match: `/workspace/**` when the file
-    /// gives no `writable`.
+    /// What a mutating operation must match: `/workspace/**` and `/tmp/**`
+    /// when the file gives no `writable`.
     pub writable: Vec<String>,
     /// What may not be looked up, opened or changed.
     pub denied: Vec<String>,
@@ -74,37 +72,13 @@ impl PolicyFile {
         self.exec.deny.len()
     }
 
-    /// What the file sets that this build does not put into force yet, by
-    /// its section and key: writes kept from anything but the whole tree,
-    /// denied paths, indicators beyond the reconciler's own, denied
-    /// programs, `keep_tool_args = false`, `scrub_argv = true`. Empty for a
-    /// file whose only effect is its egress, such as `agent-isolate`. M5's
-    /// Task 5 enforces them, and this goes.
-    pub fn not_in_force(&self) -> Vec<&'static str> {
-        let mut pending = Vec::new();
-        if !self.fs.writable.iter().any(|glob| glob == "/**") {
-            pending.push("[fs] writable");
+    /// The path rules the shares put in force: `[fs] writable` and
+    /// `denied`, and `[exec] deny`.
+    pub fn path_spec(&self) -> boxcar_fs::PathSpec {
+        boxcar_fs::PathSpec {
+            writable: self.fs.writable.clone(),
+            denied: self.fs.denied.clone(),
+            exec_deny: self.exec.deny.clone(),
         }
-        if !self.fs.denied.is_empty() {
-            pending.push("[fs] denied");
-        }
-        if self
-            .fs
-            .indicators
-            .iter()
-            .any(|glob| !RECONCILER_INDICATORS.contains(&glob.as_str()))
-        {
-            pending.push("[fs] indicators");
-        }
-        if !self.exec.deny.is_empty() {
-            pending.push("[exec] deny");
-        }
-        if !self.spans.keep_tool_args {
-            pending.push("[spans] keep_tool_args");
-        }
-        if self.record.scrub_argv {
-            pending.push("[record] scrub_argv");
-        }
-        pending
     }
 }

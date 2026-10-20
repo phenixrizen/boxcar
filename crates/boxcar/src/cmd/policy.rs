@@ -11,17 +11,33 @@
 //! parsed here first, as `boxcar run --allow` parses it, so a rule that
 //! does not parse is a usage error (exit 2) before any connection is made.
 //! The vsock allowlist is read by `show` and left as it is by the others.
+//!
+//! `allow ... --ttl DURATION` grants a live exception (`policy.update` with
+//! `exception`, alone) instead of changing the permanent policy, and
+//! `exception ls` lists the live ones; both need a server whose hello lists
+//! `policy.exception`. `show` lists the exceptions after the permanent
+//! policy.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{anyhow, Context};
 use boxcar_net::{List, Policy, Verdict};
-use boxcar_proto::control::{PolicyUpdateParams, PolicyUpdated, PolicyView};
+use boxcar_proto::control::{
+    ExceptionGrant, ExceptionKind, PolicyUpdateParams, PolicyUpdated, PolicyView,
+};
 use serde_json::Value;
 
-use crate::cli::{PolicyCommand, PolicyProfileArgs, PolicyRuleArgs, PolicyShowArgs, SessionArgs};
+use crate::cli::{
+    ExceptionCommand, PolicyAllowArgs, PolicyCommand, PolicyProfileArgs, PolicyShowArgs,
+    SessionArgs,
+};
 use crate::client::{self, Client};
+
+/// The capability a server's hello lists when it takes exceptions.
+const EXCEPTIONS: &str = "policy.exception";
 
 /// The exit code of a rule that does not parse, as clap's usage errors and
 /// `boxcar run`'s.
@@ -30,9 +46,10 @@ const USAGE_EXIT: u8 = 2;
 pub fn run(command: PolicyCommand) -> anyhow::Result<ExitCode> {
     match command {
         PolicyCommand::Show(args) => show(&args),
-        PolicyCommand::Allow(args) => change(&args, Verdict::Allow),
-        PolicyCommand::Deny(args) => change(&args, Verdict::Deny),
+        PolicyCommand::Allow(args) => allow(&args),
+        PolicyCommand::Deny(args) => change(&args.rule, &args.session, Verdict::Deny),
         PolicyCommand::Profile(args) => profile(&args),
+        PolicyCommand::Exception(ExceptionCommand::Ls(args)) => exceptions(&args),
     }
 }
 
@@ -75,33 +92,143 @@ fn show(args: &PolicyShowArgs) -> anyhow::Result<ExitCode> {
     if args.json {
         writeln!(out, "{result}")?;
     } else {
-        out.write_all(table(&view).as_bytes())?;
+        out.write_all(table(&view, now_ns()).as_bytes())?;
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// Adds `args.rule` to the `verdict` list of the session's network policy
-/// and sends the policy back, unless it is there already.
-fn change(args: &PolicyRuleArgs, verdict: Verdict) -> anyhow::Result<ExitCode> {
+/// `allow`: a permanent allow rule, or with `--ttl` a live exception.
+fn allow(args: &PolicyAllowArgs) -> anyhow::Result<ExitCode> {
+    let Some(ttl_s) = args.ttl else {
+        // clap requires RULE without --writable and --exec, which need --ttl.
+        let rule = args.rule.as_deref().unwrap_or_default();
+        return change(rule, &args.session, Verdict::Allow);
+    };
+    let (kind, rule) = match (&args.writable, &args.exec, &args.rule) {
+        (Some(glob), _, _) => (ExceptionKind::Writable, glob),
+        (_, Some(glob), _) => (ExceptionKind::Exec, glob),
+        (_, _, Some(rule)) => (ExceptionKind::Egress, rule),
+        (None, None, None) => unreachable!("clap requires one"),
+    };
+    // Checked as the VMM will check it, before any connection is made.
+    let checked = match kind {
+        ExceptionKind::Egress => Policy::default()
+            .add(List::Allow, rule)
+            .map_err(|kind| kind.to_string()),
+        ExceptionKind::Writable | ExceptionKind::Exec => boxcar_fs::rules::glob(rule)
+            .map(drop)
+            .map_err(|error| error.to_string()),
+    };
+    if let Err(problem) = checked {
+        crate::cmd::tell(&format!(
+            "error: policy allow --{} {rule:?}: {problem}",
+            match kind {
+                ExceptionKind::Egress => "ttl",
+                ExceptionKind::Writable => "writable",
+                ExceptionKind::Exec => "exec",
+            }
+        ));
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let mut client = connect(&args.session)?;
+    if !client.can(EXCEPTIONS) {
+        crate::cmd::tell(&format!(
+            "error: this session's VMM grants no exceptions (its hello lists no {EXCEPTIONS})"
+        ));
+        return Ok(ExitCode::FAILURE);
+    }
+    let params = PolicyUpdateParams {
+        exception: Some(ExceptionGrant {
+            rule: rule.clone(),
+            kind,
+            ttl_s,
+        }),
+        ..PolicyUpdateParams::default()
+    };
+    let result = client
+        .request("policy.update", serde_json::to_value(&params)?)?
+        .map_err(|error| anyhow!("policy.update: {error}"))?;
+    let updated: PolicyUpdated =
+        serde_json::from_value(result).context("the server sent a malformed result")?;
+    println!(
+        "policy version {} ({} exception {rule} for {ttl_s} s)",
+        updated.policy_version,
+        kind.as_str()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `exception ls`: the live exceptions, as a table or as the JSON list.
+fn exceptions(args: &PolicyShowArgs) -> anyhow::Result<ExitCode> {
+    let mut client = connect(&args.session)?;
+    if !client.can(EXCEPTIONS) {
+        crate::cmd::tell(&format!(
+            "error: this session's VMM has no exceptions (its hello lists no {EXCEPTIONS})"
+        ));
+        return Ok(ExitCode::FAILURE);
+    }
+    let (view, _) = get(&mut client)?;
+    let mut out = io::stdout().lock();
+    if args.json {
+        writeln!(out, "{}", serde_json::to_string(&view.exceptions)?)?;
+    } else {
+        out.write_all(exception_table(&view, now_ns()).as_bytes())?;
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The realtime clock, as `expires_ns` is.
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
+/// The live exceptions, one a line: id, kind, rule, seconds left at
+/// `now_ns`; `(none)` without any.
+fn exception_table(view: &PolicyView, now_ns: u64) -> String {
+    if view.exceptions.is_empty() {
+        return "(none)\n".to_owned();
+    }
+    view.exceptions
+        .iter()
+        .map(|e| {
+            let left = e.expires_ns.saturating_sub(now_ns).div_ceil(1_000_000_000);
+            format!(
+                "{:<4} {:<8} {} ({left} s left)\n",
+                e.id,
+                e.kind.as_str(),
+                e.rule
+            )
+        })
+        .collect()
+}
+
+/// Adds `rule` to the `verdict` list of the session's network policy and
+/// sends the policy back, unless it is there already.
+fn change(rule: &str, session: &SessionArgs, verdict: Verdict) -> anyhow::Result<ExitCode> {
     let (list, verb) = match verdict {
         Verdict::Allow => (List::Allow, "allow"),
         Verdict::Deny => (List::Deny, "deny"),
     };
     // Checked as the VMM will check it, before any connection is made.
-    if let Err(kind) = Policy::default().add(list, &args.rule) {
-        crate::cmd::tell(&format!("error: policy {verb} {:?}: {kind}", args.rule));
+    if let Err(kind) = Policy::default().add(list, rule) {
+        crate::cmd::tell(&format!("error: policy {verb} {rule:?}: {kind}"));
         return Ok(ExitCode::from(USAGE_EXIT));
     }
-    let mut client = connect(&args.session)?;
+    let mut client = connect(session)?;
     let (view, _) = get(&mut client)?;
-    let Some(net) = with_rule(view.net, verdict, &args.rule) else {
+    let Some(net) = with_rule(view.net, verdict, rule) else {
         println!("policy version {} (unchanged)", view.version);
         return Ok(ExitCode::SUCCESS);
     };
     let params = PolicyUpdateParams {
         net: Some(net),
-        vsock: None,
+        ..PolicyUpdateParams::default()
     };
     let result = client
         .request("policy.update", serde_json::to_value(&params)?)?
@@ -135,8 +262,8 @@ fn with_rule(
 }
 
 /// The policy as a two-column table: one row a rule, `(none)` for an empty
-/// list.
-fn table(view: &PolicyView) -> String {
+/// list, then a row for each live exception, its seconds left at `now_ns`.
+fn table(view: &PolicyView, now_ns: u64) -> String {
     let default = match view.net.default {
         Verdict::Allow => "allow",
         Verdict::Deny => "deny",
@@ -164,6 +291,13 @@ fn table(view: &PolicyView) -> String {
             ports.join(", ")
         },
     ));
+    for e in &view.exceptions {
+        let left = e.expires_ns.saturating_sub(now_ns).div_ceil(1_000_000_000);
+        rows.push((
+            "except",
+            format!("{} {} {} ({left} s left)", e.id, e.kind.as_str(), e.rule),
+        ));
+    }
     rows.iter()
         .map(|(name, value)| format!("{name:<8} {value}\n"))
         .collect()
@@ -219,10 +353,74 @@ mod tests {
                 allow_ports: vec![5000],
             },
             version: 2,
+            exceptions: Vec::new(),
         };
         assert_eq!(
-            table(&view),
+            table(&view, 0),
             "version  2\ndefault  deny\nallow    a.test\ndeny     (none)\ninspect  (none)\nvsock    5000\n"
         );
+        assert_eq!(exception_table(&view, 0), "(none)\n");
+    }
+
+    /// The live exceptions come after the permanent policy, each with the
+    /// seconds it has left, rounded up.
+    #[test]
+    fn exceptions_are_listed_with_their_time_left() {
+        let at = 1_760_000_000_000_000_000;
+        let view = PolicyView {
+            net: net(&[], &[]),
+            vsock: VsockPolicy::default(),
+            version: 4,
+            exceptions: vec![
+                boxcar_proto::control::ExceptionView {
+                    id: 1,
+                    rule: "pypi.org:443".into(),
+                    kind: ExceptionKind::Egress,
+                    ttl_s: 600,
+                    expires_ns: at + 599_500_000_000,
+                    by_pid: 42,
+                },
+                boxcar_proto::control::ExceptionView {
+                    id: 2,
+                    rule: "/etc/**".into(),
+                    kind: ExceptionKind::Writable,
+                    ttl_s: 60,
+                    expires_ns: at - 1,
+                    by_pid: 42,
+                },
+            ],
+        };
+        assert!(table(&view, at).ends_with(
+            "vsock    (none)\nexcept   1 egress pypi.org:443 (600 s left)\nexcept   2 writable /etc/** (0 s left)\n"
+        ));
+        assert_eq!(
+            exception_table(&view, at),
+            "1    egress   pypi.org:443 (600 s left)\n2    writable /etc/** (0 s left)\n"
+        );
+    }
+
+    /// A duration: seconds bare or with `s`, minutes, hours; 1 s to 24 h.
+    #[test]
+    fn durations_parse_within_a_day() {
+        use crate::cli::parse_ttl;
+        assert_eq!(parse_ttl("90"), Ok(90));
+        assert_eq!(parse_ttl("90s"), Ok(90));
+        assert_eq!(parse_ttl("10m"), Ok(600));
+        assert_eq!(parse_ttl("1h"), Ok(3600));
+        assert_eq!(parse_ttl("24h"), Ok(86_400));
+        for bad in [
+            "0",
+            "0s",
+            "25h",
+            "1d",
+            "",
+            "m",
+            "-5",
+            "1.5h",
+            "10 m",
+            "99999999999",
+        ] {
+            assert!(parse_ttl(bad).is_err(), "{bad:?}");
+        }
     }
 }

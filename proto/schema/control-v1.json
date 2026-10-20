@@ -246,6 +246,80 @@
         }
       ]
     },
+    "ExceptionGrant": {
+      "description": "An exception to grant, in `policy.update`: `{\"rule\":\"api.example.com:443\", \"kind\":\"egress\",\"ttl_s\":600}`. `rule` is a target as `--allow` takes it for `egress`, an absolute path glob for `writable` and `exec`. It lives `ttl_s` seconds (1 to [`MAX_EXCEPTION_TTL_S`]) on top of the permanent policy, which it never becomes part of.",
+      "type": "object",
+      "required": [
+        "kind",
+        "rule",
+        "ttl_s"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ExceptionKind"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "ttl_s": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ExceptionKind": {
+      "description": "What a live exception opens: an egress target, a path glob writes may name, or a path glob programs may be run from despite `[exec] deny`.",
+      "type": "string",
+      "enum": [
+        "egress",
+        "writable",
+        "exec"
+      ]
+    },
+    "ExceptionView": {
+      "description": "A live exception as `policy.get` reports it.",
+      "type": "object",
+      "required": [
+        "by_pid",
+        "expires_ns",
+        "id",
+        "kind",
+        "rule",
+        "ttl_s"
+      ],
+      "properties": {
+        "by_pid": {
+          "description": "The process id of the client that granted it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "expires_ns": {
+          "description": "When it expires: the host's realtime clock, in nanoseconds since the epoch (the clock of a record's `ts_host_ns`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "description": "The session's number for it, from 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "kind": {
+          "$ref": "#/definitions/ExceptionKind"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "ttl_s": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "GuestStatus": {
       "description": "What the guest's init has reported. The default is nothing yet.",
       "type": "object",
@@ -373,9 +447,19 @@
       }
     },
     "PolicyUpdateParams": {
-      "description": "The parameters of `policy.update`: `{\"net\":{...},\"vsock\":{...}}`, each optional and each replacing its whole policy when given. The response is [`PolicyUpdated`]; the server records `policy.changed`. A rule that does not parse is a `bad_request` naming it, and nothing changes.",
+      "description": "The parameters of `policy.update`: `{\"net\":{...},\"vsock\":{...}}`, each optional and each replacing its whole permanent policy when given, or `{\"exception\":{...}}` alone, granting one live exception. The response is [`PolicyUpdated`]; the server records `policy.changed`, or `policy.exception` for a grant. A rule that does not parse is a `bad_request` naming it, and nothing changes.",
       "type": "object",
       "properties": {
+        "exception": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExceptionGrant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "net": {
           "anyOf": [
             {
@@ -413,13 +497,20 @@
       }
     },
     "PolicyView": {
-      "description": "The result of `policy.get`: `{\"net\":{...},\"vsock\":{...},\"version\":N}`, the policy in force and its version (1 for the one the VM started with, one more for each `policy.update`).",
+      "description": "The result of `policy.get`: `{\"net\":{...},\"vsock\":{...},\"version\":N, \"exceptions\":[...]}`, the policy in force and its version (1 for the one the VM started with, one more for each `policy.update` and each exception's grant or expiry). `net` and `vsock` are the permanent policy; the live exceptions are listed apart, by id, and never in `net`, so a client that writes back what it read cannot make one permanent.",
       "type": "object",
       "required": [
         "net",
         "vsock"
       ],
       "properties": {
+        "exceptions": {
+          "description": "The live exceptions, by id; omitted when there are none, and absent in older servers' views.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExceptionView"
+          }
+        },
         "net": {
           "$ref": "#/definitions/NetPolicy"
         },

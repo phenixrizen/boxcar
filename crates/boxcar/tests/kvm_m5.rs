@@ -19,7 +19,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use boxcar_testreg::{config, index, layer_tar, manifest, Auth, Faults, Registry};
-use kvm_harness::{guest_or_skip, of_kind, start_with_root, Guest, Run, Scratch};
+use kvm_harness::{
+    boxcar, guest_or_skip, networked_guest_or_skip, of_kind, start_with_root, text, Guest, Run,
+    Scratch,
+};
 
 /// The marker the package's program prints.
 const MARKER: &str = "boxcar-test-marker";
@@ -675,5 +678,266 @@ fn a_policy_file_is_recorded_and_its_dns_rate_holds() {
     assert!(
         dns.iter().any(|r| r.data["rcode"] == 3),
         "the burst got its NXDOMAIN: {dns:?}"
+    );
+}
+
+/// An image for the policy tests: the Alpine tree with no
+/// `/etc/resolv.conf` (whited out), and a regular-file copy of BusyBox at
+/// `/usr/bin/nc` in place of the applet's link, a real program file of that
+/// name.
+fn publish_strict(rootfs: &Path) -> (Registry, String) {
+    let registry = Registry::start(Auth::None, Faults::default());
+    let base = layer_tar(&tar_of_dir(rootfs));
+    let mut b = tar::Builder::new(Vec::new());
+    let busybox = fs::read(rootfs.join("bin/busybox")).unwrap();
+    entry(
+        &mut b,
+        tar::EntryType::Regular,
+        "etc/.wh.resolv.conf",
+        0o644,
+        &[],
+        None,
+    );
+    entry(
+        &mut b,
+        tar::EntryType::Regular,
+        "usr/bin/nc",
+        0o755,
+        &busybox,
+        None,
+    );
+    let additions = layer_tar(&b.into_inner().unwrap());
+    let cfg = config(
+        &["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        &["/bin/sh", "-c"],
+        &["true"],
+        "/workspace",
+    );
+    let m = manifest(&cfg, &[base.clone(), additions.clone()]);
+    for blob in [&base, &additions, &cfg, &m] {
+        registry.put_blob(blob);
+    }
+    registry.put_manifest("library/strict", "1", &m);
+    let reference = format!("{}/library/strict:1", registry.host());
+    (registry, reference)
+}
+
+/// The policy refusals in `records`, as (op, path, errno, rule).
+fn refusals(records: &[boxcar_proto::Record]) -> Vec<(String, String, i64, Option<String>)> {
+    of_kind(records, "fs.denied")
+        .into_iter()
+        .filter(|r| r.data["reason"] == "policy")
+        .map(|r| {
+            (
+                r.data["op"].as_str().unwrap().to_owned(),
+                r.data["path"].as_str().unwrap().to_owned(),
+                r.data["errno"].as_i64().unwrap(),
+                r.data["rule"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+/// `agent-isolate-strict`, from an image with no `/etc/resolv.conf` and a
+/// real `nc` program file: the session boots, resolves and reaches an
+/// allowed host by name, writes `/workspace` and `/tmp`, and is refused a
+/// write to `/etc` (EROFS) and `nc` however it is tried: run, through a
+/// symlink, through the loader, copied, hard-linked (EACCES). Each refusal
+/// is a `fs.denied{reason: "policy"}` with its `policy_denial` finding.
+#[test]
+fn agent_isolate_strict_holds_in_a_session() {
+    let Some(guest) = networked_guest_or_skip("agent_isolate_strict_holds_in_a_session") else {
+        return;
+    };
+    let (_registry, reference) = publish_strict(&guest.rootfs);
+    let scratch = Scratch::new();
+    let script = "\
+        wget -q -O /dev/null https://github.com/ && echo reached || echo unreached; \
+        echo ok > /workspace/w && echo wrote-workspace; \
+        echo ok > /tmp/t && echo wrote-tmp; \
+        (echo no > /etc/boxcar-test) 2>/dev/null && echo wrote-etc || echo refused-etc; \
+        /usr/bin/nc -h >/dev/null 2>&1; echo nc=$?; \
+        ln -s /usr/bin/nc /workspace/n && /workspace/n -h >/dev/null 2>&1; echo link=$?; \
+        /lib/ld-musl-x86_64.so.1 /usr/bin/nc -h >/dev/null 2>&1 && echo loaded || echo refused-loader; \
+        cp /usr/bin/nc /tmp/x 2>/dev/null && echo copied || echo refused-copy; \
+        ln /usr/bin/nc /tmp/hard 2>/dev/null && echo linked || echo refused-link; \
+        echo done";
+    let run = run_image(
+        &guest,
+        &scratch,
+        &reference,
+        &["--policy", "agent-isolate-strict"],
+        &["sh", "-c", script],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(!run.stderr.contains("warning: --policy"), "{}", run.stderr);
+    for line in [
+        "reached",
+        "wrote-workspace",
+        "wrote-tmp",
+        "refused-etc",
+        "nc=126",
+        "link=126",
+        "refused-loader",
+        "refused-copy",
+        "refused-link",
+        "done",
+    ] {
+        assert!(
+            run.stdout.lines().any(|l| l == line),
+            "{line}: {}",
+            run.describe()
+        );
+    }
+    let records = run.records();
+    let loaded = of_kind(&records, "policy.loaded");
+    assert_eq!(loaded[0].data["name"], "agent-isolate-strict");
+    // Reached by name: the lookup and the connection allowed.
+    assert!(
+        of_kind(&records, "net.connect")
+            .iter()
+            .any(|r| r.data["verdict"] == "allow"
+                && r.data["names"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|n| n == "github.com"))),
+        "no allowed connection to github.com"
+    );
+    let refused = refusals(&records);
+    let has = |op: &str, path: &str, errno: i64, rule: Option<&str>| {
+        refused
+            .iter()
+            .any(|(o, p, e, r)| o == op && p == path && *e == errno && r.as_deref() == rule)
+    };
+    assert!(has("create", "/etc/boxcar-test", 30, None), "{refused:?}");
+    assert!(has("exec", "/usr/bin/nc", 13, Some("**/nc")), "{refused:?}");
+    assert!(
+        has("open", "/usr/bin/nc", 13, Some("**/nc")),
+        "the loader, the copy: {refused:?}"
+    );
+    assert!(has("link", "/tmp/hard", 13, Some("**/nc")), "{refused:?}");
+    // Every refusal is a finding.
+    let denials: Vec<&boxcar_proto::Record> = of_kind(&records, "finding")
+        .into_iter()
+        .filter(|f| f.data["rule"] == "policy_denial")
+        .filter(|f| {
+            f.data["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("refused by the policy"))
+        })
+        .collect();
+    assert!(
+        denials.len() >= refused.len(),
+        "{} findings for {refused:?}",
+        denials.len()
+    );
+    assert!(denials.iter().any(|f| f.data["summary"]
+        == "exec of /usr/bin/nc was refused by the policy ([exec] deny **/nc)"));
+    assert!(denials.iter().any(|f| f.data["summary"]
+        == "create of /etc/boxcar-test was refused by the policy (outside [fs] writable)"));
+}
+
+/// A writable exception granted during a run lets the guest write what it
+/// names, and once it expires the same write is refused; the log has the
+/// grant (`policy.exception`) and the expiry (`policy.changed{by_pid: 0}`).
+/// The policy file names no `writable`, so the default's `/tmp` is
+/// writable, and what is written there is recorded.
+#[test]
+fn a_writable_exception_expires_during_a_run() {
+    let Some(guest) = guest_or_skip("a_writable_exception_expires_during_a_run") else {
+        return;
+    };
+    let (_registry, reference) = publish_strict(&guest.rootfs);
+    let scratch = Scratch::new();
+    let policy = scratch.path("policy.toml");
+    fs::write(&policy, "version = 1\n").unwrap();
+    let script = "\
+        t=$(mktemp) && echo t > \"$t\" && echo TMP_WROTE; \
+        (echo a > /etc/x) 2>/dev/null && echo FIRST_WROTE || echo FIRST_REFUSED; \
+        while [ ! -e /workspace/go ]; do sleep 1; done; \
+        (echo b > /etc/x) 2>/dev/null && echo SECOND_WROTE || echo SECOND_REFUSED; \
+        while [ ! -e /workspace/go2 ]; do sleep 1; done; \
+        (echo c > /etc/x) 2>/dev/null && echo THIRD_WROTE || echo THIRD_REFUSED";
+    let cache = scratch.path("cache");
+    let root = [
+        "--image",
+        reference.as_str(),
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ];
+    let mut running = start_with_root(
+        &guest,
+        &scratch,
+        &root,
+        &["--policy", policy.to_str().unwrap()],
+        &["sh", "-c", script],
+        &[],
+    );
+    let control = running.control();
+    running.until("the first write to be refused", |run| {
+        run.stdout().contains("FIRST_REFUSED")
+    });
+    let granted = boxcar(
+        &["policy", "allow", "--writable", "/etc/**", "--ttl", "3s"],
+        &control,
+    );
+    assert!(granted.status.success(), "{}", text(&granted.stderr));
+    assert_eq!(
+        text(&granted.stdout),
+        "policy version 2 (writable exception /etc/** for 3 s)\n"
+    );
+    fs::write(scratch.path("workspace").join("go"), "").unwrap();
+    running.until("the second write", |run| run.stdout().contains("SECOND_"));
+    // The exception's three seconds, and the expiry on the VMM's loop.
+    running.until("the exception to expire", |_| {
+        let listed = boxcar(&["policy", "exception", "ls", "--json"], &control);
+        text(&listed.stdout).trim() == "[]"
+    });
+    fs::write(scratch.path("workspace").join("go2"), "").unwrap();
+    let run = running.finish();
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    for line in [
+        "TMP_WROTE",
+        "FIRST_REFUSED",
+        "SECOND_WROTE",
+        "THIRD_REFUSED",
+    ] {
+        assert!(run.stdout.contains(line), "{line}: {}", run.describe());
+    }
+    let records = run.records();
+    let granted = of_kind(&records, "policy.exception");
+    assert_eq!(granted.len(), 1, "{granted:?}");
+    assert_eq!(granted[0].data["kind"], "writable");
+    assert_eq!(granted[0].data["rule"], "/etc/**");
+    assert_eq!(granted[0].data["ttl_s"], 3);
+    assert_eq!(granted[0].data["version"], 2);
+    let changed = of_kind(&records, "policy.changed");
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(
+        changed[0].data,
+        serde_json::json!({"by_pid": 0, "version": 3})
+    );
+    assert!(changed[0].seq > granted[0].seq);
+    let refused: Vec<u64> = of_kind(&records, "fs.denied")
+        .into_iter()
+        .filter(|r| r.data["reason"] == "policy" && r.data["path"] == "/etc/x")
+        .map(|r| r.seq)
+        .collect();
+    assert!(
+        refused.iter().any(|seq| *seq < granted[0].seq),
+        "{refused:?}"
+    );
+    assert!(
+        refused.iter().any(|seq| *seq > changed[0].seq),
+        "{refused:?}"
+    );
+    // The default's `/tmp`, written and recorded as any other share path.
+    let creates = of_kind(&records, "fs.create");
+    assert!(
+        creates.iter().any(|r| r.data["mount"] == "root"
+            && r.data["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("/tmp/"))
+            && r.data["result"]["ok"] == true),
+        "{creates:?}"
     );
 }

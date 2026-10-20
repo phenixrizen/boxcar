@@ -133,10 +133,20 @@ pub enum Command {
     /// `profile NAME` prints a built-in policy file, the text `boxcar run
     /// --policy NAME` reads; it needs no session.
     ///
+    /// `allow RULE --ttl DURATION` grants a live exception instead: RULE is
+    /// allowed for DURATION (`90`, `90s`, `10m`, `1h`; 1 s to 24 h), after
+    /// the permanent rules, so a permanent deny of it still wins, and then
+    /// expires; `allow --writable GLOB --ttl DURATION` lets the guest write
+    /// the paths GLOB names, `allow --exec GLOB --ttl DURATION` lets it run
+    /// the programs GLOB names despite `[exec] deny` (both need a `--policy`
+    /// file's path rules). An exception is recorded as `policy.exception`,
+    /// listed by `show` and `exception ls`, never part of the permanent
+    /// policy, and at most 64 live at once.
+    ///
     /// Exits 0 and prints `policy version N`, 1 when the control socket
     /// cannot be reached or refuses the change (a VM without a network card
-    /// has no policy to change), 2 for a RULE that does not parse or a
-    /// profile there is none of.
+    /// has no policy to change; a 65th exception), 2 for a RULE that does
+    /// not parse or a profile there is none of.
     #[command(subcommand)]
     Policy(PolicyCommand),
     /// Boot a microVM.
@@ -235,13 +245,72 @@ pub enum PolicyCommand {
     /// Print the policy in force.
     Show(PolicyShowArgs),
     /// Allow RULE: add it to the allow rules (and take it out of the
-    /// denies).
-    Allow(PolicyRuleArgs),
+    /// denies); with `--ttl`, a live exception instead.
+    Allow(PolicyAllowArgs),
     /// Deny RULE: add it to the deny rules (and take it out of the allows).
     Deny(PolicyRuleArgs),
     /// Print the built-in policy file NAME, as `boxcar run --policy NAME`
     /// reads it. Needs no session.
     Profile(PolicyProfileArgs),
+    /// The live exceptions.
+    #[command(subcommand)]
+    Exception(ExceptionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExceptionCommand {
+    /// List the live exceptions: id, kind, rule, seconds left.
+    Ls(PolicyShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PolicyAllowArgs {
+    /// The rule's target: `name[:port]`, `*.name[:port]`, `address[:port]`
+    /// or `address/prefix[:port]`.
+    #[arg(
+        value_name = "RULE",
+        required_unless_present_any = ["writable", "exec"],
+        conflicts_with_all = ["writable", "exec"]
+    )]
+    pub rule: Option<String>,
+    /// A writable exception: the guest may write the paths GLOB names
+    /// (absolute) for `--ttl`.
+    #[arg(long, value_name = "GLOB", requires = "ttl", conflicts_with = "exec")]
+    pub writable: Option<String>,
+    /// An exec exception: the guest may run the programs GLOB names
+    /// (absolute) despite `[exec] deny`, for `--ttl`.
+    #[arg(long, value_name = "GLOB", requires = "ttl")]
+    pub exec: Option<String>,
+    /// A live exception for DURATION (`90`, `90s`, `10m`, `1h`; 1 s to
+    /// 24 h), which then expires, instead of a permanent rule.
+    #[arg(long, value_name = "DURATION", value_parser = parse_ttl)]
+    pub ttl: Option<u32>,
+    #[command(flatten)]
+    pub session: SessionArgs,
+}
+
+/// `DURATION` in seconds: a number with no unit or `s`, `m` or `h`, from
+/// 1 s to 24 h.
+pub fn parse_ttl(text: &str) -> Result<u32, String> {
+    let (number, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((at, _)) => text.split_at(at),
+        None => (text, ""),
+    };
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return Err(format!("{text:?} is not a duration: 90, 90s, 10m or 1h")),
+    };
+    let seconds = number
+        .parse::<u32>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| format!("{text:?} is not a duration: 90, 90s, 10m or 1h"))?;
+    if !(1..=boxcar_proto::control::MAX_EXCEPTION_TTL_S).contains(&seconds) {
+        return Err(format!("{text:?} is not from 1 s to 24 h"));
+    }
+    Ok(seconds)
 }
 
 #[derive(Debug, Args)]
@@ -524,10 +593,12 @@ pub struct RunArgs {
     /// DNS queries a second), `[fs]` (`writable`, `denied`, `indicators`),
     /// `[exec]` (`deny`), `[spans]` (`keep_tool_args`) and `[record]`
     /// (`scrub_argv`). Its egress comes first, the denies before the
-    /// allows; `--deny`, `--allow` and `--inspect` add to it. Recorded as
-    /// `policy.loaded`. This build enforces its `[egress]` and the DNS rate
-    /// and records the rest, saying on stderr what it would restrict. A
-    /// policy that does not parse exits 2, with its line and column.
+    /// allows; `--deny`, `--allow` and `--inspect` add to it. `[fs]` and
+    /// `[exec]` hold at the shares, by guest path and by identity (a
+    /// policy that denies or refuses anything has the shares scanned before
+    /// the guest boots); a refusal is `fs.denied{reason: "policy"}`.
+    /// Recorded as `policy.loaded`. A policy that does not parse exits 2,
+    /// with its line and column.
     #[arg(long, value_name = "FILE|NAME", conflicts_with = "policy_file")]
     pub policy: Option<PathBuf>,
     /// Watch the guest's traffic to RULE, written as for `--allow` (which

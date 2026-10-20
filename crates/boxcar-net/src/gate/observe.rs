@@ -291,6 +291,7 @@ impl ObserverThread {
         trace_id: String,
         dump: Option<DumpDir>,
         declared: Option<DeclaredArgs>,
+        keep_args: bool,
     ) -> io::Result<ObserverThread> {
         let (stopped, done) = mpsc::channel::<()>();
         let thread = thread::Builder::new()
@@ -298,7 +299,14 @@ impl ObserverThread {
             .spawn(move || {
                 // Dropped when the thread ends, however it ends.
                 let _stopped = stopped;
-                run(rx, &sink, &trace_id, dump.as_ref(), declared.as_ref());
+                run(
+                    rx,
+                    &sink,
+                    &trace_id,
+                    dump.as_ref(),
+                    declared.as_ref(),
+                    keep_args,
+                );
             })?;
         Ok(ObserverThread { done, thread })
     }
@@ -324,6 +332,7 @@ fn run(
     trace_id: &str,
     dump: Option<&DumpDir>,
     declared: Option<&DeclaredArgs>,
+    keep_args: bool,
 ) {
     let mut flows: HashMap<u64, Observation> = HashMap::new();
     // One budget for what every flow keeps.
@@ -350,6 +359,7 @@ fn run(
                     Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id)
                         .with_dump(dump.cloned())
                         .with_declared(declared.cloned())
+                        .with_keep_args(keep_args)
                         .with_retained(retained.clone()),
                 );
             }
@@ -599,7 +609,8 @@ mod tests {
         assert!(flow.lost(Direction::ToGuest));
         assert_eq!(flow.close(&observer, 1), Sent::Ok);
         drop(observer);
-        let thread = ObserverThread::spawn(rx, sink, "trace-test".into(), None, None).unwrap();
+        let thread =
+            ObserverThread::spawn(rx, sink, "trace-test".into(), None, None, true).unwrap();
         assert!(thread.join(Duration::from_secs(5)));
         writer.close().unwrap();
         let response = boxcar_audit::LogReader::open(&session_dir)
@@ -623,7 +634,8 @@ mod tests {
         .unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         let (observer, rx) = Observer::channel();
-        let thread = ObserverThread::spawn(rx, sink, "trace-test".into(), None, None).unwrap();
+        let thread =
+            ObserverThread::spawn(rx, sink, "trace-test".into(), None, None, true).unwrap();
         assert_eq!(
             observer.send(Message::Open {
                 flow: 1,

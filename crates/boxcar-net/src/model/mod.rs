@@ -104,6 +104,10 @@ pub struct ToolOpen {
 
 /// The most bytes of arguments a `tool.open` carries inline.
 pub const ARGS_INLINE: usize = 8 * 1024;
+
+/// `tool.open.args_summary` when the arguments are not kept (a policy
+/// file's `[spans] keep_tool_args = false`): the summary is made from them.
+pub const ARGS_NOT_KEPT: &str = "[arguments not kept: keep_tool_args = false]";
 /// The most bytes of a tool call's id kept anywhere (records, spans):
 /// past it the id becomes its first [`ID_PREFIX`] bytes and a hash of all
 /// of it, the same for its open and its close, two ids never one.
