@@ -10,20 +10,21 @@ use std::fs;
 use std::path::Path;
 
 use boxcar_proto::control::{
-    parse_request, AuditEvent, AuditLagged, AuditSubscribeParams, ErrorCode, Hello,
-    PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams, PtyAttached, PtyDetached,
-    PtyResizeParams, PtyWatchParams, Ready, Response, SpanList, SpanListParams, StateEvent, Status,
-    StopParams, MAX_LINE,
+    parse_request, AuditEvent, AuditLagged, AuditSubscribeParams, AuditVerify, AuditVerifyParams,
+    ErrorCode, Hello, PolicyUpdateParams, PolicyUpdated, PolicyView, PtyAttachParams, PtyAttached,
+    PtyDetached, PtyResizeParams, PtyWatchParams, Ready, Response, SpanList, SpanListParams,
+    StateEvent, Status, StopParams, MAX_LINE,
 };
 use serde_json::Value;
 
-const OPS: [&str; 9] = [
+const OPS: [&str; 10] = [
     "status",
     "stop",
     "pty.attach",
     "pty.watch",
     "pty.resize",
     "audit.subscribe",
+    "audit.verify",
     "policy.get",
     "policy.update",
     "span.list",
@@ -73,6 +74,13 @@ fn check_op(op: &str, params: &Value, result: &Value) {
             as_::<AuditSubscribeParams>("audit.subscribe params", params);
             assert!(result["next_seq"].is_u64() && result["sub"].is_u64());
         }
+        "audit.verify" => {
+            as_::<AuditVerifyParams>("audit.verify params", params);
+            as_::<AuditVerify>("audit.verify result", result);
+            let reply: AuditVerify = serde_json::from_value(result.clone()).unwrap();
+            assert!(reply.from_seq <= reply.to_seq && reply.to_seq <= reply.head_seq);
+            assert_eq!(reply.more, reply.to_seq < reply.head_seq);
+        }
         "policy.get" => as_::<PolicyView>("policy.get result", result),
         "policy.update" => {
             as_::<PolicyUpdateParams>("policy.update params", params);
@@ -119,7 +127,8 @@ fn every_golden_line_parses_as_what_it_is_and_everything_appears() {
                             "policy.inspect",
                             "findings",
                             "spans",
-                            "policy.exception"
+                            "policy.exception",
+                            "audit.verify"
                         ]
                     );
                 }

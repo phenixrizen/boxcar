@@ -300,6 +300,13 @@ impl Conn {
         self.closing.load(Ordering::Acquire)
     }
 
+    /// The flag [`close`](Self::close) sets, for an op that runs long on the
+    /// connection's thread to look at between steps: the server's shutdown
+    /// closes every connection, so a stopping VMM never waits on the op.
+    pub(crate) fn closing_flag(&self) -> &AtomicBool {
+        &self.closing
+    }
+
     /// Waits up to [`LINGER`] for the client to take what is queued,
     /// unless the connection is closed first.
     fn linger(&self) {

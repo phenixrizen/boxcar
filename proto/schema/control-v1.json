@@ -168,6 +168,74 @@
         }
       }
     },
+    "AuditVerify": {
+      "description": "The result of `audit.verify`: the records from `from_seq` to `to_seq` of the log on disk are a valid chain, checked against the writer's head at `head_seq`. A fixed shape: a few hundred bytes at most.",
+      "type": "object",
+      "required": [
+        "checkpoints",
+        "from_prev",
+        "from_seq",
+        "head_hash",
+        "head_seq",
+        "more",
+        "to_hash",
+        "to_seq"
+      ],
+      "properties": {
+        "checkpoints": {
+          "description": "How many checkpoint records were among the records checked.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "from_prev": {
+          "description": "The hash the record before `from_seq` stores, which the record at `from_seq` names as its `prev` (the genesis hash for seq 1). A client that checked up to `from_seq - 1` compares it with the hash it holds: so one stretch chains to the next.",
+          "$ref": "#/definitions/Hash"
+        },
+        "from_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "head_hash": {
+          "$ref": "#/definitions/Hash"
+        },
+        "head_seq": {
+          "description": "The writer's head when the call began: its last record, flushed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "more": {
+          "description": "`true` until `to_seq` reaches `head_seq`: ask again from `to_seq + 1`. When it is `false`, the record at the head has the head's hash.",
+          "type": "boolean"
+        },
+        "to_hash": {
+          "$ref": "#/definitions/Hash"
+        },
+        "to_seq": {
+          "description": "The last record checked, and its hash.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AuditVerifyParams": {
+      "description": "The parameters of `audit.verify`: `{\"from_seq\":S}`, optional. The result is [`AuditVerify`].",
+      "type": "object",
+      "properties": {
+        "from_seq": {
+          "description": "The first seq to check: 1 when absent; 0 is the same. A client that checked the log up to `S - 1` asks from `S`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
     "ErrorBody": {
       "description": "Why a request failed.",
       "type": "object",

@@ -29,7 +29,7 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
   events between responses.
 
 ```text
-<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings","spans","policy.exception"]}
+<- {"v":1,"event":"hello","protocol":"boxcar.control","versions":[1],"server":"boxcar/0.1.0","session_id":"...","capabilities":["pty","audit","policy.net","policy.inspect","findings","spans","policy.exception","audit.verify"]}
 -> {"v":1,"id":1,"op":"status"}
 <- {"v":1,"id":1,"ok":true,"result":{"state":"running",...}}
 -> {"v":1,"id":2,"op":"stop","mode":"graceful"}
@@ -44,10 +44,11 @@ JSON Schema to `proto/schema/control-v1.json` and example lines to
 `"boxcar.control"`, `versions` `[1]`, `server` `"boxcar/<version>"`,
 `session_id`, and `capabilities`: the op families served beyond `status`
 and `stop`, today
-`["pty","audit","policy.net","policy.inspect","findings","spans","policy.exception"]`
+`["pty","audit","policy.net","policy.inspect","findings","spans","policy.exception","audit.verify"]`
 (`policy.inspect`: the network policy carries `inspect` lines; `spans`:
 `span.list` is served; `policy.exception`: `policy.update` grants live
-exceptions and `policy.get` lists them).
+exceptions and `policy.get` lists them; `audit.verify`: `audit.verify` is
+served).
 
 **Request**: `{"v":1,"id":N,"op":"<op>", ...}`. `id` is an unsigned
 64-bit integer the client chooses; every other field is a parameter of the
@@ -192,6 +193,58 @@ Errors: `bad_request` (parameters that do not parse or pass the limits),
 `busy` (4 subscriptions already), `invalid_state` (the audit log is closed
 or has failed), `internal` (the log cannot be read).
 
+### `audit.verify`
+
+Checks that the session's audit log on disk, from `from_seq` on, is a
+valid chain up to the audit writer's head, a bounded stretch per call.
+Parameters: `from_seq`, optional (u64; 1 when absent, and 0 means 1). The
+result:
+
+```json
+{"from_seq":5,"from_prev":"b3:44…44","to_seq":7,"to_hash":"b3:22…22",
+ "head_seq":7,"head_hash":"b3:22…22","checkpoints":0,"more":false}
+```
+
+- `head_seq` and `head_hash`: the writer's head when the call began. The
+  op asks the writer for it in band, as `audit.subscribe` subscribes: the
+  writer flushes the log and answers with its last record's seq and hash.
+- `from_seq` to `to_seq`: the records checked. Each is hashed again from
+  its line on disk, with no key twice, and checked as `boxcar audit verify`
+  checks a log: its seq, its `prev` link, each checkpoint's `root_hash` and
+  `records_since`, and each checkpoint's line in `checkpoints.jsonl`.
+  `to_hash` is the last one's hash; `checkpoints` how many checkpoints were
+  among them.
+- `from_prev`: the hash the record before `from_seq` stores, which the
+  record at `from_seq` names as its `prev` (the genesis hash for seq 1). A
+  client that checked the log up to `from_seq - 1` compares it with the
+  `to_hash` it holds, and so chains each stretch to the one before.
+- `more`: `true` while `to_seq` is below `head_seq`: the client asks again
+  from `to_seq + 1`. When it is `false`, the record at the head has the
+  head's hash.
+
+A stretch is at most 50,000 records or 64 MiB of them, whichever comes
+first, and never past the head: records the writer appends meanwhile are
+not read, and are left for a later call, which asks for a new head. The
+walk starts at the last checkpoint `checkpoints.jsonl` lists before
+`from_seq`, or at the log's start: a checkpoint's root covers the records
+since the one before it. The records between that checkpoint and
+`from_seq` are read, but only the hashes they store are kept for the root,
+so a change to one of them that keeps its stored hash is not seen; a
+client that started from 1 has checked them already. The walk runs on the
+connection's thread, between its other requests, and stops at once when
+the server shuts down.
+
+`boxcar audit verify --control PATH [--from-seq N] [--json]` asks until
+`more` is `false`, refusing a stretch whose `from_prev` is not the `to_hash`
+of the one before.
+
+Errors: `bad_request` (parameters that do not parse; a `from_seq` past the
+head), `invalid_state` (the audit log is closed; or it has failed, the
+failure named: a failed writer has no head it can vouch for, so its log is
+for `boxcar audit verify PATH` once the run has ended; or the session is
+stopping), `internal` (the log is broken, or cannot be read: the
+verifier's message, cut to 512 bytes).
+
 ### `policy.get`
 
 No parameters. The result is the permanent policy in force, and the live
@@ -308,5 +361,6 @@ index. `boxcar spans [--active] [--json]` prints it.
 | A client that takes nothing (`pty.attach`, `audit.subscribe`) | 30 s |
 | `pty.attach` replay | 256 KiB scrollback; 64 KiB input queue; 1 MiB output backlog |
 | `audit.subscribe` | 4 a connection; 32 type prefixes of 1 to 64 bytes; 16384 live records queued a subscription |
+| `audit.verify` | 50,000 records or 64 MiB a call, never past the writer's head; a break's message cut to 512 bytes |
 | `policy.update` | 4096 rules of 1 to 512 bytes; 1024 vsock ports, each 1027 or more; 64 live exceptions, each 1 to 86400 s |
 | `span.list` | 1024 entries, newest first |

@@ -20,6 +20,14 @@
 //!
 //! A connection holds at most [`MAX_AUDIT_SUBSCRIPTIONS`] subscriptions,
 //! until it closes: the forwarders stop and are joined with it.
+//!
+//! `audit.verify` checks a stretch of the log on disk against the writer's
+//! head: it asks the writer for the head in band
+//! ([`boxcar_audit::AuditSink::head`]), then walks the log with
+//! [`boxcar_audit::verify_range`] on the connection's own thread, as every op
+//! runs. The walk looks at the connection's closing flag before each
+//! record: the server's shutdown closes every connection, so a stopping VMM
+//! never waits on a walk.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -27,14 +35,18 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use boxcar_audit::{AuditSink, Filter, Item, Next, Subscription, DEFAULT_QUEUE};
-use boxcar_proto::control::{
-    AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, ErrorBody, ErrorCode, Request,
-    MAX_AUDIT_SUBSCRIPTIONS,
+use boxcar_audit::{
+    verify_range, AuditSink, Filter, HeadError, Item, Next, RangeError, RangeLimits, Subscription,
+    DEFAULT_QUEUE,
 };
+use boxcar_proto::control::{
+    AuditEvent, AuditLagged, AuditSubscribeParams, AuditSubscribed, AuditVerify, AuditVerifyParams,
+    ErrorBody, ErrorCode, Request, MAX_AUDIT_SUBSCRIPTIONS, MAX_AUDIT_VERIFY_MESSAGE,
+};
+use boxcar_proto::limits::truncate_utf8;
 use serde_json::Value;
 
-use super::conn::PACE_STALL;
+use super::conn::{Conn, PACE_STALL};
 use super::ops::{params, ConnCtx, ConnEvents};
 
 /// How long a forwarder waits for a record before it looks at whether its
@@ -218,5 +230,108 @@ fn forward(
         if !sent {
             return;
         }
+    }
+}
+
+/// `audit.verify`: see the module docs and [`super::ops`]. `limits` bound
+/// the stretch one call checks.
+pub(crate) fn verify(
+    audit: &AuditSink,
+    ctx: &ConnCtx,
+    req: &Request,
+    limits: RangeLimits,
+) -> Result<Value, ErrorBody> {
+    let params: AuditVerifyParams = if req.params.is_null() {
+        AuditVerifyParams::default()
+    } else {
+        params(req)?
+    };
+    // A closed writer has no head, and a failed one none it can vouch for:
+    // it published its failure before its rollback.
+    let head = audit.head().map_err(|error: HeadError| {
+        ErrorBody::new(
+            ErrorCode::InvalidState,
+            format!("cannot verify the audit log: {error}"),
+        )
+    })?;
+    // A connection that cannot hear events is one a test made: nothing
+    // closes it.
+    let conn = ctx.events.as_ref().and_then(ConnEvents::conn);
+    let open = AtomicBool::new(false);
+    let closing = conn.as_deref().map_or(&open, Conn::closing_flag);
+    let from_seq = params.from_seq.unwrap_or(1);
+    let report = verify_range(
+        &head.session_dir,
+        from_seq,
+        (head.seq, head.hash),
+        limits,
+        closing,
+    )
+    .map_err(refusal)?;
+    serde_json::to_value(AuditVerify {
+        from_seq: report.from_seq,
+        from_prev: report.from_prev,
+        to_seq: report.to_seq,
+        to_hash: report.to_hash,
+        head_seq: head.seq,
+        head_hash: head.hash,
+        checkpoints: report.checkpoints,
+        more: report.more,
+    })
+    .map_err(|error| ErrorBody::new(ErrorCode::Internal, format!("the result: {error}")))
+}
+
+/// The error `audit.verify` answers a walk that did not finish with.
+fn refusal(error: RangeError) -> ErrorBody {
+    match error {
+        RangeError::PastHead { from_seq, head_seq } => ErrorBody::new(
+            ErrorCode::BadRequest,
+            format!("from_seq {from_seq} is past the head of the audit log, seq {head_seq}"),
+        ),
+        RangeError::Cancelled => ErrorBody::new(ErrorCode::InvalidState, "the session is stopping"),
+        RangeError::Break(error) => ErrorBody::new(
+            ErrorCode::Internal,
+            truncate_utf8(&error.to_string(), MAX_AUDIT_VERIFY_MESSAGE).0,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use boxcar_audit::VerifyError;
+    use boxcar_proto::control::MAX_LINE;
+
+    use super::*;
+
+    /// A break is `internal`, with the verifier's message cut to 512 bytes
+    /// on a character boundary; a cancelled walk is the session stopping,
+    /// and a `from_seq` past the head a bad request.
+    #[test]
+    fn a_walk_that_did_not_finish_is_refused_by_its_kind() {
+        let short = refusal(RangeError::Break(VerifyError::Gap {
+            expected_seq: 3,
+            got_seq: 4,
+        }));
+        assert_eq!(short.code, ErrorCode::Internal);
+        assert_eq!(short.message, "sequence gap: expected seq 3, got seq 4");
+        let long = refusal(RangeError::Break(VerifyError::Layout {
+            reason: "é".repeat(MAX_LINE),
+        }));
+        assert_eq!(long.code, ErrorCode::Internal);
+        assert!(long.message.len() <= MAX_AUDIT_VERIFY_MESSAGE);
+        assert!(long.message.len() > MAX_AUDIT_VERIFY_MESSAGE - 4);
+        assert!(long.message.ends_with('…'), "{}", long.message);
+
+        let stopping = refusal(RangeError::Cancelled);
+        assert_eq!(
+            (stopping.code, stopping.message.as_str()),
+            (ErrorCode::InvalidState, "the session is stopping")
+        );
+        let past = refusal(RangeError::PastHead {
+            from_seq: 9,
+            head_seq: 8,
+        });
+        assert_eq!(past.code, ErrorCode::BadRequest);
+        assert!(past.message.contains("9") && past.message.contains("8"));
     }
 }
