@@ -20,7 +20,8 @@
 //!   subscriber that falls behind.
 //! - [`verify`]: [`verify_session`] and [`verify_jsonl`] check a log from its
 //!   raw bytes, and tell a tail cut mid-write ([`Incomplete`]) from a
-//!   break.
+//!   break. [`verify_range`] checks a stretch of a live log against the
+//!   head [`AuditSink::head`] gets from its writer.
 //!
 //! The session directory layout, rotation and torn-tail recovery live in the
 //! private `segment` module, checkpoints and `checkpoints.jsonl` in
@@ -49,13 +50,15 @@ pub use reconcile::{
     ReconcileConfig, Reconciler, ReconcilerHandle, SpanIndex, SystemClock,
 };
 pub use segment::{Fdatasync, Syncer};
-pub use sink::{AuditSink, EmitError, Priority, Submission};
+pub use sink::{AuditSink, EmitError, HeadError, Priority, Submission};
 pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE, REPLAY_YIELD};
 pub use verify::{
-    read_verified, verify_jsonl, verify_session, Incomplete, IncompleteKind, VerifyError,
-    VerifyReport,
+    read_verified, verify_jsonl, verify_range, verify_session, Incomplete, IncompleteKind,
+    RangeError, RangeLimits, RangeReport, VerifyError, VerifyReport,
 };
-pub use writer::{spawn, spawn_with_syncer, CloseStats, WriteFailure, WriterConfig, WriterHandle};
+pub use writer::{
+    spawn, spawn_with_syncer, CloseStats, Head, WriteFailure, WriterConfig, WriterHandle,
+};
 
 /// Makes the directory a writer for `session_id` under `data_dir` writes
 /// to (`<data_dir>/sessions/<session_id>`, mode 0700 all the way down) and
