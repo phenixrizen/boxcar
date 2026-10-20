@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use boxcar_testreg::{config, index, layer_tar, manifest, Auth, Faults, Registry};
 use kvm_harness::{
-    boxcar, guest_or_skip, networked_guest_or_skip, of_kind, start_with_root, text, Guest, Run,
-    Scratch,
+    boxcar, boxcar_run, guest_or_skip, networked_guest_or_skip, of_kind, start_env,
+    start_with_root, text, Guest, Run, Scratch,
 };
 
 /// The marker the package's program prints.
@@ -940,4 +940,86 @@ fn a_writable_exception_expires_during_a_run() {
             && r.data["result"]["ok"] == true),
         "{creates:?}"
     );
+}
+
+/// `boxcar run` confines the VMM by default: `vmm.start` records the
+/// seccomp filter (`enforce`, or what `BOXCAR_SECCOMP` asks for a whole
+/// run of the suites) and the Landlock domain (`full` or `partial`, as the
+/// kernel allows), and a session that writes its workspace ends as usual.
+#[test]
+fn a_session_runs_confined() {
+    let Some(guest) = guest_or_skip("a_session_runs_confined") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &[],
+        &["sh", "-c", "echo confined > /workspace/c && echo WROTE"],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(run.stdout.contains("WROTE"), "{}", run.describe());
+    let records = run.records();
+    let start = of_kind(&records, "vmm.start");
+    let hardening = &start[0].data["hardening"];
+    let seccomp = std::env::var("BOXCAR_SECCOMP").unwrap_or_else(|_| "enforce".into());
+    assert_eq!(hardening["seccomp"], seccomp.as_str(), "{hardening}");
+    assert!(
+        matches!(hardening["landlock"].as_str(), Some("full" | "partial")),
+        "{hardening}"
+    );
+    assert_eq!(
+        fs::read_to_string(scratch.path("workspace").join("c")).unwrap(),
+        "confined\n"
+    );
+    assert_eq!(of_kind(&records, "vmm.stop").len(), 1);
+}
+
+/// A call off the allowlist kills the VMM: the run dies by `SIGSYS`, its
+/// log has no `vmm.stop`, and `boxcar audit verify` says the log is intact
+/// or that its tail is cut, never that it is broken. The run asks for
+/// `--seccomp enforce` itself, whatever its lane's `BOXCAR_SECCOMP`.
+#[test]
+fn a_seccomp_kill_is_a_crash() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let Some(guest) = guest_or_skip("a_seccomp_kill_is_a_crash") else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let mut running = start_env(
+        &guest,
+        &scratch,
+        &["--seccomp", "enforce"],
+        &["sh", "-c", "echo UP; sleep 60"],
+        &[("BOXCAR_TEST_SECCOMP_TRIP", Path::new("5000"))],
+    );
+    running.until("the session to start", |run| run.stdout().contains("UP"));
+    let run = running.finish();
+    assert_eq!(
+        run.status.signal(),
+        Some(libc::SIGSYS),
+        "{}",
+        run.describe()
+    );
+    let dir = run.session_dir();
+    let verify = std::process::Command::new(env!("CARGO_BIN_EXE_boxcar"))
+        .args(["audit", "verify"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(verify.status.code(), Some(0 | 4)),
+        "{}\n{}",
+        verify.status,
+        text(&verify.stdout)
+    );
+    let records: Vec<_> = boxcar_audit::LogReader::open(&dir)
+        .unwrap()
+        .records()
+        .map_while(Result::ok)
+        .collect();
+    assert_eq!(of_kind(&records, "vmm.start").len(), 1, "{records:?}");
+    assert!(of_kind(&records, "vmm.stop").is_empty(), "{records:?}");
 }

@@ -28,6 +28,8 @@ use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
 use boxcar_proto::{guestcmd, SessionId};
 use boxcar_vmm::devices::slots::DeviceSet;
 use boxcar_vmm::devices::FS_TAGS;
+use boxcar_vmm::hardening::domain::{self, Reach, Rule};
+use boxcar_vmm::hardening::{LandlockStatus, SeccompMode};
 use boxcar_vmm::lifecycle::SignalFd;
 use boxcar_vmm::lifecycle::{block_signals, block_stop_signals, exit_code_for, AUDIT_FAILED_EXIT};
 use boxcar_vmm::pty::input::{self, LocalInput};
@@ -43,7 +45,7 @@ use tracing_subscriber::EnvFilter;
 use boxcar_proto::limits::{truncate_utf8, MAX_PATH};
 use boxcar_proto::{ImageRef, PolicyLoaded};
 
-use crate::cli::{AuditLevelArg, PullArg, RunArgs};
+use crate::cli::{AuditLevelArg, LandlockArg, PullArg, RunArgs, SeccompArg};
 use crate::client;
 use crate::cmd::{image, nofile, tell};
 use crate::oci::client::{Client, ClientError};
@@ -274,6 +276,56 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let sessions_root =
         client::ensure_sessions_root().context("cannot set up the control socket's directory")?;
 
+    // What the Landlock domain names must exist before it: the session's
+    // directory (the log, the image's copy, the default workspace), the
+    // state directory (the sockets, the console's file there) and a
+    // console file elsewhere. `made` removes the two directories again,
+    // if they are empty, on every way out of `run`.
+    let mut made = MadeDirs::default();
+    let session_dir = boxcar_audit::prepare_session_dir(&audit_dir, &session_id)
+        .with_context(|| format!("cannot start the audit log under {}", audit_dir.display()))?;
+    made.0.push(session_dir.clone());
+    let state_dir = sessions_root.join(session_id.as_str());
+    make_state_dir(&state_dir)?;
+    made.0.push(state_dir.clone());
+    let relayed = mode == GuestMode::Vsock;
+    let console = console_out(args.console_log, args.console_stdout, relayed, &state_dir);
+    // The console's file in the state directory, which this run made.
+    let mut console_log = None;
+    if let ConsoleOut::File(path) = &console {
+        if relayed && path.starts_with(&state_dir) {
+            create_console_log(&state_dir, path)?;
+            console_log = Some(path.clone());
+        } else {
+            open_console_file(path)?;
+        }
+    }
+    // Before any thread of this run starts, so that every one inherits the
+    // domain (see `boxcar_vmm::hardening::domain`).
+    let landlock = confine(
+        args.landlock,
+        &SessionPaths {
+            session_dir: &session_dir,
+            sessions_root: &audit_dir.join(boxcar_audit::SESSIONS_DIR),
+            state_dir: &state_dir,
+            runtime_root: &sessions_root,
+            shares: [rootfs.as_deref(), workspace.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            image_tree: found.as_ref().map(|found| found.dir.join("rootfs")),
+            console: match &console {
+                ConsoleOut::File(path) if console_log.is_none() => Some(path),
+                _ => None,
+            },
+            dump: dump.as_ref().map(DumpDir::path),
+            kernel: &args.kernel,
+            initramfs: args.initramfs.as_deref(),
+            net,
+            fs: has_shares,
+        },
+    )?;
+
     // Before any thread starts, so that every thread inherits the mask and
     // the signals reach only the VMM's signalfd (and SIGWINCH only the
     // session terminal's).
@@ -318,19 +370,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // The image is copied: the cache may change hands.
     drop(cache_lock);
 
-    let state_dir = sessions_root.join(session_id.as_str());
-    let relayed = mode == GuestMode::Vsock;
-    let console = console_out(args.console_log, args.console_stdout, relayed, &state_dir);
-    // The console's file in the state directory, which this run made.
-    let mut console_log = None;
-    if relayed {
-        if let ConsoleOut::File(path) = &console {
-            if path.starts_with(&state_dir) {
-                create_console_log(&state_dir, path)?;
-                eprintln!("console: {}", path.display());
-                console_log = Some(path.clone());
-            }
-        }
+    if let Some(path) = &console_log {
+        eprintln!("console: {}", path.display());
     }
     // A command needs no input: the terminal stays as it is.
     let interactive = args.command.is_empty();
@@ -371,6 +412,12 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         image: image_ref,
         policy_loaded: Some(policy_loaded),
         path_rules: settings.paths,
+        seccomp: match args.seccomp {
+            SeccompArg::Enforce => SeccompMode::Enforce,
+            SeccompArg::Log => SeccompMode::Log,
+            SeccompArg::Off => SeccompMode::Off,
+        },
+        landlock: Some(landlock),
         fs_audit: AuditFsOptions {
             level: match args.audit_level {
                 AuditLevelArg::Normal => AuditLevel::Normal,
@@ -419,6 +466,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                     }
                 }
             }
+            #[cfg(feature = "kvm-tests")]
+            seccomp_trip();
             let outcome = vmm.run();
             // What the session printed last may still be on its way to a
             // slow stdout: it is written before boxcar exits, for as long as
@@ -431,11 +480,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             outcome
         }
         Err(error) => {
-            // No guest ran: the empty console file and the state directory
-            // made for it go, as the VMM's own files there did.
+            // No guest ran: the empty console file goes, as the VMM's own
+            // files did, and `made` the state directory made for it.
             if let Some(path) = console_log {
                 let _ = fs::remove_file(path);
-                let _ = fs::remove_dir(&state_dir);
             }
             Err(error)
         }
@@ -755,6 +803,147 @@ fn test_upstream_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
 #[cfg(not(feature = "kvm-tests"))]
 fn test_upstream_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
     Vec::new()
+}
+
+/// A gated test's seccomp kill: with `BOXCAR_TEST_SECCOMP_TRIP=<ms>`, a
+/// thread makes one call off the allowlist that many milliseconds after the
+/// VM starts running, so the process dies by `SIGSYS` as a seccomp kill on
+/// any path would. Only a `kvm-tests` build reads the variable.
+#[cfg(feature = "kvm-tests")]
+fn seccomp_trip() {
+    let Some(ms) = env::var("BOXCAR_TEST_SECCOMP_TRIP")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("seccomp-trip".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            // SAFETY: getppid takes no arguments; it is off the allowlist.
+            unsafe { libc::syscall(libc::SYS_getppid) };
+        });
+}
+
+/// The directories `run` made before the Landlock domain, removed again
+/// when `run` returns, each only if it is empty: the state directory once
+/// the VMM has taken its sockets away, the session's directory only when
+/// nothing was ever written to it.
+#[derive(Default)]
+struct MadeDirs(Vec<PathBuf>);
+
+impl Drop for MadeDirs {
+    fn drop(&mut self) {
+        for dir in self.0.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Creates the state directory, mode 0700, if it is not there yet: the
+/// control server and the vsock device check it is.
+fn make_state_dir(state_dir: &Path) -> anyhow::Result<()> {
+    match DirBuilder::new().mode(0o700).create(state_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("cannot create {}", state_dir.display())),
+    }
+}
+
+/// Opens the console's file `path` (`--console-log`), creating it but not
+/// cutting it, so that the Landlock domain can name it; the VMM truncates
+/// it when it opens it.
+fn open_console_file(path: &Path) -> anyhow::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("--console-log {}", path.display()))?;
+    Ok(())
+}
+
+/// What the session uses by path, for its Landlock domain.
+struct SessionPaths<'a> {
+    /// The audit log's directory for this session, which holds the image's
+    /// copy and the default workspace too.
+    session_dir: &'a Path,
+    /// Its parent, `<audit dir>/sessions`.
+    sessions_root: &'a Path,
+    /// The state directory: the sockets, and the console's file there.
+    state_dir: &'a Path,
+    /// Its parent, the sessions root under `$XDG_RUNTIME_DIR`.
+    runtime_root: &'a Path,
+    /// `--rootfs` and `--workspace`, as given.
+    shares: Vec<&'a Path>,
+    /// The cached image's tree, copied for the session after the domain.
+    image_tree: Option<PathBuf>,
+    /// A console file outside the state directory (`--console-log`).
+    console: Option<&'a Path>,
+    /// `--dump`.
+    dump: Option<&'a Path>,
+    kernel: &'a Path,
+    initramfs: Option<&'a Path>,
+    /// The VM has a network: the host's resolver configuration is read.
+    net: bool,
+    /// The VM has shares: the passthrough reads its mount table.
+    fs: bool,
+}
+
+/// The rules of the session's Landlock domain: everything but running a
+/// program beneath its own directories and its shares, reading beneath the
+/// image's tree, the console's file, the kernel and the initramfs,
+/// `/dev/kvm`, the resolver's configuration and the mount table, and
+/// removing the session's and the state directories when they are empty.
+fn landlock_rules(paths: &SessionPaths) -> Vec<Rule> {
+    let mut rules = vec![
+        Rule::new(paths.session_dir, Reach::Tree),
+        Rule::new(paths.sessions_root, Reach::RemoveDir),
+        Rule::new(paths.state_dir, Reach::Tree),
+        Rule::new(paths.runtime_root, Reach::RemoveDir),
+    ];
+    rules.extend(paths.shares.iter().map(|&dir| Rule::new(dir, Reach::Tree)));
+    if let Some(tree) = &paths.image_tree {
+        rules.push(Rule::new(tree, Reach::ReadTree));
+    }
+    if let Some(file) = paths.console {
+        rules.push(Rule::new(file, Reach::WriteFile));
+    }
+    if let Some(dir) = paths.dump {
+        rules.push(Rule::new(dir, Reach::Tree));
+    }
+    rules.push(Rule::new(paths.kernel, Reach::ReadFile));
+    if let Some(initramfs) = paths.initramfs {
+        rules.push(Rule::new(initramfs, Reach::ReadFile));
+    }
+    rules.push(Rule::new("/dev/kvm", Reach::Device));
+    if paths.net {
+        rules.push(Rule::new("/etc/resolv.conf", Reach::ReadFile));
+    }
+    if paths.fs {
+        rules.push(Rule::new("/proc/self/mountinfo", Reach::ReadFile));
+    }
+    rules
+}
+
+/// Confines this process to `paths` with Landlock (`--landlock enforce`),
+/// before its first thread, and says how far: `off`, or what the kernel
+/// allowed. A kernel without a usable Landlock runs the session without
+/// it, with a warning.
+fn confine(mode: LandlockArg, paths: &SessionPaths) -> anyhow::Result<LandlockStatus> {
+    if mode == LandlockArg::Off {
+        return Ok(LandlockStatus::Off);
+    }
+    let status = domain::apply(&landlock_rules(paths), domain::Options::default())
+        .map_err(|error| anyhow::anyhow!("{error} (--landlock off runs the session without it)"))?;
+    if status == LandlockStatus::Unsupported {
+        eprintln!(
+            "warning: this kernel has no usable Landlock; the session runs without it \
+             (boxcar doctor says why)"
+        );
+    }
+    Ok(status)
 }
 
 /// The session's CA when `policy` has an `inspect` line: made now, for

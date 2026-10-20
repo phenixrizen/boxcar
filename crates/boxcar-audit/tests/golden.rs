@@ -104,6 +104,7 @@ fn golden_records() -> Vec<Record> {
             shares: Vec::new(),
             inspect_ca_sha256: None,
             image: None,
+            hardening: None,
         }),
         None,
         None,

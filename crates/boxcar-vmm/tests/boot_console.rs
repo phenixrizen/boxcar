@@ -17,6 +17,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -94,6 +97,7 @@ fn share(tag: &str, host_dir: PathBuf, guest_path: &str, cache: CachePolicyKind)
 
 #[test]
 fn a_session_command_writes_a_file_the_audit_hashes() {
+    confine!();
     let Some((kernel, initramfs, rootfs)) = guest_or_skip() else {
         return;
     };
@@ -127,6 +131,7 @@ fn a_session_command_writes_a_file_the_audit_hashes() {
                 CachePolicyKind::Auto,
             ),
         ],
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();

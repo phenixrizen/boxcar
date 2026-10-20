@@ -9,6 +9,7 @@ pub mod console;
 pub mod control;
 pub mod devices;
 pub mod guest_ctl;
+pub mod hardening;
 pub mod kick;
 pub mod kvm;
 pub mod lifecycle;

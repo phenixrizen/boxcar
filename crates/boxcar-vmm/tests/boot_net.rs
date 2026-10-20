@@ -21,6 +21,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -118,6 +121,7 @@ fn of_kind<'a>(records: &'a [Record], kind: &str) -> Vec<&'a Record> {
 
 #[test]
 fn a_guest_downloads_what_the_policy_allows_and_resolves_nothing_else() {
+    confine!();
     let Some((kernel, initramfs, rootfs)) = guest_or_skip() else {
         return;
     };
@@ -149,6 +153,7 @@ fn a_guest_downloads_what_the_policy_allows_and_resolves_nothing_else() {
         ],
         net: Some(NetConfig::from_host()),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();

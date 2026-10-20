@@ -45,7 +45,7 @@ vmm-sys-util = "=0.15.0"
 blake3 = "1.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
@@ -72,6 +72,11 @@ boxcar-testreg = { path = "crates/boxcar-testreg" }
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 globset = { version = "0.4", default-features = false }
 boxcar-policy = { path = "crates/boxcar-policy" }
+
+# Hardening (M5): one seccomp allowlist for the VMM process, and a Landlock
+# domain over the paths a session uses.
+seccompiler = "0.5"
+landlock = "0.4"
 
 # The user-mode network stack (boxcar-net).
 # The guest sensor (M3): aya loads the eBPF programs in the guest, aya-build

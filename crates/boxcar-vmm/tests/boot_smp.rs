@@ -16,6 +16,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -111,6 +114,7 @@ fn config(
             share("root", rootfs, "/", CachePolicyKind::Always),
             share("workspace", workspace, "/workspace", CachePolicyKind::Auto),
         ],
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     }
 }
@@ -125,6 +129,7 @@ fn lines_equal(console: &str, want: &str) -> usize {
 
 #[test]
 fn four_vcpus_all_come_up_in_the_guest() {
+    confine!();
     let Some(guest) = guest_or_skip(TEST) else {
         return;
     };
@@ -226,6 +231,7 @@ fn stop_within_a_second(vcpus: u8, script: &str, extra: &[&str], marker: &str) {
 
 #[test]
 fn a_stop_under_load_on_two_vcpus_returns_within_a_second() {
+    confine!();
     // `echo busy` shows the shell got past starting the two loads.
     stop_within_a_second(
         2,
@@ -237,6 +243,7 @@ fn a_stop_under_load_on_two_vcpus_returns_within_a_second() {
 
 #[test]
 fn a_stop_returns_within_a_second_while_the_other_vcpus_never_started() {
+    confine!();
     // With `maxcpus=1` the guest runs on the first vCPU alone: `nproc`
     // says 1, and the other three have not seen INIT or SIPI when the stop
     // comes.

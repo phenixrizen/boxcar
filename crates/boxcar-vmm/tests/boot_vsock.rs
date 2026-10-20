@@ -37,6 +37,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -171,6 +174,7 @@ fn probe(console: &Path, uds: &Path) -> Result<Probe, String> {
 
 #[test]
 fn the_guest_probes_the_vsock_device_and_resets_a_host_connect_to_a_closed_port() {
+    confine!();
     let Some((kernel, initramfs, rootfs)) = guest_or_skip() else {
         return;
     };
@@ -203,6 +207,7 @@ fn the_guest_probes_the_vsock_device_and_resets_a_host_connect_to_a_closed_port(
             share("workspace", workspace, "/workspace", CachePolicyKind::Auto),
         ],
         vsock: Some(VsockConfig::new(&uds)),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -280,6 +285,7 @@ fn the_guest_probes_the_vsock_device_and_resets_a_host_connect_to_a_closed_port(
 /// the state directory the device made for it.
 #[test]
 fn a_build_that_fails_after_the_vsock_device_leaves_nothing_behind() {
+    confine!();
     let Some((kernel, initramfs, _rootfs)) = guest_or_skip() else {
         return;
     };
@@ -294,6 +300,7 @@ fn a_build_that_fails_after_the_vsock_device_leaves_nothing_behind() {
         stdin: false,
         initramfs: Some(initramfs),
         vsock: Some(VsockConfig::new(&uds)),
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     match Vmm::new(cfg) {

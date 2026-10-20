@@ -230,3 +230,14 @@ Made by Task 5 (`docs/plans/policy-enforcement.md`), 2026-10-19:
 - **An egress exception is an allow after the permanent rules**, so a permanent deny of its target still wins. **An exception comes alone in its `policy.update`**, and the 65th is `busy`.
 - **Exceptions expire by `CLOCK_BOOTTIME`**, recorded as realtime `expires_ns`. `policy.changed{by_pid: 0}` marks an expiry, and every policy record is made under the policy's lock, in version order.
 - **`keep_tool_args = false` drops the summary as well as the arguments**, and keeps `args_b3`.
+
+Made by Task 7 (`docs/plans/vmm-hardening.md`), 2026-10-20:
+
+- **The allowlist is measured, then completed from the code.** bpftrace on the test box (not `strace -f -c`, which slows the timing-sensitive tests) counted every syscall of every `boxcar` process over `test-kvm m5`, by thread and by argument, from each process's first `KVM_RUN`. What the guest can reach that the suites never did (every FUSE operation the passthrough serves, every socket call of a flow, a device reset) comes from the source: a call off the list is a guest-triggered kill. The list is glibc's on x86_64; other targets refuse `enforce` and `log`.
+- **The filter goes in before `vmm.start` is recorded**, in `Vmm::new` once the VM is built, so `vmm.start.hardening` states what is in force. `clone3` is answered `ENOSYS` by a second filter, installed first; `tgkill` and `socketpair` are filtered too.
+- **Landlock confines every thread or the run does not start.** On ABI 8 and later (the test box runs Linux 7.0) `LANDLOCK_RESTRICT_SELF_TSYNC` covers every thread; without it `run` waits up to 30 s for threads from before (ureq's resolvers) to end, then refuses. ABI 1 counts as no Landlock: without `REFER` it refuses renames across directories. TCP binds and both scopes are handled; `EXECUTE` is granted nowhere.
+- **`run` makes the session's and the state directories before the domain**, and removes them, when empty, on every way out.
+- **`--landlock enforce|off`, `BOXCAR_SECCOMP` and `BOXCAR_LANDLOCK`.** The record admits `"off"`, a missed path needs a way out without a new build, and the variables let a whole suite run under `log`. `xtask test-kvm` refuses `off`.
+- **The `boot_*` tests run confined, each in a child of its test binary**, since a process-wide filter would bind libtest and every later test.
+- **A log cut mid-write is `incomplete`, cause unknown, exit code 4.** Verify cannot tell a crash from a deliberate cut; what a cut tail can hide is bounded by the index, as for a cut at a record boundary. The writer's rollback cuts the index before the segment, so a kill halfway leaves a state a crash can produce.
+- **Guest memory is `MADV_DONTDUMP`**, so a kill's core holds none of it.

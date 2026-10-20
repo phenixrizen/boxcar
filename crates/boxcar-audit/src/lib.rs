@@ -51,3 +51,50 @@ pub use sink::{AuditSink, EmitError, Priority, Submission};
 pub use subscribe::{Item, Next, Subscription, DEFAULT_QUEUE, REPLAY_YIELD};
 pub use verify::{verify_jsonl, verify_session, VerifyError, VerifyReport};
 pub use writer::{spawn, spawn_with_syncer, CloseStats, WriteFailure, WriterConfig, WriterHandle};
+
+/// Makes the directory a writer for `session_id` under `data_dir` writes
+/// to (`<data_dir>/sessions/<session_id>`, mode 0700 all the way down) and
+/// syncs its parent, before the writer starts: a caller that confines
+/// itself to the paths it will use (`boxcar run`, with Landlock) needs the
+/// directory to exist first. The writer takes an existing empty directory
+/// as a new session.
+pub fn prepare_session_dir(
+    data_dir: &std::path::Path,
+    session_id: &boxcar_proto::SessionId,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let dir = data_dir.join(SESSIONS_DIR).join(session_id.as_str());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(segment::DIR_MODE)
+        .create(&dir)?;
+    if let Some(parent) = dir.parent() {
+        segment::sync_dir(parent)?;
+    }
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use boxcar_proto::SessionId;
+
+    use super::*;
+
+    /// A writer started on a prepared directory takes it as a new session,
+    /// and writes where it was prepared.
+    #[test]
+    fn a_prepared_session_directory_is_the_writers() {
+        let data = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let dir = prepare_session_dir(data.path(), &id).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let (_sink, writer) = spawn(WriterConfig::new(data.path(), id)).unwrap();
+        assert_eq!(writer.session_dir(), dir);
+        writer.close().unwrap();
+        assert!(dir.join("meta.json").exists());
+    }
+}

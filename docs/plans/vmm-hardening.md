@@ -222,7 +222,7 @@ The reader already stops quietly at a partial last line in the newest segment (`
 
 ### Core dumps
 
-`SECCOMP_RET_KILL_PROCESS` dumps core where the limits allow. A core holds guest RAM, which may hold an agent's secrets, and is as large as that RAM. So every guest memory region, high memory included, is marked `MADV_DONTDUMP` once it is mapped (`memory.rs:35`). A failure is an error, like any other step of the build. The rest of the core stays, for debugging.
+`SECCOMP_RET_KILL_PROCESS` dumps core where the limits allow. A core holds guest RAM, which may hold an agent's secrets, and is as large as that RAM. So every guest memory region, high memory included, is marked `MADV_DONTDUMP` once it is mapped (`memory.rs:35`). A failure is an error, like any other step of the build. The rest of the core stays, for debugging. A unit test reads the mapping's flags back from `/proc/self/smaps`; where a core goes (a file, systemd-coredump, apport) is the host's, so no gated test looks for one.
 
 ## 5. The record, the flags, doctor
 
@@ -319,7 +319,7 @@ Then:
   - the vsock device: the session's channel goes and the session ends (`ctl.rs:17`), and the VMM must stop cleanly, recording `vmm.stop`, not die by `SIGSYS`.
 - **`kvm_m5`**:
   - `a_session_runs_confined`: `vmm.start.hardening` is what the run's lane asks: `BOXCAR_SECCOMP`, else `enforce`, and `full` or `partial` as the kernel allows.
-  - `a_seccomp_kill_is_a_crash`, run with `--seccomp enforce` on its command line: a `kvm-tests` build reads `BOXCAR_TEST_SECCOMP_TRIP` and makes one call off the list once the guest has run. The run dies by `SIGSYS`, with no `vmm.stop`, and the core has no guest memory. `boxcar audit verify` says `ok` or `incomplete`, never `fail`.
+  - `a_seccomp_kill_is_a_crash`, run with `--seccomp enforce` on its command line: a `kvm-tests` build reads `BOXCAR_TEST_SECCOMP_TRIP` and makes one call off the list once the guest has run. The run dies by `SIGSYS`, with no `vmm.stop`. `boxcar audit verify` says `ok` or `incomplete`, never `fail`.
 
 ### Lanes on the test box, recorded in the pull request
 

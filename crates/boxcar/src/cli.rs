@@ -631,6 +631,37 @@ pub struct RunArgs {
     /// in memory only.
     #[arg(long)]
     pub scrub_argv: bool,
+    /// The VMM process's seccomp filter, on every thread once the VM is
+    /// built: `enforce` kills the process at a syscall off its allowlist (a
+    /// crash: no `vmm.stop`, and `boxcar audit verify` may find the log's
+    /// tail cut); `log` has the kernel log such a call and lets it go
+    /// ahead, for finding a call the list lacks; `off` installs none.
+    /// `vmm.start` records it. Also read from `BOXCAR_SECCOMP`; the flag
+    /// wins.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        env = "BOXCAR_SECCOMP",
+        default_value_t = SeccompArg::Enforce
+    )]
+    pub seccomp: SeccompArg,
+    /// The VMM process's Landlock domain, applied before its first thread:
+    /// `enforce` confines it to the paths the session uses (the shares, the
+    /// session's and the state directories, the kernel, the initramfs,
+    /// `/dev/kvm`, a dump directory); `off` leaves it unconfined, a way out
+    /// when a path a session needs is missing from the domain. A kernel
+    /// without Landlock (or with only its first version) runs the session
+    /// unconfined either way. `vmm.start` records which. Also read from
+    /// `BOXCAR_LANDLOCK`; the flag wins.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        env = "BOXCAR_LANDLOCK",
+        default_value_t = LandlockArg::Enforce
+    )]
+    pub landlock: LandlockArg,
     /// Set NAME to VALUE in the session's environment, after the defaults
     /// (PATH, HOME, TERM, LANG, BOXCAR_SESSION_ID). Repeatable. For what
     /// an agent inside needs, such as CLAUDE_CODE_OAUTH_TOKEN: the value
@@ -736,6 +767,21 @@ pub fn parse_env(text: &str) -> Result<(String, String), String> {
 pub enum AuditLevelArg {
     Normal,
     Verbose,
+}
+
+/// `--seccomp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SeccompArg {
+    Enforce,
+    Log,
+    Off,
+}
+
+/// `--landlock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LandlockArg {
+    Enforce,
+    Off,
 }
 
 #[cfg(test)]

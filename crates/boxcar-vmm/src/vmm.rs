@@ -65,13 +65,15 @@ use crate::devices::{
     DeviceError, FsDevices, FsOptions, LegacyDevices, NetDevice, NetSetup, VsockDevice,
 };
 use crate::guest_ctl::{GuestCtl, SessionConfig, CLOSE_DEADLINE};
+use crate::hardening::seccomp::{self, SeccompError};
+use crate::hardening::{Hardening, LandlockStatus, SeccompMode};
 use crate::kick::register_kick_handler;
 use crate::kvm::{KvmContext, KvmError};
 use crate::lifecycle::{
     block_stop_signals, exit_code_for, record_stop, stop, wait_for_stop, ControlSubscriber,
     MainLoop, SignalFd, StopCounts, StopLatch, Teardown, VmInfo, CONSOLE_DEADLINE,
 };
-use crate::memory::{create_guest_memory, initrd_load_addr};
+use crate::memory::{create_guest_memory, exclude_from_core_dumps, initrd_load_addr};
 use crate::policy::{ExpiryTimer, LivePolicy};
 use crate::pty::PtyHub;
 use crate::sensor_ingest::SensorIngest;
@@ -254,6 +256,15 @@ pub struct VmConfig {
     /// `policy.loaded` right after `vmm.start`, before anything else
     /// (`boxcar run` always gives it); nothing is recorded without it.
     pub policy_loaded: Option<PolicyLoaded>,
+    /// The seccomp filter installed on every thread once the VM is built,
+    /// before `vmm.start` (`crate::hardening::seccomp`). Off by default: a
+    /// filter binds the whole process, so a program that builds a VM among
+    /// other things (a test) must ask for one.
+    pub seccomp: SeccompMode,
+    /// The Landlock domain the caller confined this process to before its
+    /// first thread (`crate::hardening::domain`), for the record; `None`
+    /// when it did not try.
+    pub landlock: Option<LandlockStatus>,
 }
 
 /// Where the control socket goes and which session it serves.
@@ -305,7 +316,21 @@ impl VmConfig {
             image: None,
             policy_loaded: None,
             path_rules: None,
+            seccomp: SeccompMode::Off,
+            landlock: None,
         }
+    }
+
+    /// `vmm.start`'s `hardening`: none when the process is neither filtered
+    /// nor confined by Landlock, as when a test builds the VM.
+    fn hardening(&self) -> Option<Hardening> {
+        if self.seccomp == SeccompMode::Off && self.landlock.is_none() {
+            return None;
+        }
+        Some(Hardening {
+            seccomp: self.seccomp,
+            landlock: self.landlock.unwrap_or(LandlockStatus::Off),
+        })
     }
 }
 
@@ -365,6 +390,10 @@ pub enum VmmError {
     PathRules(#[from] boxcar_fs::rules::GlobError),
     #[error("--policy: {0}")]
     Scan(#[from] boxcar_fs::ScanError),
+    #[error("cannot keep guest memory out of core dumps")]
+    DontDump(#[source] io::Error),
+    #[error(transparent)]
+    Seccomp(#[from] SeccompError),
     #[error("cannot record vmm.start")]
     Audit(#[from] EmitError),
     #[error("cannot bind the control socket in {}", state_dir.display())]
@@ -465,6 +494,7 @@ impl Vmm {
         .map_err(kvm_ioctl("create_pit2"))?;
 
         let mem = Arc::new(create_guest_memory(mem_size)?);
+        exclude_from_core_dumps(&mem).map_err(VmmError::DontDump)?;
         register_memory(&vm, &mem)?;
 
         let (entry, kernel_end) = load_kernel(&mem, &cfg.kernel)?;
@@ -638,7 +668,12 @@ impl Vmm {
                 .as_ref()
                 .map(|gate| gate.ca().fingerprint_sha256().to_owned()),
             image: cfg.image.clone(),
+            hardening: cfg.hardening(),
         };
+        // The VM is built: from here on every thread is filtered, so the
+        // record says what is in force. Before the record, after the files
+        // it names were read and hashed.
+        seccomp::install(cfg.seccomp)?;
         tracing::debug!("vmm.start: {start:?}");
         cfg.audit.emit(Submission {
             ring: Ring::Host,

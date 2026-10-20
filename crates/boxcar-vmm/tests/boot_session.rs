@@ -38,6 +38,9 @@
 
 #![cfg(feature = "kvm-tests")]
 
+#[macro_use]
+mod confined;
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -234,6 +237,7 @@ fn run_with(
             session_id: SessionId::new(),
         }),
         inspect,
+        seccomp: confined::seccomp(),
         ..VmConfig::new(kernel, sink)
     };
     let vmm = Vmm::new(cfg).unwrap();
@@ -289,6 +293,7 @@ fn of_kind<'a>(records: &'a [Record], kind: &str) -> Vec<&'a Record> {
 
 #[test]
 fn the_session_exit_code_and_output_come_back() {
+    confine!();
     let Some(run) = run(&["/bin/sh", "-c", "echo SESSION_HI; exit 7"], |_| {}) else {
         return;
     };
@@ -365,6 +370,7 @@ fn the_session_exit_code_and_output_come_back() {
 
 #[test]
 fn a_session_killed_by_a_signal_exits_128_plus_it() {
+    confine!();
     let Some(run) = run(&["/bin/sh", "-c", "kill -9 $$"], |_| {}) else {
         return;
     };
@@ -402,6 +408,7 @@ fn graceful_stop(beside: Beside, asked: mpsc::Sender<Instant>) {
 /// `sleep` dies of the hangup, the first of the two signals.
 #[test]
 fn a_graceful_stop_ends_the_session_with_a_hangup() {
+    confine!();
     let (asked_tx, asked) = mpsc::channel();
     let Some(run) = run(&["sleep", "100"], move |beside| {
         graceful_stop(beside, asked_tx)
@@ -438,6 +445,7 @@ fn a_graceful_stop_ends_the_session_with_a_hangup() {
 /// grace and `SIGKILL`).
 #[test]
 fn a_graceful_stop_ends_an_interactive_login_shell_at_once() {
+    confine!();
     let (asked_tx, asked) = mpsc::channel();
     let Some(run) = run(&["/bin/sh", "-l"], move |beside| {
         graceful_stop(beside, asked_tx)
@@ -473,6 +481,7 @@ fn a_graceful_stop_ends_an_interactive_login_shell_at_once() {
 /// session gets `SIGWINCH`.
 #[test]
 fn a_resize_reaches_the_session() {
+    confine!();
     let script = "stty size; trap 'stty size; exit 0' WINCH; echo READY; \
                   while :; do sleep 0.1; done";
     let Some(run) = run(&["/bin/sh", "-c", script], |beside| {
@@ -501,6 +510,7 @@ fn a_resize_reaches_the_session() {
 /// fingerprint. The key never travels.
 #[test]
 fn the_guest_trusts_the_session_ca() {
+    confine!();
     let ca = Arc::new(SessionCa::generate("boot-session-test").unwrap());
     // The markers are not dashes: a PEM line starts with those.
     let script = "echo ===CA; cat /run/boxcar/ca.pem; echo ===STORE; \
@@ -577,6 +587,7 @@ fn the_guest_trusts_the_session_ca() {
 /// `vmm.start` carries no fingerprint.
 #[test]
 fn without_a_ca_the_guest_has_no_trust_files() {
+    confine!();
     let script = "if [ -e /run/boxcar ]; then echo HAVE; else echo NONE; fi; \
                   env | grep -c -E '^(SSL_CERT_FILE|NODE_EXTRA_CA_CERTS)='; true";
     let Some(run) = run(&["/bin/sh", "-c", script], |_| {}) else {
@@ -599,6 +610,7 @@ fn without_a_ca_the_guest_has_no_trust_files() {
 /// group interrupts `sleep`, and the run exits 130.
 #[test]
 fn a_signal_from_the_host_interrupts_the_session() {
+    confine!();
     let script = "echo READY; exec sleep 100";
     let Some(run) = run(&["/bin/sh", "-c", script], |beside| {
         if beside.shows("READY") {
