@@ -1,6 +1,6 @@
 # Ownership inside the guest without a privileged host process (#5, #32)
 
-Branch `issue-5`, from `main`; #32 (an image's ownership presented in the guest) follows on it. The design's section 9 and the M5 plan's section 8 (*No ownership override in M5*) set this aside. Subject: `fs: an ownership override the guest sees`.
+Branch `issue-5`, from `main`; #32 (an image's ownership presented in the guest) follows on it as branch `issue-32`, stacked. The design's section 9 and the M5 plan's section 8 (*No ownership override in M5*) set this aside. Subject: `fs: an ownership override the guest sees`.
 
 The VMM runs unprivileged, so the passthrough cannot switch uid per request: AuditFs passes uid 0 to the inner filesystem, the guest session runs as the host user's uid and gid and owns what it creates, and `chown`, `mknod` and `security.*` xattrs fail with `EPERM`. An image's files all belong to the host user once unpacked; its device nodes are skipped and listed in `image.json`.
 

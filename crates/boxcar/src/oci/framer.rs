@@ -38,6 +38,11 @@ pub struct Entry {
     pub link: Vec<u8>,
     pub mode: u32,
     pub size: u64,
+    /// The owner: the header's, or a PAX `uid`/`gid` record's.
+    pub uid: u32,
+    pub gid: u32,
+    /// A device entry's major and minor numbers; zero for any other kind.
+    pub dev: (u32, u32),
 }
 
 /// Reads entries from a tar stream.
@@ -58,6 +63,8 @@ struct Overrides {
     size: Option<u64>,
     path: Option<Vec<u8>>,
     link: Option<Vec<u8>>,
+    uid: Option<u32>,
+    gid: Option<u32>,
 }
 
 /// The current entry's data: exactly its size, an early end an error.
@@ -197,6 +204,24 @@ impl<'a, R: Read> Framer<'a, R> {
                 .take()
                 .or_else(|| header.link_name_bytes().map(|l| l.into_owned()))
                 .unwrap_or_default();
+            let uid = match over.uid.take() {
+                Some(id) => id,
+                None => id_of(header.uid(), &header.as_old().uid, "uid")?,
+            };
+            let gid = match over.gid.take() {
+                Some(id) => id,
+                None => id_of(header.gid(), &header.as_old().gid, "gid")?,
+            };
+            let dev = match kind {
+                Kind::CharDevice | Kind::BlockDevice => {
+                    let (major, minor) = raw_device_fields(header);
+                    (
+                        device_number(header.device_major(), major, "major")?,
+                        device_number(header.device_minor(), minor, "minor")?,
+                    )
+                }
+                _ => (0, 0),
+            };
             self.remaining = size;
             self.padding = (512 - size % 512) % 512;
             return Ok(Some(Entry {
@@ -205,6 +230,9 @@ impl<'a, R: Read> Framer<'a, R> {
                 link,
                 mode,
                 size,
+                uid,
+                gid,
+                dev,
             }));
         }
     }
@@ -299,8 +327,51 @@ fn check_checksum(header: &tar::Header, block: &[u8; 512]) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether a numeric field says nothing (NULs or spaces), which GNU tar
+/// reads as zero.
+fn empty_field(raw: &[u8]) -> bool {
+    raw.iter().all(|b| matches!(b, 0 | b' '))
+}
+
+/// A header's uid or gid (`parsed` from its `raw` field) as a `u32`: what
+/// the kernel takes.
+fn id_of(parsed: io::Result<u64>, raw: &[u8], what: &str) -> io::Result<u32> {
+    let id = match parsed {
+        Ok(id) => id,
+        Err(_) if empty_field(raw) => 0,
+        Err(_) => return Err(malformed(format!("a header's {what} does not parse"))),
+    };
+    u32::try_from(id).map_err(|_| malformed(format!("a header's {what} does not fit in 32 bits")))
+}
+
+/// A device entry's major or minor number (`parsed` from its `raw`
+/// field); zero where the header has no such field.
+fn device_number(parsed: io::Result<Option<u32>>, raw: &[u8], what: &str) -> io::Result<u32> {
+    match parsed {
+        Ok(number) => Ok(number.unwrap_or(0)),
+        Err(_) if empty_field(raw) => Ok(0),
+        Err(_) => Err(malformed(format!(
+            "a header's device {what} does not parse"
+        ))),
+    }
+}
+
+/// The raw device fields of a ustar or GNU header; empty for an old one.
+fn raw_device_fields(header: &tar::Header) -> (&[u8], &[u8]) {
+    if let Some(ustar) = header.as_ustar() {
+        (&ustar.dev_major, &ustar.dev_minor)
+    } else if let Some(gnu) = header.as_gnu() {
+        (&gnu.dev_major, &gnu.dev_minor)
+    } else {
+        (&[], &[])
+    }
+}
+
 /// PAX records into `over`. A global header (`overrides` false) may not
-/// set what names or sizes an entry; a sparse key fails either.
+/// set what names or sizes an entry; a sparse key fails either. A `uid`
+/// or `gid` record names the entry's owner where the header's field
+/// cannot (an id past the octal field, or a GNU extension); a global
+/// header's is not applied.
 fn parse_pax(record: &[u8], over: &mut Overrides, overrides: bool) -> io::Result<()> {
     for extension in tar::PaxExtensions::new(record) {
         let extension = extension.map_err(|_| malformed("a PAX record does not parse"))?;
@@ -326,6 +397,19 @@ fn parse_pax(record: &[u8], over: &mut Overrides, overrides: bool) -> io::Result
             }
             "path" => over.path = Some(extension.value_bytes().to_vec()),
             "linkpath" => over.link = Some(extension.value_bytes().to_vec()),
+            "uid" | "gid" => {
+                let text = extension
+                    .value()
+                    .map_err(|_| malformed(format!("a PAX {key} is not UTF-8")))?;
+                let id = text
+                    .parse()
+                    .map_err(|_| malformed(format!("a PAX {key} does not parse")))?;
+                if key == "uid" {
+                    over.uid = Some(id);
+                } else {
+                    over.gid = Some(id);
+                }
+            }
             _ => {}
         }
     }
@@ -448,6 +532,40 @@ mod tests {
         assert_eq!(got[1].1, b"hello");
         assert_eq!(got[1].0.size, 5);
         assert_eq!(got[1].0.mode, 0o644);
+    }
+
+    #[test]
+    fn owners_and_device_numbers_come_from_the_header_and_pax_records() {
+        let mut archive = Vec::new();
+        let mut owned = header(EntryType::Regular, "f", 0);
+        owned.set_uid(1000);
+        owned.set_gid(7);
+        owned.set_cksum();
+        archive.extend(owned.as_bytes());
+        let mut dev = header(EntryType::Char, "null", 0);
+        dev.set_device_major(1).unwrap();
+        dev.set_device_minor(3).unwrap();
+        dev.set_cksum();
+        archive.extend(dev.as_bytes());
+        // A PAX record's ids win over the header's.
+        let mut pax = pax_record("uid", b"70000");
+        pax.extend(pax_record("gid", b"70001"));
+        archive.extend(extension(EntryType::XHeader, &pax));
+        archive.extend(file("big", b""));
+        archive.extend(end());
+        let got = entries(&archive).unwrap();
+        assert_eq!(
+            (got[0].0.uid, got[0].0.gid, got[0].0.dev),
+            (1000, 7, (0, 0))
+        );
+        assert_eq!(got[1].0.dev, (1, 3));
+        assert_eq!((got[2].0.uid, got[2].0.gid), (70000, 70001));
+        // An id past 32 bits is refused.
+        let mut archive = extension(EntryType::XHeader, &pax_record("uid", b"4294967296"));
+        archive.extend(file("f", b""));
+        archive.extend(end());
+        let err = entries(&archive).unwrap_err();
+        assert!(err.to_string().contains("uid"), "{err}");
     }
 
     #[test]

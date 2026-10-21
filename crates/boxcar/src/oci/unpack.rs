@@ -9,6 +9,12 @@
 //! with an `*at` call that never follows a link. Whiteouts are applied in
 //! a pass of their own, before the layer's entries, so the result does
 //! not depend on the order of the archive.
+//!
+//! The tree is the pulling user's: each entry's owner, its special mode
+//! bits and, for a device node, its numbers go into the ownership
+//! override (`user.boxcar.stat`, [`boxcar_fs::ownership`]) on the file,
+//! which the guest is shown in their place; a device node is an empty
+//! regular file carrying the override. FIFOs are not made.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -17,7 +23,9 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use super::framer::{Framer, Kind};
+use boxcar_fs::ownership::{DevKind, Override, XATTR};
+
+use super::framer::{Entry, Framer, Kind};
 
 /// `struct open_how` from `linux/openat2.h`.
 #[repr(C)]
@@ -35,6 +43,46 @@ const RETRIES: usize = 8;
 
 /// The mode of a directory the archive implies but does not name.
 const IMPLIED_DIR_MODE: u32 = 0o755;
+
+/// Opening a directory just made, to set its override.
+const DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// The special mode bits (setuid, setgid, sticky).
+const SPECIAL_BITS: u32 = 0o7000;
+
+/// What the guest is to see of `entry`: its owner, its special bits and,
+/// for a device node, its kind and numbers.
+fn override_of(entry: &Entry, dev: Option<DevKind>) -> Override {
+    Override {
+        uid: Some(entry.uid),
+        gid: Some(entry.gid),
+        special: entry.mode & SPECIAL_BITS,
+        dev: dev.map(|kind| (kind, libc::makedev(entry.dev.0, entry.dev.1))),
+    }
+}
+
+/// Writes `over` as the file's `user.boxcar.stat`. A filesystem without
+/// user xattrs cannot hold the cache.
+fn set_override(fd: RawFd, over: &Override) -> io::Result<()> {
+    let name = CString::new(XATTR).expect("the xattr's name has no NUL");
+    let text = over.encode();
+    // SAFETY: fsetxattr reads the NUL-terminated name and `text.len()`
+    // bytes of the value.
+    let rc = unsafe { libc::fsetxattr(fd, name.as_ptr(), text.as_ptr().cast(), text.len(), 0) };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            io::Error::other(
+                "the cache's filesystem has no user xattrs, which the ownership override \
+                 (`user.boxcar.stat`) needs",
+            )
+        } else {
+            error
+        });
+    }
+    Ok(())
+}
 
 /// The mode directories have while the tree is built; their own modes
 /// are applied once every layer is in, so none blocks its children.
@@ -72,7 +120,7 @@ pub struct Unpacker {
     metadata_left: u64,
 }
 
-/// What unpacking left out: devices and FIFOs, by path.
+/// What unpacking left out: FIFOs, by path.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Finished {
     /// Paths of the device nodes and FIFOs not made.
@@ -242,6 +290,10 @@ impl Unpacker {
         while let Some(entry) = framer.next()? {
             let comps = components(&entry.path)?;
             let Some((name, parent)) = comps.split_last() else {
+                // The root itself: its owner, and nothing else of it.
+                if entry.kind == Kind::Dir {
+                    set_override(self.root.as_raw_fd(), &override_of(&entry, None))?;
+                }
                 continue;
             };
             if name.starts_with(WHITEOUT) {
@@ -258,6 +310,8 @@ impl Unpacker {
                         self.forget_modes(&path, true);
                     }
                     self.remember_mode(path, entry.mode)?;
+                    let dir = openat(&parent_fd, &name, DIR_FLAGS, 0)?;
+                    set_override(dir.as_raw_fd(), &override_of(&entry, None))?;
                 }
                 Kind::File => {
                     let parent_fd = self.parent_fd(parent)?;
@@ -279,13 +333,7 @@ impl Unpacker {
                     )?;
                     let mut file = File::from(fd);
                     io::copy(&mut framer.data(), &mut file)?;
-                    let stored = stored_file_mode(entry.mode);
-                    check(unsafe { libc::fchmod(file.as_raw_fd(), stored as libc::mode_t) })?;
-                    self.forget_file_mode(&parent_fd, &name)?;
-                    if stored != entry.mode {
-                        let path = self.canonical_in(&parent_fd, &name)?;
-                        self.remember_file_mode(path, entry.mode)?;
-                    }
+                    self.store_file(&parent_fd, &name, &file.into(), &entry, None)?;
                 }
                 Kind::Symlink => {
                     let target = cstr(&entry.link)?;
@@ -352,12 +400,61 @@ impl Unpacker {
                         }
                     }
                 }
-                Kind::CharDevice | Kind::BlockDevice | Kind::Fifo => {
+                Kind::CharDevice | Kind::BlockDevice => {
+                    // An empty regular file stands for the node; the
+                    // override says which device.
+                    let parent_fd = self.parent_fd(parent)?;
+                    if replace_slot(&parent_fd, &name)? {
+                        let path = self.canonical_in(&parent_fd, &name)?;
+                        self.forget_modes(&path, true);
+                    } else {
+                        self.forget_file_mode(&parent_fd, &name)?;
+                    }
+                    let fd = openat(
+                        &parent_fd,
+                        &name,
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o600,
+                    )?;
+                    let kind = match entry.kind {
+                        Kind::CharDevice => DevKind::Char,
+                        _ => DevKind::Block,
+                    };
+                    self.store_file(&parent_fd, &name, &fd, &entry, Some(kind))?;
+                }
+                Kind::Fifo => {
                     let path = display(&comps);
                     self.keep(path.len())?;
                     self.skipped.push(path);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A regular file just written (or standing for a device of `dev`):
+    /// its override (while the file is still writable: a user xattr needs
+    /// write permission on the inode, whatever the descriptor), its stored
+    /// mode, and the image's remembered where that differs.
+    fn store_file(
+        &mut self,
+        parent_fd: &OwnedFd,
+        name: &CStr,
+        fd: &OwnedFd,
+        entry: &Entry,
+        dev: Option<DevKind>,
+    ) -> io::Result<()> {
+        set_override(fd.as_raw_fd(), &override_of(entry, dev))?;
+        let stored = stored_file_mode(entry.mode);
+        check(unsafe { libc::fchmod(fd.as_raw_fd(), stored as libc::mode_t) })?;
+        self.forget_file_mode(parent_fd, name)?;
+        if stored != entry.mode {
+            let path = self.canonical_in(parent_fd, name)?;
+            self.remember_file_mode(path, entry.mode)?;
         }
         Ok(())
     }
@@ -1111,22 +1208,69 @@ mod tests {
     }
 
     #[test]
-    fn devices_and_fifos_are_skipped_and_listed() {
+    fn devices_become_stand_ins_with_the_override_and_fifos_are_skipped() {
         let layer = layer(&[
-            special(EntryType::Char, "dev/null"),
-            special(EntryType::Block, "dev/sda"),
+            device(EntryType::Char, "dev/null", 0o666, 1, 3),
+            device(EntryType::Block, "dev/sda", 0o660, 8, 0),
             special(EntryType::Fifo, "run/fifo"),
             file("ok", 0o644, b"ok"),
         ]);
         let (tmp, skipped) = unpack(&[layer]);
-        assert_eq!(
-            skipped.skipped,
-            ["dev/null".to_owned(), "dev/sda".into(), "run/fifo".into()]
-        );
+        assert_eq!(skipped.skipped, ["run/fifo".to_owned()]);
         assert_eq!(skipped.modes, Vec::<(String, u32)>::new());
-        let l = without_defaults(&tmp.path().join("rootfs"));
+        let root = tmp.path().join("rootfs");
+        let l = without_defaults(&root);
         assert!(l.contains_key("ok"));
-        assert!(!l.contains_key("dev/null"));
+        assert_eq!(l["dev/null"], "file 666 \"\"");
+        assert_eq!(l["dev/sda"], "file 660 \"\"");
+        assert!(!l.contains_key("run/fifo"));
+        assert_eq!(
+            override_text(&root.join("dev/null")).as_deref(),
+            Some("uid=0 gid=0 dev=c:1:3")
+        );
+        assert_eq!(
+            override_text(&root.join("dev/sda")).as_deref(),
+            Some("uid=0 gid=0 dev=b:8:0")
+        );
+    }
+
+    #[test]
+    fn owners_special_bits_and_the_root_land_in_the_override() {
+        let first = layer(&[
+            dir("./", 0o755),
+            dir_as("home/", 0o755, 1000, 1000),
+            file_as("home/f", 0o640, 1000, 7, b"x"),
+            file("usr/bin/su", 0o4755, b"#!"),
+            symlink("l", "home/f"),
+            hardlink("home/g", "home/f"),
+        ]);
+        let (tmp, _) = unpack(std::slice::from_ref(&first));
+        let root = tmp.path().join("rootfs");
+        for (path, want) in [
+            ("", "uid=0 gid=0"),
+            ("home", "uid=1000 gid=1000"),
+            ("home/f", "uid=1000 gid=7"),
+            // The link shares the inode, and so the override.
+            ("home/g", "uid=1000 gid=7"),
+            ("usr/bin/su", "uid=0 gid=0 mode=4000"),
+        ] {
+            assert_eq!(
+                override_text(&root.join(path)).as_deref(),
+                Some(want),
+                "{path}"
+            );
+        }
+        // An implied directory and a symlink carry none.
+        assert_eq!(override_text(&root.join("usr")), None);
+        assert_eq!(override_text(&root.join("l")), None);
+        // A later layer's entry replaces the owner, as it does the mode.
+        let later = layer(&[file_as("home/f", 0o640, 0, 0, b"y")]);
+        let (tmp, _) = unpack(&[first, later]);
+        let root = tmp.path().join("rootfs");
+        assert_eq!(
+            override_text(&root.join("home/f")).as_deref(),
+            Some("uid=0 gid=0")
+        );
     }
 
     #[test]

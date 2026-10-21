@@ -134,6 +134,46 @@ fn entry(
     builder.append_data(&mut header, path, data).unwrap();
 }
 
+/// A regular file entry owned by `uid:gid`.
+fn entry_as(
+    builder: &mut tar::Builder<Vec<u8>>,
+    kind: tar::EntryType,
+    path: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    data: &[u8],
+) {
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(kind);
+    header.set_mode(mode);
+    header.set_mtime(0);
+    header.set_uid(u64::from(uid));
+    header.set_gid(u64::from(gid));
+    header.set_size(data.len() as u64);
+    builder.append_data(&mut header, path, data).unwrap();
+}
+
+/// A character device entry, `major:minor`.
+fn device_entry(
+    builder: &mut tar::Builder<Vec<u8>>,
+    path: &str,
+    mode: u32,
+    major: u32,
+    minor: u32,
+) {
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::Char);
+    header.set_mode(mode);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_size(0);
+    header.set_device_major(major).unwrap();
+    header.set_device_minor(minor).unwrap();
+    builder.append_data(&mut header, path, &[][..]).unwrap();
+}
+
 /// Layer 2: the package to install, a file no one may read, a directory no
 /// one may enter, a locked directory the resolver's file must land in
 /// (`/etc/resolv.conf` is a link into it), a link into the workspace, and
@@ -155,6 +195,11 @@ fn additions_layer() -> Vec<u8> {
     );
     entry(&mut b, f, "etc/motd", 0o644, b"from the test image\n", None);
     entry(&mut b, f, "etc/secret", 0o000, b"no one reads this\n", None);
+    // Owned by another user, and a device node: shown through the
+    // ownership override (#32).
+    entry_as(&mut b, f, "var/app-own", 0o644, 1000, 1000, b"own\n");
+    entry(&mut b, d, "opt/", 0o755, &[], None);
+    device_entry(&mut b, "opt/null", 0o666, 1, 3);
     entry(&mut b, d, "locked/", 0o000, &[], None);
     entry(&mut b, f, "locked/inside", 0o644, b"inside\n", None);
     entry(
@@ -678,6 +723,67 @@ fn set_override(path: &Path, text: &str) {
         )
     };
     assert_eq!(rc, 0, "setxattr: {}", std::io::Error::last_os_error());
+}
+
+/// A session from an image runs as the image's `User` (root when it names
+/// none) and sees the image's owners and device nodes through the
+/// override: root writes a root-owned file, reads the device node the
+/// image carries, and owns what the image did not claim; another user
+/// (`--user nobody`, looked up in the image's passwd) is refused the
+/// root-owned file and writes the workspace (#32).
+#[test]
+fn an_image_session_runs_as_the_images_user_and_sees_its_owners() {
+    let Some(guest) = guest_or_skip("an_image_session_runs_as_the_images_user_and_sees_its_owners")
+    else {
+        return;
+    };
+    let image = publish(&guest.rootfs);
+    let script = "echo id=$(id -u):$(id -g); \
+                  stat -c 'motd %u:%g' /etc/motd; stat -c 'own %u:%g' /var/app-own; \
+                  stat -c 'null %u:%g %F %t:%T' /opt/null; cat /opt/null && echo read-null; \
+                  (echo x >> /etc/motd) 2>/dev/null && echo wrote-etc || echo refused-etc; \
+                  stat -c 'ws %u:%g' /workspace; echo y > /workspace/w && echo wrote-ws; \
+                  echo done";
+    let shown = [
+        "motd 0:0",
+        "own 1000:1000",
+        "null 0:0 character special file 1:3",
+        "read-null",
+        "wrote-ws",
+        "done",
+    ];
+    for (flags, want) in [
+        (&[][..], &["id=0:0", "wrote-etc", "ws 0:0"][..]),
+        (
+            &["--user", "nobody"][..],
+            &["id=65534:65534", "refused-etc", "ws 65534:65534"][..],
+        ),
+    ] {
+        let scratch = Scratch::new();
+        let run = run_image(
+            &guest,
+            &scratch,
+            &image.by_tag,
+            flags,
+            &["sh", "-c", script],
+        );
+        assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+        for line in want.iter().chain(shown.iter()) {
+            assert!(
+                run.stdout.lines().any(|l| l.trim() == *line),
+                "{flags:?}: {line}: {}",
+                run.describe()
+            );
+        }
+        // The cache says how its tree carries ownership; the device node
+        // is a plain file there.
+        let cached = cached_tree(&scratch, &image.manifest_digest);
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(cached.parent().unwrap().join("image.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["ownership"], "override", "{json}");
+        assert!(fs::metadata(cached.join("opt/null")).unwrap().is_file());
+    }
 }
 
 /// A policy file is recorded as `policy.loaded` right after `vmm.start`,

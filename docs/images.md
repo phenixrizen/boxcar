@@ -169,8 +169,10 @@ boxcar, with no privileges:
   missing name is ignored; one of `..` fails the pull.
 - Symlink targets are kept as written. A hardlink's target is resolved in
   the tree; one to a missing target or a directory fails the pull.
-- Device nodes and FIFOs are not made; `image.json` lists them as
-  `skipped`.
+- A character or block device node is made as an empty regular file
+  carrying the ownership override that names the device (the guest sees
+  the node and opens the device by its numbers). FIFOs are not made;
+  `image.json` lists them as `skipped`.
 - Sparse files (GNU `S`, any `GNU.sparse.*` PAX key), unknown entry types,
   a global PAX header that sets `path`, `linkpath` or `size`, an extension
   record (PAX, GNU long name or link) over 64 KiB, and a header whose
@@ -181,9 +183,12 @@ boxcar, with no privileges:
   read it all; `image.json` lists the image's modes of those entries as
   `modes`, and each copy gets them back. Directory modes are set after the
   last layer, deepest first.
-- Ownership and times are not set: everything belongs to the user who
-  pulled. `/tmp` (mode `1777`) and `/workspace` are made when the image
-  lacks them.
+- Ownership goes into the override: every file and directory the image
+  names carries `user.boxcar.stat` with its owner and its special bits
+  (from the header, or a PAX `uid`/`gid` record), while the host file is
+  the pulling user's; a symlink carries none. Times are not set. `/tmp`
+  (mode `1777`) and `/workspace` are made when the image lacks them,
+  with no override: they show as the session's own.
 
 A failed pull removes what it was building; verified blobs stay.
 
@@ -195,7 +200,7 @@ made mode 0700:
 ```
 blobs/sha256/<hex>                           a verified blob: manifest, config or layer
 images/<manifest-hex>/rootfs/                the unpacked tree
-images/<manifest-hex>/image.json             digests, layers, the config's defaults, skipped, modes
+images/<manifest-hex>/image.json             digests, layers, the config's defaults, skipped, modes, ownership
 refs/<registry>/<repository>/_tags/<tag>     a tag: the manifest digest
 refs/<registry>/<repository>/_indexes/<hex>  an index's digest: its manifest's digest
 .lock                                        shared by pulls and runs, exclusive for rm and prune
@@ -214,8 +219,12 @@ refs/<registry>/<repository>/_indexes/<hex>  an index's digest: its manifest's d
 - **Sharing.** Blobs are shared: a layer two images have is fetched once
   and unpacked into each tree.
 - **`image.json`** holds the manifest and config digests, the layers, the
-  config's `env`, `entrypoint`, `cmd`, `working_dir` and `user`, and the
-  `skipped` and `modes` lists.
+  config's `env`, `entrypoint`, `cmd`, `working_dir` and `user`, the
+  `skipped` and `modes` lists, and `ownership: "override"` for a tree
+  that carries its owners and device nodes in the override. A tree cached
+  by an earlier boxcar lacks it: a session from it shows every file as
+  the session's own, has none of the image's device nodes, and says so on
+  stderr; `boxcar image rm` the image and pull it again.
 - **Index entries** let a reference by an index's digest be found offline.
   They go with their image and keep nothing from `prune`: only tags do, so
   an image pulled by digest alone is pruned.
@@ -261,8 +270,22 @@ none of its text.
   `--env PATH=...` the image's.
 - **Working directory:** `WorkingDir`, else `/workspace`. `HOME` stays
   boxcar's unless the image's `Env` or `--env` sets it.
-- **`User` is ignored:** the session runs as the user who ran `boxcar run`,
-  and owns every file of its root. There is no ownership override yet.
+- **`User`:** the session runs as the image's `User` in the guest
+  (`user[:group]`, each a number or a name in the image's `/etc/passwd`
+  and `/etc/group`, as Docker reads it; a user named alone gets its passwd
+  entry's group; no supplementary groups), root when it names none;
+  `--user USER[:GROUP]` overrides it. The guest kernel checks what the
+  session may read and write against this identity and the owners the
+  root shows; the host side acts as the user who ran `boxcar run` either
+  way. `HOME` is `/root` for root and `/workspace` otherwise, unless the
+  image's `Env` or `--env` sets it.
+- **Ownership:** the override is on (`--ownership override`, see
+  [architecture.md](architecture.md)): the guest sees the image's owners,
+  special bits and device nodes, and what the image did not claim (the
+  workspace, what the session makes) as the session's own. `--ownership
+  host` shows every file as the host user's, as `--rootfs` does by
+  default. The session has no capability whatever its uid, so `chown` and
+  `mknod` are refused in the guest either way.
 
 ## The session's copy
 
@@ -272,8 +295,9 @@ calls, following no link on either side. A regular file is reflinked
 (`FICLONE`) where the filesystem can, sharing its data but not its inode,
 and copied otherwise (`copy_file_range`, or reads and writes). Hardlink
 groups stay groups within the copy, never linked to the cache. Symlinks keep
-their targets. Times are not copied; anything but a file, directory or link
-is skipped and counted on stderr. A failed copy is removed whole and the
+their targets, and each file and directory its ownership override
+(`user.boxcar.stat`). Times are not copied; anything but a file, directory
+or link is skipped and counted on stderr. A failed copy is removed whole and the
 run exits 1: no `vmm.start` is recorded. A tree cached by an earlier boxcar
 can hold an entry its owner cannot read; the copy then fails, saying to
 `boxcar image rm` the image and pull it again.

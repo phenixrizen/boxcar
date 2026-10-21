@@ -438,8 +438,10 @@ in is [boot.md](boot.md)'s.
   carries no override is shown as the session's own identity, chosen with
   `boxcar run --user UID[:GID]` (the invoking user's by default; the host
   side acts as the invoking user still), so a root session writes what it
-  is given. An image's own ownership, written as the override when it is
-  unpacked, is #32.
+  is given. An image's own ownership is
+  written as the override when it is unpacked, and a session from an
+  image runs as the image's `User` with the override on (#32,
+  [images.md](images.md)).
 - **The sensor** runs as root in a cgroup apart from the session's, with
   its programs filtered to the session's cgroup. It connects to port
   1026, says what it attached, and streams `proc.*` frames with a

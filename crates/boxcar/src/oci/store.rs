@@ -97,7 +97,17 @@ pub struct ImageJson {
     /// trees cached before this field, which may hold unreadable entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modes: Vec<(String, u32)>,
+    /// How the tree carries the image's ownership: [`OWNERSHIP_OVERRIDE`]
+    /// (each entry's owner, special bits and device nodes in
+    /// `user.boxcar.stat`, shown in the guest). Absent in trees cached
+    /// before: those show the host user as every owner and have no device
+    /// nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<String>,
 }
+
+/// The `ownership` of a tree unpacked with the override.
+pub const OWNERSHIP_OVERRIDE: &str = "override";
 
 /// One layer of an image.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -894,6 +904,7 @@ mod tests {
             defaults: Defaults::default(),
             skipped: Vec::new(),
             modes: Vec::new(),
+            ownership: Some(OWNERSHIP_OVERRIDE.to_owned()),
         }
     }
 
@@ -1533,6 +1544,7 @@ mod tests {
             },
             skipped: vec!["dev/null".into()],
             modes: vec![("etc/shadow".into(), 0o000)],
+            ownership: Some("override".into()),
         };
         let text = serde_json::to_string(&j).unwrap();
         assert!(

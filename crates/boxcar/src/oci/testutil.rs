@@ -52,6 +52,54 @@ pub fn dir(path: &str, mode: u32) -> Vec<u8> {
         .to_vec()
 }
 
+/// A regular file entry owned by `uid:gid`.
+pub fn file_as(path: &str, mode: u32, uid: u32, gid: u32, data: &[u8]) -> Vec<u8> {
+    let mut h = header(EntryType::Regular, path, data.len() as u64, mode);
+    h.set_uid(u64::from(uid));
+    h.set_gid(u64::from(gid));
+    h.set_cksum();
+    let mut out = h.as_bytes().to_vec();
+    out.extend(padded(data));
+    out
+}
+
+/// A directory entry owned by `uid:gid`.
+pub fn dir_as(path: &str, mode: u32, uid: u32, gid: u32) -> Vec<u8> {
+    let mut h = header(EntryType::Directory, path, 0, mode);
+    h.set_uid(u64::from(uid));
+    h.set_gid(u64::from(gid));
+    h.set_cksum();
+    h.as_bytes().to_vec()
+}
+
+/// A device entry of `kind` (`Char` or `Block`) with `major:minor`.
+pub fn device(kind: EntryType, path: &str, mode: u32, major: u32, minor: u32) -> Vec<u8> {
+    let mut h = header(kind, path, 0, mode);
+    h.set_device_major(major).unwrap();
+    h.set_device_minor(minor).unwrap();
+    h.set_cksum();
+    h.as_bytes().to_vec()
+}
+
+/// The ownership override's text on `path` (not following a link), if any.
+pub fn override_text(path: &Path) -> Option<String> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = std::ffi::CString::new(boxcar_fs::ownership::XATTR).unwrap();
+    let mut text = [0u8; 256];
+    // SAFETY: lgetxattr writes at most `text.len()` bytes into `text`.
+    let len = unsafe {
+        libc::lgetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            text.as_mut_ptr().cast(),
+            text.len(),
+        )
+    };
+    usize::try_from(len)
+        .ok()
+        .map(|len| String::from_utf8(text[..len].to_vec()).unwrap())
+}
+
 /// A symlink entry.
 pub fn symlink(path: &str, target: &str) -> Vec<u8> {
     let mut h = header(EntryType::Symlink, path, 0, 0o777);

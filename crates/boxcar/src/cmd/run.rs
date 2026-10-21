@@ -53,6 +53,7 @@ use crate::oci::defaults;
 use crate::oci::pull::{ensure, Found, PullError, PullMode};
 use crate::oci::reference::Reference;
 use crate::oci::session::{self, BootNeeds, Layout, Reflink};
+use crate::oci::store::OWNERSHIP_OVERRIDE;
 
 /// The exit code of a usage error, as clap's: a policy rule that does not
 /// parse.
@@ -229,7 +230,46 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         )),
         None => None,
     };
-    let user = args.user.unwrap_or_else(invoking_user);
+    // Who the session is in the guest: `--user`, else the image's `User`
+    // (root when it names none), else the invoking user. A name is looked
+    // up in the root the session gets.
+    let image_tree = found.as_ref().map(|found| found.dir.join("rootfs"));
+    let names_root = image_tree.as_deref().or(args.rootfs.as_deref());
+    let user = match (&args.user, &found) {
+        (Some(spec), _) => match guest_user(spec, names_root) {
+            Ok(user) => user,
+            Err(error) => {
+                tell(&format!("error: --user {spec}: {error}"));
+                return Ok(ExitCode::from(USAGE_EXIT));
+            }
+        },
+        (None, Some(found)) => match guest_user(&found.json.defaults.user, names_root) {
+            Ok(user) => user,
+            Err(error) => {
+                tell(&format!(
+                    "error: the image's User `{}`: {error}",
+                    found.json.defaults.user
+                ));
+                return Ok(ExitCode::from(1));
+            }
+        },
+        (None, None) => invoking_user(),
+    };
+    // The ownership override: on with an image, whose tree carries its
+    // owners and device nodes, unless said otherwise.
+    let ownership = match args.ownership {
+        Some(mode) => mode == OwnershipArg::Override,
+        None => found.is_some(),
+    };
+    if let Some(found) = &found {
+        if ownership && found.json.ownership.as_deref() != Some(OWNERSHIP_OVERRIDE) {
+            eprintln!(
+                "warning: the image was cached by an earlier boxcar without its ownership: every \
+                 file shows as the session's own and its device nodes are missing; `boxcar image \
+                 rm` it and pull it again"
+            );
+        }
+    }
     // clap requires --rootfs or --image unless --no-fs.
     let share_count = if has_shares { SHARE_COUNT } else { 0 };
     let mode = guest_mode(has_shares, vsock, user.0, user.1);
@@ -431,7 +471,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 AuditLevelArg::Normal => AuditLevel::Normal,
                 AuditLevelArg::Verbose => AuditLevel::Verbose,
             },
-            ownership: args.ownership == OwnershipArg::Override,
+            ownership,
             owner: user,
             ..AuditFsOptions::default()
         },
@@ -1619,9 +1659,93 @@ fn guest_cmdline(
     cmdline
 }
 
-/// The invoking user's real uid and gid, which the guest session runs as:
-/// the host-side filesystem acts as this user, so files the session creates
-/// belong to it on both sides.
+/// The identity `spec` names, as Docker reads an image's `User`:
+/// `user[:group]`, each a number or a name in `root`'s `/etc/passwd` and
+/// `/etc/group` (resolved within the tree, as the guest would); empty is
+/// root. A user with no group gets its passwd entry's group, or root's
+/// where a number has no entry. No supplementary groups.
+fn guest_user(spec: &str, root: Option<&Path>) -> Result<(u32, u32), String> {
+    let (user, group) = match spec.split_once(':') {
+        Some((user, group)) => (user, Some(group)),
+        None => (spec, None),
+    };
+    let (uid, primary) = if user.is_empty() {
+        (0, 0)
+    } else if let Ok(uid) = user.parse::<u32>() {
+        let primary = match root {
+            Some(root) => passwd_entries(root)?
+                .into_iter()
+                .find(|(_, id, _)| *id == uid)
+                .map_or(0, |(_, _, gid)| gid),
+            None => 0,
+        };
+        (uid, primary)
+    } else {
+        let root = root
+            .ok_or_else(|| format!("`{user}` is a name, and there is no root to look it up in"))?;
+        passwd_entries(root)?
+            .into_iter()
+            .find(|(name, _, _)| name == user)
+            .map(|(_, uid, gid)| (uid, gid))
+            .ok_or_else(|| format!("user `{user}` is not in the root's /etc/passwd"))?
+    };
+    let gid = match group {
+        None | Some("") => primary,
+        Some(group) => match group.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => {
+                let root = root.ok_or_else(|| {
+                    format!("`{group}` is a name, and there is no root to look it up in")
+                })?;
+                group_entries(root)?
+                    .into_iter()
+                    .find(|(name, _)| name == group)
+                    .map(|(_, gid)| gid)
+                    .ok_or_else(|| format!("group `{group}` is not in the root's /etc/group"))?
+            }
+        },
+    };
+    if uid == u32::MAX || gid == u32::MAX {
+        return Err("4294967295 is not an id the kernel takes".to_owned());
+    }
+    Ok((uid, gid))
+}
+
+/// `root`'s `/etc/passwd`: each entry's name, uid and gid; lines that are
+/// not entries are skipped.
+fn passwd_entries(root: &Path) -> Result<Vec<(String, u32, u32)>, String> {
+    let text = session::read_within(root, "etc/passwd")
+        .map_err(|error| format!("reading its /etc/passwd: {error}"))?;
+    Ok(String::from_utf8_lossy(&text)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let uid = fields.nth(1)?.parse().ok()?;
+            let gid = fields.next()?.parse().ok()?;
+            Some((name.to_owned(), uid, gid))
+        })
+        .collect())
+}
+
+/// `root`'s `/etc/group`: each entry's name and gid.
+fn group_entries(root: &Path) -> Result<Vec<(String, u32)>, String> {
+    let text = session::read_within(root, "etc/group")
+        .map_err(|error| format!("reading its /etc/group: {error}"))?;
+    Ok(String::from_utf8_lossy(&text)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let gid = fields.nth(1)?.parse().ok()?;
+            Some((name.to_owned(), gid))
+        })
+        .collect())
+}
+
+/// The invoking user's real uid and gid, which the guest session runs as
+/// without an image or `--user`: the host-side filesystem acts as this
+/// user, so files the session creates belong to it on both sides.
 fn invoking_user() -> (u32, u32) {
     // SAFETY: getuid and getgid take no arguments, touch no memory and
     // cannot fail.
@@ -1699,6 +1823,47 @@ mod tests {
             guest_cmdline(console, &[], &[], false),
             ["boxcar.mode=console", "boxcar.uid=1", "boxcar.gid=2"]
         );
+    }
+
+    #[test]
+    fn the_guest_user_is_read_as_docker_reads_an_images_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("etc")).unwrap();
+        fs::write(
+            tmp.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nbroken\napp:x:1001:1002:app:/app:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("etc/group"), "root:x:0:\nstaff:x:50:app\n").unwrap();
+        let tree = Some(tmp.path());
+        assert_eq!(guest_user("", tree), Ok((0, 0)));
+        assert_eq!(guest_user("app", tree), Ok((1001, 1002)));
+        assert_eq!(guest_user("app:staff", tree), Ok((1001, 50)));
+        assert_eq!(guest_user("app:", tree), Ok((1001, 1002)));
+        assert_eq!(guest_user("1001", tree), Ok((1001, 1002)));
+        assert_eq!(guest_user("7", tree), Ok((7, 0)));
+        assert_eq!(guest_user("7:8", tree), Ok((7, 8)));
+        assert_eq!(guest_user("7:staff", tree), Ok((7, 50)));
+        assert_eq!(guest_user("7", None), Ok((7, 0)));
+        assert!(guest_user("ghost", tree).unwrap_err().contains("ghost"));
+        assert!(guest_user("app:ghosts", tree)
+            .unwrap_err()
+            .contains("ghosts"));
+        assert!(guest_user("app", None).unwrap_err().contains("name"));
+        assert!(guest_user("4294967295", tree).is_err());
+        // The files are read within the tree: a link out of it leads
+        // nowhere.
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join("passwd"), "out:x:9:9::/:/bin/sh\n").unwrap();
+        fs::remove_file(tmp.path().join("etc/passwd")).unwrap();
+        std::os::unix::fs::symlink(other.path().join("passwd"), tmp.path().join("etc/passwd"))
+            .unwrap();
+        assert!(guest_user("out", tree).is_err());
+        // A link within it is followed.
+        fs::remove_file(tmp.path().join("etc/passwd")).unwrap();
+        fs::write(tmp.path().join("etc/passwd.real"), "in:x:9:9::/:/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd.real", tmp.path().join("etc/passwd")).unwrap();
+        assert_eq!(guest_user("in", tree), Ok((9, 9)));
     }
 
     #[test]
