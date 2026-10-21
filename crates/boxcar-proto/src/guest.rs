@@ -55,12 +55,32 @@ pub enum GuestMsg {
         code: Option<i32>,
         signal: Option<i32>,
     },
-    /// The answer to a [`HostMsg::Ping`] with the same `id`.
+    /// The answer to a [`HostMsg::Ping`] with the same `id`: the guest's
+    /// `CLOCK_MONOTONIC` when it answered, and, where the guest has
+    /// `ptp_kvm`'s clock, the host's and the guest's clocks paired from
+    /// one read of the TSC ([`PtpPair`]), omitted otherwise.
     #[serde(rename = "pong")]
-    Pong { id: u64, guest_mono_ns: u64 },
+    Pong {
+        id: u64,
+        guest_mono_ns: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ptp: Option<PtpPair>,
+    },
     /// A line for the host's log.
     #[serde(rename = "log")]
     Log { level: LogLevel, msg: String },
+}
+
+/// The clocks paired through `ptp_kvm` (`PTP_SYS_OFFSET_PRECISE` on the
+/// `KVM virtual PTP` clock), from one read of the TSC: the host's
+/// `CLOCK_REALTIME`, the guest's `CLOCK_MONOTONIC`, and the window on the
+/// guest's clock within which the read was taken, which bounds the pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PtpPair {
+    pub host_real_ns: u64,
+    pub guest_mono_ns: u64,
+    pub window_ns: u64,
 }
 
 /// The level of a [`GuestMsg::Log`].
@@ -489,6 +509,7 @@ mod tests {
                 GuestMsg::Pong {
                     id: 3,
                     guest_mono_ns: 9,
+                    ptp: None,
                 },
                 json!({"t": "pong", "id": 3, "guest_mono_ns": 9}),
             ),

@@ -78,19 +78,19 @@
       ],
       "properties": {
         "guest_mono_ns": {
-          "description": "The guest's `CLOCK_MONOTONIC` when it answered, in nanoseconds.",
+          "description": "The guest's `CLOCK_MONOTONIC` at the pair, in nanoseconds: when it answered the ping, or at its read of the host's clock.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "host_mono_ns": {
-          "description": "The host's `CLOCK_MONOTONIC` at the round trip's midpoint.",
+          "description": "The host's `CLOCK_MONOTONIC` at the pair: the round trip's midpoint, or the host's clock at the guest's read.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "method": {
-          "description": "How the pair was taken: `vsock_rtt`.",
+          "description": "How the pair was taken: `ptp_kvm` (the guest read the host's clock and its own from one read of the TSC, through `ptp_kvm`'s clock) or `vsock_rtt` (a ping's round trip over the control channel).",
           "type": "string"
         },
         "offset_ns": {
@@ -99,7 +99,7 @@
           "format": "int64"
         },
         "rtt_ns": {
-          "description": "The round trip, in nanoseconds: the pairing is no surer than this.",
+          "description": "What bounds the pair, in nanoseconds: the round trip, or the window on the guest's clock within which its read was taken. The pairing is no surer than this.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0

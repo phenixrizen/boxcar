@@ -852,15 +852,21 @@ pub struct SessionExit {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ClockSync {
-    /// How the pair was taken: `vsock_rtt`.
+    /// How the pair was taken: `ptp_kvm` (the guest read the host's clock
+    /// and its own from one read of the TSC, through `ptp_kvm`'s clock)
+    /// or `vsock_rtt` (a ping's round trip over the control channel).
     pub method: String,
-    /// The guest's `CLOCK_MONOTONIC` when it answered, in nanoseconds.
+    /// The guest's `CLOCK_MONOTONIC` at the pair, in nanoseconds: when it
+    /// answered the ping, or at its read of the host's clock.
     pub guest_mono_ns: u64,
-    /// The host's `CLOCK_MONOTONIC` at the round trip's midpoint.
+    /// The host's `CLOCK_MONOTONIC` at the pair: the round trip's
+    /// midpoint, or the host's clock at the guest's read.
     pub host_mono_ns: u64,
     /// `host_mono_ns` minus `guest_mono_ns`.
     pub offset_ns: i64,
-    /// The round trip, in nanoseconds: the pairing is no surer than this.
+    /// What bounds the pair, in nanoseconds: the round trip, or the
+    /// window on the guest's clock within which its read was taken. The
+    /// pairing is no surer than this.
     pub rtt_ns: u64,
 }
 

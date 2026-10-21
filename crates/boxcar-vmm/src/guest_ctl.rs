@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use boxcar_audit::{AuditSink, Priority, Submission};
 use boxcar_proto::control::{GuestStatus, SessionOutcome};
 use boxcar_proto::guest::{
-    decode, encode, GuestMsg, GuestProtoError, HostMsg, LineBuf, LogLevel, MAX_LINE,
+    decode, encode, GuestMsg, GuestProtoError, HostMsg, LineBuf, LogLevel, PtpPair, MAX_LINE,
 };
 use boxcar_proto::redact::scrub_argv;
 use boxcar_proto::{ClockSync, Payload, Ring, SessionExit, SessionStart, Subject};
@@ -68,8 +68,10 @@ pub const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 /// How often the VMM pings init to pair the clocks.
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How a `sync` record says its pair was taken.
+/// How a `sync` record says its pair was taken: from the ping's round
+/// trip, or from `ptp_kvm`'s read of the host's clock in the guest.
 pub const SYNC_METHOD: &str = "vsock_rtt";
+pub const SYNC_METHOD_PTP: &str = "ptp_kvm";
 
 /// How often the sync thread looks whether a ping is due.
 const SYNC_TICK: Duration = Duration::from_millis(50);
@@ -211,10 +213,32 @@ impl GuestCtl {
         Ok(id)
     }
 
-    /// Records the `sync` a pong makes with the ping it answers.
-    fn record_sync(&self, ping: Ping, guest_mono_ns: u64) {
+    /// Records the `sync` a pong makes with the ping it answers: from the
+    /// pair `ptp_kvm` gave the guest when it carries one (the host's wall
+    /// clock at the guest's read, moved onto the host's monotonic clock as
+    /// the two stand now; the pair is as sure as the window it was taken
+    /// in), else from the round trip.
+    fn record_sync(&self, ping: Ping, guest_mono_ns: u64, ptp: Option<PtpPair>) {
         let rtt_ns = monotonic_ns().saturating_sub(ping.sent_mono_ns);
-        let host_mono_ns = ping.sent_mono_ns + rtt_ns / 2;
+        let (method, guest_mono_ns, host_mono_ns, rtt_ns) = match ptp {
+            Some(pair) => {
+                let (real, mono) = (realtime_ns(), monotonic_ns());
+                let host_mono_ns =
+                    i128::from(pair.host_real_ns) - (i128::from(real) - i128::from(mono));
+                (
+                    SYNC_METHOD_PTP,
+                    pair.guest_mono_ns,
+                    u64::try_from(host_mono_ns).unwrap_or(0),
+                    pair.window_ns,
+                )
+            }
+            None => (
+                SYNC_METHOD,
+                guest_mono_ns,
+                ping.sent_mono_ns + rtt_ns / 2,
+                rtt_ns,
+            ),
+        };
         let offset_ns =
             i64::try_from(i128::from(host_mono_ns) - i128::from(guest_mono_ns)).unwrap_or(i64::MAX);
         let submission = Submission {
@@ -222,7 +246,7 @@ impl GuestCtl {
             ts_guest_ns: None,
             subject: None,
             payload: Payload::ClockSync(ClockSync {
-                method: SYNC_METHOD.to_owned(),
+                method: method.to_owned(),
                 guest_mono_ns,
                 host_mono_ns,
                 offset_ns,
@@ -410,7 +434,11 @@ impl GuestCtl {
                     let _ = stream.shutdown(Shutdown::Write);
                 }
             }
-            GuestMsg::Pong { id, guest_mono_ns } => {
+            GuestMsg::Pong {
+                id,
+                guest_mono_ns,
+                ptp,
+            } => {
                 let answered = {
                     let mut state = self.lock();
                     match state.ping {
@@ -419,7 +447,7 @@ impl GuestCtl {
                     }
                 };
                 if let Some(ping) = answered {
-                    self.record_sync(ping, guest_mono_ns);
+                    self.record_sync(ping, guest_mono_ns, ptp);
                 }
             }
             GuestMsg::Log { level, msg } => log_guest(level, &msg),
@@ -604,6 +632,19 @@ impl GuestCtlHandle {
 }
 
 /// Host `CLOCK_MONOTONIC` in nanoseconds.
+/// Host `CLOCK_REALTIME` in nanoseconds, the clock of `ts_host_ns`.
+fn realtime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid pointer to a timespec, which the call fills.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap_or(0)
+}
+
 fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -728,6 +769,7 @@ mod tests {
         init.send(&GuestMsg::Pong {
             id: 77,
             guest_mono_ns: 1,
+            ptp: None,
         });
         let id = handle.ping().unwrap();
         assert_eq!(init.recv(), HostMsg::Ping { id });
@@ -735,6 +777,7 @@ mod tests {
         init.send(&GuestMsg::Pong {
             id,
             guest_mono_ns: 5_000_000_000,
+            ptp: None,
         });
         let deadline = Instant::now() + LIMIT;
         while ctl.ping_outstanding() {
@@ -767,6 +810,70 @@ mod tests {
         );
     }
 
+    /// A pong that carries `ptp_kvm`'s pair makes a `sync` from it: the
+    /// method says so, the guest's clock is the pair's, the host's is the
+    /// pair's wall clock moved onto the monotonic clock, and the bound is
+    /// the pair's window, not the round trip.
+    #[test]
+    fn a_pong_with_a_ptp_pair_becomes_a_ptp_kvm_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(tmp.path(), SessionId::new())).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let ctl = GuestCtl::new(session(), sink);
+        let handle = ctl.handle();
+        let mut init = FakeInit::connect(&ctl);
+        init.send(&GuestMsg::Hello {
+            init_version: "0.1.0".into(),
+            guest_mono_ns: 1_000,
+            guest_real_ns: 2_000,
+        });
+        assert_eq!(init.recv(), HostMsg::Config(session()));
+        let id = handle.ping().unwrap();
+        assert_eq!(init.recv(), HostMsg::Ping { id });
+        // The guest read the host's wall clock 3 ms ago, as the host's
+        // clocks stand now.
+        let (real, mono) = (realtime_ns(), monotonic_ns());
+        std::thread::sleep(Duration::from_millis(20));
+        init.send(&GuestMsg::Pong {
+            id,
+            guest_mono_ns: 5_000_000_000,
+            ptp: Some(PtpPair {
+                host_real_ns: real - 3_000_000,
+                guest_mono_ns: 4_000_000_000,
+                window_ns: 1_200,
+            }),
+        });
+        let deadline = Instant::now() + LIMIT;
+        while ctl.ping_outstanding() {
+            assert!(Instant::now() < deadline, "the pong was not seen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(init);
+        assert!(ctl.close(LIMIT));
+        writer.close().unwrap();
+
+        let syncs = records_of(&session_dir, "sync");
+        assert_eq!(syncs.len(), 1, "{syncs:?}");
+        let data = &syncs[0].data;
+        assert_eq!(data["method"], "ptp_kvm");
+        assert_eq!(
+            data["guest_mono_ns"], 4_000_000_000_u64,
+            "the pair's, not the pong's"
+        );
+        assert_eq!(data["rtt_ns"], 1_200_u64, "the window, not the round trip");
+        let host_mono = data["host_mono_ns"].as_u64().unwrap();
+        let want = mono - 3_000_000;
+        assert!(
+            host_mono.abs_diff(want) < 50_000_000,
+            "host_mono_ns {host_mono} is not 3 ms before {mono}"
+        );
+        assert_eq!(
+            data["offset_ns"].as_i64().unwrap(),
+            host_mono as i64 - 4_000_000_000_i64
+        );
+    }
+
     /// With the sync thread started, the channel pings on its own: once
     /// init is ready, then every interval; each answered ping is a `sync`.
     /// The thread ends with the channel.
@@ -794,6 +901,7 @@ mod tests {
                     init.send(&GuestMsg::Pong {
                         id,
                         guest_mono_ns: 10 * id,
+                        ptp: None,
                     });
                 }
                 other => panic!("not a ping: {other:?}"),
@@ -865,6 +973,7 @@ mod tests {
         init.send(&GuestMsg::Pong {
             id,
             guest_mono_ns: 3,
+            ptp: None,
         });
         init.send(&GuestMsg::Log {
             level: LogLevel::Warn,

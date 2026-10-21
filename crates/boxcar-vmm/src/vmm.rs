@@ -84,8 +84,13 @@ use crate::vcpu::VcpuSet;
 pub use crate::devices::ConsoleOut;
 pub use crate::lifecycle::{SessionOutcome, StopReason, VmExit, VmState, VmmHandle};
 
-/// The kernel command line every boot starts from.
-pub const BASE_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.dumbkbd lockdown=integrity random.trust_cpu=on quiet loglevel=4 rdinit=/init";
+/// The kernel command line every boot starts from. `clocksource=kvm-clock`
+/// keeps the guest on the paravirtual clock rather than the TSC it would
+/// otherwise choose on a host with a stable one: `ptp_kvm`'s cross
+/// timestamp, which pairs the guest's clock with the host's (`sync`
+/// records, `method: "ptp_kvm"`), is given by the kernel only against
+/// `kvm-clock` (`ENODEV` otherwise).
+pub const BASE_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule 8250.nr_uarts=1 i8042.noaux i8042.nomux i8042.dumbkbd lockdown=integrity random.trust_cpu=on clocksource=kvm-clock quiet loglevel=4 rdinit=/init";
 
 /// The part of [`BASE_CMDLINE`] that `--debug-boot` replaces...
 const QUIET: &str = "quiet loglevel=4";
@@ -1079,7 +1084,7 @@ mod tests {
             base_cmdline(true),
             "console=ttyS0 reboot=k panic=1 pci=off nomodule 8250.nr_uarts=1 \
              i8042.noaux i8042.nomux i8042.dumbkbd lockdown=integrity random.trust_cpu=on \
-             earlyprintk=serial,ttyS0,115200 loglevel=7 rdinit=/init"
+             clocksource=kvm-clock earlyprintk=serial,ttyS0,115200 loglevel=7 rdinit=/init"
         );
     }
 
