@@ -107,8 +107,12 @@ processes and ring 0 effects to the span:
   or `-o noexec` runs nothing) (spaces at either end aside), or
   Claude Code's wrapper around exactly it read as a shell reads
   it (its own setup as whole `&&` parts, then `eval '<command>' <
-  /dev/null && pwd -P >| <file>`, nothing after), or, run without a
-  shell, the exec's argv is its words. The declared command appearing
+  /dev/null && pwd -P >| <file>`, nothing after; the setup varies by
+  version and shell, as sourcing its shell snapshot, `export`s, `shopt`
+  or `setopt`, an `unalias` group, and is not judged beyond each part
+  being there; the forms of 2.1.290, 2.1.304 and 2.1.306 are tested; the
+  `>nul` rewrite of Windows and `CLAUDE_CODE_SHELL_PREFIX` are not read),
+  or, run without a shell, the exec's argv is its words. The declared command appearing
   elsewhere in the shell's text (a comment, beside other commands, inside
   a longer `eval`) is not carrying it, nor is a command that reads the
   same once its quotes are dropped. Else as the only open span.
