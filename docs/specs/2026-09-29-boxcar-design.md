@@ -224,6 +224,21 @@ milestone 2.
 
 ## 14. Amendments
 
+### 2026-10-21: ring 1 TLS corroboration stays with OpenSSL's functions (#11)
+
+The sensor's TLS probes attach to `SSL_write` and `SSL_read` where a
+program or a library it maps exports them, and to nothing else. Claude
+Code's native build (Bun, BoringSSL compiled in, stripped), Codex
+(rustls) and Go's `crypto/tls` give them nothing, and `proc.tls_attach`
+says so per file. Offsets per known build of a stripped binary would be
+a table of guesses to keep up with every release; Go's register ABI and
+growable stacks make a uprobe's arguments and a return probe unreliable;
+rustls exports no stable function. What those runtimes lose is
+corroboration only: a span's executor is bound by the process that
+opened the request's flow, which the sensor names for every runtime, and
+a TLS write only ever named a provisional one. The decision in section
+11 stands, with these reasons; `docs/architecture.md` carries them.
+
 ### 2026-10-21: the tool-executor process shape a harness needs (#7)
 
 The reconciler closes a span only by a `tool.close` sent from the process
