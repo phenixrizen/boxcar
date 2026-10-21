@@ -168,10 +168,11 @@ inside each.
 | `intent_effect_mismatch` | `phantom_write` | a write tool's call said `ok`, and a second after its close no `fs.create`, `fs.close` with bytes written, `fs.rename` or `fs.unlink` among its effects touched a declared path (`file_path`, `notebook_path`, `path`, `filename`, or the files an `apply_patch` names) | 65 |
 | `intent_effect_mismatch` | `hidden_net` | a span's process made an allowed `net.connect` whose names and address appear nowhere in the call's arguments, and the call said `ok`; judged at the close | 55 |
 | `orphaned_work` | `orphaned_work` | a span's process is still running a second after the span closed, while the sensor reports exits; once a span | 50 |
+| `unverified_intent` | `args_lost` | a tool call's `tool.open` carried neither its arguments nor their hash (the gate did not keep them whole: `args_summary` is `[arguments not kept whole]`), so what the call did could not be compared with what was declared; said at the close, nothing partial kept | 45 |
 
 The span rules rest on cross-ring joins (`tool.open` is ring 0, the exec
 ring 1) and are marked `low_confidence` as the joins are, `phantom_write`
-excepted.
+and `args_lost` excepted (the latter reads ring 0 alone).
 
 ## What a finding carries
 

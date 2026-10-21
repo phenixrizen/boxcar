@@ -345,6 +345,10 @@ pub struct Span {
     recorded: bool,
     /// Set aside open, past [`MAX_OPEN_SPANS`].
     abandoned: bool,
+    /// The gate did not keep the call's arguments whole: the record has
+    /// no copy and no hash of them. What the call did cannot be compared
+    /// with what was declared.
+    args_lost: bool,
 }
 
 impl Span {
@@ -391,6 +395,7 @@ impl Span {
             ),
         };
         args_text.make_ascii_lowercase();
+        let args_lost = raw.is_none() && open.args.is_none() && open.args_b3.is_none();
         Span {
             id: open.tool_use_id.clone(),
             tool_name: open.tool_name.clone(),
@@ -418,6 +423,7 @@ impl Span {
             carried: false,
             recorded: false,
             abandoned: false,
+            args_lost,
         }
     }
 
@@ -984,6 +990,7 @@ impl Spans {
         span.status = Some(close.status.clone());
         self.open.retain(|open| open != id);
         let mut findings = self.argv_at_close(state, id);
+        findings.extend(self.args_lost_at_close(state, id, record));
         if close.status == "ok" {
             findings.extend(self.hidden_net(state, id, record));
         }
@@ -1616,6 +1623,34 @@ impl Spans {
         if let Some(span) = self.spans.get_mut(id) {
             span.argv_fired = true;
         }
+        self.note_finding(id, finding.score);
+        vec![finding]
+    }
+
+    /// `unverified_intent` / `args_lost`, at the close: the gate did not
+    /// keep the call's arguments whole (a piece of them found no room:
+    /// `args_summary` says so, and there is no copy and no hash), so the
+    /// call ran with no declared command or paths to compare what it did
+    /// against. Nothing partial is kept, as a part of the arguments is not
+    /// the arguments and cannot be scrubbed reliably; the loss is said
+    /// instead, from ring 0 alone, so never `low_confidence`.
+    fn args_lost_at_close(&mut self, state: &State, id: &str, record: &Record) -> Vec<Finding> {
+        let Some(span) = self.spans.get(id) else {
+            return Vec::new();
+        };
+        if !span.args_lost {
+            return Vec::new();
+        }
+        let opened_seq = span.opened.0;
+        let tool = span.tool_name.clone();
+        let summary = format!(
+            "the {tool} tool call {id} ran with arguments the observer did not keep whole; what \
+             it did could not be compared with what was declared"
+        );
+        let finding = Draft::new(FindingCategory::UnverifiedIntent, 45, "args_lost", summary)
+            .evidence([opened_seq, record.seq])
+            .span(id)
+            .finish(state);
         self.note_finding(id, finding.score);
         vec![finding]
     }

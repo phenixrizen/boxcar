@@ -235,6 +235,10 @@ Made while writing the plan, 2026-10-06:
   session tests, with the CA made by the test; `boxcar run --inspect` is
   covered by unit tests here and by the M4 gated suite from Task 2 on.
 
+Follow-ups after the plan, 2026-10-21:
+
+- #12: a tool call whose arguments the observer did not keep whole stays without them (a part of the arguments is not the arguments, and cannot be scrubbed reliably), and the reconciler says so at the close: `unverified_intent` / `args_lost`, score 45, from ring 0 alone. The `argv` rule has nothing to compare and stays silent for it.
+
 ### Task 2
 
 - **Which flows the gate reads.** A flow a network rule allowed is not
