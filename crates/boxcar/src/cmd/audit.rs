@@ -127,7 +127,13 @@ fn export(args: &ExportArgs) -> anyhow::Result<ExitCode> {
     }
     super::tell(&summary);
     if let Some(endpoint) = endpoint {
-        let roots = native_roots()?;
+        // Plain `http` needs no trust store, and a host without one can
+        // still reach its collector.
+        let roots = if endpoint.is_https() {
+            native_roots()?
+        } else {
+            Vec::new()
+        };
         match post(&endpoint, &bytes, &roots, DEADLINE) {
             Ok(Outcome::Accepted(None)) => super::tell(&format!("sent to {}", endpoint.as_str())),
             Ok(Outcome::Accepted(Some(message))) => super::tell(&format!(
@@ -195,7 +201,10 @@ fn verify(path: &Path, json: bool) -> anyhow::Result<ExitCode> {
 /// `audit.verify` after `audit.verify`, until a stretch reaches the
 /// writer's head. Each stretch after the first must start from the hash
 /// the one before ended at (its `from_prev`). Prints `ok: verified seq
-/// <from>..<head> against the writer's head <hash>` and exits 0; prints
+/// <from>..<head> against the writer's head <hash>; from <from_prev>, the
+/// hash stored before seq <from>` (the first stretch's `from_prev`, for the
+/// caller to set against the head an earlier verify ended at) and exits 0;
+/// prints
 /// `fail: ...` and exits 1 at a break the VMM found or a stretch that does
 /// not chain; says why and exits 1 when the session cannot verify (its
 /// writer closed or failed, or its VMM is older than `audit.verify`).
@@ -214,6 +223,8 @@ fn verify_live(control: &Path, from_seq: Option<u64>, json: bool) -> anyhow::Res
     let first = from_seq.unwrap_or(1).max(1);
     let mut next = first;
     let mut held: Option<Hash> = None;
+    // The first stretch's `from_prev`: the hash stored before `first`.
+    let mut from_prev: Option<Hash> = None;
     let (mut checkpoints, mut stretches) = (0u64, 0u64);
     let last = loop {
         let params = serde_json::to_value(AuditVerifyParams {
@@ -234,6 +245,7 @@ fn verify_live(control: &Path, from_seq: Option<u64>, json: bool) -> anyhow::Res
             return failed(json, "chain", &problem);
         }
         stretches += 1;
+        from_prev.get_or_insert(reply.from_prev);
         checkpoints += reply.checkpoints;
         held = Some(reply.to_hash);
         next = reply.to_seq.saturating_add(1);
@@ -241,11 +253,13 @@ fn verify_live(control: &Path, from_seq: Option<u64>, json: bool) -> anyhow::Res
             break reply;
         }
     };
+    let from_prev = from_prev.unwrap_or(last.from_prev);
     let mut out = io::stdout().lock();
     if json {
         let summary = json!({
             "ok": true,
             "from_seq": first,
+            "from_prev": from_prev,
             "to_seq": last.to_seq,
             "head_seq": last.head_seq,
             "head_hash": last.head_hash,
@@ -256,7 +270,8 @@ fn verify_live(control: &Path, from_seq: Option<u64>, json: bool) -> anyhow::Res
     } else {
         writeln!(
             out,
-            "ok: verified seq {first}..{} against the writer's head {}",
+            "ok: verified seq {first}..{} against the writer's head {}; from {from_prev}, \
+             the hash stored before seq {first}",
             last.head_seq, last.head_hash
         )?;
     }

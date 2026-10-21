@@ -252,6 +252,7 @@ Made by Task 6 (`docs/plans/exporters.md`), 2026-10-20:
 - **An incomplete log exports its verified prefix and exits 4**, as verify does.
 - **`audit.verify` checks a bounded stretch of a live log per call against the writer's flushed head**, cancellable, refusing a failed writer; the CLI chains the stretches by `from_prev`.
 - **`--otlp-endpoint` takes `http://`**, never a user and password, with a 60 s deadline and a 64 KiB answer cap, and retries nothing.
+- Follow-up #60 (2026-10-21) closed the five gaps #30's documentation found between the exporters plan and the code; the plan's section 9 records them.
 
 Made by Task 8 (#30), 2026-10-20:
 

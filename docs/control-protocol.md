@@ -236,7 +236,9 @@ the server shuts down.
 
 `boxcar audit verify --control PATH [--from-seq N] [--json]` asks until
 `more` is `false`, refusing a stretch whose `from_prev` is not the `to_hash`
-of the one before.
+of the one before. It shows the first stretch's `from_prev`, the hash stored
+before N, for the caller to set against the head an earlier verify ended
+at.
 
 Errors: `bad_request` (parameters that do not parse; a `from_seq` past the
 head), `invalid_state` (the audit log is closed; or it has failed, the

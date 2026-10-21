@@ -11,7 +11,8 @@
 //! - **a model call** per `llm.request`, ended by its `llm.response`: the one
 //!   on the same `(flow, stream)` that answers the latest unanswered
 //!   request, as WebSocket carries several calls on one stream. A response
-//!   with no request opens nothing and is counted as unpaired;
+//!   with no request opens nothing and is counted as unpaired; a request
+//!   with no response ends where it started, `boxcar.llm.unanswered` true;
 //! - **a tool call** per occurrence of a `tool_use_id`, as `span.effects`
 //!   defines it: opened by the `tool.open` at its `opened_seq`, ended only by
 //!   the close at its `closed_seq` (a null one stays open). A `tool.open`
@@ -215,6 +216,13 @@ impl Trace {
                 }
                 _ => {}
             }
+        }
+
+        // The requests no response answered end where they started.
+        for span in open_calls.into_values().flatten() {
+            spans[span]
+                .attributes
+                .push(KeyValue::bool("boxcar.llm.unanswered", true));
         }
 
         for occurrence in &occurrences {

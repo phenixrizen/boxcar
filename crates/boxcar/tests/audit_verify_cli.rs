@@ -143,8 +143,10 @@ fn it_asks_until_the_head_chaining_the_stretches() {
     assert_eq!(
         text(&output.stdout),
         format!(
-            "ok: verified seq 1..25 against the writer's head b3:{}\n",
-            "19".repeat(32)
+            "ok: verified seq 1..25 against the writer's head b3:{}; from b3:{}, the hash \
+             stored before seq 1\n",
+            "19".repeat(32),
+            "00".repeat(32)
         )
     );
     assert_eq!(asked(&server.join().unwrap()), [1, 11, 21]);
@@ -160,6 +162,7 @@ fn it_asks_until_the_head_chaining_the_stretches() {
         json!({
             "ok": true,
             "from_seq": 1,
+            "from_prev": h(0),
             "to_seq": 25,
             "head_seq": 25,
             "head_hash": h(25),
@@ -169,21 +172,38 @@ fn it_asks_until_the_head_chaining_the_stretches() {
     );
     server.join().unwrap();
 
-    // From a seq: the first stretch's `from_prev` is the server's to say.
+    // From a seq: the first stretch's `from_prev` is the server's to say,
+    // and is shown, for the caller to set against the head an earlier
+    // verify ended at.
+    let replies = || {
+        vec![
+            Ok(stretch(11, h(77), 20, 25)),
+            Ok(stretch(21, h(20), 25, 25)),
+        ]
+    };
     let (_tmp, path) = socket();
-    let replies = vec![
-        Ok(stretch(11, h(77), 20, 25)),
-        Ok(stretch(21, h(20), 25, 25)),
-    ];
-    let server = fake_server(&path, &CAPABILITIES, replies);
+    let server = fake_server(&path, &CAPABILITIES, replies());
     let output = verify(&path, &["--from-seq", "11"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
-    assert!(
-        text(&output.stdout).starts_with("ok: verified seq 11..25 "),
-        "{}",
-        text(&output.stdout)
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "ok: verified seq 11..25 against the writer's head b3:{}; from b3:{}, the hash \
+             stored before seq 11\n",
+            "19".repeat(32),
+            "4d".repeat(32)
+        )
     );
     assert_eq!(asked(&server.join().unwrap()), [11, 21]);
+
+    let (_tmp, path) = socket();
+    let server = fake_server(&path, &CAPABILITIES, replies());
+    let output = verify(&path, &["--from-seq", "11", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["from_seq"], json!(11));
+    assert_eq!(summary["from_prev"], json!(h(77)));
+    server.join().unwrap();
 }
 
 /// A stretch that does not start from the hash the one before ended at is
