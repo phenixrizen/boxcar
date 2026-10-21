@@ -89,6 +89,7 @@ the first 4096 of them. The other names (`path_at_open`, `target_path`,
 | `fs.open` | `mount`, `path`, `fh`, `flags` (raw `open(2)` flags), `flags_decoded [string]`, `exec` (the open is for `execve`), `result` |
 | `fs.create` | `mount`, `path`, `fh`, `mode`, `flags`, `result` |
 | `fs.close` | `mount`, `path` (at close), `path_at_open`, `fh`, `bytes_read`, `bytes_written`, `size` (or null), `blake3` (or null), `hash_status`, `open_seq` (or null), `attrib`, `ts_release_ns` (host `CLOCK_REALTIME` at the release itself: the hash that completes the record may come later, and the record's `ts_host_ns` is then later still; 0 in logs written before it existed) |
+| `fs.copy_up` | `mount`, `path`, `bytes`: an image session's overlay copied the image's file or directory at `path` into the session's layer before a change to it (`bytes` of data; 0 for a directory or a link). No subject: the copy is the overlay's own, on the guest's request that follows. A directory renamed brings its subtree up in one record. |
 | `fs.read` | `mount`, `path`, `fh`, `offset`, `len`, `result`, `attrib` |
 | `fs.write` | `mount`, `path`, `fh`, `offset`, `len`, `result`, `attrib` |
 | `fs.unlink` | `mount`, `path`, `result` |

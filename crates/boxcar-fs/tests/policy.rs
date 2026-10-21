@@ -119,6 +119,7 @@ impl Share {
             host_dir: root.clone(),
             guest_path: "/workspace".into(),
             cache: CachePolicyKind::Auto,
+            lower: None,
         };
         let inner = PassthroughFs::<()>::new(passthrough_config(&config)).unwrap();
         inner.import().unwrap();

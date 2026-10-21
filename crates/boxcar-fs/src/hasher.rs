@@ -219,7 +219,7 @@ impl HashOutcome {
 }
 
 /// How a job's file is hashed: [`hash_file`], except in tests.
-pub(crate) type HashFn = fn(&OwnedFd, &CString, Option<FileId>, u64) -> HashOutcome;
+pub(crate) type HashFn = fn(&[OwnedFd], &CString, Option<FileId>, u64) -> HashOutcome;
 
 /// Jobs and threads, counted under one lock.
 #[derive(Debug, Default)]
@@ -234,7 +234,9 @@ struct Counts {
 
 /// What the threads share.
 struct Shared {
-    root: OwnedFd,
+    /// The share's host directory, then an image session's lower layer:
+    /// a closed file is reopened beneath the first that has it.
+    roots: Mutex<Vec<OwnedFd>>,
     max_bytes: u64,
     events: Arc<Events>,
     hash: HashFn,
@@ -260,7 +262,9 @@ impl Shared {
             inline,
             unrecorded: Some((job.subject, job.close.clone())),
         };
-        let mut outcome = (self.hash)(&self.root, &job.rel_path, job.expected, self.max_bytes);
+        let roots = self.roots.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut outcome = (self.hash)(&roots, &job.rel_path, job.expected, self.max_bytes);
+        drop(roots);
         let moved = job.watch.as_ref().is_some_and(|watch| !watch.unchanged());
         if outcome.status == HashStatus::Ok && moved {
             // The content read is not the content the closer left.
@@ -348,7 +352,7 @@ impl HashWorker {
         hash: HashFn,
     ) -> Self {
         let shared = Arc::new(Shared {
-            root,
+            roots: Mutex::new(vec![root]),
             max_bytes,
             events,
             hash,
@@ -362,6 +366,16 @@ impl HashWorker {
             tx: Mutex::new(tx),
             threads: Mutex::new(threads),
         }
+    }
+
+    /// Adds a directory beneath which a closed file is looked for when
+    /// the share's own has none: an image session's lower layer.
+    pub fn add_root(&self, root: OwnedFd) {
+        self.shared
+            .roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(root);
     }
 
     /// Starts the threads again after [`shutdown`](Self::shutdown); does
@@ -496,22 +510,30 @@ fn serve(shared: &Shared, rx: &Receiver<HashJob>) {
     }
 }
 
-/// Hashes `rel_path` under `root`. See the module docs for the checks.
+/// Hashes `rel_path` under the first of `roots` that has it. See the
+/// module docs for the checks.
 pub fn hash_file(
-    root: &OwnedFd,
+    roots: &[OwnedFd],
     rel_path: &CString,
     expected: Option<FileId>,
     max_bytes: u64,
 ) -> HashOutcome {
-    let file = match open_beneath(root, rel_path) {
-        Ok(file) => file,
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-            return HashOutcome::status(HashStatus::Gone)
+    let mut file = None;
+    for root in roots {
+        match open_beneath(root, rel_path) {
+            Ok(opened) => {
+                file = Some(opened);
+                break;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(e) => {
+                tracing::debug!(path = ?rel_path, "reopening a closed file to hash it failed: {e}");
+                return HashOutcome::status(HashStatus::Error);
+            }
         }
-        Err(e) => {
-            tracing::debug!(path = ?rel_path, "reopening a closed file to hash it failed: {e}");
-            return HashOutcome::status(HashStatus::Error);
-        }
+    }
+    let Some(file) = file else {
+        return HashOutcome::status(HashStatus::Gone);
     };
     let Ok(before) = fstat(&file) else {
         return HashOutcome::status(HashStatus::Error);
@@ -630,7 +652,7 @@ mod tests {
         fs::create_dir(dir.path().join("d")).unwrap();
         fs::write(dir.path().join("d/f"), b"content").unwrap();
         let id = id_of(&dir.path().join("d/f"));
-        let outcome = hash_file(&root(&dir), &path("d/f"), Some(id), MAX);
+        let outcome = hash_file(&[root(&dir)], &path("d/f"), Some(id), MAX);
         assert_eq!(
             outcome,
             HashOutcome {
@@ -639,14 +661,14 @@ mod tests {
                 status: HashStatus::Ok,
             }
         );
-        let unknown = hash_file(&root(&dir), &path("d/f"), None, MAX);
+        let unknown = hash_file(&[root(&dir)], &path("d/f"), None, MAX);
         assert_eq!(unknown.status, HashStatus::Ok);
     }
 
     #[test]
     fn a_missing_file_is_gone() {
         let dir = TempDir::new().unwrap();
-        let outcome = hash_file(&root(&dir), &path("nothing"), None, MAX);
+        let outcome = hash_file(&[root(&dir)], &path("nothing"), None, MAX);
         assert_eq!(outcome, HashOutcome::status(HashStatus::Gone));
     }
 
@@ -656,7 +678,7 @@ mod tests {
         fs::write(dir.path().join("a"), b"a").unwrap();
         fs::write(dir.path().join("b"), b"bb").unwrap();
         let other = id_of(&dir.path().join("b"));
-        let outcome = hash_file(&root(&dir), &path("a"), Some(other), MAX);
+        let outcome = hash_file(&[root(&dir)], &path("a"), Some(other), MAX);
         assert_eq!(outcome, HashOutcome::sized(HashStatus::Raced, 1));
     }
 
@@ -672,7 +694,7 @@ mod tests {
         symlink("..", share.join("sub/up")).unwrap();
         let root = OwnedFd::from(File::open(&share).unwrap());
         for p in ["link", "../outside", "sub/up/inside", "/etc/passwd"] {
-            let outcome = hash_file(&root, &path(p), None, MAX);
+            let outcome = hash_file(std::slice::from_ref(&root), &path(p), None, MAX);
             assert_eq!(outcome, HashOutcome::status(HashStatus::Error), "{p}");
         }
     }
@@ -685,7 +707,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
         fs::create_dir(dir.path().join("d")).unwrap();
         for p in ["fifo", "d"] {
-            let outcome = hash_file(&root(&dir), &path(p), None, MAX);
+            let outcome = hash_file(&[root(&dir)], &path(p), None, MAX);
             assert_eq!(outcome, HashOutcome::status(HashStatus::Error), "{p}");
         }
     }
@@ -695,9 +717,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("big"), vec![1; 17]).unwrap();
         fs::write(dir.path().join("fits"), vec![1; 16]).unwrap();
-        let outcome = hash_file(&root(&dir), &path("big"), None, 16);
+        let outcome = hash_file(&[root(&dir)], &path("big"), None, 16);
         assert_eq!(outcome, HashOutcome::sized(HashStatus::SkippedSize, 17));
-        let outcome = hash_file(&root(&dir), &path("fits"), None, 16);
+        let outcome = hash_file(&[root(&dir)], &path("fits"), None, 16);
         assert_eq!(outcome.status, HashStatus::Ok);
     }
 
@@ -765,7 +787,7 @@ mod tests {
     }
 
     fn boom_or_hash(
-        root: &OwnedFd,
+        root: &[OwnedFd],
         rel_path: &CString,
         expected: Option<FileId>,
         max: u64,
@@ -828,7 +850,7 @@ mod tests {
     static GATE_OPENED: Condvar = Condvar::new();
 
     /// Waits until the gate opens, then panics.
-    fn panic_after_the_gate(_: &OwnedFd, _: &CString, _: Option<FileId>, _: u64) -> HashOutcome {
+    fn panic_after_the_gate(_: &[OwnedFd], _: &CString, _: Option<FileId>, _: u64) -> HashOutcome {
         let mut open = GATE.lock().unwrap();
         while !*open {
             open = GATE_OPENED.wait(open).unwrap();

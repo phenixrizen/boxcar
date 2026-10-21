@@ -111,6 +111,7 @@ fn share(tag: &str, host_dir: PathBuf, guest_path: &str, cache: CachePolicyKind)
         host_dir,
         guest_path: guest_path.into(),
         cache,
+        lower: None,
     }
 }
 

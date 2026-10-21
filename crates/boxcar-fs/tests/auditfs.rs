@@ -181,6 +181,7 @@ fn share_config(root: &Path) -> FsShareConfig {
         host_dir: root.to_owned(),
         guest_path: "/workspace".into(),
         cache: CachePolicyKind::Auto,
+        lower: None,
     }
 }
 

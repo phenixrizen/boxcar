@@ -528,10 +528,19 @@ impl Vmm {
             Some(spec) => PathRules::new(spec, &[], &[])?,
             None => PathRules::allow_all(),
         };
+        // An image session's lower layer is scanned too: its files are
+        // what the guest sees beneath the share's upper directory.
         let shares: Vec<(&Path, &str)> = cfg
             .fs_shares
             .iter()
-            .map(|share| (share.host_dir.as_path(), share.guest_path.as_str()))
+            .flat_map(|share| {
+                std::iter::once((share.host_dir.as_path(), share.guest_path.as_str())).chain(
+                    share
+                        .lower
+                        .iter()
+                        .map(|lower| (lower.dir.as_path(), share.guest_path.as_str())),
+                )
+            })
             .collect();
         let denied = Arc::new(scan(&shares, &path_rules)?);
         let fs_rules: LiveRules = Arc::new(ArcSwap::from_pointee(path_rules));
@@ -1186,6 +1195,7 @@ mod tests {
             host_dir: PathBuf::from(dir),
             guest_path: "/".into(),
             cache: boxcar_fs::CachePolicyKind::Auto,
+            lower: None,
         };
         let refs = share_refs(&[share("root", "/r/rootfs"), share("workspace", "/w")]);
         let named: Vec<(&str, &str)> = refs

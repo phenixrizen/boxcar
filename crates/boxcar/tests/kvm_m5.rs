@@ -424,47 +424,32 @@ fn a_session_boots_from_an_image_with_its_defaults() {
         run.session_dir().display()
     );
     assert_eq!(Path::new(host_root).file_name().unwrap(), "rootfs");
-    // The copy has the image's modes, and the boot paths were made in it:
-    // resolv.conf in the locked /etc, the working directory in the workspace.
-    let copy = Path::new(host_root);
-    assert_eq!(
-        fs::symlink_metadata(copy.join("conf"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o555
-    );
-    assert_eq!(
-        fs::symlink_metadata(copy.join("etc/secret"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o000
-    );
-    assert_eq!(
-        fs::symlink_metadata(copy.join("locked"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o000
-    );
+    // The session's directory is the overlay's upper layer: it holds the
+    // boot paths made in the merge (resolv.conf where the image's link
+    // leads, in a shell of the locked /conf) and nothing of the image.
+    let upper = Path::new(host_root);
     assert!(
-        copy.join("conf/resolv.conf").is_file(),
-        "made where the link leads, before the mode"
+        upper.join("conf/resolv.conf").is_file(),
+        "made where the link leads"
     );
-    assert_eq!(
-        fs::read_link(copy.join("etc/resolv.conf")).unwrap(),
-        Path::new("/conf/resolv.conf")
+    assert!(upper.join("conf").is_dir(), "a shell for it");
+    assert!(
+        !upper.join("etc").exists(),
+        "the link below was followed, not copied"
     );
+    assert!(!upper.join("etc/secret").exists());
+    assert!(!upper.join("locked").exists());
     assert!(
         scratch.path("workspace").join("project").is_dir(),
         "WorkingDir through /app -> /workspace"
     );
-    // The cached tree stores readable modes, listed in image.json.
+    // The cached tree stores readable modes, listed in image.json, and has
+    // the link the merge followed.
     let cached = cached_tree(&scratch, &image.manifest_digest);
+    assert_eq!(
+        fs::read_link(cached.join("etc/resolv.conf")).unwrap(),
+        Path::new("/conf/resolv.conf")
+    );
     assert_eq!(
         fs::symlink_metadata(cached.join("etc/secret"))
             .unwrap()
@@ -481,6 +466,77 @@ fn a_session_boots_from_an_image_with_its_defaults() {
         .unwrap()
         .iter()
         .any(|m| m[0] == "etc/secret" && m[1] == 0));
+}
+
+/// An image session runs on the overlay: the image's modes show as the
+/// image has them, a write to the image's file goes to the session's
+/// directory and is recorded as a copy-up, a directory of the image moves
+/// with its contents (no `EXDEV`), and the cache is never written (#31).
+#[test]
+fn an_image_session_runs_on_an_overlay_and_leaves_the_image_below() {
+    let Some(guest) =
+        guest_or_skip("an_image_session_runs_on_an_overlay_and_leaves_the_image_below")
+    else {
+        return;
+    };
+    let image = publish(&guest.rootfs);
+    let scratch = Scratch::new();
+    let script = "stat -c '%n %a' /conf /etc/secret /locked; \
+                  echo appended >> /etc/motd && cat /etc/motd; \
+                  mv /etc/ssl /etc/ssl-moved && ls /etc/ssl-moved | head -1 && echo dir-moved; \
+                  ls /etc/ssl 2>/dev/null || echo ssl-gone; \
+                  rm /etc/motd && ls /etc/motd 2>/dev/null || echo motd-gone; \
+                  echo done";
+    let run = run_image(&guest, &scratch, &image.by_tag, &[], &["sh", "-c", script]);
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    for line in [
+        "/conf 555",
+        "/etc/secret 0",
+        "/locked 0",
+        "from the test image",
+        "appended",
+        "dir-moved",
+        "ssl-gone",
+        "motd-gone",
+        "done",
+    ] {
+        assert!(
+            run.stdout.lines().any(|l| l.trim() == line),
+            "{line}: {}",
+            run.describe()
+        );
+    }
+    let records = run.records();
+    let start = of_kind(&records, "vmm.start");
+    let upper = PathBuf::from(start[0].data["shares"][0]["host_root"].as_str().unwrap());
+    // The cache is untouched; the session's directory holds the changes.
+    let cached = cached_tree(&scratch, &image.manifest_digest);
+    assert_eq!(
+        fs::read(cached.join("etc/motd")).unwrap(),
+        b"from the test image\n"
+    );
+    assert!(cached.join("etc/ssl").is_dir());
+    assert!(!cached.join("etc/ssl-moved").exists());
+    assert!(
+        upper.join("etc/ssl-moved/certs").is_dir(),
+        "the subtree came up"
+    );
+    assert!(upper.join("etc/ssl-moved/.wh..wh..opq").exists());
+    assert!(upper.join("etc/.wh.ssl").exists());
+    assert!(upper.join("etc/.wh.motd").exists());
+    assert!(!upper.join("etc/motd").exists());
+    // The copy-ups are recorded, the file's with its bytes.
+    let copy_ups = of_kind(&records, "fs.copy_up");
+    assert!(
+        copy_ups
+            .iter()
+            .any(|r| r.data["path"] == "/etc/motd" && r.data["bytes"] == 20),
+        "{copy_ups:?}"
+    );
+    assert!(
+        copy_ups.iter().any(|r| r.data["path"] == "/etc/ssl"),
+        "{copy_ups:?}"
+    );
 }
 
 /// A command installs the package from the layer with apk, offline, and

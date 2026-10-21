@@ -157,7 +157,7 @@ prints it:
 # spans. The package registries and git hosts are allowed on 443, and the
 # Debian mirrors on 80 too (apt's default sources are plain HTTP, signed).
 # Everything else is denied. The session may write all of its shares: with
-# --image the root share is the session's own copy of the image.
+# --image the root share is the session's own layer over the image.
 version = 1
 
 [egress]
@@ -351,8 +351,8 @@ otherwise.
 
 With `--rootfs`, init creates `/etc/resolv.conf` on the root share when the
 tree has none; under a `writable` that leaves out `/etc` it cannot, and the
-guest resolves no names. An `--image` session's copy has the file made
-before boot.
+guest resolves no names. An `--image` session has the file made in its
+layer before boot.
 
 Each refusal is one `fs.denied` with `reason: "policy"`, its `op` (`exec`
 for an open to run a program), its `errno`, and `rule`: the glob that

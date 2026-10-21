@@ -157,6 +157,7 @@ fn hello_boots_with_the_root_and_workspace_shares_attached() {
         host_dir,
         guest_path: guest_path.into(),
         cache,
+        lower: None,
     };
     let cfg = VmConfig {
         cmdline_extra: vec!["boxcar.mode=hello".into()],

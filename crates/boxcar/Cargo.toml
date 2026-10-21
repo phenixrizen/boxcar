@@ -20,6 +20,7 @@ boxcar-proto = { workspace = true, features = ["hash"] }
 boxcar-audit = { workspace = true }
 boxcar-vmm = { workspace = true }
 boxcar-fs = { workspace = true }
+fuse-backend-rs = { workspace = true }
 boxcar-net = { workspace = true }
 # Policy files and the built-in profiles (`run --policy`, `policy profile`).
 boxcar-policy = { workspace = true }

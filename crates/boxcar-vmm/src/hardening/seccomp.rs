@@ -182,6 +182,8 @@ const FILES: &[i64] = &[
     libc::SYS_fsync,
     libc::SYS_fdatasync,
     libc::SYS_umask,
+    // The overlay's copy-up of an image's file into the session's layer.
+    libc::SYS_copy_file_range,
 ];
 
 /// Extended attributes, which the passthrough reaches by path through
@@ -191,6 +193,10 @@ const XATTRS: &[i64] = &[
     libc::SYS_setxattr,
     libc::SYS_listxattr,
     libc::SYS_removexattr,
+    // The overlay's copy-up carries a file's xattrs by descriptor.
+    libc::SYS_fgetxattr,
+    libc::SYS_fsetxattr,
+    libc::SYS_flistxattr,
 ];
 
 /// Sockets: the guest's TCP and UDP flows and its DNS, the gate, the

@@ -2,7 +2,7 @@
 
 What `boxcar run --image REF` does: how a reference is read, how boxcar's
 own registry client fetches and verifies an image, how the layers are
-unpacked into a per-user cache, and how each session gets its own copy of
+unpacked into a per-user cache, and how each session gets its own layer over
 the tree as its root filesystem. Booting from a directory is the README's
 [quick start](../README.md#quick-start); what happens from `boxcar run` to
 the agent's shell is [boot.md](boot.md); the policy a session runs under,
@@ -25,12 +25,14 @@ sensor are on by default, as with `--rootfs`. `--pull` and
 `--cache-dir DIR` without `--image` are a usage error (exit 2).
 
 `--rootfs` hands the guest a directory it changes in place, for the next
-session too. `--image` copies the cached tree into the session's directory,
-`<audit dir>/sessions/<session-id>/rootfs`, and that copy is the root
-share: what the session writes stays in its copy, which stays with the
-session, and the next session starts from the image again. The run reads
-the cached tree and never writes it; where Landlock confines the run, its
-domain grants only reading beneath that tree.
+session too. `--image` serves the cached tree through an overlay: the
+tree read-only below, the session's own directory,
+`<audit dir>/sessions/<session-id>/rootfs`, above. What the session
+changes is copied up into its directory as it changes it (see [The
+session's layer](#the-sessions-layer)), which stays with the session, and
+the next session starts from the image again. The run reads the cached
+tree and never writes it; where Landlock confines the run, its domain
+grants only reading beneath that tree.
 
 `--pull` says when to ask the registry:
 
@@ -179,10 +181,10 @@ boxcar, with no privileges:
   checksum does not match fail the pull.
 - Modes are kept, setuid and setgid included where the host allows, but the
   cache stores every entry readable by its owner (owner read on a file,
-  owner read, write and search on a directory), so a session's copy can
-  read it all; `image.json` lists the image's modes of those entries as
-  `modes`, and each copy gets them back. Directory modes are set after the
-  last layer, deepest first.
+  owner read, write and search on a directory), so a session's overlay can
+  read and copy it all; `image.json` lists the image's modes of those
+  entries as `modes`, which the overlay shows in their place. Directory
+  modes are set after the last layer, deepest first.
 - Ownership goes into the override: every file and directory the image
   names carries `user.boxcar.stat` with its owner and its special bits
   (from the header, or a PAX `uid`/`gid` record), while the host file is
@@ -213,7 +215,7 @@ refs/<registry>/<repository>/_indexes/<hex>  an index's digest: its manifest's d
   after its image. What a process that is gone left half done is swept
   when a pull starts and by `prune`.
 - **Locking.** A pull holds `.lock` shared, and so does `boxcar run
-  --image` from finding the image until its copy is made; `rm` and `prune`
+  --image` from finding the image until its root is prepared; `rm` and `prune`
   hold it exclusive, so each waits for the other. Two pulls of one image
   at once each build a tree, and the second to finish uses the first's.
 - **Sharing.** Blobs are shared: a layer two images have is fetched once
@@ -287,25 +289,52 @@ none of its text.
   default. The session has no capability whatever its uid, so `chown` and
   `mknod` are refused in the guest either way.
 
-## The session's copy
+## The session's layer
 
-The copy is made after the session's directory exists and before the VM is
-built. The cached tree is walked with directory descriptors and `*at`
-calls, following no link on either side. A regular file is reflinked
-(`FICLONE`) where the filesystem can, sharing its data but not its inode,
-and copied otherwise (`copy_file_range`, or reads and writes). Hardlink
-groups stay groups within the copy, never linked to the cache. Symlinks keep
-their targets, and each file and directory its ownership override
-(`user.boxcar.stat`). Times are not copied; anything but a file, directory
-or link is skipped and counted on stderr. A failed copy is removed whole and the
-run exits 1: no `vmm.start` is recorded. A tree cached by an earlier boxcar
-can hold an entry its owner cannot read; the copy then fails, saying to
-`boxcar image rm` the image and pull it again.
+The root share of an image session is an overlay of boxcar's own
+(`boxcar-fs`'s `overlay`), under `AuditFs` as the passthrough is: the
+cached tree read-only below, the session's directory above, both on the
+host, and the guest shown their union.
+
+- **Lookup and readdir** merge the two: an entry above hides one of the
+  same name below; a whiteout above (an empty file `.wh.<name>`, the OCI
+  layer convention) hides a lower entry; an opaque mark above
+  (`.wh..wh..opq` in a directory) hides everything below that directory.
+  Names beginning with `.wh.` are the overlay's own: never shown, never
+  made (`EPERM`).
+- **Reads** go to whichever layer holds the entry. **Writes** copy up
+  first: a lower file opened for writing (or truncated, or whose
+  attributes or xattrs change) is copied to the session's directory with
+  its data, mode, times and user xattrs (the ownership override among
+  them), its parent directories made above as shells with theirs; then
+  the request goes to the copy. Each copy-up is one `fs.copy_up` record
+  (`path`, `bytes`). What the session creates is created above.
+- **Rename** works within the upper layer: a lower source is copied up
+  first, a directory with its whole lower subtree (less what is whited
+  out) and then marked opaque, and the old name gets a whiteout where a
+  lower entry remains. So `rename(2)` never answers `EXDEV`, and a
+  package manager renames files into place as it would on a disk.
+- **Unlink and rmdir** remove the upper entry and leave a whiteout where
+  a lower one remains; `rmdir` refuses a directory that is not empty in
+  the merge.
+- **Modes.** The cache stores every entry readable by its owner and lists
+  the image's modes of the rest (`modes`); the overlay shows those modes,
+  for the lower entry and for its copy (which keeps the readable mode on
+  the host, so copy-ups can go on beneath it), until the guest sets a mode
+  of its own.
+- **Hashing.** A closed file is reopened for its hash beneath the session's
+  directory, or beneath the cached tree when the session never copied it
+  up.
+
+The session's directory needs user xattrs (the override travels in one);
+nothing is reflinked or copied ahead of time, so a session costs what it
+changes, on any filesystem.
 
 Init writes to the root share at boot. So that a policy keeping writes out
 of the root share does not stand between init and its setup, the host
-makes in the copy what init would, following the image's links as init
-will, while every directory of the copy is still 0o700:
+makes in the merge, through the overlay itself (so a directory made above
+a lower one is its shell, owner and all), what init would, following the
+image's links as init will:
 
 1. The mount points `/dev`, `/proc`, `/sys` and `/run` (0o755), where each
    leads, when missing.
@@ -322,16 +351,13 @@ will, while every directory of the copy is still 0o700:
 4. `/etc/ssl/certs/ca-certificates.crt`, when the session inspects
    ([gate.md](gate.md)): the same.
 
-The modes come last, deepest first: every directory and every entry in
-`modes` gets the image's mode, so a `0o555` `/etc` still gets its
-`resolv.conf`.
-
 ## What is recorded
 
 `vmm.start` carries `image {reference, manifest_digest, config_digest}`:
 the reference normalized (`alpine:3.22` is recorded as
 `docker.io/library/alpine:3.22`), and the digests of the manifest and
-config whose tree was copied. `shares[0].host_root` is the copy. The pull
+config whose tree is served. `shares[0].host_root` is the session's
+directory, the overlay's upper layer. The pull
 is not in the log: it happens before the log opens.
 
 ## `boxcar doctor`
@@ -339,9 +365,7 @@ is not in the log: it happens before the log opens.
 Two lines about the default cache (`doctor` takes no `--cache-dir`):
 
 - `image cache: <dir>`: missing until a pull makes it; otherwise how many
-  images and tags it holds, and `sessions reflink it` or `sessions copy
-  it`, from a probe file cloned from the cache into the default audit
-  directory (unknown before a session has made that directory).
+  images and tags it holds.
 - The free space where the cache is or will be: missing under 2 GiB, with
   the hint to free some or point `--cache-dir` or `XDG_CACHE_HOME` at a
   larger filesystem.

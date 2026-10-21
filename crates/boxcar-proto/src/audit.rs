@@ -42,15 +42,15 @@ mod payloads;
 
 pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, ExecRing1,
-    Finding, FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir,
-    FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hardening,
-    HashStatus, HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest, LlmResponse,
-    NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult,
-    PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec, ProcExecDenied,
-    ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
-    ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SeccompMode, SensorPhase, SessionExit,
-    SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop,
-    VsockClose, VsockConnect,
+    Finding, FindingCategory, FsClose, FsCopyUp, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
+    FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
+    Hardening, HashStatus, HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest,
+    LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp,
+    OpResult, PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec,
+    ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd,
+    ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SeccompMode,
+    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen,
+    Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -398,6 +398,8 @@ pub enum Payload {
     FsCreate(FsCreate),
     #[serde(rename = "fs.close")]
     FsClose(FsClose),
+    #[serde(rename = "fs.copy_up")]
+    FsCopyUp(FsCopyUp),
     #[serde(rename = "fs.read")]
     FsRead(FsIo),
     #[serde(rename = "fs.write")]
@@ -519,6 +521,7 @@ impl Payload {
             Payload::FsOpen(_) => "fs.open",
             Payload::FsCreate(_) => "fs.create",
             Payload::FsClose(_) => "fs.close",
+            Payload::FsCopyUp(_) => "fs.copy_up",
             Payload::FsRead(_) => "fs.read",
             Payload::FsWrite(_) => "fs.write",
             Payload::FsUnlink(_) => "fs.unlink",
@@ -589,6 +592,7 @@ impl Payload {
             | Payload::FsOpen(_)
             | Payload::FsCreate(_)
             | Payload::FsClose(_)
+            | Payload::FsCopyUp(_)
             | Payload::FsRead(_)
             | Payload::FsWrite(_)
             | Payload::FsUnlink(_)
@@ -664,13 +668,14 @@ impl Payload {
 /// The wire names of the typed payloads ([`Payload`]), in schema order: the
 /// kinds a log of this version can hold. A reader meets other kinds in a
 /// log written by a newer version.
-pub const KINDS: [&str; 60] = [
+pub const KINDS: [&str; 61] = [
     "vmm.start",
     "vmm.stop",
     "fs.mount",
     "fs.open",
     "fs.create",
     "fs.close",
+    "fs.copy_up",
     "fs.read",
     "fs.write",
     "fs.unlink",
@@ -926,6 +931,15 @@ mod tests {
                     "attrib": "caller",
                     "ts_release_ns": 1_700_000_000_000_000_007_u64,
                 }),
+            ),
+            (
+                Payload::FsCopyUp(FsCopyUp {
+                    mount: "root".into(),
+                    path: "/etc/motd".into(),
+                    path_b64: None,
+                    bytes: 12,
+                }),
+                json!({"mount": "root", "path": "/etc/motd", "bytes": 12}),
             ),
             (
                 Payload::FsRead(FsIo {

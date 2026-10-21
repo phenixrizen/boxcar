@@ -21,7 +21,7 @@ use boxcar_audit::{
     AuditSink, DeclaredArgs, PolicyIndicators, RawArgv, ReconcileConfig, Reconciler, SpanIndex,
     SystemClock, WriterConfig, WriterHandle,
 };
-use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig, PathSpec};
+use boxcar_fs::{AuditFsOptions, AuditLevel, CachePolicyKind, FsShareConfig, LowerLayer, PathSpec};
 use boxcar_net::{DumpDir, InspectConfig, List, NetConfig, Policy, SessionCa};
 use boxcar_proto::control::{to_line, Ready};
 use boxcar_proto::guest::{SessionConfig, DEFAULT_ARGV};
@@ -52,7 +52,7 @@ use crate::oci::client::{Client, ClientError};
 use crate::oci::defaults;
 use crate::oci::pull::{ensure, Found, PullError, PullMode};
 use crate::oci::reference::Reference;
-use crate::oci::session::{self, BootNeeds, Layout, Reflink};
+use crate::oci::session::{self, BootNeeds};
 use crate::oci::store::OWNERSHIP_OVERRIDE;
 
 /// The exit code of a usage error, as clap's: a policy rule that does not
@@ -397,10 +397,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             None => new_workspace(writer.session_dir())?,
         };
         eprintln!("workspace: {}", workspace.display());
-        let root = match (&found, rootfs) {
-            // The session's own copy of the image's tree, prepared for the
-            // boot, in the session directory beside the workspace.
-            (Some(found), _) => session_rootfs(
+        let (root, lower) = match (&found, rootfs) {
+            // The session's own layer over the image's tree, prepared for
+            // the boot, in the session directory beside the workspace.
+            (Some(found), _) => session_overlay(
                 found,
                 &writer.session_dir().join("rootfs"),
                 &workspace,
@@ -408,10 +408,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 net,
                 inspect.is_some(),
             )?,
-            (None, Some(rootfs)) => rootfs,
+            (None, Some(rootfs)) => (rootfs, None),
             (None, None) => bail!("no root share"),
         };
-        shares(root, workspace)
+        shares(root, lower, workspace)
     } else {
         Vec::new()
     };
@@ -1161,45 +1161,43 @@ fn find_or_pull(
     )
 }
 
-/// The session's root share from the cached image `found`: its tree copied
-/// to `copy`, the boot paths made in it (and in `workspace`), its modes
-/// set last. A failure leaves nothing behind.
-fn session_rootfs(
+/// The session's root share from the cached image `found`: the session's
+/// directory `upper`, made empty, over the cached tree (the overlay's
+/// layers), the boot paths made in the merge (and in `workspace`). A
+/// failure leaves nothing behind.
+fn session_overlay(
     found: &Found,
-    copy: &Path,
+    upper: &Path,
     workspace: &Path,
     cwd: &str,
     net: bool,
     inspect: bool,
-) -> anyhow::Result<PathBuf> {
-    let copied = session::copy_tree(&found.dir.join("rootfs"), copy, Reflink::Try)?;
-    if copied.skipped > 0 {
-        eprintln!(
-            "warning: {} entries of the image were not copied: not files, directories or links",
-            copied.skipped
-        );
-    }
+) -> anyhow::Result<(PathBuf, Option<LowerLayer>)> {
+    let lower = LowerLayer {
+        dir: found.dir.join("rootfs"),
+        modes: found.json.modes.clone(),
+    };
+    DirBuilder::new()
+        .mode(0o700)
+        .create(upper)
+        .with_context(|| format!("cannot make {}", upper.display()))?;
     let prepared = session::prepare_boot_paths(
-        &Layout {
-            root: copy,
-            workspace,
-        },
+        &lower.dir,
+        upper,
+        &lower.modes,
+        workspace,
         &BootNeeds { cwd, net, inspect },
-    )
-    .and_then(|()| session::set_modes(copy, &copied, &found.json.modes));
+    );
     if let Err(error) = prepared {
-        if let (Some(parent), Some(name)) = (copy.parent(), copy.file_name()) {
+        if let (Some(parent), Some(name)) = (upper.parent(), upper.file_name()) {
             let _ = crate::oci::unpack::delete_tree(parent, &name.to_string_lossy());
         }
         return Err(error.into());
     }
-    let copy = copy
+    let upper = upper
         .canonicalize()
-        .with_context(|| format!("cannot resolve {}", copy.display()))?;
-    if copy.to_str().is_none() {
-        bail!("{}: the path is not valid UTF-8", copy.display());
-    }
-    Ok(copy)
+        .with_context(|| format!("cannot resolve {}", upper.display()))?;
+    Ok((upper, Some(lower)))
 }
 
 /// How many shares a run with `--rootfs` gives the VM ([`shares`]), for
@@ -1209,7 +1207,7 @@ const SHARE_COUNT: usize = FS_TAGS.len();
 /// The shares, one per tag of the VMM's [`FS_TAGS`], in its slot order:
 /// the root filesystem, which only the guest changes, cached freely; the
 /// workspace, which the host may edit too, revalidated.
-fn shares(rootfs: PathBuf, workspace: PathBuf) -> Vec<FsShareConfig> {
+fn shares(rootfs: PathBuf, lower: Option<LowerLayer>, workspace: PathBuf) -> Vec<FsShareConfig> {
     // Fails to compile when the VMM's shares change, so the two cannot
     // drift apart.
     let [root_tag, workspace_tag] = FS_TAGS;
@@ -1219,12 +1217,14 @@ fn shares(rootfs: PathBuf, workspace: PathBuf) -> Vec<FsShareConfig> {
             host_dir: rootfs,
             guest_path: "/".into(),
             cache: CachePolicyKind::Always,
+            lower,
         },
         FsShareConfig {
             tag: workspace_tag.into(),
             host_dir: workspace,
             guest_path: "/workspace".into(),
             cache: CachePolicyKind::Auto,
+            lower: None,
         },
     ]
 }
@@ -2625,7 +2625,7 @@ mod tests {
     /// gives the VM: the VMM's tags, in its slot order.
     #[test]
     fn the_shares_are_the_vmm_s_tags_in_slot_order() {
-        let shares = shares(PathBuf::from("/r"), PathBuf::from("/w"));
+        let shares = shares(PathBuf::from("/r"), None, PathBuf::from("/w"));
         let tags: Vec<&str> = shares.iter().map(|share| share.tag.as_str()).collect();
         assert_eq!(tags, FS_TAGS);
         assert_eq!(shares.len(), SHARE_COUNT);

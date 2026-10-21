@@ -289,6 +289,7 @@ mod tests {
             host_dir: dir.path().to_path_buf(),
             guest_path: "/".into(),
             cache: boxcar_fs::CachePolicyKind::Auto,
+            lower: None,
         };
         cfg.fs_shares = vec![share("root"), share("workspace")];
         let set = DeviceSet::from_config(&cfg);

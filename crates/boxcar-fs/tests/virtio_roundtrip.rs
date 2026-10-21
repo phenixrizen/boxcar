@@ -94,6 +94,7 @@ impl Share {
             host_dir: root.clone(),
             guest_path: format!("/{tag}"),
             cache: CachePolicyKind::Auto,
+            lower: None,
         };
         Share {
             _dir: dir,
