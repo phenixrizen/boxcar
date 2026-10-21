@@ -223,10 +223,21 @@ milestone 2.
 - ptp_kvm availability on nested-virtualization hosts for clock pairing.
 - Which agents' harnesses expose a stable tool-executor process shape for
   span ancestry.
-- An agent that pins its provider's certificate: it fails closed and
-  visibly, and is not observed.
 
 ## 14. Amendments
+
+### 2026-10-21: an agent that pins its provider's certificate runs uninspected (#9)
+
+The gate does not break a pin and does not relay a connection it could
+not verify: a pinning agent run under an `inspect` line fails closed and
+visibly (`net.inspect{result:"guest_rejected"}`). Such an agent is run
+with its provider allowed and not inspected, which the policy already
+allows: its TLS runs to the provider untouched, the log holds the flow as
+ring 0 sees it (`net.tls` with `inspect` omitted, the close with the
+bytes) and what ring 1 adds, and no `http.*`, `llm.*` or `tool.*` is
+recorded. That was an open question above; it is now the answer, in
+`docs/gate.md` and `docs/policy.md`, with a gated test of the uninspected
+TLS flow.
 
 ### 2026-10-21: zstd content coding decoded (#8)
 

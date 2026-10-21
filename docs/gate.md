@@ -37,6 +37,21 @@ and a handshake slower than 5 s end the connection with nothing relayed:
 gate fails closed; it never falls back to relaying a connection it could
 not verify.
 
+**An agent that pins its provider's certificate** refuses the session's
+leaf: `net.inspect{result:"guest_rejected"}`, the connection reset, its
+model traffic never observed. Such an agent is run with its provider
+allowed and not inspected: leave the provider out of the `inspect` lines,
+and its TLS runs to the provider untouched, as any allowed connection
+does. The log then holds what ring 0 sees of the flow (`net.dns`,
+`net.connect`, `net.tls` with `kind:"tls"` and `inspect` omitted,
+`net.close` with the bytes each way) and what ring 1 adds for a runtime
+that exports OpenSSL's functions (`proc.tls_io`), but no `http.*`,
+`llm.*` or `tool.*`: no model call or tool call is recorded, and the
+reconciler's span rules have nothing to judge. That is the whole of what
+boxcar offers such an agent (#9): it does not break a pin, and it does
+not relay a connection it could not verify, so the session is observed to
+the flow and no further, and the policy says so.
+
 ## The session's CA
 
 Each session with an `inspect` line makes its own CA: ECDSA P-256, named

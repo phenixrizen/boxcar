@@ -79,6 +79,74 @@ fn an_allowed_download_succeeds_and_is_recorded() {
     );
 }
 
+/// (a, over TLS) The same name allowed on 443 and no `inspect` line: the
+/// guest's own TLS runs to the host untouched, as an agent that pins its
+/// provider's certificate needs (#9: such an agent is run with its
+/// provider allowed and not inspected). The log holds the flow as ring 0
+/// saw it (`net.tls{kind:"tls"}` with `inspect` omitted, then its close
+/// with the bytes), no `net.inspect`, and nothing of its plaintext.
+#[test]
+fn an_allowed_tls_download_runs_untouched_and_is_recorded_as_a_flow() {
+    let Some(guest) =
+        networked_guest_or_skip("an_allowed_tls_download_runs_untouched_and_is_recorded_as_a_flow")
+    else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &["--allow", "example.com:443"],
+        &[
+            "/bin/sh",
+            "-c",
+            "wget -q -O - https://example.com/ | grep -c -i '<html' ; sleep 1",
+        ],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(
+        run.stdout.lines().any(|line| line.trim() == "1"),
+        "the page did not reach the guest:\n{}",
+        run.describe()
+    );
+    let records = run.records();
+    let tls: Vec<_> = of_kind(&records, "net.tls")
+        .into_iter()
+        .filter(|r| r.data["sni"] == "example.com")
+        .collect();
+    assert_eq!(tls.len(), 1, "{tls:?}\n{}", run.describe());
+    assert_eq!(tls[0].data["kind"], "tls", "{:?}", tls[0]);
+    assert_eq!(tls[0].data["verdict"], "allow", "{:?}", tls[0]);
+    assert!(
+        tls[0].data.get("inspect").is_none(),
+        "decided for inspection without an inspect line: {:?}",
+        tls[0]
+    );
+    let flow = tls[0].data["flow"].as_u64().unwrap();
+    for kind in ["net.inspect", "http.request", "http.response"] {
+        let seen = of_kind(&records, kind);
+        assert!(seen.is_empty(), "{kind} without an inspect line: {seen:?}");
+    }
+    let close = of_kind(&records, "net.close")
+        .into_iter()
+        .find(|r| r.data["flow"] == flow)
+        .unwrap_or_else(|| panic!("no net.close for flow {flow}\n{}", run.describe()));
+    assert!(
+        close.data["rx"].as_u64().unwrap() > 0 && close.data["tx"].as_u64().unwrap() > 0,
+        "{close:?}"
+    );
+    // No inspect line, no CA: nothing was put in the guest's trust store.
+    let start = of_kind(&records, "vmm.start");
+    assert!(
+        start[0]
+            .data
+            .get("inspect_ca_sha256")
+            .is_none_or(|h| h.is_null()),
+        "{:?}",
+        start[0]
+    );
+}
+
 /// (b) A name the policy does not allow: the download fails (the name does
 /// not resolve: NXDOMAIN) and the log says the query was denied.
 #[test]
