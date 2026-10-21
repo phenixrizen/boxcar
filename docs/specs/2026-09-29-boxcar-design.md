@@ -223,11 +223,20 @@ milestone 2.
 - ptp_kvm availability on nested-virtualization hosts for clock pairing.
 - Which agents' harnesses expose a stable tool-executor process shape for
   span ancestry.
-- Content encodings beyond gzip, deflate and brotli in model responses
-  (zstd), and an agent that pins its provider's certificate: both fail
-  closed and visibly, neither is observed.
+- An agent that pins its provider's certificate: it fails closed and
+  visibly, and is not observed.
 
 ## 14. Amendments
+
+### 2026-10-21: zstd content coding decoded (#8)
+
+The gate's observer decodes `zstd` content coding as it does gzip,
+deflate and brotli, through `ruzstd` (pure Rust, already the layer
+decoder's). A frame's window is capped at 16 MiB, Brotli's largest, and
+a frame asking for more is refused before its window is allocated, as a
+large-window Brotli stream is; the decode budget and the kept-bytes limit
+apply unchanged. zstd was an open question above; a body in any other
+coding still degrades to its raw bytes, hashed, and is recorded so.
 
 ### 2026-10-06: the model traffic gate replaces the model gateway
 

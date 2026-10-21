@@ -2,14 +2,15 @@
 // Copyright 2026 The boxcar Authors
 
 //! A message body as the observer keeps it: content-decoded as it comes
-//! (`gzip`, `deflate`, `br`; anything else degrades the body to its raw
-//! bytes), hashed whole (blake3 over the decoded bytes), and kept for the
+//! (`gzip`, `deflate`, `br`, `zstd`; anything else degrades the body to its
+//! raw bytes), hashed whole (blake3 over the decoded bytes), and kept for the
 //! parsers up to [`BODY_KEEP`], after which the body is hashed but not
 //! kept (`truncated`).
 
 use std::io::Write;
 
 use super::retain::{Retained, Share};
+use super::zstd;
 
 /// The most decoded bytes kept for the parsers.
 pub const BODY_KEEP: usize = 16 * 1024 * 1024;
@@ -58,23 +59,26 @@ pub enum Coding {
     Gzip,
     Deflate,
     Brotli,
+    Zstd,
 }
 
 impl Coding {
     /// The most a decoder of this coding holds, as charged against the
     /// observer's budget when it is made: zlib's window and state for
-    /// gzip and deflate, and for Brotli its largest window (16 MiB) and the
-    /// writer's buffer.
+    /// gzip and deflate; for Brotli its largest window (16 MiB) and the
+    /// writer's buffer; for zstd the largest window it is allowed, the
+    /// same 16 MiB, a block waiting to be whole and a block decoded.
     pub fn decoder_cost(self) -> usize {
         match self {
             Coding::Identity => 0,
             Coding::Gzip | Coding::Deflate => 64 * 1024,
             Coding::Brotli => 16 * 1024 * 1024 + 64 * 1024,
+            Coding::Zstd => zstd::MAX_WINDOW as usize + 2 * zstd::MAX_BLOCK,
         }
     }
 
     /// The coding `content_encoding` names; `Err` for one the observer
-    /// does not decode (`zstd`, a chain of codings, anything else).
+    /// does not decode (a chain of codings, anything else).
     pub fn parse(content_encoding: Option<&str>) -> Result<Coding, &'static str> {
         match content_encoding.map(|c| c.trim().to_ascii_lowercase()) {
             None => Ok(Coding::Identity),
@@ -82,6 +86,7 @@ impl Coding {
             Some(c) if c == "gzip" || c == "x-gzip" => Ok(Coding::Gzip),
             Some(c) if c == "deflate" => Ok(Coding::Deflate),
             Some(c) if c == "br" => Ok(Coding::Brotli),
+            Some(c) if c == "zstd" => Ok(Coding::Zstd),
             Some(_) => Err("content_encoding"),
         }
     }
@@ -92,6 +97,7 @@ enum Inner {
     Gzip(flate2::write::GzDecoder<Capped>),
     Deflate(flate2::write::ZlibDecoder<Capped>),
     Brotli(Box<brotli_decompressor::DecompressorWriter<Capped>>),
+    Zstd(Box<zstd::Decoder<Capped>>),
 }
 
 /// Decodes one body's content coding as its bytes come.
@@ -119,6 +125,7 @@ impl ContentDecoder {
             Coding::Brotli => Inner::Brotli(Box::new(
                 brotli_decompressor::DecompressorWriter::new(Capped::new(), 64 * 1024),
             )),
+            Coding::Zstd => Inner::Zstd(Box::new(zstd::Decoder::new(Capped::new()))),
         };
         ContentDecoder {
             inner,
@@ -144,13 +151,26 @@ impl ContentDecoder {
             Inner::Identity => return Ok(raw.to_vec()),
             Inner::Gzip(d) => d
                 .write_all(raw)
-                .map(|_| std::mem::take(&mut d.get_mut().buf)),
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
             Inner::Deflate(d) => d
                 .write_all(raw)
-                .map(|_| std::mem::take(&mut d.get_mut().buf)),
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
             Inner::Brotli(d) => d
                 .write_all(raw)
-                .map(|_| std::mem::take(&mut d.get_mut().buf)),
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
+            Inner::Zstd(d) => match d.feed(raw) {
+                Ok(()) => Ok(std::mem::take(&mut d.get_mut().buf)),
+                // Refused at the header, before its window is allocated:
+                // the budget, as for Brotli's large-window format.
+                Err(zstd::Error::WindowTooBig) => {
+                    self.failed = true;
+                    return Err("decode_budget");
+                }
+                Err(_) => Err(()),
+            },
         };
         result.map_err(|_| self.fail())
     }
@@ -162,9 +182,22 @@ impl ContentDecoder {
         }
         let result = match &mut self.inner {
             Inner::Identity => return Ok(Vec::new()),
-            Inner::Gzip(d) => d.try_finish().map(|_| std::mem::take(&mut d.get_mut().buf)),
-            Inner::Deflate(d) => d.try_finish().map(|_| std::mem::take(&mut d.get_mut().buf)),
-            Inner::Brotli(d) => d.flush().map(|_| std::mem::take(&mut d.get_mut().buf)),
+            Inner::Gzip(d) => d
+                .try_finish()
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
+            Inner::Deflate(d) => d
+                .try_finish()
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
+            Inner::Brotli(d) => d
+                .flush()
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
+            Inner::Zstd(d) => d
+                .finish()
+                .map(|_| std::mem::take(&mut d.get_mut().buf))
+                .map_err(|_| ()),
         };
         result.map_err(|_| self.fail())
     }
@@ -178,6 +211,7 @@ impl ContentDecoder {
             Inner::Gzip(d) => d.get_mut(),
             Inner::Deflate(d) => d.get_mut(),
             Inner::Brotli(d) => d.get_mut(),
+            Inner::Zstd(d) => d.get_mut(),
         };
         capped.buf = Vec::new();
         if capped.left == 0 {
@@ -447,9 +481,89 @@ mod tests {
         assert!(sink.summary().degraded.is_none());
     }
 
+    /// zstd bodies decode as the others do: from the zstd CLI's frames
+    /// (checksum or not), ruzstd's own, several frames in a row with a
+    /// skippable one between, pushed in pieces of any size.
+    #[test]
+    fn zstd_bodies_decode_and_hash_the_plaintext() {
+        use super::super::zstd::tests::{skippable, text, EMPTY, TEXT, TEXT_NO_CHECK};
+        let text = text();
+        let mut two = TEXT.to_vec();
+        two.extend(skippable(b"meta"));
+        two.extend(TEXT_NO_CHECK);
+        let mut twice = text.clone();
+        twice.extend(&text);
+        let own = ruzstd::encoding::compress_to_vec(
+            text.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        for (raw, want) in [
+            (TEXT.to_vec(), text.clone()),
+            (TEXT_NO_CHECK.to_vec(), text.clone()),
+            (own, text.clone()),
+            (two, twice),
+            (EMPTY.to_vec(), Vec::new()),
+        ] {
+            for chunk in [1, 7, 4096] {
+                let mut sink = BodySink::new(Some("zstd"));
+                let mut decoded = Vec::new();
+                for piece in raw.chunks(chunk) {
+                    decoded.extend(sink.push(piece));
+                }
+                decoded.extend(sink.finish());
+                assert_eq!(decoded, want, "{chunk}");
+                let summary = sink.summary();
+                assert_eq!(summary.bytes, want.len() as u64);
+                assert_eq!(
+                    summary.b3,
+                    (!want.is_empty()).then(|| format!("b3:{}", blake3::hash(&want).to_hex()))
+                );
+                assert!(!summary.truncated && summary.degraded.is_none());
+                assert_eq!(sink.kept(), want);
+            }
+        }
+    }
+
+    /// A zstd body that decodes past the budget is cut there, like a gzip
+    /// one; a frame whose window is past the cap is refused before it is
+    /// allocated; a bad or cut stream degrades to the raw bytes.
+    #[test]
+    fn zstd_bodies_are_bounded_and_degrade_like_the_others() {
+        use super::super::zstd::tests::{zeros, TEXT};
+        // 600 blocks of 128 KiB zeros: 75 MiB, past the 64 MiB budget.
+        let raw = zeros(600);
+        let mut sink = BodySink::new(Some("zstd"));
+        let decoded = sink.push(&raw);
+        assert_eq!(decoded, raw, "the raw bytes stand in");
+        sink.finish();
+        let summary = sink.summary();
+        assert_eq!(summary.degraded, Some("decode_budget"));
+        assert_eq!(summary.bytes, raw.len() as u64);
+
+        let mut header = zstd::MAGIC_BYTES.to_vec();
+        header.push(0xa0);
+        header.extend((zstd::MAX_WINDOW as u32 + 1).to_le_bytes());
+        let mut sink = BodySink::new(Some("zstd"));
+        assert_eq!(sink.push(&header), header);
+        assert_eq!(sink.summary().degraded, Some("decode_budget"));
+
+        let mut sink = BodySink::new(Some("zstd"));
+        sink.push(b"not zstd");
+        sink.finish();
+        assert_eq!(sink.summary().degraded, Some("content_decode"));
+
+        let mut sink = BodySink::new(Some("zstd"));
+        let mut decoded = Vec::new();
+        for piece in TEXT[..TEXT.len() - 10].chunks(7) {
+            decoded.extend(sink.push(piece));
+        }
+        decoded.extend(sink.finish());
+        assert_eq!(sink.summary().degraded, Some("content_decode"));
+    }
+
     #[test]
     fn an_unknown_coding_or_a_bad_stream_degrades_to_the_raw_bytes() {
-        let mut sink = BodySink::new(Some("zstd"));
+        let mut sink = BodySink::new(Some("compress"));
         assert_eq!(sink.push(b"raw"), b"raw");
         assert_eq!(sink.summary().degraded, Some("content_encoding"));
         assert_eq!(sink.summary().bytes, 3);
@@ -491,7 +605,8 @@ mod tests {
         assert_eq!(Coding::parse(Some("x-gzip")), Ok(Coding::Gzip));
         assert_eq!(Coding::parse(Some("deflate")), Ok(Coding::Deflate));
         assert_eq!(Coding::parse(Some("br")), Ok(Coding::Brotli));
-        assert_eq!(Coding::parse(Some("zstd")), Err("content_encoding"));
+        assert_eq!(Coding::parse(Some("zstd")), Ok(Coding::Zstd));
+        assert_eq!(Coding::parse(Some("compress")), Err("content_encoding"));
         assert_eq!(Coding::parse(Some("gzip, br")), Err("content_encoding"));
     }
 
@@ -542,8 +657,9 @@ mod tests {
         assert_eq!(retained.held(), Coding::Brotli.decoder_cost());
         let gz = BodySink::new(Some("gzip")).with_retained(retained.clone());
         assert_eq!(retained.held(), Coding::Brotli.decoder_cost() + 64 * 1024);
-        let mut late = BodySink::new(Some("br")).with_retained(retained.clone());
+        let mut late = BodySink::new(Some("zstd")).with_retained(retained.clone());
         assert_eq!(late.summary().degraded, Some("observe_budget"));
+        assert_eq!(Coding::Zstd.decoder_cost(), 16 * 1024 * 1024 + 256 * 1024);
         late.push(b"raw");
         assert_eq!(late.summary().bytes, 3, "hashed raw");
         drop(late);
