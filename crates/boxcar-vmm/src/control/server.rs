@@ -157,7 +157,10 @@ impl ControlServer {
         };
         let thread = thread::Builder::new()
             .name("control-accept".into())
-            .spawn(move || accept.run());
+            .spawn(move || {
+                boxcar_confine::at_thread_start();
+                accept.run()
+            });
         let thread = match thread {
             Ok(thread) => thread,
             Err(error) => {
@@ -318,7 +321,10 @@ impl Accept {
         };
         let thread = thread::Builder::new()
             .name("control-conn".into())
-            .spawn(move || session.serve());
+            .spawn(move || {
+                boxcar_confine::at_thread_start();
+                session.serve()
+            });
         let thread = match thread {
             Ok(thread) => thread,
             Err(error) => {

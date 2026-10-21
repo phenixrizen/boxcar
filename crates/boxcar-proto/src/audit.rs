@@ -800,6 +800,7 @@ mod tests {
                     hardening: Some(Hardening {
                         seccomp: SeccompMode::Enforce,
                         landlock: LandlockStatus::Partial,
+                        seccomp_threads: false,
                     }),
                 }),
                 json!({
@@ -2271,6 +2272,7 @@ mod tests {
             hardening: Some(Hardening {
                 seccomp: SeccompMode::Enforce,
                 landlock: LandlockStatus::Unsupported,
+                seccomp_threads: false,
             }),
         };
         let payload = Payload::VmmStart(start.clone());

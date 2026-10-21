@@ -171,7 +171,10 @@ pub(crate) fn subscribe(
         .name("audit-forward".into())
         .spawn({
             let stop = Arc::clone(&stop);
-            move || forward(subscription, sub, &events, &stop, &released, limits.stall)
+            move || {
+                boxcar_confine::at_thread_start();
+                forward(subscription, sub, &events, &stop, &released, limits.stall)
+            }
         })
         .map_err(|error| {
             ErrorBody::new(

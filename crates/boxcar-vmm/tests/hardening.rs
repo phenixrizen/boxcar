@@ -138,6 +138,135 @@ fn threads_start_under_the_filter() {
     assert_eq!(code, Some(0));
 }
 
+/// A thread whose name says its role, started once the process list is in,
+/// is confined to that role's list at its start, through the hook the mode
+/// sets: a virtio-fs queue cannot open a socket, and the process dies for it.
+#[test]
+fn a_thread_is_confined_to_its_role() {
+    let code = in_child("a_thread_is_confined_to_its_role", || {
+        seccomp::set_mode(SeccompMode::Enforce);
+        seccomp::install(SeccompMode::Enforce).unwrap();
+        let worker = thread::Builder::new()
+            .name("fs-root-q1".into())
+            .spawn(|| {
+                boxcar_confine::at_thread_start();
+                // SAFETY: plain arguments; the filter answers first.
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) }
+            })
+            .unwrap();
+        let _ = worker.join();
+        1
+    });
+    assert_eq!(code, Some(128 + libc::SIGSYS));
+}
+
+/// The same under `log`: the call returns and the thread goes on.
+#[test]
+fn in_log_a_thread_off_its_role_goes_on() {
+    let code = in_child("in_log_a_thread_off_its_role_goes_on", || {
+        seccomp::set_mode(SeccompMode::Log);
+        seccomp::install(SeccompMode::Log).unwrap();
+        let worker = thread::Builder::new()
+            .name("fs-root-q1".into())
+            .spawn(|| {
+                boxcar_confine::at_thread_start();
+                // SAFETY: plain arguments.
+                let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+                if fd >= 0 {
+                    // SAFETY: a descriptor this thread opened.
+                    unsafe { libc::close(fd) };
+                }
+                fd >= 0
+            })
+            .unwrap();
+        i32::from(!worker.join().unwrap_or(false))
+    });
+    assert_eq!(code, Some(0));
+}
+
+/// A thread's role takes nothing from another's: the net thread keeps its
+/// sockets and loses files, which the queue thread keeps. A thread with no
+/// role (a vCPU's name) is left to the process list.
+#[test]
+fn each_role_keeps_its_own_calls() {
+    let code = in_child("each_role_keeps_its_own_calls", || {
+        seccomp::set_mode(SeccompMode::Enforce);
+        seccomp::install(SeccompMode::Enforce).unwrap();
+        let opens = |name: &str| {
+            thread::Builder::new()
+                .name(name.into())
+                .spawn(|| {
+                    boxcar_confine::at_thread_start();
+                    File::open("/proc/self/stat").is_ok()
+                })
+                .unwrap()
+                .join()
+                .unwrap_or(false)
+        };
+        let sockets = |name: &str| {
+            thread::Builder::new()
+                .name(name.into())
+                .spawn(|| {
+                    boxcar_confine::at_thread_start();
+                    // SAFETY: plain arguments.
+                    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+                    if fd >= 0 {
+                        // SAFETY: a descriptor this thread opened.
+                        unsafe { libc::close(fd) };
+                    }
+                    fd >= 0
+                })
+                .unwrap()
+                .join()
+                .unwrap_or(false)
+        };
+        if !opens("fs-workspace-q1") || !sockets("net") || !opens("vcpu0") || !sockets("vcpu0") {
+            return 2;
+        }
+        // The net thread, given a file: the process dies.
+        opens("net");
+        3
+    });
+    assert_eq!(code, Some(128 + libc::SIGSYS));
+}
+
+/// A thread started before the process list is in keeps that list alone
+/// once it comes, by `TSYNC`, and the install does not fail for it: its
+/// role's filter is not added first.
+#[test]
+fn a_thread_started_before_the_process_list_keeps_it_alone() {
+    let code = in_child(
+        "a_thread_started_before_the_process_list_keeps_it_alone",
+        || {
+            seccomp::set_mode(SeccompMode::Enforce);
+            let (mut wait, mut release) = pipe();
+            let early = thread::Builder::new()
+                .name("fs-root-q1".into())
+                .spawn(move || {
+                    boxcar_confine::at_thread_start();
+                    let mut byte = [0u8; 1];
+                    let _ = wait.read(&mut byte);
+                    // On the process list, which allows a socket; its role's
+                    // list, had it been added, would not.
+                    // SAFETY: plain arguments.
+                    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+                    if fd >= 0 {
+                        // SAFETY: a descriptor this thread opened.
+                        unsafe { libc::close(fd) };
+                    }
+                    fd >= 0
+                })
+                .unwrap();
+            if seccomp::install(SeccompMode::Enforce).is_err() {
+                return 2;
+            }
+            release.write_all(b"!").unwrap();
+            i32::from(!early.join().unwrap_or(false))
+        },
+    );
+    assert_eq!(code, Some(0));
+}
+
 /// A process, unlike a thread, cannot be started: `fork` is a `clone`
 /// without `CLONE_THREAD`.
 #[test]

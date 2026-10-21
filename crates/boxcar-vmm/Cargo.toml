@@ -10,6 +10,7 @@ repository.workspace = true
 kvm-tests = []
 
 [dependencies]
+boxcar-confine = { workspace = true }
 boxcar-proto = { workspace = true, features = ["hash"] }
 boxcar-audit = { workspace = true }
 boxcar-virtio = { workspace = true }

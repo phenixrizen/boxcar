@@ -291,6 +291,7 @@ name = "boxcar-audit"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "boxcar-confine",
  "boxcar-proto",
  "crossbeam-channel",
  "globset",
@@ -305,6 +306,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxcar-confine"
+version = "0.1.0"
+
+[[package]]
 name = "boxcar-fs"
 version = "0.1.0"
 dependencies = [
@@ -312,6 +317,7 @@ dependencies = [
  "base64",
  "blake3",
  "boxcar-audit",
+ "boxcar-confine",
  "boxcar-proto",
  "boxcar-virtio",
  "crossbeam-channel",
@@ -348,6 +354,7 @@ dependencies = [
  "base64",
  "blake3",
  "boxcar-audit",
+ "boxcar-confine",
  "boxcar-proto",
  "boxcar-virtio",
  "brotli-decompressor",
@@ -464,6 +471,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "boxcar-audit",
+ "boxcar-confine",
  "boxcar-fs",
  "boxcar-net",
  "boxcar-proto",
@@ -494,6 +502,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "boxcar-audit",
+ "boxcar-confine",
  "boxcar-proto",
  "boxcar-virtio",
  "event-manager",

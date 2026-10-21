@@ -847,6 +847,7 @@ fn spawn(worker: Worker) -> Result<WorkerHandle, ActivateError> {
     }
     let (stopped, done) = mpsc::channel::<()>();
     let thread = thread::Builder::new().name("vsock".into()).spawn(move || {
+        boxcar_confine::at_thread_start();
         // Dropped when the thread ends, however it ends.
         let _stopped = stopped;
         run(manager, id, worker);

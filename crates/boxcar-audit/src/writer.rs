@@ -287,7 +287,10 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
     };
     let thread = thread::Builder::new()
         .name("audit-writer".into())
-        .spawn(move || writer.run(rx, stopped))?;
+        .spawn(move || {
+            boxcar_confine::at_thread_start();
+            writer.run(rx, stopped)
+        })?;
 
     let handle = WriterHandle {
         session_dir,

@@ -540,7 +540,10 @@ impl PtyHub {
         let hub = Arc::clone(shared);
         let spawned = thread::Builder::new()
             .name("pty-hub".into())
-            .spawn(move || serve(&hub, theirs));
+            .spawn(move || {
+                boxcar_confine::at_thread_start();
+                serve(&hub, theirs)
+            });
         if let Err(error) = spawned {
             *shared.stream_slot() = None;
             return Err(refused(error));

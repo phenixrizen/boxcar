@@ -242,6 +242,8 @@ Made by Task 7 (`docs/plans/vmm-hardening.md`), 2026-10-20:
 - **A log cut mid-write is `incomplete`, cause unknown, exit code 4.** Verify cannot tell a crash from a deliberate cut; what a cut tail can hide is bounded by the index, as for a cut at a record boundary. The writer's rollback cuts the index before the segment, so a kill halfway leaves a state a crash can produce.
 - **Guest memory is `MADV_DONTDUMP`**, so a kill's core holds none of it.
 
+- Follow-up #34 (2026-10-21, `docs/plans/per-thread-seccomp.md`): on top of the process list, each worker thread confines itself to its role's list at its start; the vCPU and main threads keep the process list, as a filter is inherited by the threads a thread starts.
+
 Made by Task 6 (`docs/plans/exporters.md`), 2026-10-20:
 
 - **An export reads the log once, in the verification walk** (`verify::read_verified`), so what it exports is what was hashed. Only the log and the running version shape it: no clock, host, environment or locale.

@@ -470,7 +470,10 @@ fn start_threads(
         shared.counts().alive += 1;
         let spawned = thread::Builder::new()
             .name(format!("fs-{tag}-hash{n}"))
-            .spawn(move || serve(&worker, &rx));
+            .spawn(move || {
+                boxcar_confine::at_thread_start();
+                serve(&worker, &rx)
+            });
         match spawned {
             Ok(handle) => threads.push(handle),
             Err(error) => {

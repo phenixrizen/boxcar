@@ -248,7 +248,7 @@ The reader already stops quietly at a partial last line in the newest segment (`
 
 ## 6. Out of scope
 
-- **Per-thread filters.** The M5 plan's decision stands: one list for the process.
+- **Per-thread filters.** The M5 plan's decision stands: one list for the process. (Done after this task by #34, `docs/plans/per-thread-seccomp.md`: a filter per worker role on top of the process list.)
 - **Confining `boxcar` client commands** (`policy`, `audit`, `attach`, `image`).
 - **Filtering `mmap`/`mprotect` for `PROT_EXEC`.**
 - **Landlock's `CONNECT_TCP`.** The guest's flows connect anywhere the policy allows, and the policy changes live.

@@ -165,6 +165,7 @@ impl GuestCtl {
         let thread = thread::Builder::new()
             .name("guest-ctl-sync".into())
             .spawn(move || {
+                boxcar_confine::at_thread_start();
                 ctl.sync_loop(interval);
                 let _ = done.send(());
             });
@@ -340,6 +341,7 @@ impl GuestCtl {
         let write_thread = thread::Builder::new()
             .name("guest-ctl-tx".into())
             .spawn(move || {
+                boxcar_confine::at_thread_start();
                 write_lines(writer, &lines);
                 let _ = writer_done.send(());
             })?;
@@ -347,6 +349,7 @@ impl GuestCtl {
         let read_thread = thread::Builder::new()
             .name("guest-ctl-rx".into())
             .spawn(move || {
+                boxcar_confine::at_thread_start();
                 ctl.read_lines(reader);
                 let _ = reader_done.send(());
             });

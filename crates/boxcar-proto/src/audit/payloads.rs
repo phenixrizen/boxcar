@@ -88,12 +88,17 @@ pub struct ImageRef {
 }
 
 /// How the VMM process is confined (`vmm.start.hardening`): its seccomp
-/// filter and its Landlock domain, both in force before the record is made.
+/// filter and its Landlock domain, both in force before the record is made,
+/// and whether its worker threads each confine themselves further to their
+/// role's list (omitted when they do not: `seccomp` is `off`, or the host
+/// is not one the lists are built for).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Hardening {
     pub seccomp: SeccompMode,
     pub landlock: LandlockStatus,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seccomp_threads: bool,
 }
 
 /// The process's seccomp filter (`boxcar run --seccomp`).

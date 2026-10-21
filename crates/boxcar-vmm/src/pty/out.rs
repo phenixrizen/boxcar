@@ -376,6 +376,7 @@ pub fn spawn(output: Output, target: Target) -> io::Result<OutHandle> {
     thread::Builder::new()
         .name("pty-stdout".into())
         .spawn(move || {
+            boxcar_confine::at_thread_start();
             // The target goes with `write_out`'s return.
             let finish = write_out(&output, target, &progress);
             *progress.lock_queue() = None;
