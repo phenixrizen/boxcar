@@ -248,21 +248,39 @@ fn is_user_flag(arg: &str) -> bool {
 }
 
 /// A user flag's `value` (`user:password`, quoted or not) with its
-/// password redacted, a closing quote kept; a user alone, or an empty
-/// password, as it is.
+/// password redacted; a user alone, or an empty password, as it is. A
+/// quoted value's password runs to its closing quote, and the result is
+/// closed again there, whatever the word went on with (`'alice:pw'x` is one
+/// value to the shell, so `x` is the password's; `'alice:[redacted]'`
+/// holds no open quote for a second scrub to read past). One with no
+/// closing quote is redacted to its end.
 fn user_value(value: &str) -> String {
     let Some(colon) = value.find(':') else {
         return value.to_owned();
     };
     let (head, tail) = value.split_at(colon + 1);
-    let close = match value.chars().next() {
-        Some(q @ ('\'' | '"')) if tail.ends_with(q) => 1,
-        _ => 0,
-    };
-    if tail.len() == close {
+    let quote = value.chars().next().filter(|c| matches!(c, '\'' | '"'));
+    let close = quote.and_then(|q| closing_quote(tail, q));
+    if close.unwrap_or(tail.len()) == 0 {
         return value.to_owned();
     }
-    format!("{head}{REDACTED}{}", &tail[tail.len() - close..])
+    match (quote, close) {
+        (Some(q), Some(_)) => format!("{head}{REDACTED}{q}"),
+        _ => format!("{head}{REDACTED}"),
+    }
+}
+
+/// Where the first `q` outside a backslash escape is in `text`.
+fn closing_quote(text: &str, q: char) -> Option<usize> {
+    let mut chars = text.char_indices();
+    while let Some((at, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == q {
+            return Some(at);
+        }
+    }
+    None
 }
 
 /// A word that is a user flag with its value attached (`-ualice:pw`,
@@ -281,7 +299,9 @@ fn attached_user(word: &str) -> Option<(&str, &str)> {
 /// The passwords of `user:password` values after the user flags
 /// ([`USER_FLAGS`]) in `text`: the value the next word, attached, or after
 /// `=`. Words are read as a shell reads them: a quoted part, spaces and
-/// all, belongs to its word.
+/// all, belongs to its word, and the value ends where the shell would end
+/// the word, at an operator outside quotes ([`value_end`]), so `'alice:pw';`
+/// keeps its closing quote and the `;` after it.
 fn user_flags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut after_flag = false;
@@ -295,20 +315,48 @@ fn user_flags(text: &str) -> String {
         let end = word_end(text, i);
         let word = &text[i..end];
         if after_flag {
-            out.push_str(&user_value(word));
+            let (value, rest) = word.split_at(value_end(word));
+            out.push_str(&user_value(value));
+            out.push_str(rest);
             after_flag = false;
         } else if is_user_flag(word) {
             out.push_str(word);
             after_flag = true;
         } else if let Some((flag, value)) = attached_user(word) {
+            let (value, rest) = value.split_at(value_end(value));
             out.push_str(flag);
             out.push_str(&user_value(value));
+            out.push_str(rest);
         } else {
             out.push_str(word);
         }
         i = end;
     }
     out
+}
+
+/// Where a user flag's value ends within its word in text: at the first
+/// shell operator character (`;`, `&`, `|`, `(`, `)`, `<`, `>`) outside
+/// quotes, which ends the word as the shell reads it, or the word's end.
+/// What follows is kept as it is: `'alice:pw';` is the value `'alice:pw'`
+/// then `;`. An operator inside quotes is the value's own. A quoted value
+/// the word goes on with (`'alice:pw'x`) runs to the word's end, since
+/// the shell joins the two into one value ([`user_value`] closes it).
+fn value_end(word: &str) -> usize {
+    let mut quote = None;
+    let mut chars = word.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match (quote, c) {
+            (_, '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, ';' | '&' | '|' | '(' | ')' | '<' | '>') => return at,
+            _ => {}
+        }
+    }
+    word.len()
 }
 
 /// Where the shell word starting at byte `start` of `text` ends: at the
@@ -876,12 +924,56 @@ mod tests {
                 "curl -u 'alice:[redacted]' x",
             ),
             ("curl -u \"alice:pw\" x", "curl -u \"alice:[redacted]\" x"),
+            // The value ends where the shell ends the word: at an operator
+            // outside quotes. The quote and the operator stay (#40).
+            (
+                "curl https://example.test -u 'alice:pw'; echo retained",
+                "curl https://example.test -u 'alice:[redacted]'; echo retained",
+            ),
+            (
+                "curl -u \"alice:pw\"; echo x",
+                "curl -u \"alice:[redacted]\"; echo x",
+            ),
+            (
+                "curl -u alice:pw; echo x",
+                "curl -u alice:[redacted]; echo x",
+            ),
+            ("curl -u alice:pw|cat", "curl -u alice:[redacted]|cat"),
+            (
+                "curl -u alice:pw&&echo x",
+                "curl -u alice:[redacted]&&echo x",
+            ),
+            ("(curl -u alice:pw)", "(curl -u alice:[redacted])"),
+            ("curl -u alice:pw>out", "curl -u alice:[redacted]>out"),
+            (
+                "curl --user='alice:pw'&&echo x",
+                "curl --user='alice:[redacted]'&&echo x",
+            ),
+            ("curl -ualice:pw;id", "curl -ualice:[redacted];id"),
+            // An operator inside the quotes is the password's own.
+            ("curl -u 'alice:p;w' x", "curl -u 'alice:[redacted]' x"),
+            (
+                "curl -u \"alice:a|b\"; x",
+                "curl -u \"alice:[redacted]\"; x",
+            ),
+            // A quoted value the word goes on with is one value to the
+            // shell: redacted to the word's end, and closed again, so the
+            // result scrubs the same a second time.
+            ("curl -u 'alice:pw'x y", "curl -u 'alice:[redacted]' y"),
+            (
+                "curl -u \"alice:p\\\"w\" x",
+                "curl -u \"alice:[redacted]\" x",
+            ),
+            ("curl -u 'alice:pw", "curl -u 'alice:[redacted]"),
+            ("curl -u 'alice:' x", "curl -u 'alice:' x"),
             ("curl -u alice x", "curl -u alice x"),
             ("curl -u alice: x", "curl -u alice: x"),
             ("sort -u notes.txt", "sort -u notes.txt"),
         ];
         for (text, want) in cases {
             assert_eq!(scrub_text(text), want, "{text}");
+            // A fixed point: a second scrub changes nothing (#40).
+            assert_eq!(scrub_text(want), want, "{text}");
         }
         // A key as the user, an empty password: the key is a token.
         let key = ["sk", "test", "a1B2c3D4e5F6g7H8i9J0k1L2"].join("_");
