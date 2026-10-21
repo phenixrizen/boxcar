@@ -193,6 +193,7 @@ Made by Task 2 (`docs/plans/oci-image-cache.md`), 2026-10-16:
 - **A multi-frame zstd adapter of our own** over ruzstd, which decodes one frame and only stores its checksum.
 - **`--cache-dir`**, so tests and the test box point the cache anywhere.
 - **The test registry is a crate**, `boxcar-testreg`: `boxcar` is a binary, and a test-only crate is the one place its unit tests and the gated suites can both reach.
+- Follow-up #35 (2026-10-21): the credential helper the Docker config names for a registry is run (`docker-credential-<name> get`, as Docker runs it), once, at the first challenge, before the Landlock domain and the seccomp filter; its answer is used as `auths` credentials are and never repeated. Identity tokens stay out.
 
 Made by Task 3 (`docs/plans/run-from-image.md`), 2026-10-17:
 
