@@ -147,6 +147,23 @@ processes and ring 0 effects to the span:
   once it has settled (its count stays for `span.list`). The effects
   themselves are never edited.
 
+**Harness shapes.** What the close rule needs of an agent is that one
+process send every model request, and that its tools be that process's
+descendants, which is how the harnesses boxcar runs its gated agent tests
+with behave: Claude Code (the native build and the npm one, one Bun or
+Node process sending every request, its Bash tool a child shell) and
+Codex (one process, its shell tool a child; over WebSocket, one stream
+carrying several calls). A harness that sends each request from a
+process of its own (a script whose every request is a `wget`) is told
+apart from nothing: its tools are the script's children too, and a tool
+that could send a model request could then close its own span. Boxcar
+does not trust a tool, so such a harness's spans stay open and are
+recorded as they stand at the stop, with a `span.effects` whose
+`closed_seq` is null, and `boxcar spans` lists them open (#7, decided
+2026-10-21: there is no safe way to close them without trusting the
+harness's whole process tree, and no policy knob that would). An agent
+written for boxcar sends its requests from one process.
+
 Findings inside a span carry its id in `span_id` and in their envelope.
 `boxcar spans` lists the spans from the control socket's `span.list`
 (docs/control-protocol.md), newest first, with the worst finding's score

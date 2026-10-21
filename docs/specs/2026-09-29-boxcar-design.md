@@ -221,10 +221,21 @@ milestone 2.
 - Ownership fidelity inside the guest without a privileged host process.
 - Whether the overlay filesystem's whiteout handling needs CAP_MKNOD.
 - ptp_kvm availability on nested-virtualization hosts for clock pairing.
-- Which agents' harnesses expose a stable tool-executor process shape for
-  span ancestry.
 
 ## 14. Amendments
+
+### 2026-10-21: the tool-executor process shape a harness needs (#7)
+
+The reconciler closes a span only by a `tool.close` sent from the process
+that sent the span's request. That needs one process to send every model
+request, with the tools as its descendants: Claude Code and Codex do, and
+the gated agent tests hold them to it. A harness that sends each request
+from a process of its own cannot be told from its tools, and a tool that
+could send a model request could then close its own span; boxcar does
+not trust a tool, so such spans stay open and are recorded as they stand
+at the stop, which the gated stub-model test checks. No policy knob
+transfers that trust to a harness's process tree. That was an open
+question above; it is now the answer, in `docs/reconciler.md`.
 
 ### 2026-10-21: an agent that pins its provider's certificate runs uninspected (#9)
 
