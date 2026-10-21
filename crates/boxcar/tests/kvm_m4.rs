@@ -1021,11 +1021,31 @@ fn check_agent_run(run: &kvm_harness::Run, provider: &str, scratch: &Scratch, se
         .collect();
     let in_span: Vec<&boxcar_proto::Record> =
         records.iter().filter(|r| seqs.contains(&r.seq)).collect();
+    // When the exec is not in the span, the timeline tells why: whether
+    // the shell ran before the gate recorded the call (an exec waits 2 s
+    // for a late `tool.open`), and under which parent (#51).
+    let timeline = || {
+        let mut lines = vec![format!(
+            "tool.open seq {} ts {} ; span.effects opened_seq {} closed_seq {}",
+            open.seq, open.ts_host_ns, effects.data["opened_seq"], effects.data["closed_seq"]
+        )];
+        for r in records
+            .iter()
+            .filter(|r| r.kind == "proc.exec" && r.data["argv"].to_string().contains("boxcar-m4"))
+        {
+            lines.push(format!(
+                "proc.exec seq {} ts {} guest {:?} tgid {} ppid {} argv {}",
+                r.seq, r.ts_host_ns, r.ts_guest_ns, r.data["tgid"], r.data["ppid"], r.data["argv"]
+            ));
+        }
+        lines.join("\n")
+    };
     assert!(
         in_span
             .iter()
             .any(|r| r.kind == "proc.exec" && r.data["argv"].to_string().contains("boxcar-m4")),
-        "no shell exec with the command in the span: {in_span:?}\n{}",
+        "no shell exec with the command in the span: {in_span:?}\n{}\n{}",
+        timeline(),
         run.describe()
     );
     assert!(

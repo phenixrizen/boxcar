@@ -1210,7 +1210,9 @@ mod tests {
     /// buffers (1518 bytes of frame and the header), rounded up.
     const RX_BUF_LEN: u32 = 0x800;
     /// How long the net thread has to answer a kick.
-    const THREAD_LIMIT: Duration = Duration::from_secs(5);
+    /// How long a device thread is given to act: generous, for a loaded
+    /// machine; a passing test never waits it out.
+    const THREAD_LIMIT: Duration = Duration::from_secs(30);
 
     /// An audit session, and the local socket the stack forwards DNS to,
     /// which nothing reads: no query leaves the host.

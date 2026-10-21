@@ -805,6 +805,13 @@ mod tests {
             started.elapsed()
         );
         assert!(ids.windows(2).all(|w| w[1] > w[0]), "{ids:?}");
+        // The last pong is seen before the channel goes: its `sync` is
+        // recorded only then.
+        let deadline = Instant::now() + LIMIT;
+        while ctl.ping_outstanding() {
+            assert!(Instant::now() < deadline, "the last pong was not seen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(init);
         assert!(ctl.close(LIMIT), "the sync thread ended with the channel");
         writer.close().unwrap();
