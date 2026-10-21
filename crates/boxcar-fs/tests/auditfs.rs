@@ -115,6 +115,8 @@ impl Share {
         let opts = AuditFsOptions {
             level,
             hash_max_bytes,
+            ownership: dir.path().join("ownership").exists(),
+            ..AuditFsOptions::default()
         };
         let fs = AuditFs::new(inner, &config, root_fd(&root), sink, opts);
         Share {
@@ -127,6 +129,16 @@ impl Share {
 
     fn normal() -> Share {
         Share::new(AuditLevel::Normal, HASH_MAX)
+    }
+
+    /// A share with the ownership override on (`--ownership override`).
+    fn ownership() -> Share {
+        let dir = TempDir::new().unwrap();
+        // The marker the constructor reads, since it takes no option.
+        fs::write(dir.path().join("ownership"), "").unwrap();
+        let log = WriterConfig::new(dir.path().join("data"), SessionId::new());
+        let (sink, writer) = boxcar_audit::spawn(log).expect("start the audit writer");
+        Share::with_log(dir, AuditLevel::Normal, HASH_MAX, sink, writer)
     }
 
     /// Waits for queued hashes, closes the log, verifies its chain, and
@@ -1512,4 +1524,173 @@ fn a_non_utf8_name_gets_path_b64() {
     assert!(!text.contains("path_b64"), "{text}");
     let text = serde_json::to_string(&Payload::FsClose(close)).unwrap();
     assert!(text.contains(&format!("\"path_b64\":\"{b64}\"")), "{text}");
+}
+
+/// The ownership override (`--ownership override`): the owner the guest
+/// sets goes into boxcar's xattr on the host file, which stays the host
+/// user's, and comes back in every attribute reply; without the override
+/// a `chown` is the host's to refuse.
+#[test]
+fn a_chown_goes_into_the_override_and_is_shown_in_every_reply() {
+    let share = Share::ownership();
+    let fs = Arc::clone(&share.fs);
+    let (entry, fh) = create(&fs, &GUEST, 1, "owned");
+    release(&fs, entry.inode, fh);
+    let host_uid = fs::metadata(&share.root).unwrap().uid();
+    assert_eq!(entry.attr.st_uid, host_uid, "the host user's at first");
+
+    // SAFETY: stat64 is plain data; zeroed is a valid value.
+    let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
+    attr.st_uid = 0;
+    attr.st_gid = 7;
+    let (shown, _) = fs
+        .setattr(
+            &GUEST,
+            entry.inode,
+            attr,
+            None,
+            SetattrValid::UID | SetattrValid::GID,
+        )
+        .expect("chown through the override");
+    assert_eq!((shown.st_uid, shown.st_gid), (0, 7));
+    assert_eq!(lookup(&fs, 1, "owned").attr.st_uid, 0);
+    let (again, _) = fs.getattr(&GUEST, entry.inode, None).unwrap();
+    assert_eq!((again.st_uid, again.st_gid), (0, 7));
+    // The host file is still the host user's, with the xattr beside it.
+    let host = share.root.join("owned");
+    assert_eq!(fs::metadata(&host).unwrap().uid(), host_uid);
+    let path = cstr(host.to_str().unwrap());
+    let name = cstr("user.boxcar.stat");
+    let mut value = [0u8; 64];
+    // SAFETY: a valid path, name and buffer.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    assert!(n > 0, "the override xattr is on the host file");
+    assert_eq!(&value[..n as usize], b"uid=0 gid=7");
+    // A mode change beside it still reaches the host, and the owner shown
+    // stays the override's.
+    let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
+    attr.st_mode = 0o600;
+    let (shown, _) = fs
+        .setattr(&GUEST, entry.inode, attr, None, SetattrValid::MODE)
+        .unwrap();
+    assert_eq!(shown.st_mode & 0o777, 0o600);
+    assert_eq!(shown.st_uid, 0);
+    assert_eq!(
+        fs::metadata(&host).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(fs);
+    let events = share.events();
+    assert!(events
+        .iter()
+        .any(|(p, _)| matches!(p, Payload::FsSetattr(s) if s.result.ok)));
+
+    // Without the override: the host's answer, which refuses an
+    // unprivileged user giving a file away.
+    let plain = Share::normal();
+    let fs = Arc::clone(&plain.fs);
+    let (entry, fh) = create(&fs, &GUEST, 1, "kept");
+    release(&fs, entry.inode, fh);
+    let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
+    attr.st_uid = 0;
+    let refused = fs
+        .setattr(&GUEST, entry.inode, attr, None, SetattrValid::UID)
+        .unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+}
+
+/// A device node the guest makes stands as an empty regular file on the
+/// host, the override saying what it is, and is shown as the device.
+#[test]
+fn a_device_node_is_a_stand_in_file_shown_as_the_device() {
+    let share = Share::ownership();
+    let fs = Arc::clone(&share.fs);
+    let rdev = libc::makedev(1, 3) as u32;
+    let entry = fs
+        .mknod(&GUEST, 1, &cstr("null"), libc::S_IFCHR | 0o666, rdev, 0o022)
+        .expect("mknod of a character device");
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFCHR);
+    assert_eq!(entry.attr.st_rdev, u64::from(rdev));
+    assert_eq!(
+        lookup(&fs, 1, "null").attr.st_mode & libc::S_IFMT,
+        libc::S_IFCHR
+    );
+    let host = fs::metadata(share.root.join("null")).unwrap();
+    assert!(host.file_type().is_file(), "a regular file on the host");
+    // Listed as the device too.
+    let fh = fs.opendir(&GUEST, 1, 0).map(|(h, _)| h.unwrap()).unwrap();
+    let mut seen = Vec::new();
+    fs.readdirplus(&GUEST, 1, fh, 65536, 0, &mut |dirent, entry| {
+        seen.push((dirent.name.to_vec(), entry.attr.st_mode & libc::S_IFMT));
+        Ok(1)
+    })
+    .unwrap();
+    assert!(
+        seen.contains(&(b"null".to_vec(), libc::S_IFCHR)),
+        "{seen:?}"
+    );
+    // Without the override, the host refuses it as it always did.
+    let plain = Share::normal();
+    let refused = plain
+        .fs
+        .mknod(&GUEST, 1, &cstr("null"), libc::S_IFCHR | 0o666, rdev, 0o022)
+        .unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+}
+
+/// The override's xattr is boxcar's own: the guest neither sees it among
+/// the file's xattrs nor reads, sets or removes it.
+#[test]
+fn the_override_xattr_is_hidden_from_the_guest() {
+    use fuse_backend_rs::api::filesystem::ListxattrReply;
+    let share = Share::ownership();
+    let fs = Arc::clone(&share.fs);
+    let (entry, fh) = create(&fs, &GUEST, 1, "hidden");
+    release(&fs, entry.inode, fh);
+    let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
+    attr.st_gid = 5;
+    fs.setattr(&GUEST, entry.inode, attr, None, SetattrValid::GID)
+        .unwrap();
+    fs.setxattr(&GUEST, entry.inode, &cstr("user.other"), b"x", 0)
+        .unwrap();
+    let names = match fs.listxattr(&GUEST, entry.inode, 65536).unwrap() {
+        ListxattrReply::Names(names) => names,
+        ListxattrReply::Count(n) => panic!("a count of {n}"),
+    };
+    assert!(names.windows(10).any(|w| w == b"user.other"), "{names:?}");
+    assert!(
+        !names.windows(16).any(|w| w == b"user.boxcar.stat"),
+        "{names:?}"
+    );
+    let counted = match fs.listxattr(&GUEST, entry.inode, 0).unwrap() {
+        ListxattrReply::Count(n) => n,
+        ListxattrReply::Names(_) => panic!("names for a count"),
+    };
+    assert_eq!(counted as usize, names.len());
+    let name = cstr("user.boxcar.stat");
+    match fs.getxattr(&GUEST, entry.inode, &name, 4096) {
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ENODATA)),
+        Ok(_) => panic!("the override xattr was read"),
+    }
+    assert_eq!(
+        fs.setxattr(&GUEST, entry.inode, &name, b"uid=0", 0)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EPERM)
+    );
+    assert_eq!(
+        fs.removexattr(&GUEST, entry.inode, &name)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EPERM)
+    );
+    // Still shown.
+    assert_eq!(lookup(&fs, 1, "hidden").attr.st_gid, 5);
 }

@@ -45,7 +45,7 @@ use tracing_subscriber::EnvFilter;
 use boxcar_proto::limits::{truncate_utf8, MAX_PATH};
 use boxcar_proto::{ImageRef, PolicyLoaded};
 
-use crate::cli::{AuditLevelArg, LandlockArg, PullArg, RunArgs, SeccompArg};
+use crate::cli::{AuditLevelArg, LandlockArg, OwnershipArg, PullArg, RunArgs, SeccompArg};
 use crate::client;
 use crate::cmd::{image, nofile, tell};
 use crate::oci::client::{Client, ClientError};
@@ -229,7 +229,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         )),
         None => None,
     };
-    let user = invoking_user();
+    let user = args.user.unwrap_or_else(invoking_user);
     // clap requires --rootfs or --image unless --no-fs.
     let share_count = if has_shares { SHARE_COUNT } else { 0 };
     let mode = guest_mode(has_shares, vsock, user.0, user.1);
@@ -431,6 +431,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 AuditLevelArg::Normal => AuditLevel::Normal,
                 AuditLevelArg::Verbose => AuditLevel::Verbose,
             },
+            ownership: args.ownership == OwnershipArg::Override,
+            owner: user,
             ..AuditFsOptions::default()
         },
     };

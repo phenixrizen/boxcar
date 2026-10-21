@@ -22,6 +22,7 @@ pub mod device;
 mod events;
 pub mod handles;
 pub mod hasher;
+pub mod ownership;
 pub mod path_map;
 pub mod rules;
 pub mod scan;

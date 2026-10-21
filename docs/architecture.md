@@ -418,6 +418,28 @@ in is [boot.md](boot.md)'s.
   init reboots, and the guest's reset stops the VM. With `--no-vsock` the
   session runs on the serial console instead; a VM with no shares prints
   a marker and reboots.
+- **The ownership override** (`boxcar run --ownership override`): the VMM
+  runs unprivileged, so the shares' files are the host user's and the
+  guest's `chown`, `mknod` of a device and `security.*` xattrs are
+  refused by the host. With the override, AuditFs keeps what the guest
+  sets of a file's owner, its special mode bits and its device kind in an
+  xattr of boxcar's own on the host file (`user.boxcar.stat`, as
+  fuse-overlayfs keeps `user.containers.override_stat`), presents it in
+  every attribute reply (`lookup`, `getattr`, `setattr`, `create`,
+  `mkdir`, `mknod`, `symlink`, `link`, `readdirplus`), makes an empty
+  regular file stand for a device node, and hides the xattr from the
+  guest. The host file stays the host user's; `fs.setattr` and
+  `fs.mknod` record what the guest asked for, as before. Without the flag
+  (the default) nothing changes. The guest kernel checks `chown` and
+  `mknod` against the session's capabilities and what the share shows
+  (virtio-fs mounts with `default_permissions`), and the session has none
+  whatever its uid (init empties the bounding set), so both are refused in
+  the guest in every mode: the override is what the guest sees. What
+  carries no override is shown as the session's own identity, chosen with
+  `boxcar run --user UID[:GID]` (the invoking user's by default; the host
+  side acts as the invoking user still), so a root session writes what it
+  is given. An image's own ownership, written as the override when it is
+  unpacked, is #32.
 - **The sensor** runs as root in a cgroup apart from the session's, with
   its programs filtered to the session's cgroup. It connects to port
   1026, says what it attached, and streams `proc.*` frames with a
