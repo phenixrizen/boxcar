@@ -341,6 +341,7 @@ impl Context {
                     e.insert("answers".into(), Value::Array(answers));
                 }
                 e.insert("rcode_id".into(), json!(rcode_id(d.rcode)));
+                e.insert("rcode".into(), json!(rcode_name(d.rcode)));
                 e.insert("status_id".into(), json!(if d.rcode == 0 { 1 } else { 2 }));
                 verdict(&mut e, d.verdict == Verdict::Allow);
                 e
@@ -672,6 +673,38 @@ fn rcode_id(rcode: u16) -> u16 {
     }
 }
 
+/// `rcode`: the code's name as OCSF 1.9.0 captions it; for one it does
+/// not list (`rcode_id` 99, Other, "defined by the event source"), the
+/// code's number as text.
+fn rcode_name(rcode: u16) -> String {
+    let name = match rcode {
+        0 => "NoError",
+        1 => "FormError",
+        2 => "ServError",
+        3 => "NXDomain",
+        4 => "NotImp",
+        5 => "Refused",
+        6 => "YXDomain",
+        7 => "YXRRSet",
+        8 => "NXRRSet",
+        9 => "NotAuth",
+        10 => "NotZone",
+        11 => "DSOTYPENI",
+        16 => "BADVERS",
+        17 => "BADKEY",
+        18 => "BADTIME",
+        19 => "BADMODE",
+        20 => "BADNAME",
+        21 => "BADALG",
+        22 => "BADTRUNC",
+        23 => "BADCOOKIE",
+        24 => "Unassigned",
+        25 => "Reserved",
+        other => return other.to_string(),
+    };
+    name.to_owned()
+}
+
 /// A query type's name, such as `A`, else its number.
 fn qtype(qtype: u16) -> String {
     match qtype {
@@ -713,6 +746,12 @@ mod tests {
         assert_eq!(rcode_id(3), 3);
         assert_eq!(rcode_id(12), 99);
         assert_eq!(rcode_id(16), 16);
+        assert_eq!(rcode_name(0), "NoError");
+        assert_eq!(rcode_name(3), "NXDomain");
+        assert_eq!(rcode_name(16), "BADVERS");
+        assert_eq!(rcode_name(25), "Reserved");
+        // Other: the source's to define, so the code itself.
+        assert_eq!(rcode_name(12), "12");
     }
 
     #[test]

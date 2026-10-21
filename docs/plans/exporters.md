@@ -411,6 +411,14 @@ Both were done on 2026-10-20:
 - **`audit.verify` checks a bounded stretch per call against the writer's flushed head**, cancellable. It refuses a failed writer. The CLI chains the stretches by `from_prev`.
 - **`--otlp-endpoint` takes `http://`**, never a user and password, and has a 60 s deadline and a 64 KiB response cap. Nothing is retried.
 
+Added by #60 (2026-10-21), closing the gaps #30's documentation found between this plan and the code:
+
+- **A request no response answered carries `boxcar.llm.unanswered` = true**, as section 4 says; the code had left it out.
+- **OCSF `net.dns` carries `rcode` beside `rcode_id`**: the code's OCSF 1.9.0 caption, and for `rcode_id` 99 (Other, "defined by the event source") the code's number as text.
+- **Plain `http` loads no trust store.** The host's roots are read for `https` only, so a host without them still reaches a collector on its loopback.
+- **`verify --control` shows the first stretch's `from_prev`**, in the text and as `from_prev` with `--json`: a run from the seq after an earlier run's head is chained to it by that hash.
+- **Only 200 is success; a 202 or 204 is refused** like any other status, as OTLP/HTTP specifies. A decision, kept and tested.
+
 ## 10. Review (2026-10-20, before the code)
 
 Codex (`codex exec`, read-only, reasoning effort xhigh) reviewed the first draft (the plan's first commit) against the code and the specifications. Its findings, and what changed:

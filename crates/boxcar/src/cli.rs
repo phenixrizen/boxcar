@@ -414,7 +414,9 @@ pub struct VerifyArgs {
     #[arg(long, value_name = "PATH")]
     pub control: Option<PathBuf>,
     /// With `--control`, the first seq to verify: the one after the last a
-    /// verify before checked. Default: 1.
+    /// verify before checked. Default: 1. The hash stored before N is
+    /// printed (`from_prev` with `--json`): the head hash that earlier
+    /// verify reported, when the log is one chain.
     #[arg(long, value_name = "N", conflicts_with = "path")]
     pub from_seq: Option<u64>,
     /// Print the report, or the first break, as one JSON object. An

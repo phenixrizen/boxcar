@@ -273,6 +273,38 @@ fn an_export_is_posted_to_the_collector() {
     );
 }
 
+/// A plain `http` endpoint needs no trust store: the export is posted
+/// from a host with none. An `https` one still needs it, and says so.
+#[test]
+fn a_plain_http_endpoint_needs_no_trust_store() {
+    let session = fixture("session.jsonl");
+    let (url, served) = collector(200, b"{}".to_vec());
+    let without_roots = |endpoint: &str| {
+        Command::new(env!("CARGO_BIN_EXE_boxcar"))
+            .args(["audit", "export", "--format", "otlp", "--otlp-endpoint"])
+            .arg(endpoint)
+            .arg(&session)
+            // Set, these alone are read for roots: a store with none.
+            .env("SSL_CERT_FILE", "/nonexistent/roots.pem")
+            .env("SSL_CERT_DIR", "/nonexistent/roots")
+            .output()
+            .unwrap()
+    };
+    let out = without_roots(&url);
+    // The status first: a binary that bailed never connected, and the
+    // collector would wait for it.
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(served.join().unwrap().path, "/v1/traces");
+
+    let out = without_roots("https://127.0.0.1:9/");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        stderr(&out).contains("no root certificates found on this host"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 #[test]
 fn a_collector_that_refuses_fails_the_export() {
     let session = fixture("session.jsonl");

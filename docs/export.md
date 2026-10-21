@@ -115,12 +115,13 @@ The CLI asks from `--from-seq` (1 by default) until `more` is false,
 waiting up to 10 s for each reply, and chains the stretches: each must
 start at the seq it asked for, from the hash the one before ended at (its
 `from_prev` against the earlier `to_hash`), and end within the head, with
-the head's hash when it reaches it. The first stretch's `from_prev` is not
-shown, so a run that starts with `--from-seq` is chained to nothing
-before it. It prints `ok: verified seq <from>..<head> against the
-writer's head <hash>` and exits 0; with `--json`, `{"ok": true,
-"from_seq", "to_seq", "head_seq", "head_hash", "checkpoints",
-"stretches"}`. There is no incomplete answer here: the walk reads only
+the head's hash when it reaches it. It prints `ok: verified seq
+<from>..<head> against the writer's head <hash>; from <from_prev>, the
+hash stored before seq <from>` and exits 0; with `--json`, `{"ok": true,
+"from_seq", "from_prev", "to_seq", "head_seq", "head_hash",
+"checkpoints", "stretches"}`. That `from_prev` is the first stretch's: a
+run from the seq after an earlier run's head is chained to it when the
+two hashes are one. There is no incomplete answer here: the walk reads only
 lines the writer flushed whole.
 
 It exits 1 when:
@@ -208,7 +209,7 @@ records that opened them:
   unanswered there, since over WebSocket one stream carries several
   calls. A response with no request opens no span and is counted as
   unpaired; a request with no response opens a span that ends where it
-  starts.
+  starts, with `boxcar.llm.unanswered` true.
 - **Tool calls.** A span is one occurrence of a `tool_use_id` as the
   reconciler's `span.effects` defines it: opened by the `tool.open` at its
   `opened_seq`, ended only by the close at its `closed_seq`.
@@ -279,7 +280,9 @@ own), which find it in the log.
     status is then ERROR;
   - `boxcar.llm.api` (`anthropic`, `openai_chat` or `openai_responses`),
     `boxcar.llm.tool_uses`, `boxcar.net.flow`, `boxcar.http.stream`, and
-    the response's `boxcar.response.seq` and `boxcar.response.hash`.
+    the response's `boxcar.response.seq` and `boxcar.response.hash`; or,
+    for a request no response answered, `boxcar.llm.unanswered` = true
+    and none of the response's attributes.
 - **A tool call:** `gen_ai.operation.name` = `execute_tool`,
   `gen_ai.tool.name`, `gen_ai.tool.call.id`, `boxcar.tool.args_b3` (the
   arguments' hash); from its `span.effects`, `boxcar.span.procs` (tgids),
@@ -338,7 +341,9 @@ receiver.
   network.
 - **The POST** is one request with the export's bytes and
   `Content-Type: application/json`, over rustls with the host's root
-  certificates, following no redirect, with 60 s for the whole exchange.
+  certificates for `https` (plain `http` loads none, so a host without
+  them still reaches a collector on its loopback), following no redirect,
+  with 60 s for the whole exchange.
   Nothing is retried.
 - **The answer.** 200 with an empty body, or with a JSON object that has
   no `partialSuccess`, is success. A `partialSuccess` whose
@@ -347,7 +352,10 @@ receiver.
   `errorMessage` is success, and the message is shown. A 200 whose body
   is not a JSON object is a failure: the receiver is not speaking OTLP.
   Any other status, a redirect included, is a failure, shown with at most
-  512 bytes of the body. At most 64 KiB of an answer is read.
+  512 bytes of the body; a 202 or 204 too, by choice: OTLP/HTTP has one
+  success, 200 with an `ExportTraceServiceResponse`, and a receiver that
+  answers otherwise is not speaking it. At most 64 KiB of an answer is
+  read.
 
 stderr then says `sent to` and the URL posted to (with `; the collector
 says: <message>` when it sent one), or `error:`, the URL and why, and the
@@ -444,7 +452,7 @@ decimal strings.
 | `proc.exit` of a thread group | 1007 | 2 Terminate | `process {pid}`; `exit_code`, or `status_detail` naming the signal that ended it |
 | `net.connect`, `net.udp` | Network Activity 4001 (4) | 1 Open | the endpoints; `connection_info {protocol_name, uid: <flow>, direction_id: 2}` (outbound); the verdict |
 | `net.close` | 4001 | 2 Close | the endpoints; `traffic {bytes_out, bytes_in}`; `dur_ms` and `reason` in `unmapped` |
-| `net.dns` | DNS Activity 4003 (4) | 6 Traffic | `query {hostname, type}`, `answers [{rdata}]`, `rcode_id` (99 for a code OCSF does not list); the verdict |
+| `net.dns` | DNS Activity 4003 (4) | 6 Traffic | `query {hostname, type}`, `answers [{rdata}]`, `rcode_id` (99 for a code OCSF does not list) and `rcode` (the code's OCSF name; for 99, its number as text); the verdict |
 | `http.request` | HTTP Activity 4002 (4) | its method's (3 Get, 6 Post, ...), else 99 named by the method | `http_request {http_method, url {hostname, path, url_string}, version, user_agent}`; the endpoints |
 | `http.response` | 4002 | its request's method's | `http_response {code}`, `http_request {http_method}`; the endpoints |
 | `finding` | Detection Finding 2004 (2) | 1 Create | `finding_info`, `risk_score`, `severity_id`; `evidence`, `span_id` and `low_confidence` in `unmapped` |

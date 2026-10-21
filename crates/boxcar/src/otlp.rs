@@ -4,13 +4,15 @@
 //! Sending an OTLP/JSON export to a collector (`boxcar audit export
 //! --otlp-endpoint URL`): one POST of the export's bytes to `URL/v1/traces`,
 //! with `Content-Type: application/json`, over the registry client's TLS
-//! (rustls, the host's roots), no redirects, and one deadline for the whole
-//! exchange. Nothing is retried.
+//! for `https` (rustls, the host's roots; plain `http` loads none), no
+//! redirects, and one deadline for the whole exchange. Nothing is retried.
 //!
 //! The URL is `http` or `https`, with no user or password (a credential
 //! must not land in an error or a shell's history) and no query or
 //! fragment. A collector answers 200 with an `ExportTraceServiceResponse`;
-//! a `partialSuccess` that rejected spans is a failure.
+//! a `partialSuccess` that rejected spans is a failure, and so is any other
+//! status: OTLP/HTTP has that one success, and a 202 or 204 is not taken
+//! for it.
 
 use std::io::Read;
 use std::time::Duration;
@@ -80,6 +82,11 @@ impl Endpoint {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether the POST is over TLS, and so needs a trust store.
+    pub fn is_https(&self) -> bool {
+        self.0.starts_with("https://")
+    }
 }
 
 /// How a POST went that the collector answered.
@@ -91,8 +98,9 @@ pub enum Outcome {
     Refused(String),
 }
 
-/// POSTs `body` to `endpoint`, trusting `roots`, within `deadline` (the
-/// CLI's is [`DEADLINE`]). An error is one the exchange itself met (no
+/// POSTs `body` to `endpoint`, trusting `roots` (for `https`; plain `http`
+/// needs none), within `deadline` (the CLI's is [`DEADLINE`]). An error is
+/// one the exchange itself met (no
 /// answer in time, say); a refusal is in the [`Outcome`].
 pub fn post(
     endpoint: &Endpoint,
@@ -193,6 +201,26 @@ mod tests {
         assert_eq!(url("http://c:4318/").unwrap(), "http://c:4318/v1/traces");
         assert_eq!(url("https://c/otlp/").unwrap(), "https://c/otlp/v1/traces");
         assert_eq!(url("https://c/v1/traces").unwrap(), "https://c/v1/traces");
+    }
+
+    #[test]
+    fn https_is_told_from_http() {
+        assert!(Endpoint::parse("https://c/").unwrap().is_https());
+        assert!(!Endpoint::parse("http://c:4318").unwrap().is_https());
+    }
+
+    /// OTLP/HTTP has one success, 200 with an `ExportTraceServiceResponse`.
+    /// A 202 or 204 is a receiver speaking something else, and is refused
+    /// like any other status, not taken for success.
+    #[test]
+    fn only_200_is_success() {
+        for status in [202u16, 204, 301, 400, 503] {
+            let why = match outcome(status, b"") {
+                Outcome::Refused(why) => why,
+                Outcome::Accepted(_) => panic!("{status} accepted"),
+            };
+            assert!(why.starts_with(&format!("HTTP {status}")), "{why}");
+        }
     }
 
     #[test]

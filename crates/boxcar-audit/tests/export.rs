@@ -810,12 +810,18 @@ fn the_trace_holds_the_session_its_calls_and_its_tools() {
         .collect();
     assert_eq!(names, [&json!({"stringValue": "toolu_ABSENT"})]);
 
-    // The request with no response ends at its own time.
+    // The request with no response ends at its own time, and says so;
+    // an answered one does not.
     let unanswered = span_by_seq(&trace, 31);
     assert_eq!(
         unanswered["startTimeUnixNano"],
         unanswered["endTimeUnixNano"]
     );
+    assert_eq!(
+        attr(unanswered, "boxcar.llm.unanswered"),
+        Some(&json!({"boolValue": true}))
+    );
+    assert_eq!(attr(span_by_seq(&trace, 10), "boxcar.llm.unanswered"), None);
 
     // Each WebSocket response answers the latest request on its stream.
     let ws_first = span_by_seq(&trace, 33);
