@@ -981,10 +981,38 @@ fn check_agent_run(run: &kvm_harness::Run, provider: &str, scratch: &Scratch, se
             )
         });
     let span_id = open.data["tool_use_id"].as_str().unwrap().to_owned();
+    // The agent's next request carries the result: the span closes, once,
+    // and every other span at most once.
+    let closes = of_kind(&records, "tool.close");
+    let mut closed = std::collections::HashSet::new();
+    for close in &closes {
+        let id = close.data["tool_use_id"].as_str().unwrap_or_default();
+        assert!(
+            closed.insert(id),
+            "{id} closed twice: {closes:?}\n{}",
+            run.describe()
+        );
+    }
+    let close = closes
+        .iter()
+        .find(|r| r.data["tool_use_id"] == span_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "no tool.close for {span_id}: {closes:?}\n{}",
+                run.describe()
+            )
+        });
+    assert_eq!(close.data["status"], "ok", "{}", run.describe());
     let effects = of_kind(&records, "span.effects")
         .into_iter()
         .find(|r| r.data["span_id"] == span_id)
         .unwrap_or_else(|| panic!("no span.effects for {span_id}\n{}", run.describe()));
+    assert_eq!(
+        effects.data["closed_seq"],
+        close.seq,
+        "the span closed elsewhere: {effects:?}\n{}",
+        run.describe()
+    );
     let seqs: Vec<u64> = effects.data["effects"]
         .as_array()
         .unwrap()

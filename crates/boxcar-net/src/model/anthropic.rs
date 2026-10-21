@@ -4,8 +4,8 @@
 //! The Anthropic Messages API: `POST /v1/messages`.
 //!
 //! A request's `messages` are counted, its `system` hashed, its `tools`
-//! named; the `tool_result` blocks in its last user message close the
-//! spans their `tool_use_id`s opened. A response, as one JSON document or
+//! named; the `tool_result` blocks after its last assistant message close
+//! the spans their `tool_use_id`s opened. A response, as one JSON document or
 //! as an event stream (`message_start`, `content_block_start`,
 //! `content_block_delta`, `content_block_stop`, `message_delta`,
 //! `message_stop`), gives the model, the stop reason, the token counts,
@@ -46,11 +46,21 @@ pub fn request(body: &[u8]) -> Result<(RequestInfo, Vec<ToolClose>), &'static st
             .map(label)
             .collect();
     }
-    // The tool results are in the last message, which the agent just
-    // added: a result for a call the model made in its last reply.
+    // The tool results answer the model's last reply: they are in the
+    // messages after the last assistant message, which the agent just
+    // added. Not only the last of them: Claude Code 2.1.304 puts a
+    // `system` message after its `tool_result`s. Earlier turns' results
+    // were recorded when they were first sent.
     let mut closes = Vec::new();
-    if let Some(last) = messages.and_then(|m| m.last()) {
-        if let Some(blocks) = last.get("content").and_then(Value::as_array) {
+    if let Some(messages) = messages {
+        let from = messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .map_or(0, |i| i + 1);
+        for message in &messages[from..] {
+            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
             for block in blocks {
                 if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                     continue;
@@ -340,6 +350,71 @@ mod tests {
             ("toolu_2", "error")
         );
         assert!(request(b"not json").is_err());
+    }
+
+    #[test]
+    fn tool_results_followed_by_a_system_message_still_close_spans() {
+        // Claude Code 2.1.304's follow-up request: a `system` message
+        // after the `tool_result`, the shape that once left the span open.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 128000,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "<context>"}, {"type": "text", "text": "run curl"}]},
+                {"role": "system", "content": "<reminder>"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "curl -sI x"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "HTTP/2 200"}]},
+                {"role": "system", "content": [{"type": "text", "text": "<reminder>"}]}
+            ]
+        });
+        let (info, closes) = request(body.to_string().as_bytes()).unwrap();
+        assert_eq!(info.messages, 5);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(
+            (closes[0].tool_use_id.as_str(), closes[0].status.as_str()),
+            ("toolu_1", "ok")
+        );
+    }
+
+    #[test]
+    fn only_the_results_after_the_last_assistant_message_close_spans() {
+        // A later turn carries the whole conversation: the first call's
+        // result was recorded when it was first sent, and is not again.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "run two commands"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo one"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "one"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"command": "echo two"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2", "content": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "and stop"}]}
+            ]
+        });
+        let (_, closes) = request(body.to_string().as_bytes()).unwrap();
+        let ids: Vec<&str> = closes.iter().map(|c| c.tool_use_id.as_str()).collect();
+        assert_eq!(ids, ["toolu_2"]);
+
+        // A turn whose model reply used no tool closes nothing, whatever
+        // the history holds.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "run one"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo one"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                {"role": "user", "content": "thanks"}
+            ]
+        });
+        let (_, closes) = request(body.to_string().as_bytes()).unwrap();
+        assert!(
+            closes.is_empty(),
+            "{:?}",
+            closes.iter().map(|c| &c.tool_use_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
