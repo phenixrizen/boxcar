@@ -11,12 +11,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use boxcar_proto::limits::{MAX_ARGV_ELEMS, MAX_PATH};
 use boxcar_proto::sensor::SensorFrame;
 use boxcar_proto::{
-    Payload, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork, ProcLsmDeny,
-    ProcMemfd, ProcTcpConnect, ProcTlsIo, Subject,
+    Payload, ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork,
+    ProcLsmDeny, ProcMemfd, ProcTcpConnect, ProcTlsIo, Subject,
 };
 use boxcar_sensor_common::{
-    ConnectAttempt, ExecEvent, ExitEvent, FileOpen, ForkEvent, Header, Hook, Kind, LsmDeny,
-    MemfdEvent, TcpConnect, TlsIoEvent, AF_INET, AF_INET6, MEMFD_NAME_MAX, TLS_DIR_WRITE,
+    ConnectAttempt, ExecDeniedEvent, ExecEvent, ExitEvent, FileOpen, ForkEvent, Header, Hook, Kind,
+    LsmDeny, MemfdEvent, TcpConnect, TlsIoEvent, AF_INET, AF_INET6, MEMFD_NAME_MAX, PATH_MAX,
+    TLS_DIR_WRITE,
 };
 
 /// Why bytes from the ring buffer are not an event.
@@ -77,6 +78,9 @@ pub fn frame_from_event(bytes: &[u8]) -> Result<SensorFrame, EventError> {
             Kind::Memfd => Payload::ProcMemfd(memfd(&header, &read::<MemfdEvent>(bytes))),
             Kind::LsmDeny => Payload::ProcLsmDeny(lsm_deny(&header, &read::<LsmDeny>(bytes))),
             Kind::TlsIo => Payload::ProcTlsIo(tls_io(&header, &read::<TlsIoEvent>(bytes))),
+            Kind::ExecDenied => {
+                Payload::ProcExecDenied(exec_denied(&header, &read::<ExecDeniedEvent>(bytes)))
+            }
         }
     };
     Ok(SensorFrame {
@@ -217,6 +221,14 @@ fn memfd(header: &Header, ev: &MemfdEvent) -> ProcMemfd {
         tgid: header.tgid,
         name: text(&ev.name, ev.name_len.min(MEMFD_NAME_MAX as u32)),
         flags: ev.flags,
+    }
+}
+
+fn exec_denied(header: &Header, ev: &ExecDeniedEvent) -> ProcExecDenied {
+    ProcExecDenied {
+        tid: header.tid,
+        tgid: header.tgid,
+        filename: text(&ev.filename, ev.filename_len.min(PATH_MAX as u32)),
     }
 }
 

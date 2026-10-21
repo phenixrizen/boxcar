@@ -109,6 +109,9 @@ impl SensorFrame {
             Payload::ProcFileOpen(open) => within("path", open.path.len(), MAX_PATH)?,
             Payload::ProcMemfd(memfd) => within("name", memfd.name.len(), MAX_MEMFD_NAME)?,
             Payload::ProcLsmDeny(deny) => within("hook", deny.hook.len(), MAX_NAME)?,
+            Payload::ProcExecDenied(denied) => {
+                within("filename", denied.filename.len(), MAX_PATH)?;
+            }
             Payload::ProcConnectAttempt(attempt) => {
                 within("proto", attempt.proto.len(), MAX_NAME)?;
             }
@@ -156,6 +159,103 @@ pub fn encode(frame: &SensorFrame) -> Result<Vec<u8>, FrameError> {
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
     out.extend_from_slice(&json);
     Ok(out)
+}
+
+/// The most program names a host frame may carry.
+pub const MAX_EXEC_NAMES: usize = 1024;
+
+/// The longest program name a host frame may carry: the sensor's key
+/// holds this many bytes and a NUL.
+pub const MAX_EXEC_NAME: usize = 63;
+
+/// A frame from the VMM to the sensor, on the same stream the sensor's
+/// own frames travel the other way, framed the same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "t")]
+pub enum HostFrame {
+    /// The names of the programs the policy denies (`[exec] deny`'s globs'
+    /// last components), the whole set each time; the sensor refuses an
+    /// `execve` of any file so named, wherever it is.
+    #[serde(rename = "exec_deny")]
+    ExecDeny {
+        /// The policy's version the set is from.
+        version: u64,
+        names: Vec<String>,
+    },
+}
+
+impl HostFrame {
+    /// Whether the frame may travel: at most [`MAX_EXEC_NAMES`] names, each
+    /// non-empty, at most [`MAX_EXEC_NAME`] bytes, with no `/` and no NUL.
+    pub fn check(&self) -> Result<(), FrameError> {
+        match self {
+            HostFrame::ExecDeny { names, .. } => {
+                if names.len() > MAX_EXEC_NAMES {
+                    return Err(FrameError::Limit(format!(
+                        "{} names, over {MAX_EXEC_NAMES}",
+                        names.len()
+                    )));
+                }
+                for name in names {
+                    if name.is_empty() || name.contains(['/', '\0']) {
+                        return Err(FrameError::Limit(format!("{name:?} is no program name")));
+                    }
+                    within("a name", name.len(), MAX_EXEC_NAME)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `frame` as its bytes on the stream, as [`encode`] frames the sensor's.
+pub fn encode_host(frame: &HostFrame) -> Result<Vec<u8>, FrameError> {
+    frame.check()?;
+    let json = serde_json::to_vec(frame).map_err(|e| FrameError::Json(e.to_string()))?;
+    if json.len() > MAX_FRAME {
+        return Err(FrameError::TooLong(json.len()));
+    }
+    let mut out = Vec::with_capacity(4 + json.len());
+    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&json);
+    Ok(out)
+}
+
+/// Host frames out of the bytes the sensor reads, as [`Decoder`] takes the
+/// sensor's.
+#[derive(Debug, Default)]
+pub struct HostDecoder {
+    buf: Vec<u8>,
+}
+
+impl HostDecoder {
+    pub fn new() -> HostDecoder {
+        HostDecoder::default()
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// The next complete frame, or `None` until more bytes arrive.
+    pub fn next_frame(&mut self) -> Result<Option<HostFrame>, FrameError> {
+        let Some(prefix) = self.buf.get(..4) else {
+            return Ok(None);
+        };
+        let len = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+        if len > MAX_FRAME {
+            return Err(FrameError::TooLong(len));
+        }
+        let Some(json) = self.buf.get(4..4 + len) else {
+            return Ok(None);
+        };
+        let frame: HostFrame =
+            serde_json::from_slice(json).map_err(|e| FrameError::Json(e.to_string()))?;
+        self.buf.drain(..4 + len);
+        frame.check()?;
+        Ok(Some(frame))
+    }
 }
 
 /// Frames out of a byte stream, however the bytes arrive. Feed what was
@@ -389,5 +489,38 @@ mod tests {
         ] {
             assert!(!is_sensor_kind(kind), "{kind}");
         }
+    }
+    /// A host frame travels framed like the sensor's, with its limits.
+    #[test]
+    fn host_frames_carry_the_denied_names_within_limits() {
+        let frame = HostFrame::ExecDeny {
+            version: 3,
+            names: vec!["nc".into(), "socat".into()],
+        };
+        let bytes = encode_host(&frame).unwrap();
+        assert_eq!(&bytes[..4], &((bytes.len() - 4) as u32).to_le_bytes());
+        let mut decoder = HostDecoder::new();
+        decoder.feed(&bytes[..5]);
+        assert_eq!(decoder.next_frame().unwrap(), None);
+        decoder.feed(&bytes[5..]);
+        assert_eq!(decoder.next_frame().unwrap(), Some(frame));
+        assert_eq!(decoder.next_frame().unwrap(), None);
+        for names in [
+            vec!["".to_owned()],
+            vec!["usr/nc".to_owned()],
+            vec!["a\0b".to_owned()],
+            vec!["x".repeat(MAX_EXEC_NAME + 1)],
+            vec!["nc".to_owned(); MAX_EXEC_NAMES + 1],
+        ] {
+            let frame = HostFrame::ExecDeny { version: 1, names };
+            assert!(
+                matches!(frame.check(), Err(FrameError::Limit(_))),
+                "{frame:?}"
+            );
+            assert!(encode_host(&frame).is_err());
+        }
+        let mut decoder = HostDecoder::new();
+        decoder.feed(&[0xff, 0xff, 0xff, 0x7f]);
+        assert!(matches!(decoder.next_frame(), Err(FrameError::TooLong(_))));
     }
 }

@@ -41,16 +41,16 @@ mod errno;
 mod payloads;
 
 pub use payloads::{
-    ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, Finding,
-    FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir, FsMknod,
-    FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hardening, HashStatus,
-    HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest, LlmResponse, NetClose,
-    NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult, PolicyChanged,
-    PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec, ProcExit, ProcFileOpen, ProcFork,
-    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach,
-    ProcTlsIo, ProgramStatus, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr,
-    ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose,
-    VsockConnect,
+    ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, ExecRing1,
+    Finding, FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir,
+    FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hardening,
+    HashStatus, HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest, LlmResponse,
+    NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult,
+    PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec, ProcExecDenied,
+    ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
+    ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SeccompMode, SensorPhase, SessionExit,
+    SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop,
+    VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -480,6 +480,8 @@ pub enum Payload {
     ProcFileOpen(ProcFileOpen),
     #[serde(rename = "proc.lsm_deny")]
     ProcLsmDeny(ProcLsmDeny),
+    #[serde(rename = "proc.exec_denied")]
+    ProcExecDenied(ProcExecDenied),
     #[serde(rename = "proc.heartbeat")]
     ProcHeartbeat(ProcHeartbeat),
     #[serde(rename = "proc.sensor_status")]
@@ -558,6 +560,7 @@ impl Payload {
             Payload::ProcMemfd(_) => "proc.memfd",
             Payload::ProcFileOpen(_) => "proc.file_open",
             Payload::ProcLsmDeny(_) => "proc.lsm_deny",
+            Payload::ProcExecDenied(_) => "proc.exec_denied",
             Payload::ProcHeartbeat(_) => "proc.heartbeat",
             Payload::ProcSensorStatus(_) => "proc.sensor_status",
             Payload::ProcTlsIo(_) => "proc.tls_io",
@@ -623,6 +626,7 @@ impl Payload {
             | Payload::ProcMemfd(_)
             | Payload::ProcFileOpen(_)
             | Payload::ProcLsmDeny(_)
+            | Payload::ProcExecDenied(_)
             | Payload::ProcHeartbeat(_)
             | Payload::ProcSensorStatus(_)
             | Payload::ProcTlsIo(_)
@@ -660,7 +664,7 @@ impl Payload {
 /// The wire names of the typed payloads ([`Payload`]), in schema order: the
 /// kinds a log of this version can hold. A reader meets other kinds in a
 /// log written by a newer version.
-pub const KINDS: [&str; 59] = [
+pub const KINDS: [&str; 60] = [
     "vmm.start",
     "vmm.stop",
     "fs.mount",
@@ -708,6 +712,7 @@ pub const KINDS: [&str; 59] = [
     "proc.memfd",
     "proc.file_open",
     "proc.lsm_deny",
+    "proc.exec_denied",
     "proc.heartbeat",
     "proc.sensor_status",
     "proc.tls_io",
@@ -1351,6 +1356,7 @@ mod tests {
                     egress_rules: 25,
                     fs_rules: 5,
                     exec_rules: 0,
+                    exec_ring1: None,
                 }),
                 json!({
                     "source": "profile",
@@ -1528,6 +1534,14 @@ mod tests {
                     detail: 5,
                 }),
                 json!({"tid": 212, "tgid": 212, "hook": "bpf", "detail": 5}),
+            ),
+            (
+                Payload::ProcExecDenied(ProcExecDenied {
+                    tid: 212,
+                    tgid: 212,
+                    filename: "/tmp/nc".into(),
+                }),
+                json!({"tid": 212, "tgid": 212, "filename": "/tmp/nc"}),
             ),
             (
                 Payload::ProcHeartbeat(ProcHeartbeat {
@@ -1836,6 +1850,7 @@ mod tests {
                     egress_rules: 0,
                     fs_rules: 0,
                     exec_rules: 0,
+                    exec_ring1: None,
                 }),
                 json!({
                     "source": "flags",
@@ -2294,6 +2309,7 @@ mod tests {
             egress_rules: u32::MAX,
             fs_rules: u32::MAX,
             exec_rules: u32::MAX,
+            exec_ring1: None,
         });
         let (kind, data) = payload.into_parts();
         let back = Payload::from_record(&record(&kind, Source::Policy, data.clone())).unwrap();

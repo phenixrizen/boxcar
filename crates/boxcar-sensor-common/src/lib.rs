@@ -53,6 +53,7 @@ pub enum Kind {
     Memfd = 7,
     LsmDeny = 8,
     TlsIo = 9,
+    ExecDenied = 10,
 }
 
 impl Kind {
@@ -68,6 +69,7 @@ impl Kind {
             7 => Some(Kind::Memfd),
             8 => Some(Kind::LsmDeny),
             9 => Some(Kind::TlsIo),
+            10 => Some(Kind::ExecDenied),
             _ => None,
         }
     }
@@ -85,6 +87,7 @@ impl Kind {
             Kind::Memfd => size_of::<MemfdEvent>(),
             Kind::LsmDeny => size_of::<LsmDeny>(),
             Kind::TlsIo => size_of::<TlsIoEvent>(),
+            Kind::ExecDenied => size_of::<ExecDeniedEvent>(),
         }
     }
 }
@@ -235,6 +238,25 @@ pub struct LsmDeny {
     pub detail: i64,
 }
 
+/// The most bytes of a program's name the exec denial matches, the
+/// terminating NUL included: a longer name never matches.
+pub const EXEC_NAME_MAX: usize = 64;
+
+/// A program's name as the `EXEC_DENY` map keys it: NUL-padded.
+pub type ExecName = [u8; EXEC_NAME_MAX];
+
+/// `Kind::ExecDenied`: the session tried to run a program whose name the
+/// policy denies, wherever it was (`[exec] deny`, through the sensor); the
+/// exec was refused with `EPERM`. Written through at once.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecDeniedEvent {
+    pub header: Header,
+    pub filename_len: u32,
+    pub _pad: u32,
+    pub filename: [u8; PATH_MAX],
+}
+
 /// `Kind::TlsIo`: a TLS write or read through a runtime that exports
 /// OpenSSL's functions: `dir` is [`TLS_DIR_WRITE`] or [`TLS_DIR_READ`],
 /// `bytes` the size the call carried. The buffer is never read.
@@ -314,6 +336,7 @@ mod tests {
             Kind::Memfd,
             Kind::LsmDeny,
             Kind::TlsIo,
+            Kind::ExecDenied,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(Kind::from_u32(*a as u32), Some(*a));
@@ -326,6 +349,7 @@ mod tests {
         assert_eq!(Kind::Exec.size(), size_of::<ExecEvent>());
         assert_eq!(Kind::LsmDeny.size(), size_of::<LsmDeny>());
         assert_eq!(Kind::TlsIo.size(), size_of::<TlsIoEvent>());
+        assert_eq!(Kind::ExecDenied.size(), size_of::<ExecDeniedEvent>());
     }
 
     #[test]

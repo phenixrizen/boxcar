@@ -636,6 +636,17 @@ impl Vmm {
         if !cfg.fs_shares.is_empty() {
             live_policy = live_policy.with_paths(fs_rules, cfg.path_rules.clone());
         }
+        let live_policy = Arc::new(live_policy);
+        // The sensor refuses the names the policy denies wherever a program
+        // is: told at its connection, and at every change.
+        if let Some(sensor) = &sensor {
+            let policy = Arc::clone(&live_policy);
+            sensor.set_exec_source(Arc::new(move || policy.exec_names()));
+            let sensor = Arc::clone(sensor);
+            live_policy.set_exec_sink(Arc::new(move |version, names| {
+                sensor.send_exec_deny(version, names)
+            }));
+        }
         let info = Arc::new(VmInfo {
             session_id: cfg
                 .control
@@ -654,7 +665,7 @@ impl Vmm {
             guest,
             pty,
             sensor,
-            policy: Arc::new(live_policy),
+            policy: live_policy,
             spans: cfg.spans.clone(),
         });
 

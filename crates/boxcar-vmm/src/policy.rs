@@ -189,6 +189,58 @@ pub struct LivePolicy {
     expiry_wake: EventFd,
     version: AtomicU64,
     state: Mutex<State>,
+    /// Where the names `[exec] deny` denies go when they change: the
+    /// sensor, which refuses them wherever a program is.
+    exec_sink: Mutex<Option<ExecSink>>,
+}
+
+/// Where the names `[exec] deny` denies go: the policy's version and the
+/// names, the whole set each time.
+pub type ExecSink = Arc<dyn Fn(u64, Vec<String>) + Send + Sync>;
+
+/// The program names `globs` deny, for the sensor: each glob's last
+/// component, braces expanded one level (`{socat,telnet}`); a component
+/// with a wildcard in it cannot be matched there and is counted as left to
+/// the shares' path denial. `lifted` are exception globs: a name they
+/// name is taken out, and a last component that is a wildcard lifts all.
+pub fn exec_names_of(globs: &[String], lifted: &[String]) -> (Vec<String>, usize) {
+    let components = |glob: &str| -> Vec<String> {
+        let last = glob.rsplit('/').next().unwrap_or(glob);
+        match (last.find('{'), last.rfind('}')) {
+            (Some(open), Some(close)) if open < close => {
+                let (head, tail) = (&last[..open], &last[close + 1..]);
+                last[open + 1..close]
+                    .split(',')
+                    .map(|alt| format!("{head}{alt}{tail}"))
+                    .collect()
+            }
+            _ => vec![last.to_owned()],
+        }
+    };
+    let wild = |name: &str| name.contains(['*', '?', '[']);
+    let mut lifted_names = Vec::new();
+    let mut lift_all = false;
+    for glob in lifted {
+        for name in components(glob) {
+            if wild(&name) {
+                lift_all = true;
+            } else {
+                lifted_names.push(name);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    let mut left = 0;
+    for glob in globs {
+        for name in components(glob) {
+            if name.is_empty() || wild(&name) || name.len() > boxcar_proto::sensor::MAX_EXEC_NAME {
+                left += 1;
+            } else if !lift_all && !lifted_names.contains(&name) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    (names, left)
 }
 
 /// Why an update was refused. Nothing changed.
@@ -267,6 +319,7 @@ impl LivePolicy {
     ) -> io::Result<LivePolicy> {
         let permanent = net.load().as_ref().clone();
         Ok(LivePolicy {
+            exec_sink: Mutex::new(None),
             net,
             net_wake,
             vsock,
@@ -511,9 +564,49 @@ impl LivePolicy {
         }
     }
 
+    /// Sets where the names `[exec] deny` denies go (the sensor), and
+    /// sends them now.
+    pub fn set_exec_sink(&self, sink: ExecSink) {
+        *self.exec_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+        let state = self.lock();
+        self.send_exec_names(&state);
+    }
+
+    /// The names `[exec] deny` denies with the exec exceptions lifted, and
+    /// the policy's version: what the sensor is told.
+    pub fn exec_names(&self) -> (u64, Vec<String>) {
+        let state = self.lock();
+        (self.version.load(Ordering::Acquire), self.names_in(&state))
+    }
+
+    fn names_in(&self, state: &State) -> Vec<String> {
+        let Some(paths) = &state.paths else {
+            return Vec::new();
+        };
+        let lifted: Vec<String> = state
+            .exceptions
+            .iter()
+            .filter(|e| e.kind == ExceptionKind::Exec)
+            .map(|e| e.rule.clone())
+            .collect();
+        exec_names_of(&paths.exec_deny, &lifted).0
+    }
+
+    fn send_exec_names(&self, state: &State) {
+        let sink = self
+            .exec_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            sink(self.version.load(Ordering::Acquire), self.names_in(state));
+        }
+    }
+
     /// The permanent path rules with the writable and exec exceptions,
-    /// swapped in.
+    /// swapped in, and the sensor told the names.
     fn apply_paths(&self, state: &State) {
+        self.send_exec_names(state);
         let (Some(fs), Some(paths)) = (&self.fs, &state.paths) else {
             return;
         };
@@ -1223,5 +1316,30 @@ mod tests {
         let last = s.records().pop().unwrap();
         assert_eq!(last.0, "policy.changed");
         assert_eq!(last.1, serde_json::json!({"by_pid": 0, "version": 4}));
+    }
+    /// The names the sensor is told: each glob's last component, braces
+    /// expanded, wildcards left to the shares, exceptions lifting names.
+    #[test]
+    fn exec_names_come_from_the_globs_last_components() {
+        let globs: Vec<String> = [
+            "**/nc",
+            "/usr/bin/{socat,telnet}",
+            "**/nc",
+            "**/nc*",
+            "/opt/tools/[a-z]*",
+            "/x/",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let (names, left) = exec_names_of(&globs, &[]);
+        assert_eq!(names, ["nc", "socat", "telnet"]);
+        assert_eq!(left, 3, "two wildcards and an empty component");
+        let (names, _) = exec_names_of(&globs, &["/workspace/nc".to_owned()]);
+        assert_eq!(names, ["socat", "telnet"], "an exception lifts the name");
+        let (names, _) = exec_names_of(&globs, &["/workspace/*".to_owned()]);
+        assert!(names.is_empty(), "a wildcard exception lifts them all");
+        let long = "x".repeat(64);
+        let (names, left) = exec_names_of(&[format!("**/{long}")], &[]);
+        assert!(names.is_empty() && left == 1, "too long for the key");
     }
 }

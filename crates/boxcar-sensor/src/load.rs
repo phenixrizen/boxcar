@@ -8,10 +8,11 @@
 //! rules to skip. The TLS probes are only loaded here: `tls` attaches them
 //! to each file found to export their symbols.
 
-use aya::maps::{MapData, PerCpuArray, RingBuf};
+use aya::maps::{HashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::{BtfTracePoint, FEntry, Lsm, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
 use boxcar_sensor_common::programs::{ProgramKind, GLOBALS, PROGRAMS};
+use boxcar_sensor_common::{ExecName, EXEC_NAME_MAX};
 
 use crate::object::OBJECT;
 use crate::status::Attached;
@@ -23,6 +24,8 @@ pub struct Loaded {
     pub results: Vec<Attached>,
     pub events: Option<RingBuf<MapData>>,
     pub drops: Option<PerCpuArray<MapData, u64>>,
+    /// The names the policy denies, filled from the VMM's frames.
+    pub exec_deny: Option<HashMap<MapData, ExecName, u8>>,
     /// One reason that covers everything that did not load.
     pub reason: Option<String>,
 }
@@ -37,6 +40,7 @@ impl Loaded {
                 .collect(),
             events: None,
             drops: None,
+            exec_deny: None,
             reason: Some(reason),
         }
     }
@@ -76,6 +80,9 @@ pub fn load(session_cgroup: u64, sensor_tgid: u64) -> Loaded {
     let drops = ebpf
         .take_map("DROPS")
         .and_then(|map| PerCpuArray::try_from(map).ok());
+    let exec_deny = ebpf
+        .take_map("EXEC_DENY")
+        .and_then(|map| HashMap::try_from(map).ok());
     let reason = match (&events, &drops) {
         (Some(_), Some(_)) => None,
         _ => Some("maps: EVENTS or DROPS is missing from the object".to_owned()),
@@ -85,6 +92,7 @@ pub fn load(session_cgroup: u64, sensor_tgid: u64) -> Loaded {
         results,
         events,
         drops,
+        exec_deny,
         reason,
     }
 }
@@ -142,4 +150,26 @@ pub fn drops_total(drops: Option<&PerCpuArray<MapData, u64>>) -> u64 {
         .and_then(|map| map.get(&0, 0).ok())
         .map(|values| values.iter().sum())
         .unwrap_or(0)
+}
+
+/// Puts `names` in the map, and nothing else: the set the VMM sent is the
+/// whole set. A name the key cannot hold is left out.
+pub fn apply_exec_deny(map: &mut HashMap<MapData, ExecName, u8>, names: &[String]) -> usize {
+    let old: Vec<ExecName> = map.keys().filter_map(Result::ok).collect();
+    for key in old {
+        let _ = map.remove(&key);
+    }
+    let mut put = 0;
+    for name in names {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() >= EXEC_NAME_MAX {
+            continue;
+        }
+        let mut key: ExecName = [0; EXEC_NAME_MAX];
+        key[..bytes.len()].copy_from_slice(bytes);
+        if map.insert(key, 1, 0).is_ok() {
+            put += 1;
+        }
+    }
+    put
 }

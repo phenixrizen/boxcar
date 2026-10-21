@@ -448,6 +448,14 @@ pub fn observe(
         | Payload::NetDhcp(_)
         | Payload::VsockClose(_) => {}
 
+        // Ring 1: a program the policy denies by name, wherever it was.
+        Payload::ProcExecDenied(denied) => {
+            let summary = format!(
+                "exec of {} was refused by the policy ([exec] deny, by its name, through the sensor)",
+                denied.filename
+            );
+            out.push(policy_denial(state, record.seq, summary));
+        }
         // Ring 0: the filesystem.
         Payload::FsDenied(denied) => {
             state.last_effect_ts = Some(ts);
