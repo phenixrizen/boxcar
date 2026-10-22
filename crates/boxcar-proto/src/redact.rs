@@ -1274,6 +1274,21 @@ mod tests {
         assert_eq!(v[3], "keep");
     }
 
+    /// The calling thread's CPU time: what its work costs, not how long a
+    /// loaded machine took to let it run.
+    fn thread_cpu_time() -> std::time::Duration {
+        // SAFETY: timespec is plain data; all zeroes is valid.
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: clock_gettime writes one timespec through the pointer,
+        // which points at `ts`, alive for the call.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime: {}", std::io::Error::last_os_error());
+        std::time::Duration::new(
+            u64::try_from(ts.tv_sec).unwrap(),
+            u32::try_from(ts.tv_nsec).unwrap(),
+        )
+    }
+
     /// A long argument costs a long argument's time: one with no
     /// whitespace and a separator every other byte, one with a stem only
     /// near its end, and one of Kelvin signs (which lowercase to `k`).
@@ -1285,14 +1300,15 @@ mod tests {
             format!("{pairs}token=x"),
             "\u{212a}".repeat(96 * 1024),
         ] {
-            let started = std::time::Instant::now();
+            let started = thread_cpu_time();
             let _ = scrub_argv(std::slice::from_ref(&arg));
             let mut v = json!([arg]);
             scrub_deep(&mut v);
-            let took = started.elapsed();
-            // Linear work takes well under a second; quadratic work on
-            // 256 KiB would take minutes. The bound leaves a loaded
-            // machine room.
+            let took = thread_cpu_time().saturating_sub(started);
+            // Linear work takes the debug build about a second of the
+            // thread's time; quadratic work on 256 KiB would take minutes
+            // of it. The thread's own time is measured: a loaded machine,
+            // which only keeps the thread off the CPU, adds nothing to it.
             assert!(took < std::time::Duration::from_secs(30), "{took:?}");
         }
     }

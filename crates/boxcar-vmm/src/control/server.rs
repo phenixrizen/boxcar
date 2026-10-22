@@ -923,10 +923,11 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         let started = Instant::now();
         fixture.server.take().unwrap().shutdown();
-        // A stop that waited on the client would never end; the bound is
-        // generous for a loaded machine, not tight.
+        // A stop that waited on the client would never end; the bound
+        // tells that from a slow stop on a loaded machine, and is the 30 s
+        // such bounds have.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );

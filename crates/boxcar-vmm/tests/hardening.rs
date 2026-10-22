@@ -232,7 +232,10 @@ fn each_role_keeps_its_own_calls() {
 
 /// A thread started before the process list is in keeps that list alone
 /// once it comes, by `TSYNC`, and the install does not fail for it: its
-/// role's filter is not added first.
+/// role's filter is not added first. The thread says when it has started
+/// (its hook ran with no process list to add a role to), and the install
+/// waits for that: a thread scheduled late would otherwise start under
+/// the list and take its role's filter, which the test is not about.
 #[test]
 fn a_thread_started_before_the_process_list_keeps_it_alone() {
     let code = in_child(
@@ -240,10 +243,12 @@ fn a_thread_started_before_the_process_list_keeps_it_alone() {
         || {
             seccomp::set_mode(SeccompMode::Enforce);
             let (mut wait, mut release) = pipe();
+            let (mut started, mut start) = pipe();
             let early = thread::Builder::new()
                 .name("fs-root-q1".into())
                 .spawn(move || {
                     boxcar_confine::at_thread_start();
+                    start.write_all(b"!").unwrap();
                     let mut byte = [0u8; 1];
                     let _ = wait.read(&mut byte);
                     // On the process list, which allows a socket; its role's
@@ -257,6 +262,8 @@ fn a_thread_started_before_the_process_list_keeps_it_alone() {
                     fd >= 0
                 })
                 .unwrap();
+            let mut byte = [0u8; 1];
+            started.read_exact(&mut byte).unwrap();
             if seccomp::install(SeccompMode::Enforce).is_err() {
                 return 2;
             }

@@ -697,6 +697,8 @@ mod tests {
     struct FakeInit {
         lines: BufReader<UnixStream>,
         out: UnixStream,
+        /// What came of a line before a read timed out.
+        partial: Vec<u8>,
     }
 
     impl FakeInit {
@@ -706,6 +708,7 @@ mod tests {
             FakeInit {
                 out: stream.try_clone().unwrap(),
                 lines: BufReader::new(stream),
+                partial: Vec::new(),
             }
         }
 
@@ -714,9 +717,36 @@ mod tests {
         }
 
         fn recv(&mut self) -> HostMsg {
-            let mut line = Vec::new();
-            self.lines.read_until(b'\n', &mut line).unwrap();
-            decode(&line).unwrap()
+            self.recv_within(LIMIT)
+                .unwrap_or_else(|| panic!("no message within {LIMIT:?}"))
+        }
+
+        /// The next message, or `None` when `timeout` passes first; what
+        /// came of a line by then is kept for the next call.
+        fn recv_within(&mut self, timeout: Duration) -> Option<HostMsg> {
+            self.lines
+                .get_ref()
+                .set_read_timeout(Some(timeout))
+                .unwrap();
+            let mut line = std::mem::take(&mut self.partial);
+            match self.lines.read_until(b'\n', &mut line) {
+                Ok(_) if line.ends_with(b"\n") => Some(decode(&line).unwrap()),
+                Ok(0) => panic!("the channel closed"),
+                Ok(_) => {
+                    self.partial = line;
+                    None
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    self.partial = line;
+                    None
+                }
+                Err(error) => panic!("{error}"),
+            }
         }
 
         /// Reads until the VMM closes its side, and returns what came.
@@ -897,9 +927,21 @@ mod tests {
         assert_eq!(init.recv(), HostMsg::Config(session()));
         let mut ids = Vec::new();
         let started = Instant::now();
-        while ids.len() < 3 {
-            match init.recv() {
-                HostMsg::Ping { id } => {
+        // Every ping is answered until three have come and none is
+        // outstanding. The thread sends on its interval whether or not the
+        // last ping was answered, and a pong whose ping is no longer the
+        // outstanding one records nothing: a test that stopped answering
+        // after the third pong would race the fourth ping.
+        loop {
+            if ids.len() >= 3 && !ctl.ping_outstanding() {
+                break;
+            }
+            assert!(
+                started.elapsed() < LIMIT,
+                "three pings, the last answered, did not come in {LIMIT:?}: {ids:?}"
+            );
+            match init.recv_within(SYNC_TICK) {
+                Some(HostMsg::Ping { id }) => {
                     ids.push(id);
                     init.send(&GuestMsg::Pong {
                         id,
@@ -907,7 +949,8 @@ mod tests {
                         ptp: None,
                     });
                 }
-                other => panic!("not a ping: {other:?}"),
+                Some(other) => panic!("not a ping: {other:?}"),
+                None => {}
             }
         }
         assert!(
@@ -916,19 +959,24 @@ mod tests {
             started.elapsed()
         );
         assert!(ids.windows(2).all(|w| w[1] > w[0]), "{ids:?}");
-        // The last pong is seen before the channel goes: its `sync` is
-        // recorded only then.
-        let deadline = Instant::now() + LIMIT;
-        while ctl.ping_outstanding() {
-            assert!(Instant::now() < deadline, "the last pong was not seen");
-            std::thread::sleep(Duration::from_millis(5));
-        }
         drop(init);
         assert!(ctl.close(LIMIT), "the sync thread ended with the channel");
         writer.close().unwrap();
+        // Each pong that found its ping outstanding is a `sync`, in order,
+        // the last answered ping's among them; one that found a newer ping
+        // outstanding is none.
         let syncs = records_of(&session_dir, "sync");
-        assert!(syncs.len() >= 3, "{}", syncs.len());
-        assert_eq!(syncs[2].data["guest_mono_ns"], 10 * ids[2]);
+        let answered: Vec<u64> = syncs
+            .iter()
+            .map(|sync| sync.data["guest_mono_ns"].as_u64().unwrap() / 10)
+            .collect();
+        assert!(!answered.is_empty(), "{syncs:?}");
+        assert!(answered.windows(2).all(|w| w[1] > w[0]), "{answered:?}");
+        assert!(
+            answered.iter().all(|id| ids.contains(id)),
+            "{answered:?} not all of {ids:?}"
+        );
+        assert_eq!(answered.last(), ids.last(), "{answered:?} {ids:?}");
     }
 
     #[test]

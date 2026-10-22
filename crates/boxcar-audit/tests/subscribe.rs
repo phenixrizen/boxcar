@@ -209,50 +209,37 @@ fn a_lagged_subscriber_gets_resume_seq_and_recovers() {
     writer.close().unwrap();
 }
 
+/// A subscriber whose queue (of four) overflows round after round sees
+/// every record once, each lag report naming the seq of the record after
+/// it. The overflows are made, not left to the two threads' pace: a round
+/// writes a batch while the subscriber reads nothing, waits for the
+/// writer, and reads it all back (the queue, the report, the rest from
+/// the log).
 #[test]
 fn a_subscriber_that_lags_over_and_over_still_sees_every_record_once() {
-    const EVENTS: u64 = 2_000;
+    const ROUNDS: u64 = 20;
+    const BATCH: u64 = 100;
+    const EVENTS: u64 = ROUNDS * BATCH;
     let tmp = TempDir::new().unwrap();
     let (sink, writer) = quiet_writer(tmp.path());
     let mut sub = sink.subscribe_with_queue(1, Filter::default(), 4).unwrap();
-    let producer = thread::spawn({
-        let sink = sink.clone();
-        move || {
-            // Faster than the subscriber reads, even while it replays.
-            for n in 0..EVENTS {
-                sink.emit(event(n)).unwrap();
-                if n % 10 == 9 {
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-        }
-    });
     let mut items = Vec::new();
-    loop {
-        let item = next(&mut sub).expect("the stream ended early");
-        let done = matches!(&item, Item::Record(record) if record.seq == EVENTS);
-        items.push(item);
-        if done {
-            break;
+    for round in 0..ROUNDS {
+        for n in round * BATCH..(round + 1) * BATCH {
+            sink.emit(event(n)).unwrap();
         }
-        if items.len() % 4 == 0 {
-            // Slower than the writer, so that the queue overflows again and
-            // again: much slower at first, so that it does whatever the
-            // machine's load makes of the two threads' pace.
-            thread::sleep(Duration::from_millis(if items.len() <= 40 {
-                20
-            } else {
-                1
-            }));
-        }
+        barrier(&sink);
+        items.extend(collect_until(&mut sub, (round + 1) * BATCH));
     }
-    producer.join().unwrap();
     assert_eq!(seqs(&items), (1..=EVENTS).collect::<Vec<_>>());
     let laggeds = items
         .iter()
         .filter(|item| matches!(item, Item::Lagged { .. }))
         .count();
-    assert!(laggeds > 1, "only {laggeds} lag reports");
+    assert_eq!(
+        laggeds, ROUNDS as usize,
+        "lag reports for {ROUNDS} overflows"
+    );
     // Each report names the seq the next record has.
     for (at, item) in items.iter().enumerate() {
         if let Item::Lagged { resume_seq } = item {
