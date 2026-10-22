@@ -163,7 +163,10 @@ impl Reconciler {
         let flag = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("reconcile".into())
-            .spawn(move || run(sink, cfg, &flag))?;
+            .spawn(move || {
+                boxcar_confine::at_thread_start();
+                run(sink, cfg, &flag)
+            })?;
         Ok(ReconcilerHandle {
             stop,
             thread: Some(thread),

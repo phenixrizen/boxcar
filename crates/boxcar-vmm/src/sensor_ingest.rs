@@ -174,7 +174,10 @@ impl SensorIngest {
         let ingest = Arc::clone(self);
         thread::Builder::new()
             .name("sensor-rx".into())
-            .spawn(move || ingest.read_frames(theirs))?;
+            .spawn(move || {
+                boxcar_confine::at_thread_start();
+                ingest.read_frames(theirs)
+            })?;
         self.lock().connected = true;
         Ok(ours)
     }

@@ -231,9 +231,10 @@ impl FrameDump {
         file.write_all(&pcap_header())?;
         let (tx, rx) = bounded(FRAME_QUEUE);
         let payloads = dir.payloads();
-        let thread = thread::Builder::new()
-            .name("dump".into())
-            .spawn(move || write_frames(rx, file))?;
+        let thread = thread::Builder::new().name("dump".into()).spawn(move || {
+            boxcar_confine::at_thread_start();
+            write_frames(rx, file)
+        })?;
         Ok((FrameDump { tx, payloads }, DumpThread { thread }))
     }
 

@@ -7,6 +7,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+boxcar-confine = { workspace = true }
 boxcar-proto = { workspace = true, features = ["hash"] }
 boxcar-audit = { workspace = true }
 # The virtio-net device: the `VirtioDevice` trait, the queue drain, and

@@ -105,7 +105,10 @@ pub fn serve(
     let (id, stall_limit) = (attached.id, attached.stall_limit);
     let writer = thread::Builder::new()
         .name("pty-attach".into())
-        .spawn(move || write_out(&to_client, &output, &hub, id, stall_limit));
+        .spawn(move || {
+            boxcar_confine::at_thread_start();
+            write_out(&to_client, &output, &hub, id, stall_limit)
+        });
     let writer = match writer {
         Ok(writer) => writer,
         Err(error) => {

@@ -341,10 +341,26 @@ every right boxcar handles is `full`, one that enforces only some of them
 `BOXCAR_SECCOMP`). One allowlist for the whole process, measured over the
 gated suites and completed from the code, is installed once the VM is
 built and before `vmm.start` is recorded, with `SECCOMP_FILTER_FLAG_TSYNC`, so the threads running then
-and every thread started later have it. A few calls are allowed only
+and every thread started later have it. On top of it, each worker thread
+started once that list is in confines itself to its role's list as its
+first act (the net thread keeps
+sockets and loses files; a virtio-fs queue keeps files and loses sockets;
+the audit writer has the log's files; the control socket's threads have
+their socket, the log's files and the threads they start), through a hook
+set before `boxcar run` spawns anything; a role's list is a subset of the
+process list, and the kernel takes the strictest answer. The vCPU threads,
+which start the device workers at the guest's activation, and the main
+thread keep the process list, since a filter is inherited by the threads a
+thread starts; so do the threads started before the VM was built (the
+audit writer, the control socket's acceptor, the terminal's), since
+`TSYNC` installs the process list only while no thread's filters differ
+from the installer's, and the device workers, the guest channels, the
+connections and the subscriptions all start after it. `vmm.start`'s
+`hardening.seccomp_threads` says the workers are confined so. A few calls are allowed only
 with some arguments: `ioctl` by request, `socket` and `socketpair` by
-family, `clone` for threads only, `prctl` for `PR_SET_NAME`, `tgkill` to
-this process. A second filter answers `clone3` `ENOSYS`, since a filter
+family, `clone` for threads only, `prctl` for `PR_SET_NAME` and
+`PR_SET_NO_NEW_PRIVS`, `seccomp` to add a filter to the calling thread
+alone (which only narrows), `tgkill` to this process. A second filter answers `clone3` `ENOSYS`, since a filter
 cannot read its flags, and glibc falls back to `clone`. The list is built
 for x86_64 glibc. Under `enforce` a call off the list kills the process:
 a crash, with no `vmm.stop` (see *Order and durability* in

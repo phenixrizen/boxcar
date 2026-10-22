@@ -66,6 +66,14 @@ const USAGE_EXIT: u8 = 2;
 /// guest did.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     init_tracing();
+    // Before any thread: each worker confines itself to its role's seccomp
+    // list at its start, under this mode (the process list comes with the
+    // VM, in `Vmm::new`).
+    boxcar_vmm::hardening::seccomp::set_mode(match args.seccomp {
+        SeccompArg::Enforce => SeccompMode::Enforce,
+        SeccompArg::Log => SeccompMode::Log,
+        SeccompArg::Off => SeccompMode::Off,
+    });
     // Everything that can be refused is checked before the session exists,
     // so that a typo does not leave an empty session behind: the network
     // flags, the policy, the vsock flags, the ready descriptor, the shares,

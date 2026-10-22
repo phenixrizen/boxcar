@@ -126,7 +126,10 @@ impl LocalInput {
 pub fn forward(input: LocalInput, to: Input, handle: VmmHandle) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("pty-stdin".into())
-        .spawn(move || forward_all(input, &to, &handle))
+        .spawn(move || {
+            boxcar_confine::at_thread_start();
+            forward_all(input, &to, &handle)
+        })
 }
 
 fn forward_all(mut input: LocalInput, to: &Input, handle: &VmmHandle) {

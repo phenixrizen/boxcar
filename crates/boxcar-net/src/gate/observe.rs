@@ -297,6 +297,7 @@ impl ObserverThread {
         let thread = thread::Builder::new()
             .name("gate-observe".into())
             .spawn(move || {
+                boxcar_confine::at_thread_start();
                 // Dropped when the thread ends, however it ends.
                 let _stopped = stopped;
                 run(

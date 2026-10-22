@@ -254,7 +254,10 @@ impl ConsoleWriter {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("console".into())
-                .spawn(move || drain(&shared, target))?
+                .spawn(move || {
+                    boxcar_confine::at_thread_start();
+                    drain(&shared, target)
+                })?
         };
         Ok((
             ConsoleSink {

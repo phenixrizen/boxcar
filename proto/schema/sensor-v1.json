@@ -861,7 +861,7 @@
       }
     },
     "Hardening": {
-      "description": "How the VMM process is confined (`vmm.start.hardening`): its seccomp filter and its Landlock domain, both in force before the record is made.",
+      "description": "How the VMM process is confined (`vmm.start.hardening`): its seccomp filter and its Landlock domain, both in force before the record is made, and whether its worker threads each confine themselves further to their role's list (omitted when they do not: `seccomp` is `off`, or the host is not one the lists are built for).",
       "type": "object",
       "required": [
         "landlock",
@@ -873,6 +873,9 @@
         },
         "seccomp": {
           "$ref": "#/definitions/SeccompMode"
+        },
+        "seccomp_threads": {
+          "type": "boolean"
         }
       }
     },

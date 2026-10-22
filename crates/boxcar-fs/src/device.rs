@@ -578,9 +578,10 @@ impl PreparedWorker {
             irq,
             tag,
         } = self;
-        let thread = thread::Builder::new()
-            .name(name.clone())
-            .spawn(move || run_worker(manager, id, &irq, &tag))?;
+        let thread = thread::Builder::new().name(name.clone()).spawn(move || {
+            boxcar_confine::at_thread_start();
+            run_worker(manager, id, &irq, &tag)
+        })?;
         Ok(WorkerHandle { name, kill, thread })
     }
 }

@@ -335,6 +335,7 @@ impl VmConfig {
         Some(Hardening {
             seccomp: self.seccomp,
             landlock: self.landlock.unwrap_or(LandlockStatus::Off),
+            seccomp_threads: seccomp::threads_confined(),
         })
     }
 }

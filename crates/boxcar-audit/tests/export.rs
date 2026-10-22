@@ -333,6 +333,7 @@ fn fixture() -> Builder {
         hardening: Some(Hardening {
             seccomp: SeccompMode::Enforce,
             landlock: LandlockStatus::Partial,
+            seccomp_threads: false,
         }),
     }));
     b.push(Payload::PolicyLoaded(PolicyLoaded {
