@@ -12,8 +12,8 @@
 //!   (through `ppid`) reaches the agent (the session's root, or the span's
 //!   bound executor): by argv first (a shell tool whose declared command
 //!   the exec carries, compared exactly as the call sent it), else as the
-//!   only open span. One that joins no span waits [`PENDING_NS`] for a
-//!   late `tool.open`.
+//!   only open span. One that joins no span waits [`EXEC_PENDING_NS`] for
+//!   a late `tool.open`.
 //! - A process forked or exec'd by a span's process joins that span.
 //! - A filesystem effect joins the span of its process. One by the agent
 //!   itself, in no span (as for a `Write` tool), joins the
@@ -47,7 +47,7 @@ use serde_json::Value;
 
 use super::rules::Draft;
 use super::state::{ProcKey, State};
-use super::{JOIN_WINDOW_NS, PENDING_NS};
+use super::{EXEC_PENDING_NS, JOIN_WINDOW_NS, PENDING_NS};
 
 /// The most processes a span lists.
 pub const MAX_SPAN_PROCS: usize = 1024;
@@ -68,6 +68,8 @@ const MAX_SPANS_KEPT: usize = 4096;
 pub const MAX_OPEN_SPANS: usize = 256;
 /// The most effects waiting for their process to join a span.
 const MAX_RECENT: usize = 4096;
+/// The most execs waiting for a late `tool.open`; past it the oldest goes.
+const MAX_PENDING_EXECS: usize = 4096;
 /// How many parents are followed when looking for the agent.
 const MAX_ANCESTRY: usize = 64;
 /// How far apart a TLS write and the `http.request` it carried may be.
@@ -1039,6 +1041,9 @@ impl Spans {
                 }
             }
             None => {
+                if self.pending_execs.len() >= MAX_PENDING_EXECS {
+                    self.pending_execs.pop_front();
+                }
                 self.pending_execs.push_back(PendingExec { key, seq, ts });
                 Vec::new()
             }
@@ -1187,7 +1192,7 @@ impl Spans {
         while self
             .pending_execs
             .front()
-            .is_some_and(|p| now.saturating_sub(p.ts) >= PENDING_NS)
+            .is_some_and(|p| now.saturating_sub(p.ts) >= EXEC_PENDING_NS)
         {
             self.pending_execs.pop_front();
         }

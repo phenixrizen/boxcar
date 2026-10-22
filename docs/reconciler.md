@@ -118,7 +118,9 @@ processes and ring 0 effects to the span:
   elsewhere in the shell's text (a comment, beside other commands, inside
   a longer `eval`) is not carrying it, nor is a command that reads the
   same once its quotes are dropped. Else as the only open span.
-  An exec that joins nothing waits 2 s for a late `tool.open`. A process
+  An exec that joins nothing waits 10 s for a late `tool.open` (the gate
+  records a call when the model's reply names it; the agent may run the
+  command seconds before that record lands). A process
   forked or exec'd by a span's process joins that span, and a process
   that exec's again stays in its span; when a process ran before the
   gate recorded the call (a runtime that runs its tool at once, as

@@ -223,6 +223,16 @@ milestone 2.
 
 ## 14. Amendments
 
+### 2026-10-22: an exec waits 10 s for a late `tool.open` (#84)
+
+The M4 plan kept an exec that joined no span for 2 s, for a `tool.open`
+the gate's observer wrote a moment late. The gate records a call when the
+model's reply names it, and an agent may run the command seconds before
+that record lands (Codex has, by 2.5 s on the test box). The wait is now
+its own constant, 10 s, with the queue of waiting execs capped at 4096;
+the join stays by argv, and the only-open-span fallback keeps its 500 ms
+window. A filesystem effect's 2 s wait for its process is unchanged.
+
 ### 2026-10-21: an overlay for image sessions (#31)
 
 The M5 plan served an image session from a per-session copy of the
