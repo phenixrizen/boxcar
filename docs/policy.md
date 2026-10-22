@@ -260,8 +260,11 @@ A connection is decided in this order:
 - **Inspection.** An `inspect` target decides nothing. A connection an
   allow admitted whose name (or, for a network target, destination) an
   `inspect` target matches has its TLS ended in boxcar and its traffic
-  recorded; a session with any `inspect` target makes its own CA. What the
-  gate records, and what it never does, is in [gate.md](gate.md).
+  recorded; a session with any `inspect` target makes its own CA. An
+  agent that pins its provider's certificate cannot be inspected: allow
+  its provider without an `inspect` target, and it runs with the flow
+  recorded by ring 0 only. What the gate records, and what it never does,
+  is in [gate.md](gate.md).
 
 `net.dns`, `net.connect` and `net.udp` record each decision with its
 verdict and the rule that decided, as written (a `builtin:` name for a
