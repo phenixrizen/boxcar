@@ -2040,9 +2040,23 @@ fn carries(declared: &Command, program: &str, argv: &[String]) -> bool {
 /// comments): its last `&&` part `pwd -P >| <file>`, the one before it
 /// `eval <one word>` (and `< /dev/null` unless the command reads its own
 /// input) whose word, unquoted, is the declared command. The parts before
-/// are the runtime's own setup (sourcing its shell snapshot, exports) and
-/// are not judged here, but each must be there: a comment or an open
-/// quote that swallows the rest is no wrapper.
+/// are the runtime's own setup and are not judged here, but each must be
+/// there: a comment or an open quote that swallows the rest is no
+/// wrapper.
+///
+/// The setup is what the Claude Code at hand puts there, and it changes
+/// between versions; the two parts judged have not, from 2.1.290 (the
+/// form taken from its binary) through 2.1.304 (the guest's) to 2.1.306:
+/// `source <its shell snapshot> 2>/dev/null || true`, `export PATH=...`
+/// and, since 2.1.30x, exports of its plugins' variables joined by
+/// newlines and ended by `:`, `shopt -u extglob 2>/dev/null || true`
+/// (bash) or `setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null ||
+/// true` (zsh), and a `{ \builtin unalias -- ...; \builtin unset -f --
+/// ...; } >/dev/null 2>&1 || true` group, each of them one or more
+/// non-empty `&&` parts. What is not read here: the `>nul` rewrite it
+/// applies on Windows, and `CLAUDE_CODE_SHELL_PREFIX`, which runs the
+/// whole line through a program of the user's; neither is a form boxcar
+/// runs an agent under.
 fn wraps(text: &str, declared: &str) -> bool {
     let Some(tokens) = lex(text) else {
         return false;
@@ -2350,6 +2364,35 @@ mod tests {
             "/bin/bash",
             &shell("eval 'sort < in.txt' && pwd -P >| /tmp/c")
         ));
+        // Claude Code 2.1.304, the guest's, under bash: the snapshot, the
+        // PATH, `shopt`, the unalias group (a `;` and a redirection inside
+        // braces), then the two parts judged.
+        assert!(carries(&declared, "/bin/bash", &shell(concat!(
+            "source /root/.claude/shell-snapshots/snapshot-bash-1792541123845-tgt6wz.sh 2>/dev/null || true",
+            " && export PATH=\"${PATH:+$PATH:}\"'/root/.local/bin'",
+            " && shopt -u extglob 2>/dev/null || true",
+            " && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true",
+            " && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-a1b2-cwd"
+        ))));
+        // Claude Code 2.1.306 under zsh, as this host runs it: its plugins'
+        // exports in one part, joined by newlines and ended by `:`, then
+        // `setopt`, the unalias group, and the two parts judged.
+        assert!(carries(&declared, "/bin/zsh", &words(&["zsh", "-c", concat!(
+            "source /home/u/.claude/shell-snapshots/snapshot-zsh-1792541123845-tgt6wz.sh 2>/dev/null || true",
+            " && export CODEX_COMPANION_SESSION_ID='784e8f8f-ed58-4703-b074-3cd250a05963'\n",
+            "export CLAUDE_PLUGIN_DATA='/home/u/.claude/plugins/data/codex-openai-codex'\n",
+            ": && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true",
+            " && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true",
+            " && eval 'echo boxcar-m4 > marker.txt' && pwd -P >| /tmp/claude-139a-cwd"
+        )])));
+        // With CLAUDE_CODE_SHELL_PREFIX set, the shell-option part covers
+        // both shells; the line is then run through the prefix program,
+        // which is not read here.
+        assert!(carries(&declared, "/bin/bash", &shell(concat!(
+            "source /tmp/s.sh 2>/dev/null || true",
+            " && { shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true",
+            " && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c"
+        ))));
         // An argv, as declared; a line run without a shell, as its words.
         let make = Command::Argv(words(&["bash", "-lc", "make test"]));
         assert!(carries(
