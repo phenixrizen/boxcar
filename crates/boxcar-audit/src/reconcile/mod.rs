@@ -67,6 +67,10 @@ pub const TICK: Duration = Duration::from_secs(1);
 pub const JOIN_WINDOW_NS: u64 = 500 * 1_000_000;
 /// How long an effect with no process waits for a late exec.
 pub const PENDING_NS: u64 = 2 * 1_000_000_000;
+/// How long an exec that joined no span waits for a late `tool.open`: the
+/// gate records a call when the model's reply names it, and the agent may
+/// run the command seconds before that record lands (Codex has, by 2.5 s).
+pub const EXEC_PENDING_NS: u64 = 10 * 1_000_000_000;
 /// Without a heartbeat for this long while ring 0 is active, the sensor is
 /// silent.
 pub const SILENCE_NS: u64 = 3 * 1_000_000_000;

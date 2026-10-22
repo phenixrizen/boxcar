@@ -1335,6 +1335,14 @@ fn codex_runs_a_shell_tool_inside() {
     )
     .with_limit(AGENT_LIMIT)
     .finish();
+    // Codex refreshes its login in there, and a refresh retires the old
+    // refresh token: a changed file goes back where it came from, or the
+    // next run cannot sign in.
+    if let Ok(refreshed) = fs::read_to_string(home.join("auth.json")) {
+        if refreshed != auth_json {
+            fs::write(&auth, &refreshed).unwrap();
+        }
+    }
     let _ = fs::remove_dir_all(&home);
     assert_eq!(run.status.code(), Some(0), "{}", run.describe());
     check_agent_run(&run, "openai_responses", &scratch, &secret);

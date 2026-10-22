@@ -2405,6 +2405,54 @@ fn a_late_tool_open_takes_the_exec_that_waited() {
     assert_eq!(spans[0].effects, [4]);
 }
 
+/// The agent may run the command seconds before the gate records the call
+/// (Codex has, by 2.5 s): an exec that declares the command waits 10 s
+/// for its `tool.open`, through the ticks between, and joins by argv.
+#[test]
+fn a_tool_open_seconds_late_still_takes_the_exec_it_declares() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(2000, 370, 100, 10, &["sh", "-c", "ls -la"]));
+    for at in [3000, 4000, 5000, 6000, 7000] {
+        steps.push(Step::Tick(at));
+    }
+    steps.push(log.tool_open(7500, "toolu_01", "Bash", json!({"command": "ls -la"})));
+    steps.push(log.exit(7600, 370, 10));
+    steps.push(log.tool_close(8000, "toolu_01", "ok"));
+    for at in [9000, 10_000] {
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].procs, [370], "{out:?}");
+    assert_eq!(spans[0].effects, [4]);
+}
+
+/// Past the wait the exec is let go: a `tool.open` later still opens its
+/// span, with nothing in it.
+#[test]
+fn an_exec_past_the_wait_is_let_go() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(2000, 370, 100, 10, &["sh", "-c", "ls -la"]));
+    for at in (3000..=13_000).step_by(1000) {
+        steps.push(Step::Tick(at));
+    }
+    steps.push(log.tool_open(13_500, "toolu_01", "Bash", json!({"command": "ls -la"})));
+    steps.push(log.exit(13_600, 370, 10));
+    steps.push(log.tool_close(14_000, "toolu_01", "ok"));
+    for at in [15_000, 16_000] {
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert!(spans[0].procs.is_empty(), "{out:?}");
+}
+
 /// A TLS write sized like the request's body, 100 ms before the gate's
 /// `http.request`, names the process that made the request: the span the
 /// reply opens has it as its executor, and its children join the span.
