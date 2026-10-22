@@ -617,9 +617,10 @@ mod tests {
         guest.shutdown(Shutdown::Write).unwrap();
         // 256 bytes every 150 ms: 1.7 KiB/s, about 3.6 s in all.
         let reader = slow_reader(read_end, 256, Duration::from_millis(150));
-        // An idle limit below a page's time at this pace (2.4 s), with
-        // room for a loaded machine to delay the reader's steps.
-        let ended = writer.wait_with(Duration::from_secs(1), LIMIT, || false);
+        // An idle limit below a page's time at this pace (2.4 s) and far
+        // above a step's: a loaded machine may hold the reader's thread
+        // off its next step for most of it.
+        let ended = writer.wait_with(Duration::from_secs(2), LIMIT, || false);
         assert_eq!(ended, OutWait::Done);
         assert_eq!(writer.undelivered(), 0);
         assert_eq!(writer.written(), PAYLOAD as u64);

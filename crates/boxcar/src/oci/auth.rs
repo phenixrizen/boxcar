@@ -551,12 +551,23 @@ pub(crate) mod tests {
         assert_eq!(helper_server("r.example:5000"), "r.example:5000");
     }
 
-    /// A helper script `docker-credential-<name>` in `dir`.
+    /// A helper script `docker-credential-<name>` in `dir`, written and
+    /// made executable by a child process: a descriptor this process held
+    /// open for writing would be inherited by whatever another test's
+    /// thread forked meanwhile, until that child's exec, and running the
+    /// script then fails with `ETXTBSY`.
     pub(crate) fn fake_helper(dir: &Path, name: &str, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(format!("docker-credential-{name}"));
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$0" && chmod 755 "$0""#])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        std::io::Write::write_all(&mut stdin, format!("#!/bin/sh\n{script}\n").as_bytes()).unwrap();
+        drop(stdin);
+        assert!(child.wait().unwrap().success(), "{}", path.display());
     }
 
     #[test]
