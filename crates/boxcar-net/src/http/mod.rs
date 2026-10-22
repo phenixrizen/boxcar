@@ -12,8 +12,9 @@
 //! chunked bodies, pipelining) or HTTP/2 ([`h2`]: frames, HPACK through
 //! `fluke-hpack`, streams), chosen by the ALPN protocol the TLS legs
 //! agreed on. Bodies come out as framed, still content-coded; [`body`]
-//! decodes and hashes them, [`sse`] splits event streams, [`ws`] reads
-//! WebSocket frames. Headers come out as [`Headers`], which never hold a
+//! decodes and hashes them ([`zstd`] delimits that coding's frames for
+//! its decoder), [`sse`] splits event streams, [`ws`] reads WebSocket
+//! frames. Headers come out as [`Headers`], which never hold a
 //! credential's value.
 //!
 //! Nothing here allocates without a bound: a head is at most 64 KiB, a
@@ -26,6 +27,7 @@ pub mod headers;
 pub mod retain;
 pub mod sse;
 pub mod ws;
+pub mod zstd;
 
 pub use body::{BodySink, BodySummary, Coding, ContentDecoder, BODY_KEEP};
 pub use headers::{is_credential, Headers};

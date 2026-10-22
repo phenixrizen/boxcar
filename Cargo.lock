@@ -364,6 +364,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "ruzstd",
  "serde_json",
  "smoltcp",
  "socket2",

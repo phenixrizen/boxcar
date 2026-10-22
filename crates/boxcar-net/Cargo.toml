@@ -42,6 +42,7 @@ httparse = { workspace = true }
 fluke-hpack = { workspace = true }
 flate2 = { workspace = true }
 brotli-decompressor = { workspace = true }
+ruzstd = { workspace = true }
 blake3 = { workspace = true }
 serde_json = { workspace = true }
 

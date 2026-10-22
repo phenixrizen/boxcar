@@ -101,7 +101,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 ring = "0.17"
 # The HTTP observer: HTTP/1.1 heads, HPACK for HTTP/2, and the content
 # codings it decodes (gzip and deflate through flate2's pure-Rust backend,
-# brotli through brotli-decompressor).
+# brotli through brotli-decompressor, zstd through ruzstd above).
 httparse = "1"
 fluke-hpack = "0.3"
 flate2 = "1.1"

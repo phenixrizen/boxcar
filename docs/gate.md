@@ -58,8 +58,12 @@ one.
 The observer (thread `gate-observe`, fed by a bounded channel the net
 thread never waits on) reads each inspected flow's plaintext as HTTP/1.1
 or HTTP/2 (chosen by the ALPN protocol), with HPACK, chunked and
-content-length framing, gzip, deflate and brotli content codings, event
-streams and WebSocket upgrades.
+content-length framing, gzip, deflate, brotli and zstd content codings,
+event streams and WebSocket upgrades. A zstd body's decoded bytes come
+as they leave the frame's window (at most 16 MiB; a frame asking for
+more is refused) and the rest at the frame's end, so a tool call in a
+zstd event stream is seen when its bytes do, at the latest at the
+stream's end; the other codings give their bytes as they decode.
 
 - `http.request` and `http.response`: one pair per exchange, with the
   method, authority, path, content type, status, the body's size and
