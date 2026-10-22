@@ -343,6 +343,7 @@ fn fixture() -> Builder {
         egress_rules: 3,
         fs_rules: 2,
         exec_rules: 0,
+        exec_ring1: None,
     }));
     for (tag, dir) in [("root", "/"), ("workspace", "/workspace")] {
         b.push(Payload::FsMount(FsMount {

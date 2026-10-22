@@ -35,7 +35,7 @@
 //! `attached` or `degraded` as it said, `silent` once its stream ended or
 //! no heartbeat came for [`SILENCE`].
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -79,7 +79,15 @@ struct State {
     last_heartbeat: Option<(Instant, u64)>,
     /// What the sensor last said it had attached.
     phase: Option<SensorPhase>,
+    /// The VMM's end of the stream, to write host frames to.
+    host: Option<UnixStream>,
+    /// The names the policy denies, asked when the sensor connects.
+    exec_source: Option<ExecSource>,
 }
+
+/// Where the names the policy denies come from: the policy's version and
+/// the names.
+pub type ExecSource = Arc<dyn Fn() -> (u64, Vec<String>) + Send + Sync>;
 
 impl SensorIngest {
     /// A service that records into `audit`, idle until its
@@ -116,6 +124,36 @@ impl SensorIngest {
     pub fn service(self: &Arc<Self>) -> Service {
         let ingest = Arc::clone(self);
         Arc::new(move |meta| ingest.accept(meta))
+    }
+
+    /// Sets where the names the policy denies come from, asked when the
+    /// sensor connects.
+    pub fn set_exec_source(&self, source: ExecSource) {
+        self.lock().exec_source = Some(source);
+    }
+
+    /// Tells the sensor the names `[exec] deny` denies: the whole set. A
+    /// stream not yet taken, or ended, takes nothing; the names are sent
+    /// again when it connects.
+    pub fn send_exec_deny(&self, version: u64, names: Vec<String>) {
+        let frame = boxcar_proto::sensor::HostFrame::ExecDeny { version, names };
+        let bytes = match boxcar_proto::sensor::encode_host(&frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                boxcar_virtio::limited!(warn, "sensor stream: the exec deny names: {error}");
+                return;
+            }
+        };
+        let mut state = self.lock();
+        if let Some(host) = state.host.as_mut() {
+            if let Err(error) = host.write_all(&bytes) {
+                boxcar_virtio::limited!(
+                    warn,
+                    "sensor stream: cannot send the exec deny names: {error}"
+                );
+                state.host = None;
+            }
+        }
     }
 
     /// What the control socket's `status` reports under `sensor`.
@@ -171,6 +209,7 @@ impl SensorIngest {
     /// end; returns the end the vsock device gets.
     fn open(self: &Arc<Self>) -> io::Result<UnixStream> {
         let (ours, theirs) = UnixStream::pair()?;
+        let host = theirs.try_clone()?;
         let ingest = Arc::clone(self);
         thread::Builder::new()
             .name("sensor-rx".into())
@@ -178,7 +217,17 @@ impl SensorIngest {
                 boxcar_confine::at_thread_start();
                 ingest.read_frames(theirs)
             })?;
-        self.lock().connected = true;
+        let source = {
+            let mut state = self.lock();
+            state.connected = true;
+            state.host = Some(host);
+            state.exec_source.clone()
+        };
+        // The names the policy denies, before the session runs anything.
+        if let Some(source) = source {
+            let (version, names) = source();
+            self.send_exec_deny(version, names);
+        }
         Ok(ours)
     }
 
@@ -213,6 +262,9 @@ impl SensorIngest {
         let mut state = self.lock();
         state.connected = false;
         state.ended = true;
+        // The VMM's end goes with the reader: nothing is written to a
+        // stream that ended.
+        state.host = None;
     }
 
     /// Notes what the frame says about the sensor, then records it; waits
@@ -241,7 +293,7 @@ impl SensorIngest {
 /// sent, written through at once when it is a `proc.lsm_deny`.
 pub fn submission(frame: SensorFrame) -> Submission {
     let priority = match frame.payload {
-        Payload::ProcLsmDeny(_) => Priority::Critical,
+        Payload::ProcLsmDeny(_) | Payload::ProcExecDenied(_) => Priority::Critical,
         _ => Priority::Normal,
     };
     Submission {

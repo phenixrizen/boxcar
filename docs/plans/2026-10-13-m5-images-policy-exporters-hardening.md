@@ -244,6 +244,7 @@ Made by Task 7 (`docs/plans/vmm-hardening.md`), 2026-10-20:
 - **Guest memory is `MADV_DONTDUMP`**, so a kill's core holds none of it.
 
 - Follow-up #34 (2026-10-21, `docs/plans/per-thread-seccomp.md`): on top of the process list, each worker thread confines itself to its role's list at its start; the vCPU and main threads keep the process list, as a filter is inherited by the threads a thread starts.
+- Follow-up #33 (2026-10-21, `docs/plans/exec-deny-ring1.md`): `[exec] deny` is also enforced by the sensor, by name, wherever a program is: the VMM sends the globs' last components over the sensor stream, a sleepable LSM program on `bprm_check_security` refuses them, and `proc.exec_denied` records it. Ring 0's denial by path on the shares stays.
 
 Made by Task 6 (`docs/plans/exporters.md`), 2026-10-20:
 

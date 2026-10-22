@@ -32,7 +32,7 @@ mod status;
 mod tls;
 mod vsock;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -150,6 +150,9 @@ fn kernel_release() -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Bytes read from the VMM at a time.
+const READ_CHUNK: usize = 8192;
+
 fn write_frame(out: &mut std::fs::File, frame: &SensorFrame) -> Result<(), SensorError> {
     let bytes = encode(frame)?;
     out.write_all(&bytes).map_err(SensorError::Write)
@@ -206,6 +209,9 @@ fn run(args: &[String]) -> Result<(), SensorError> {
     // TLS probes attach to files as the session runs them.
     let mut ebpf = ebpf;
     let mut events = events;
+    let mut exec_deny = loaded.exec_deny;
+    let mut host = boxcar_proto::sensor::HostDecoder::new();
+    let mut host_buf = vec![0u8; READ_CHUNK];
     let mut poll = [
         libc::pollfd {
             fd: events.as_ref().map_or(-1, |ring| ring.as_raw_fd()),
@@ -214,6 +220,12 @@ fn run(args: &[String]) -> Result<(), SensorError> {
         },
         libc::pollfd {
             fd: attacher.wake_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        // The VMM's frames: the names the policy denies.
+        libc::pollfd {
+            fd: out.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         },
@@ -239,8 +251,9 @@ fn run(args: &[String]) -> Result<(), SensorError> {
         let timeout = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
         poll[0].revents = 0;
         poll[1].revents = 0;
-        // SAFETY: poll reads and writes the two pollfds given, for the count given.
-        let ready = unsafe { libc::poll(poll.as_mut_ptr(), 2, timeout) };
+        poll[2].revents = 0;
+        // SAFETY: poll reads and writes the three pollfds given, for the count given.
+        let ready = unsafe { libc::poll(poll.as_mut_ptr(), 3, timeout) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -250,6 +263,30 @@ fn run(args: &[String]) -> Result<(), SensorError> {
         }
         if ready == 0 {
             continue;
+        }
+        if poll[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let n = out.read(&mut host_buf).map_err(SensorError::Write)?;
+            if n == 0 {
+                return Err(SensorError::Write(std::io::Error::other(
+                    "the VMM closed the stream",
+                )));
+            }
+            host.feed(&host_buf[..n]);
+            loop {
+                match host.next_frame() {
+                    Ok(Some(boxcar_proto::sensor::HostFrame::ExecDeny { names, .. })) => {
+                        if let Some(map) = exec_deny.as_mut() {
+                            load::apply_exec_deny(map, &names);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(SensorError::Write(std::io::Error::other(format!(
+                            "a host frame: {error}"
+                        ))))
+                    }
+                }
+            }
         }
         if poll[1].revents & libc::POLLIN != 0 {
             // A file's symbols are in: attach, and say how it went.

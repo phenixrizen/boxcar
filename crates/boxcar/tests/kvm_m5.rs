@@ -761,6 +761,8 @@ fn agent_isolate_strict_holds_in_a_session() {
         /lib/ld-musl-x86_64.so.1 /usr/bin/nc -h >/dev/null 2>&1 && echo loaded || echo refused-loader; \
         cp /usr/bin/nc /tmp/x 2>/dev/null && echo copied || echo refused-copy; \
         ln /usr/bin/nc /tmp/hard 2>/dev/null && echo linked || echo refused-link; \
+        cp /bin/busybox /dev/shm/nc && /dev/shm/nc -h >/dev/null 2>&1; echo named=$?; \
+        cp /bin/busybox /dev/shm/true && /dev/shm/true; echo other=$?; \
         echo done";
     let run = run_image(
         &guest,
@@ -781,6 +783,10 @@ fn agent_isolate_strict_holds_in_a_session() {
         "refused-loader",
         "refused-copy",
         "refused-link",
+        // Off the shares, under a denied name: refused by the sensor; under
+        // another name: not, which is the bound (#33).
+        "named=126",
+        "other=0",
         "done",
     ] {
         assert!(
@@ -792,6 +798,24 @@ fn agent_isolate_strict_holds_in_a_session() {
     let records = run.records();
     let loaded = of_kind(&records, "policy.loaded");
     assert_eq!(loaded[0].data["name"], "agent-isolate-strict");
+    assert_eq!(
+        loaded[0].data["exec_ring1"],
+        serde_json::json!({"names": 7, "left_to_ring0": 0}),
+        "{:?}",
+        loaded[0]
+    );
+    // The sensor's refusal of the copy under the denied name, and its
+    // finding, beside the shares' refusals below.
+    let denied = of_kind(&records, "proc.exec_denied");
+    assert!(
+        denied.iter().any(|r| r.data["filename"] == "/dev/shm/nc"),
+        "no proc.exec_denied for /dev/shm/nc: {denied:?}\n{}",
+        run.describe()
+    );
+    assert!(
+        !denied.iter().any(|r| r.data["filename"] == "/dev/shm/true"),
+        "{denied:?}"
+    );
     // Reached by name: the lookup and the connection allowed.
     assert!(
         of_kind(&records, "net.connect")
@@ -832,6 +856,8 @@ fn agent_isolate_strict_holds_in_a_session() {
     );
     assert!(denials.iter().any(|f| f.data["summary"]
         == "exec of /usr/bin/nc was refused by the policy ([exec] deny **/nc)"));
+    assert!(denials.iter().any(|f| f.data["summary"]
+        == "exec of /dev/shm/nc was refused by the policy ([exec] deny, by its name, through the sensor)"));
     assert!(denials.iter().any(|f| f.data["summary"]
         == "create of /etc/boxcar-test was refused by the policy (outside [fs] writable)"));
 }

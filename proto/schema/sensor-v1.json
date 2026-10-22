@@ -168,6 +168,26 @@
         }
       }
     },
+    "ExecRing1": {
+      "description": "`policy.loaded`'s `exec_ring1`.",
+      "type": "object",
+      "required": [
+        "left_to_ring0",
+        "names"
+      ],
+      "properties": {
+        "left_to_ring0": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "names": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "Finding": {
       "description": "`finding`: the reconciler's conclusion from records of both rings, with the records it read as evidence. Never sampled; a score of 70 or more is written through to disk at once.",
       "type": "object",
@@ -2549,6 +2569,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/ProcExecDenied"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exec_denied"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/ProcHeartbeat"
             },
             "type": {
@@ -2849,6 +2887,17 @@
           "format": "uint32",
           "minimum": 0.0
         },
+        "exec_ring1": {
+          "description": "What of `[exec] deny` the sensor enforces by name wherever a program is (see `proc.exec_denied`): the names sent, and the globs whose last component holds a wildcard and so are left to the shares' path denial alone. Omitted for a policy with no `[exec] deny`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExecRing1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "exec_rules": {
           "description": "A policy file's `[exec] deny` globs. 0 for a line policy.",
           "type": "integer",
@@ -2994,6 +3043,30 @@
           "minimum": 0.0
         },
         "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ProcExecDenied": {
+      "description": "`proc.exec_denied`: a thread in the session tried to run a program whose name the policy denies (`[exec] deny`, through the sensor: the globs' last components, wherever the file is), and `execve` was refused with `EPERM`. `filename` is the path as given to `execve`. Written through to disk at once.",
+      "type": "object",
+      "required": [
+        "filename",
+        "tgid",
+        "tid"
+      ],
+      "properties": {
+        "filename": {
+          "type": "string"
+        },
+        "tgid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tid": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -4281,6 +4354,24 @@
               "type": "string",
               "enum": [
                 "proc.lsm_deny"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/ProcExecDenied"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc.exec_denied"
               ]
             }
           }

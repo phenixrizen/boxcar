@@ -1,0 +1,1 @@
+{"category":"policy_denial","score":40,"rule":"policy_denial","summary":"exec of /tmp/nc was refused by the policy ([exec] deny, by its name, through the sensor)","evidence":[{"seq":5,"ring":1}],"low_confidence":false}

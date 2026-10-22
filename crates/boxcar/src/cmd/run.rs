@@ -711,6 +711,7 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
             egress_rules: egress_rules(&net),
             fs_rules: 0,
             exec_rules: 0,
+            exec_ring1: None,
         };
         return Ok(Ok(Loaded {
             net,
@@ -745,6 +746,13 @@ fn load_policy(args: &RunArgs) -> anyhow::Result<Result<Loaded, String>> {
         egress_rules: egress_rules(&net),
         fs_rules: u32::try_from(file.fs_rules()).unwrap_or(u32::MAX),
         exec_rules: u32::try_from(file.exec_rules()).unwrap_or(u32::MAX),
+        exec_ring1: (!file.exec.deny.is_empty()).then(|| {
+            let (names, left) = boxcar_vmm::policy::exec_names_of(&file.exec.deny, &[]);
+            boxcar_proto::ExecRing1 {
+                names: u32::try_from(names.len()).unwrap_or(u32::MAX),
+                left_to_ring0: u32::try_from(left).unwrap_or(u32::MAX),
+            }
+        }),
     };
     Ok(Ok(Loaded {
         net,
@@ -1968,6 +1976,7 @@ mod tests {
                 // writable, and the reconciler's 4 indicators.
                 fs_rules: 5,
                 exec_rules: 0,
+                exec_ring1: None,
             }
         );
         assert_eq!(profile.max_dns_qps, Some(20));
@@ -1995,6 +2004,10 @@ mod tests {
                 // The default writable's two globs.
                 fs_rules: 2,
                 exec_rules: 1,
+                exec_ring1: Some(boxcar_proto::ExecRing1 {
+                    names: 1,
+                    left_to_ring0: 0,
+                }),
             }
         );
         assert_eq!(file.max_dns_qps, None);
@@ -2026,6 +2039,7 @@ mod tests {
                 egress_rules: 3,
                 fs_rules: 0,
                 exec_rules: 0,
+                exec_ring1: None,
             }
         );
         assert_eq!(flags.max_dns_qps, None);
@@ -2044,6 +2058,7 @@ mod tests {
                 egress_rules: 0,
                 fs_rules: 0,
                 exec_rules: 0,
+                exec_ring1: None,
             }
         );
         assert_eq!(none.net, Policy::default());

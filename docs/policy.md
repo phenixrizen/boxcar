@@ -95,7 +95,16 @@ optional; a key the format does not have is refused wherever it is.
   - `denied`: what may not be looked up, opened, created or changed at all.
   - `indicators`: paths added to those the reconciler's `indicator_removal`
     rule watches.
-- `[exec] deny`: program files that may not be run, or opened at all.
+- `[exec] deny`: program files that may not be run, or opened at all. On
+  the shares, by path, through AuditFs; and, through the sensor, by name
+  wherever the file is: each glob's last component (`**/nc` denies `nc`,
+  `/usr/bin/{socat,telnet}` denies `socat` and `telnet`) is refused at
+  `execve` with `EPERM` whatever directory holds the file, a copy to the
+  guest's tmpfs included, and recorded as `proc.exec_denied`. A last
+  component with a wildcard in it (`**/nc*`) is matched on the shares
+  only; `policy.loaded` says how many names went to the sensor and how
+  many globs stayed with the shares. A copy under another name is not
+  stopped by name, and the write that made it is in the log.
 - `[spans] keep_tool_args`: `true` keeps a tool call's arguments inline in
   `tool.open` when their JSON is at most 8 KiB. `false` drops them and the
   summary made from them (`args_summary` reads `[arguments not kept:

@@ -612,6 +612,20 @@ pub struct PolicyLoaded {
     pub fs_rules: u32,
     /// A policy file's `[exec] deny` globs. 0 for a line policy.
     pub exec_rules: u32,
+    /// What of `[exec] deny` the sensor enforces by name wherever a program
+    /// is (see `proc.exec_denied`): the names sent, and the globs whose last
+    /// component holds a wildcard and so are left to the shares' path
+    /// denial alone. Omitted for a policy with no `[exec] deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_ring1: Option<ExecRing1>,
+}
+
+/// `policy.loaded`'s `exec_ring1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExecRing1 {
+    pub names: u32,
+    pub left_to_ring0: u32,
 }
 
 /// `net.dhcp`: the network stack answered a guest DHCP message with the
@@ -1007,6 +1021,19 @@ pub struct ProcLsmDeny {
     pub tgid: u32,
     pub hook: String,
     pub detail: i64,
+}
+
+/// `proc.exec_denied`: a thread in the session tried to run a program
+/// whose name the policy denies (`[exec] deny`, through the sensor: the
+/// globs' last components, wherever the file is), and `execve` was refused
+/// with `EPERM`. `filename` is the path as given to `execve`. Written
+/// through to disk at once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcExecDenied {
+    pub tid: u32,
+    pub tgid: u32,
+    pub filename: String,
 }
 
 /// `proc.heartbeat`: the sensor is alive, once a second. The counters are

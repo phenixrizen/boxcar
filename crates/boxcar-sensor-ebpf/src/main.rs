@@ -6,7 +6,8 @@
 //! (`memfd_create`), sampled opens (`file_open`), TLS writes and reads of
 //! runtimes that export OpenSSL's functions (`tls`, attached by the
 //! userspace sensor to each file that has them), and the self-protection
-//! (`bpf`, `task_kill`). Every event is a struct of `boxcar-sensor-common`
+//! (`bpf`, `task_kill`), and the exec denial of the policy's names
+//! (`exec_deny`). Every event is a struct of `boxcar-sensor-common`
 //! in the `EVENTS` ring buffer; every program but the guards reports only
 //! for tasks in the session's cgroup (`SESSION_CGROUP`, set by the loader).
 //!
@@ -21,6 +22,7 @@
 mod common;
 mod connect;
 mod exec;
+mod exec_deny;
 mod exit;
 mod file_open;
 mod fork;

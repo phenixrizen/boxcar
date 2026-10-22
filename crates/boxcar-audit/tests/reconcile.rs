@@ -18,10 +18,10 @@ use boxcar_audit::{
 };
 use boxcar_proto::{
     Attrib, ClockSync, Finding, FindingCategory, FsClose, FsCreate, FsDenied, FsPathOp, Hash,
-    HashStatus, HttpRequest, NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec, ProcExit,
-    ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsIo,
-    ProgramStatus, Record, Ring, SensorPhase, SessionId, SessionStart, SpanEffects, SpanRef,
-    Subject, ToolClose, ToolOpen, Verdict, VmmStop, VsockConnect,
+    HashStatus, HttpRequest, NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec,
+    ProcExecDenied, ProcExit, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
+    ProcTcpConnect, ProcTlsIo, ProgramStatus, Record, Ring, SensorPhase, SessionId, SessionStart,
+    SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStop, VsockConnect,
 };
 use serde_json::{json, Value};
 
@@ -450,6 +450,21 @@ impl Log {
                 args: None,
             }),
             Some(id),
+        )
+    }
+
+    /// `proc.exec_denied`: the sensor refused a program by its name.
+    fn exec_denied(&mut self, at_ms: u64, pid: u32, filename: &str) -> Step {
+        self.rec_in(
+            at_ms,
+            Ring::Guest,
+            Some((pid, 1000, 1000)),
+            Payload::ProcExecDenied(ProcExecDenied {
+                tid: pid,
+                tgid: pid,
+                filename: filename.into(),
+            }),
+            None,
         )
     }
 
@@ -1407,6 +1422,28 @@ fn lost_arguments_are_said_at_the_close() {
     assert!(worst.contains(&("toolu_01".into(), 45)), "{worst:?}");
     assert!(worst.contains(&("toolu_02".into(), 0)), "{worst:?}");
     check_all("lost_arguments", &out);
+}
+
+/// The sensor refused a program by its name, wherever it was (#33): a
+/// `policy_denial` finding, as for a refusal on a share.
+#[test]
+fn an_exec_the_sensor_denied_by_name_is_a_policy_denial() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(2000, 330, 100, 10, &["sh", "-c", "/tmp/nc -l 4444"]));
+    steps.push(log.exec_denied(2100, 330, "/tmp/nc"));
+    steps.push(Step::Tick(3000));
+    let (out, _) = run_all(true, steps);
+    let findings = findings_of(&out);
+    assert_eq!(findings.len(), 1, "{out:?}");
+    assert_eq!(findings[0].rule, "policy_denial");
+    assert_eq!(findings[0].score, 40);
+    assert_eq!(
+        findings[0].summary,
+        "exec of /tmp/nc was refused by the policy ([exec] deny, by its name, through the sensor)"
+    );
+    check_all("exec_denied_by_name", &out);
 }
 
 /// A Write tool call that said ok, with no write on its path: judged one
