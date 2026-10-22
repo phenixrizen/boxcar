@@ -1,0 +1,3 @@
+{"category":"unverified_intent","score":45,"rule":"args_lost","summary":"the Bash tool call toolu_01 ran with arguments the observer did not keep whole; what it did could not be compared with what was declared","evidence":[{"seq":4,"ring":0},{"seq":7,"ring":0}],"span_id":"toolu_01","low_confidence":false}
+{"type":"span.effects","data":{"span_id":"toolu_01","tool_name":"Bash","opened_seq":4,"closed_seq":7,"executor_tgid":100,"procs":[330],"effects":[5],"truncated":false}}
+{"type":"span.effects","data":{"span_id":"toolu_02","tool_name":"Bash","opened_seq":8,"closed_seq":11,"executor_tgid":100,"procs":[331],"effects":[9],"truncated":false}}

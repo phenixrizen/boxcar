@@ -1309,6 +1309,9 @@ pub enum FindingCategory {
     NetworkAnomaly,
     PrivilegeProbe,
     PolicyDenial,
+    /// A tool call ran with arguments the gate did not keep whole, so
+    /// what it did could not be compared with what was declared.
+    UnverifiedIntent,
 }
 
 /// A record a finding rests on.

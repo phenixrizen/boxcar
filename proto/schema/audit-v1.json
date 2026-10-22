@@ -219,17 +219,28 @@
     },
     "FindingCategory": {
       "description": "The kinds of finding; see the design's section 7.",
-      "type": "string",
-      "enum": [
-        "unattributed_effect",
-        "sensor_silence",
-        "intent_effect_mismatch",
-        "indicator_removal",
-        "off_book_channel",
-        "orphaned_work",
-        "network_anomaly",
-        "privilege_probe",
-        "policy_denial"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "unattributed_effect",
+            "sensor_silence",
+            "intent_effect_mismatch",
+            "indicator_removal",
+            "off_book_channel",
+            "orphaned_work",
+            "network_anomaly",
+            "privilege_probe",
+            "policy_denial"
+          ]
+        },
+        {
+          "description": "A tool call ran with arguments the gate did not keep whole, so what it did could not be compared with what was declared.",
+          "type": "string",
+          "enum": [
+            "unverified_intent"
+          ]
+        }
       ]
     },
     "FsClose": {
