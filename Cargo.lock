@@ -477,6 +477,7 @@ dependencies = [
  "boxcar-fs",
  "boxcar-net",
  "boxcar-proto",
+ "boxcar-sensor-common",
  "boxcar-virtio",
  "boxcar-vsock",
  "event-manager",
