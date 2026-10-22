@@ -8,7 +8,8 @@
 //! What it proves:
 //!
 //! - the sensor connects, attaches every program (`proc.sensor_status` says
-//!   `attached`, `btf_ok`, nine programs), heartbeats, and `status.sensor`
+//!   `attached`, `btf_ok`, one entry per program of the sensor's table),
+//!   heartbeats, and `status.sensor`
 //!   says so while the VM runs; init waited for it, so the session's own
 //!   exec is the first thing ring 1 reports about the session;
 //! - the host's ping right after the config is answered, and the log holds
@@ -53,6 +54,7 @@ use boxcar_audit::{verify_session, LogReader, WriterConfig};
 use boxcar_fs::{CachePolicyKind, FsShareConfig};
 use boxcar_proto::control::SensorState;
 use boxcar_proto::{Record, Ring, SessionId, Source};
+use boxcar_sensor_common::programs::PROGRAMS;
 use boxcar_vmm::guest_ctl::SessionConfig;
 use boxcar_vmm::kvm::kvm_available;
 use boxcar_vmm::lifecycle::VmmHandle;
@@ -315,11 +317,16 @@ fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
     assert!(status.ts_guest_ns.is_some());
     assert_eq!(status.data["phase"], "attached", "{status:?}");
     assert_eq!(status.data["btf_ok"], true, "{status:?}");
-    assert_eq!(
-        status.data["programs"].as_array().unwrap().len(),
-        15,
-        "{status:?}"
-    );
+    // One entry per program of the sensor's table, in its order, each
+    // attached: the table is the one place that says how many there are.
+    let programs = status.data["programs"].as_array().unwrap();
+    let names: Vec<&str> = programs
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    let table: Vec<&str> = PROGRAMS.iter().map(|p| p.name).collect();
+    assert_eq!(names, table, "{status:?}");
+    assert!(programs.iter().all(|p| p["attached"] == true), "{status:?}");
     assert!(status.data["pid"].as_u64().unwrap() > 1, "{status:?}");
     assert!(status.data.get("reason").is_none(), "{status:?}");
 
