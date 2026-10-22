@@ -245,6 +245,7 @@ Made by Task 7 (`docs/plans/vmm-hardening.md`), 2026-10-20:
 
 - Follow-up #34 (2026-10-21, `docs/plans/per-thread-seccomp.md`): on top of the process list, each worker thread confines itself to its role's list at its start; the vCPU and main threads keep the process list, as a filter is inherited by the threads a thread starts.
 - Follow-up #33 (2026-10-21, `docs/plans/exec-deny-ring1.md`): `[exec] deny` is also enforced by the sensor, by name, wherever a program is: the VMM sends the globs' last components over the sensor stream, a sleepable LSM program on `bprm_check_security` refuses them, and `proc.exec_denied` records it. Ring 0's denial by path on the shares stays.
+- Follow-up #5 (2026-10-21, `docs/plans/ownership-override.md`): the ownership override, `--ownership override`: an xattr of boxcar's own on each host file holds the owner, special bits and device kind the guest sets, shown in every attribute reply and hidden as an xattr; off by default. #32 unpacks an image's ownership as it.
 
 Made by Task 6 (`docs/plans/exporters.md`), 2026-10-20:
 

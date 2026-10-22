@@ -614,6 +614,72 @@ fn the_package_can_be_dumped_for_inspection() {
     }
 }
 
+/// With `--ownership override` the share shows what the override says: a
+/// host file given one shows its owner and stands for the device node it
+/// names, which the guest reads; what carries none is the session's own,
+/// so a root session writes the share. The session has no capability
+/// whatever its uid, so `chown` and `mknod` are refused by the guest
+/// kernel in either mode, and the host file stays the host user's (#5).
+#[test]
+fn the_ownership_override_is_what_the_guest_sees_on_a_share() {
+    let Some(guest) = guest_or_skip("the_ownership_override_is_what_the_guest_sees_on_a_share")
+    else {
+        return;
+    };
+    let script = "echo x > /workspace/f && stat -c 'f %u:%g' /workspace/f; \
+                  stat -c 'null %u:%g %F' /workspace/null; \
+                  cat /workspace/null && echo read-null; \
+                  chown 0:7 /workspace/f 2>/dev/null && echo chowned || echo refused-chown; \
+                  mknod /workspace/n c 1 3 2>/dev/null && echo made || echo refused-mknod; \
+                  echo done";
+    // SAFETY: getuid and getgid take no arguments.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let host_f = format!("f {uid}:{gid}");
+    let host_null = format!("null {uid}:{gid} regular empty file");
+    let refused = ["read-null", "refused-chown", "refused-mknod", "done"];
+    for (flags, want) in [
+        (
+            &["--user", "0", "--ownership", "override"][..],
+            vec!["f 0:0", "null 7:7 character special file"],
+        ),
+        (&[][..], vec![host_f.as_str(), host_null.as_str()]),
+    ] {
+        let scratch = Scratch::new();
+        let workspace = scratch.path("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("null"), b"").unwrap();
+        set_override(&workspace.join("null"), "uid=7 gid=7 dev=c:1:3");
+        let run = boxcar_run(&guest, &scratch, flags, &["sh", "-c", script]);
+        assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+        for line in want.iter().chain(refused.iter()) {
+            assert!(
+                run.stdout.lines().any(|l| l.trim() == *line),
+                "{flags:?}: {line}: {}",
+                run.describe()
+            );
+        }
+        let meta = fs::metadata(workspace.join("f")).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), uid);
+    }
+}
+
+/// Writes the ownership override `text` on the host file at `path`.
+fn set_override(path: &Path, text: &str) {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = c"user.boxcar.stat";
+    // SAFETY: setxattr reads the two C strings and `text.len()` bytes.
+    let rc = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            text.as_ptr().cast(),
+            text.len(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0, "setxattr: {}", std::io::Error::last_os_error());
+}
+
 /// A policy file is recorded as `policy.loaded` right after `vmm.start`,
 /// with its path and the SHA-256 of its text, and its DNS rate holds in
 /// the guest: lookups past a burst of two are answered REFUSED, each

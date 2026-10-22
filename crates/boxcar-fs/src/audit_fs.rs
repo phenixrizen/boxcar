@@ -71,13 +71,16 @@
 //! cannot record does not happen. Reads, lookups and releases are still
 //! served. A log closed cleanly, as the VM stops, refuses nothing.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use crate::ownership::{DevKind, Override, XATTR as OWNERSHIP_XATTR};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -133,6 +136,11 @@ pub struct AuditFsOptions {
     pub level: AuditLevel,
     /// Files larger than this are closed without a hash (`skipped_size`).
     pub hash_max_bytes: u64,
+    /// Present and take the ownership override (`--ownership override`).
+    pub ownership: bool,
+    /// With `ownership`, the owner shown for what carries no override: the
+    /// session's own identity.
+    pub owner: (u32, u32),
 }
 
 impl Default for AuditFsOptions {
@@ -141,6 +149,8 @@ impl Default for AuditFsOptions {
         AuditFsOptions {
             level: AuditLevel::Normal,
             hash_max_bytes: 64 * 1024 * 1024,
+            ownership: false,
+            owner: invoking_user(),
         }
     }
 }
@@ -161,6 +171,16 @@ pub struct AuditFs<F: FileSystem<Inode = u64, Handle = u64>> {
     rules: LiveRules,
     /// What the boot scan found denied, by host identity.
     denied_ids: Arc<DeniedIds>,
+    /// Whether the ownership override is presented and taken
+    /// (`--ownership override`): the owner, the special bits and the
+    /// device kind the guest is to see, kept in an xattr of boxcar's own
+    /// on the host file (`crate::ownership`).
+    ownership: bool,
+    /// The owner shown for what carries no override, with `ownership`.
+    owner: (u32, u32),
+    /// The override each inode carries, read once and kept until the inode
+    /// is forgotten or the override changed; `None` for an inode without.
+    overrides: Mutex<HashMap<u64, Option<Override>>>,
 }
 
 /// A request the path rules refuse: its errno, and the glob that refused it
@@ -260,6 +280,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
             generations: Arc::default(),
             rules: Arc::new(ArcSwap::from_pointee(PathRules::allow_all())),
             denied_ids: Arc::default(),
+            ownership: opts.ownership,
+            owner: opts.owner,
+            overrides: Mutex::new(HashMap::new()),
         }
     }
 
@@ -861,7 +884,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                 }
             }
         }
-        result
+        self.present_entry(ctx, result)
     }
 
     fn getattr(
@@ -871,7 +894,9 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         handle: Option<u64>,
     ) -> io::Result<(stat64, Duration)> {
         self.gate(ctx, "getattr", inode)?;
-        self.inner.getattr(&squash(ctx), inode, handle)
+        let (mut st, ttl) = self.inner.getattr(&squash(ctx), inode, handle)?;
+        self.present(ctx, inode, &mut st);
+        Ok((st, ttl))
     }
 
     fn readlink(&self, ctx: &Context, inode: u64) -> io::Result<Vec<u8>> {
@@ -892,12 +917,31 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         size: u32,
     ) -> io::Result<GetxattrReply> {
         self.gate(ctx, "getxattr", inode)?;
+        if is_ownership_xattr(name) {
+            // Boxcar's own: the guest sees it as the attributes, never as
+            // an xattr.
+            return Err(io::Error::from_raw_os_error(libc::ENODATA));
+        }
         self.inner.getxattr(&squash(ctx), inode, name, size)
     }
 
     fn listxattr(&self, ctx: &Context, inode: u64, size: u32) -> io::Result<ListxattrReply> {
         self.gate(ctx, "listxattr", inode)?;
-        self.inner.listxattr(&squash(ctx), inode, size)
+        // A count (size 0) asks for the names instead, so that the count
+        // is right without boxcar's own: the kernel lists at most
+        // XATTR_LIST_MAX bytes, so that many never fall short.
+        let asked = if size == 0 { XATTR_LIST_MAX } else { size };
+        match self.inner.listxattr(&squash(ctx), inode, asked)? {
+            ListxattrReply::Names(names) => {
+                let names = without_ownership(&names);
+                if size == 0 {
+                    Ok(ListxattrReply::Count(names.len() as u32))
+                } else {
+                    Ok(ListxattrReply::Names(names))
+                }
+            }
+            count => Ok(count),
+        }
     }
 
     fn opendir(
@@ -916,13 +960,16 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
     fn forget(&self, ctx: &Context, inode: u64, count: u64) {
         self.inner.forget(&squash(ctx), inode, count);
         self.write_paths().forget(inode, count);
+        self.overrides().remove(&inode);
     }
 
     fn batch_forget(&self, ctx: &Context, requests: Vec<(u64, u64)>) {
         {
             let mut paths = self.write_paths();
+            let mut overrides = self.overrides();
             for &(inode, count) in &requests {
                 paths.forget(inode, count);
+                overrides.remove(&inode);
             }
         }
         self.inner.batch_forget(&squash(ctx), requests);
@@ -941,7 +988,41 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
             return Err(self.refuse(ctx, "setattr", path, refusal));
         }
-        let result = self.inner.setattr(&squash(ctx), inode, attr, handle, valid);
+        let mut valid = valid;
+        let owner_taken = self.ownership && valid.intersects(SetattrValid::UID | SetattrValid::GID);
+        if owner_taken {
+            // The owner the guest sets goes into the override; the host
+            // file stays the invoking user's.
+            let mut over = self.override_of(ctx, inode).unwrap_or_default();
+            if valid.contains(SetattrValid::UID) {
+                over.uid = Some(attr.st_uid);
+            }
+            if valid.contains(SetattrValid::GID) {
+                over.gid = Some(attr.st_gid);
+            }
+            if let Err(error) = self.write_override(ctx, inode, &over) {
+                let payload = Payload::FsSetattr(FsSetattr {
+                    mount: self.events.mount(),
+                    path: path.path,
+                    path_b64: path.path_b64,
+                    set: set_attrs(&attr, valid, None),
+                    result: op_result::<()>(&Err(io::Error::from_raw_os_error(errno(&error)))),
+                });
+                self.events.record(Some(subject(ctx)), payload);
+                return Err(error);
+            }
+            valid.remove(SetattrValid::UID | SetattrValid::GID);
+        }
+        let result = if owner_taken && valid.is_empty() {
+            // Nothing left for the host: the attributes as they now are.
+            self.inner.getattr(&squash(ctx), inode, handle)
+        } else {
+            self.inner.setattr(&squash(ctx), inode, attr, handle, valid)
+        };
+        let result = result.map(|(mut st, ttl)| {
+            self.present(ctx, inode, &mut st);
+            (st, ttl)
+        });
         if result.is_ok() && valid.contains(SetattrValid::SIZE) {
             self.content_changed(inode);
             if let Some(fh) = handle {
@@ -976,6 +1057,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Ok(entry) = &result {
             self.remember(parent, name.to_bytes(), entry);
         }
+        let result = self.present_entry(ctx, result);
         let payload = Payload::FsSymlink(FsSymlink {
             mount: self.events.mount(),
             path: path.path,
@@ -1001,12 +1083,44 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Err(refusal) = self.check_name(&self.rules.load(), inode, name.to_bytes(), true) {
             return Err(self.refuse(ctx, "mknod", path, refusal));
         }
-        let result = self
-            .inner
-            .mknod(&squash(ctx), inode, name, mode, rdev, umask);
+        let kind = match mode & libc::S_IFMT {
+            libc::S_IFCHR => Some(DevKind::Char),
+            libc::S_IFBLK => Some(DevKind::Block),
+            _ => None,
+        };
+        let result = match kind {
+            // A device node the host cannot make: an empty regular file
+            // stands for it, the override saying what it is.
+            Some(kind) if self.ownership => {
+                let plain = (mode & !libc::S_IFMT) | libc::S_IFREG;
+                let made = self.inner.mknod(&squash(ctx), inode, name, plain, 0, umask);
+                match made {
+                    Ok(entry) => {
+                        let over = Override {
+                            dev: Some((kind, u64::from(rdev))),
+                            ..Override::default()
+                        };
+                        match self.write_override(ctx, entry.inode, &over) {
+                            Ok(()) => Ok(entry),
+                            Err(error) => {
+                                // Not a device after all: the stand-in goes.
+                                let _ = self.inner.unlink(&squash(ctx), inode, name);
+                                self.inner.forget(&squash(ctx), entry.inode, 1);
+                                Err(error)
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => self
+                .inner
+                .mknod(&squash(ctx), inode, name, mode, rdev, umask),
+        };
         if let Ok(entry) = &result {
             self.remember(inode, name.to_bytes(), entry);
         }
+        let result = self.present_entry(ctx, result);
         let payload = Payload::FsMknod(FsMknod {
             mount: self.events.mount(),
             path: path.path,
@@ -1036,6 +1150,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Ok(entry) = &result {
             self.remember(parent, name.to_bytes(), entry);
         }
+        let result = self.present_entry(ctx, result);
         let payload = Payload::FsMkdir(FsMkdir {
             mount: self.events.mount(),
             path: path.path,
@@ -1175,6 +1290,7 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Ok(entry) = &result {
             self.remember(newparent, newname.to_bytes(), entry);
         }
+        let result = self.present_entry(ctx, result);
         let payload = Payload::FsLink(FsLink {
             mount: self.events.mount(),
             path: path.path,
@@ -1264,7 +1380,12 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Err(refusal) = checked {
             return Err(self.refuse(ctx, "create", path, refusal));
         }
-        let result = self.inner.create(&squash(ctx), parent, name, args);
+        let result = self.inner.create(&squash(ctx), parent, name, args).map(
+            |(mut entry, handle, opts, flags)| {
+                self.present(ctx, entry.inode, &mut entry.attr);
+                (entry, handle, opts, flags)
+            },
+        );
         if let Ok((entry, handle, _, _)) = &result {
             // Creating an existing file opens it: under another name it may
             // be one the scan found denied.
@@ -1509,7 +1630,11 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
             return Err(self.refuse(ctx, "setxattr", path, refusal));
         }
-        let result = self.inner.setxattr(&squash(ctx), inode, name, value, flags);
+        let result = if is_ownership_xattr(name) {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        } else {
+            self.inner.setxattr(&squash(ctx), inode, name, value, flags)
+        };
         let payload = Payload::FsXattr(FsXattr {
             mount: self.events.mount(),
             path: path.path,
@@ -1528,7 +1653,11 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
         if let Err(refusal) = self.check_inode(&self.rules.load(), inode, true, false) {
             return Err(self.refuse(ctx, "removexattr", path, refusal));
         }
-        let result = self.inner.removexattr(&squash(ctx), inode, name);
+        let result = if is_ownership_xattr(name) {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        } else {
+            self.inner.removexattr(&squash(ctx), inode, name)
+        };
         let payload = Payload::FsXattr(FsXattr {
             mount: self.events.mount(),
             path: path.path,
@@ -1595,6 +1724,10 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
                     }
                     return Ok(added);
                 }
+                let mut entry = entry;
+                if !dot {
+                    self.present(ctx, entry.inode, &mut entry.attr);
+                }
                 let added = add_entry(dirent, entry)?;
                 // 0: the reply is full and the entry was not added.
                 if added > 0 && !dot {
@@ -1633,6 +1766,69 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> FileSystem for AuditFs<F> {
 }
 
 impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
+    fn overrides(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Option<Override>>> {
+        self.overrides
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The override `inode` carries, from the cache or the host file's
+    /// xattr; `None` without one, or with the override off.
+    fn override_of(&self, ctx: &Context, inode: u64) -> Option<Override> {
+        if !self.ownership {
+            return None;
+        }
+        if let Some(cached) = self.overrides().get(&inode) {
+            return *cached;
+        }
+        let name = CString::new(OWNERSHIP_XATTR).expect("a plain name");
+        let read = self
+            .inner
+            .getxattr(&squash(ctx), inode, &name, 4096)
+            .ok()
+            .and_then(|reply| match reply {
+                GetxattrReply::Value(value) => Override::parse(&value),
+                GetxattrReply::Count(_) => None,
+            })
+            .filter(|over| !over.is_empty());
+        self.overrides().insert(inode, read);
+        read
+    }
+
+    /// Writes `over` as `inode`'s xattr and remembers it.
+    fn write_override(&self, ctx: &Context, inode: u64, over: &Override) -> io::Result<()> {
+        let name = CString::new(OWNERSHIP_XATTR).expect("a plain name");
+        self.inner
+            .setxattr(&squash(ctx), inode, &name, &over.encode(), 0)?;
+        self.overrides().insert(inode, Some(*over));
+        Ok(())
+    }
+
+    /// `st` as the guest is to see it: the override where there is one,
+    /// else the session's own identity (with the override on).
+    fn present(&self, ctx: &Context, inode: u64, st: &mut stat64) {
+        if !self.ownership {
+            return;
+        }
+        match self.override_of(ctx, inode) {
+            Some(over) => over.apply(st),
+            None => {
+                st.st_uid = self.owner.0;
+                st.st_gid = self.owner.1;
+            }
+        }
+    }
+
+    /// An entry's attributes as the guest is to see them.
+    fn present_entry(&self, ctx: &Context, result: io::Result<Entry>) -> io::Result<Entry> {
+        result.map(|mut entry| {
+            if entry.inode != 0 {
+                self.present(ctx, entry.inode, &mut entry.attr);
+            }
+            entry
+        })
+    }
+
     /// `fs.readdir`, at the verbose level.
     fn listed(&self, ctx: &Context, inode: u64, result: &io::Result<()>) {
         let path = self.path(inode);
@@ -1644,6 +1840,33 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
         });
         self.events.sample(Some(subject(ctx)), payload);
     }
+}
+
+/// The most bytes the kernel lists for an inode's xattr names.
+const XATTR_LIST_MAX: u32 = 65536;
+
+/// The invoking user's real uid and gid: the default owner shown.
+fn invoking_user() -> (u32, u32) {
+    // SAFETY: getuid and getgid take no arguments, touch no memory and
+    // cannot fail.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+/// Whether `name` is the ownership override's xattr, boxcar's own.
+fn is_ownership_xattr(name: &CStr) -> bool {
+    name.to_bytes() == OWNERSHIP_XATTR.as_bytes()
+}
+
+/// `names` (NUL-separated) without the ownership override's.
+fn without_ownership(names: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names.split(|&b| b == 0) {
+        if !name.is_empty() && name != OWNERSHIP_XATTR.as_bytes() {
+            out.extend_from_slice(name);
+            out.push(0);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -576,6 +576,21 @@ pub struct RunArgs {
     /// directory listing).
     #[arg(long, value_enum, value_name = "LEVEL", default_value_t = AuditLevelArg::Normal)]
     pub audit_level: AuditLevelArg,
+    /// What the guest sees of the shares' ownership: `host` (every file
+    /// the host user's, `chown` and `mknod` refused) or `override` (the
+    /// owner, the special bits and the device nodes the guest sets, or an
+    /// image carries, kept in an xattr of boxcar's own on each host file
+    /// and shown in its place; the host file stays the host user's).
+    #[arg(long, value_enum, value_name = "MODE", default_value_t = OwnershipArg::Host)]
+    pub ownership: OwnershipArg,
+    /// Run the session as `UID[:GID]` in the guest (GID defaults to UID)
+    /// instead of the invoking user: what the session may read and write
+    /// of the shares, the guest kernel checks against this identity and
+    /// the owners the shares show, and with `--ownership override` a file
+    /// with no override is shown as this identity's. The host side acts as
+    /// the invoking user either way.
+    #[arg(long, value_name = "UID[:GID]", value_parser = parse_user)]
+    pub user: Option<(u32, u32)>,
     /// An extra kernel command line argument. Repeatable. These follow the
     /// `boxcar.mode` key boxcar sets (and, with `--no-vsock`, `boxcar.uid`
     /// and `boxcar.gid`), so they can override them; with `--no-vsock`,
@@ -818,6 +833,28 @@ pub fn parse_upstream(text: &str) -> Result<SocketAddr, String> {
 
 /// `--env NAME=VALUE`: the name before the first `=`, which must be
 /// there, and everything after it (possibly nothing).
+/// `UID[:GID]`, each a number the kernel takes (not 4294967295).
+pub fn parse_user(text: &str) -> Result<(u32, u32), String> {
+    let (uid, gid) = match text.split_once(':') {
+        Some((uid, gid)) => (uid, Some(gid)),
+        None => (text, None),
+    };
+    let id = |what: &str, field: &str| -> Result<u32, String> {
+        match field.parse::<u32>() {
+            Ok(id) if id != u32::MAX => Ok(id),
+            _ => Err(format!(
+                "{text:?}: the {what} is not a number below 4294967295"
+            )),
+        }
+    };
+    let uid = id("uid", uid)?;
+    let gid = match gid {
+        Some(gid) => id("gid", gid)?,
+        None => uid,
+    };
+    Ok((uid, gid))
+}
+
 pub fn parse_env(text: &str) -> Result<(String, String), String> {
     let Some((name, value)) = text.split_once('=') else {
         return Err(format!("{text:?} is not NAME=VALUE"));
@@ -838,6 +875,16 @@ pub fn parse_env(text: &str) -> Result<(String, String), String> {
 pub enum AuditLevelArg {
     Normal,
     Verbose,
+}
+
+/// `--ownership`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OwnershipArg {
+    /// Files belong to the host user, as the host has them.
+    Host,
+    /// The guest sees and sets owners, special bits and device nodes
+    /// through boxcar's override on each file (`user.boxcar.stat`).
+    Override,
 }
 
 /// `--seccomp`.

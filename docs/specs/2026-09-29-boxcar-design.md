@@ -223,6 +223,18 @@ milestone 2.
 
 ## 14. Amendments
 
+### 2026-10-21: the ownership override (#5)
+
+Section 9 left `chown`, device nodes and `security.*` xattrs at `EPERM`
+until an ownership override xattr landed. It has: with `boxcar run
+--ownership override`, AuditFs keeps the owner, the special mode bits
+and the device kind the guest sets in `user.boxcar.stat` on the host
+file, presents them in every attribute reply, and hides the xattr; the
+host file stays the host user's, and `security.*` xattrs stay the
+host's. A device node is an empty regular file on the host that the
+override names. Off by default. An image's ownership and device nodes,
+unpacked as the override, are #32's.
+
 ### 2026-10-21: clock pairing through `ptp_kvm` where the guest has it (#6)
 
 The guest kernel carries `ptp_kvm`, and on a bare-metal KVM host the
