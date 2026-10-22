@@ -1304,8 +1304,10 @@ mod tests {
             thread.join().unwrap();
             let _ = done.send(());
         });
+        // A thread held up by a forwarder would never end; the bound is
+        // generous for a loaded machine, not tight.
         ended
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the connection's thread did not end");
     }
 

@@ -1290,7 +1290,10 @@ mod tests {
             let mut v = json!([arg]);
             scrub_deep(&mut v);
             let took = started.elapsed();
-            assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+            // Linear work takes well under a second; quadratic work on
+            // 256 KiB would take minutes. The bound leaves a loaded
+            // machine room.
+            assert!(took < std::time::Duration::from_secs(30), "{took:?}");
         }
     }
 

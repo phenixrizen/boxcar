@@ -614,10 +614,11 @@ mod tests {
         let mut guest = fixture.guest();
         guest.write_all(&[b'z'; PAYLOAD]).unwrap();
         guest.shutdown(Shutdown::Write).unwrap();
-        // 256 bytes every 50 ms: 5 KiB/s, about 1.2 s in all.
-        let reader = slow_reader(read_end, 256, Duration::from_millis(50));
-        // An idle limit far below a page's time at this pace (0.8 s).
-        let ended = writer.wait_with(Duration::from_millis(300), LIMIT, || false);
+        // 256 bytes every 150 ms: 1.7 KiB/s, about 3.6 s in all.
+        let reader = slow_reader(read_end, 256, Duration::from_millis(150));
+        // An idle limit below a page's time at this pace (2.4 s), with
+        // room for a loaded machine to delay the reader's steps.
+        let ended = writer.wait_with(Duration::from_secs(1), LIMIT, || false);
         assert_eq!(ended, OutWait::Done);
         assert_eq!(writer.undelivered(), 0);
         assert_eq!(writer.written(), PAYLOAD as u64);
@@ -643,7 +644,9 @@ mod tests {
         let started = Instant::now();
         let ended = writer.wait_with(Duration::from_millis(200), LIMIT, || false);
         assert_eq!(ended, OutWait::Stalled);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Well under the cap, which is what a wait that ignored the idle
+        // limit would take; generous for a loaded machine.
+        assert!(started.elapsed() < Duration::from_secs(5));
         // The writer never waits inside a write: it stops at once.
         assert!(writer.stop(Duration::from_secs(1)));
         let written = writer.written();

@@ -237,8 +237,13 @@ fn a_subscriber_that_lags_over_and_over_still_sees_every_record_once() {
         }
         if items.len() % 4 == 0 {
             // Slower than the writer, so that the queue overflows again and
-            // again.
-            thread::sleep(Duration::from_millis(1));
+            // again: much slower at first, so that it does whatever the
+            // machine's load makes of the two threads' pace.
+            thread::sleep(Duration::from_millis(if items.len() <= 40 {
+                20
+            } else {
+                1
+            }));
         }
     }
     producer.join().unwrap();
