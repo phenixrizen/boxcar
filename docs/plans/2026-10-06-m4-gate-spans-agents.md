@@ -238,6 +238,7 @@ Made while writing the plan, 2026-10-06:
 Follow-ups after the plan, 2026-10-21:
 
 - #12: a tool call whose arguments the observer did not keep whole stays without them (a part of the arguments is not the arguments, and cannot be scrubbed reliably), and the reconciler says so at the close: `unverified_intent` / `args_lost`, score 45, from ring 0 alone. The `argv` rule has nothing to compare and stays silent for it.
+- #11: ring 1 TLS corroboration stays with runtimes that export OpenSSL's functions; the native Claude Code build (Bun, BoringSSL, stripped), Codex (rustls) and Go's `crypto/tls` are out of scope by decision, with the reasons in `docs/architecture.md` and the design's amendment of that date. The flow's opener binds the executor for every runtime; a TLS write only ever named a provisional one.
 
 ### Task 2
 

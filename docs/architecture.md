@@ -407,7 +407,21 @@ in is [boot.md](boot.md)'s.
   1026, says what it attached, and streams `proc.*` frames with a
   heartbeat every second. It is one event loop on `poll(2)`, with one
   helper thread, `tls-resolve`, that reads programs' files for the
-  symbols the TLS probes attach to.
+  symbols the TLS probes attach to: OpenSSL's `SSL_write` and `SSL_read`,
+  as a program or a `libssl.so*` it maps exports them (Node, Python,
+  curl, `ssl_client`). A runtime that exports none gives the probes
+  nothing, which `proc.tls_attach{ok:false}` says per file: Claude Code's
+  native build (Bun, BoringSSL compiled in, stripped), Codex (rustls) and
+  Go's `crypto/tls`. Their model requests lose nothing that binds a
+  span, since a span's executor is the process that opened the request's
+  flow, which the sensor's `proc.tcp_connect` names for every runtime;
+  what they lose is the provisional executor a TLS write would have
+  named earlier, and the sizes and times of their TLS reads and writes.
+  That is where it stays (#11, decided 2026-10-21): offsets per known
+  build of a stripped binary would be a table of guesses to keep up with
+  every release, Go's register ABI and growable stacks make a uprobe's
+  arguments and a return probe unreliable, and rustls exports no stable
+  function; none of it would name an executor the flow's opener does not.
 - **The internal ports** (1024 `boxcar.ctl`, 1025 `boxcar.pty`, 1026
   `boxcar.sensor`) take a connection only from a guest port below 1024,
   which only a process with `CAP_NET_BIND_SERVICE` can bind (init and the
