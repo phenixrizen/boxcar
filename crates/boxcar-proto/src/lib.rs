@@ -33,16 +33,16 @@ pub mod sensor;
 pub use audit::genesis_prev;
 pub use audit::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, ExecRing1,
-    Finding, FindingCategory, FsClose, FsCreate, FsDenied, FsFallocate, FsIo, FsLink, FsMkdir,
-    FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr, Hardening, Hash,
-    HashStatus, HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest, LlmResponse,
-    NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp, OpResult,
-    ParseHashError, Payload, PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt,
-    ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny,
-    ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, Record,
-    Ring, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, Source,
-    SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose,
-    VsockConnect, SCHEMA_VERSION,
+    Finding, FindingCategory, FsClose, FsCopyUp, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
+    FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
+    Hardening, Hash, HashStatus, HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest,
+    LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp,
+    OpResult, ParseHashError, Payload, PolicyChanged, PolicyException, PolicyLoaded,
+    ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
+    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo,
+    ProgramStatus, Record, Ring, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr,
+    ShareRef, Source, SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStart,
+    VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

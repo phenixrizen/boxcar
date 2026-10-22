@@ -288,6 +288,7 @@ mod tests {
             host_dir: "/".into(),
             guest_path: "/".into(),
             cache: CachePolicyKind::Auto,
+            lower: None,
         }
     }
 

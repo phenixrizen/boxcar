@@ -65,6 +65,9 @@ use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 
 use crate::audit_fs::{AuditFs, AuditFsOptions};
+use crate::events::Events as AuditEvents;
+use crate::inner::Inner;
+use crate::overlay::OverlayFs;
 use crate::rules::{LiveRules, PathRules};
 use crate::scan::DeniedIds;
 use crate::share::{passthrough_config, FsShareConfig};
@@ -85,7 +88,7 @@ pub const CONFIG_SIZE: usize = TAG_LEN + 4;
 /// device keeps a handle on it to flush and shut it down: the server does
 /// not give its filesystem back. fuse-backend-rs implements `FileSystem`
 /// for `Arc<FS>` by forwarding every method.
-pub type FsServer = Server<Arc<AuditFs<PassthroughFs<()>>>>;
+pub type FsServer = Server<Arc<AuditFs<Inner>>>;
 
 /// Why a share cannot be served.
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +127,7 @@ pub struct VirtioFs {
     /// [`MAX_REQUEST_QUEUES`].
     request_queues: u16,
     config: [u8; CONFIG_SIZE],
-    fs: Arc<AuditFs<PassthroughFs<()>>>,
+    fs: Arc<AuditFs<Inner>>,
     server: Arc<FsServer>,
     metrics: Arc<OpcodeCounts>,
     /// The running workers; `None` when the device is not activated.
@@ -170,13 +173,69 @@ impl VirtioFs {
             path: share.host_dir.clone(),
             source,
         })?;
-        let inner = PassthroughFs::<()>::new(passthrough_config(&share)).map_err(|source| {
-            FsError::Passthrough {
-                path: share.host_dir.clone(),
-                source,
+        let passthrough = |dir: &Path| {
+            let config = FsShareConfig {
+                host_dir: dir.to_path_buf(),
+                lower: None,
+                ..share.clone()
+            };
+            PassthroughFs::<()>::new(passthrough_config(&config)).map_err(|source| {
+                FsError::Passthrough {
+                    path: dir.to_path_buf(),
+                    source,
+                }
+            })
+        };
+        // An image session's root: the session's directory over the cached
+        // tree, each copy-up recorded; the audit hashes a closed file
+        // beneath whichever holds it.
+        let (inner, lower_root) = match &share.lower {
+            None => (
+                Inner::Passthrough(Box::new(passthrough(&share.host_dir)?)),
+                None,
+            ),
+            Some(lower) => {
+                if lower.dir.to_str().is_none() {
+                    return Err(FsError::NonUtf8Dir(lower.dir.clone()));
+                }
+                let open = |path: &Path| {
+                    open_dir(path).map_err(|source| FsError::OpenDir {
+                        path: path.to_path_buf(),
+                        source,
+                    })
+                };
+                let lower_fs = passthrough(&lower.dir)?;
+                let upper_fs = passthrough(&share.host_dir)?;
+                let events = AuditEvents::new(sink.clone(), share.tag.clone());
+                let mount = share.tag.clone();
+                let hook: crate::overlay::CopyUpHook = Box::new(move |path: &[u8], bytes: u64| {
+                    let text = boxcar_fs_path_text(path);
+                    events.record(
+                        None,
+                        boxcar_proto::Payload::FsCopyUp(boxcar_proto::FsCopyUp {
+                            mount: mount.clone(),
+                            path: text.path,
+                            path_b64: text.path_b64,
+                            bytes,
+                        }),
+                    );
+                });
+                let overlay = OverlayFs::new(
+                    lower_fs,
+                    open(&lower.dir)?,
+                    upper_fs,
+                    open(&share.host_dir)?,
+                    &lower.modes,
+                )
+                .with_copy_up_hook(hook);
+                (Inner::Overlay(Box::new(overlay)), Some(open(&lower.dir)?))
             }
-        })?;
-        let fs = Arc::new(AuditFs::new(inner, &share, root, sink, opts).with_rules(rules, denied));
+        };
+        let mut fs = AuditFs::new(inner, &share, root, sink, opts).with_rules(rules, denied);
+        if let Some(lower_root) = lower_root {
+            fs = fs.with_lower_root(lower_root);
+        }
+        let fs = Arc::new(fs);
         let server = Arc::new(Server::new(Arc::clone(&fs)));
         Ok(VirtioFs {
             metrics: Arc::new(OpcodeCounts::new(&share.tag)),
@@ -373,6 +432,15 @@ fn config_space(tag: &str, request_queues: u16) -> Result<[u8; CONFIG_SIZE], FsE
 }
 
 /// Opens `path` as a directory handle for `openat2`, without reading it.
+/// A path from a share's root (no leading `/`) as a record says it: the
+/// guest path, and its bytes where they are not UTF-8.
+fn boxcar_fs_path_text(path: &[u8]) -> crate::path_map::PathText {
+    let mut full = Vec::with_capacity(path.len() + 1);
+    full.push(b'/');
+    full.extend_from_slice(path);
+    crate::path_map::PathText::from_bytes(&full)
+}
+
 fn open_dir(path: &Path) -> io::Result<OwnedFd> {
     let dir = OpenOptions::new()
         .read(true)

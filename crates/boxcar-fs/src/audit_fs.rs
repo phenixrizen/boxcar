@@ -250,6 +250,13 @@ impl<F: FileSystem<Inode = u64, Handle = u64>> AuditFs<F> {
         Self::with_hash(inner, share, host_root_fd, sink, opts, hash_file)
     }
 
+    /// Looks for a closed file beneath `lower` too, when the share's own
+    /// directory has none: an image session's lower layer.
+    pub fn with_lower_root(self, lower: OwnedFd) -> Self {
+        self.hasher.add_root(lower);
+        self
+    }
+
     /// [`new`](Self::new), hashing closed files with `hash`.
     pub(crate) fn with_hash(
         inner: F,
@@ -1889,7 +1896,7 @@ mod tests {
 
     /// Waits until the gate opens, then hashes as in production.
     fn hash_after_the_gate(
-        root: &OwnedFd,
+        root: &[OwnedFd],
         rel_path: &CString,
         expected: Option<FileId>,
         max: u64,
@@ -1930,6 +1937,7 @@ mod tests {
             host_dir: root.clone(),
             guest_path: "/workspace".into(),
             cache: CachePolicyKind::Auto,
+            lower: None,
         };
         let inner = PassthroughFs::<()>::new(passthrough_config(&share)).unwrap();
         inner.import().unwrap();
@@ -2006,7 +2014,7 @@ mod tests {
 
     /// A hash function that panics, as a bug in one would.
     fn panicking_hash(
-        _: &OwnedFd,
+        _: &[OwnedFd],
         _: &CString,
         _: Option<FileId>,
         _: u64,
@@ -2029,6 +2037,7 @@ mod tests {
             host_dir: root.clone(),
             guest_path: "/workspace".into(),
             cache: CachePolicyKind::Auto,
+            lower: None,
         };
         let inner = PassthroughFs::<()>::new(passthrough_config(&share)).unwrap();
         inner.import().unwrap();

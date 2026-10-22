@@ -23,7 +23,6 @@ use boxcar_vmm::kvm::{
 };
 
 use super::nofile::{self, Limit};
-use crate::oci::session;
 use crate::oci::store::Store;
 
 const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
@@ -128,10 +127,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         let dir = nearest_existing(cache);
         cache_space_check(dir, free_space(dir))
     });
-    checks.push(cache_check(
-        cache,
-        super::run::default_audit_dir(env::var_os("XDG_DATA_HOME"), env::var_os("HOME")),
-    ));
+    checks.push(cache_check(cache));
     checks.extend(space);
 
     let mut out = io::stdout().lock();
@@ -317,9 +313,8 @@ fn pahole_check() -> Check {
 }
 
 /// The image cache: missing until a pull makes it; otherwise how much it
-/// holds, and whether a session's copy of an image into the audit
-/// directory reflinks or costs a copy.
-fn cache_check(cache: Option<PathBuf>, audit: Option<PathBuf>) -> Check {
+/// holds.
+fn cache_check(cache: Option<PathBuf>) -> Check {
     let Some(cache) = cache else {
         return Check::missing(
             "image cache",
@@ -334,16 +329,8 @@ fn cache_check(cache: Option<PathBuf>, audit: Option<PathBuf>) -> Check {
         Ok(listing) => listing,
         Err(error) => return Check::fail(name, error.to_string()),
     };
-    let copies = match audit.filter(|dir| dir.is_dir()) {
-        Some(audit) => match session::reflinks(&cache, &audit) {
-            Ok(true) => "sessions reflink it",
-            Ok(false) => "sessions copy it",
-            Err(_) => "whether sessions reflink it is unknown",
-        },
-        None => "whether sessions reflink it is unknown until a session runs",
-    };
     Check::ok(format!(
-        "{name} ({} images, {} tags; {copies})",
+        "{name} ({} images, {} tags)",
         listing.images.len(),
         listing.refs.len()
     ))

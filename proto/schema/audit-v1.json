@@ -354,6 +354,36 @@
         }
       }
     },
+    "FsCopyUp": {
+      "description": "`fs.copy_up`: an image session's overlay copied a file or directory of the image into the session's layer, before a change to it.",
+      "type": "object",
+      "required": [
+        "bytes",
+        "mount",
+        "path"
+      ],
+      "properties": {
+        "bytes": {
+          "description": "The bytes of file data copied (none for a directory or a link).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "mount": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_b64": {
+          "description": "`path` as base64 of its raw bytes, set when the name was not valid UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad byte); omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "FsCreate": {
       "description": "`fs.create`.",
       "type": "object",
@@ -1819,6 +1849,24 @@
               "type": "string",
               "enum": [
                 "fs.close"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/FsCopyUp"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "fs.copy_up"
               ]
             }
           }

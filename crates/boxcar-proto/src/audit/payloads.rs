@@ -301,6 +301,22 @@ pub struct FsClose {
     pub ts_release_ns: u64,
 }
 
+/// `fs.copy_up`: an image session's overlay copied a file or directory
+/// of the image into the session's layer, before a change to it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FsCopyUp {
+    pub mount: String,
+    pub path: String,
+    /// `path` as base64 of its raw bytes, set when the name was not valid
+    /// UTF-8 (`path` then holds the lossy form, `U+FFFD` for each bad
+    /// byte); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_b64: Option<String>,
+    /// The bytes of file data copied (none for a directory or a link).
+    pub bytes: u64,
+}
+
 /// `fs.read` and `fs.write`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

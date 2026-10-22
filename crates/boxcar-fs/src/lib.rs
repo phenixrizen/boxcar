@@ -22,6 +22,8 @@ pub mod device;
 mod events;
 pub mod handles;
 pub mod hasher;
+pub mod inner;
+pub mod overlay;
 pub mod ownership;
 pub mod path_map;
 pub mod rules;
@@ -32,10 +34,12 @@ pub use audit_fs::{AuditFs, AuditFsOptions, AuditLevel};
 pub use device::{FsError, FsServer, OpcodeCounts, VirtioFs, MAX_REQUEST_QUEUES};
 pub use handles::{HandleEntry, HandleTable};
 pub use hasher::{HashJob, HashWorker};
+pub use inner::Inner;
+pub use overlay::{CopyUpHook, OverlayFs};
 pub use path_map::{FileId, PathMap, PathText, ROOT_INO};
 pub use rules::{LiveRules, PathRules, PathSpec};
 pub use scan::{DeniedIds, ScanError};
-pub use share::{passthrough_config, CachePolicyKind, FsShareConfig};
+pub use share::{passthrough_config, CachePolicyKind, FsShareConfig, LowerLayer};
 
 #[cfg(test)]
 mod dep_check {

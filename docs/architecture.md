@@ -81,8 +81,9 @@ socket all run in it, as threads. It runs no other program. In order, it:
    or pulls it, before the session exists: a refused flag leaves nothing
    behind.
 2. Makes the session's id, its CA when the policy has an `inspect` line,
-   the session directory under the audit directory (the log, the image's
-   copy, the default workspace) and the state directory (the sockets).
+   the session directory under the audit directory (the log, the image
+   session's upper layer, the default workspace) and the state directory
+   (the sockets).
 3. Applies the Landlock domain on the main thread, before any thread of
    its own starts (see [Confinement](#confinement)).
 4. Blocks the stop signals and `SIGWINCH`, so every thread started later

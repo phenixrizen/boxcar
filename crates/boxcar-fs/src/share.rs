@@ -50,6 +50,19 @@ pub struct FsShareConfig {
     pub guest_path: String,
     /// `Always` for the root filesystem, `Auto` for the workspace.
     pub cache: CachePolicyKind,
+    /// An image's cached tree served read-only beneath `host_dir`, which
+    /// is then the session's upper layer ([`crate::overlay`]).
+    pub lower: Option<LowerLayer>,
+}
+
+/// The lower layer of an image session's root share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LowerLayer {
+    /// The cached tree.
+    pub dir: PathBuf,
+    /// The image's modes of the entries the cache stores otherwise
+    /// (`image.json`'s `modes`), shown in their place.
+    pub modes: Vec<(String, u32)>,
 }
 
 /// The passthrough configuration for `share`: rooted at `host_dir`, with the
@@ -83,6 +96,7 @@ mod tests {
             host_dir: PathBuf::from("/srv/rootfs"),
             guest_path: "/".into(),
             cache,
+            lower: None,
         }
     }
 

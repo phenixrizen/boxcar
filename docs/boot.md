@@ -45,7 +45,7 @@ a typo leaves nothing behind.
    <manifest digest>`, with `(cached)` when no layer was fetched (the registry may still have been
    asked for the manifest). An image
    the cache lacks under `--pull never` exits 1. The lock is held until the
-   session's copy is made, so `boxcar image rm` and `boxcar image prune`
+   session's root is prepared, so `boxcar image rm` and `boxcar image prune`
    wait for it ([images.md](images.md)).
 
 ## The session
@@ -88,11 +88,11 @@ a typo leaves nothing behind.
    control").
 7. **The audit writer.** Its thread starts the log. stderr says
    `session: <id>` and `audit: <dir>`.
-8. **The shares.** The root share is `--rootfs`, or with an image a copy
-   of the cached tree at `rootfs/` in the session's directory, reflinked
-   where the filesystem can, with what init would otherwise make at boot
-   (mount points, the working directory, `/etc/resolv.conf`, the trust
-   store) made in it first. The workspace is `--workspace`, or a new
+8. **The shares.** The root share is `--rootfs`, or with an image an
+   overlay: the cached tree read-only below, `rootfs/` in the session's
+   directory above, with what init would otherwise make at boot (mount
+   points, the working directory, `/etc/resolv.conf`, the trust store)
+   made in the merge first. The workspace is `--workspace`, or a new
    `workspace/` in the session's directory; stderr says
    `workspace: <dir>`. The image cache's lock goes. The guest caches the
    root share freely and revalidates the workspace, which the host may

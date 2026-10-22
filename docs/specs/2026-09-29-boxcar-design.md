@@ -223,6 +223,17 @@ milestone 2.
 
 ## 14. Amendments
 
+### 2026-10-21: an overlay for image sessions (#31)
+
+The M5 plan served an image session from a per-session copy of the
+cached tree, since fuse-backend-rs's overlay answers `rename` with
+`EXDEV`. An overlay of boxcar's own now serves it: the cached tree
+read-only below, the session's directory above, whiteouts and opaque
+marks as OCI layers have them, copy-up with data, mode, times and user
+xattrs (one `fs.copy_up` record each), and `rename` within the upper
+layer (a directory copied up with its subtree first), so a session costs
+what it changes on any filesystem. `AuditFs` sits above it as before.
+
 ### 2026-10-21: the ownership override (#5)
 
 Section 9 left `chown`, device nodes and `security.*` xattrs at `EPERM`

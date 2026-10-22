@@ -43,8 +43,8 @@ cargo run --release -p boxcar -- run \
 
 `--image` pulls the image without root, checks every blob against its
 digest, keeps it in a cache (`~/.cache/boxcar`), and boots the session from
-its own copy of the image's tree, so nothing a session writes reaches the
-cache ([docs/images.md](docs/images.md)). `--policy agent-isolate` lets the
+an overlay of its own over the image's tree, so nothing a session writes
+reaches the cache ([docs/images.md](docs/images.md)). `--policy agent-isolate` lets the
 session reach the model providers (inspected), the package registries and
 the git hosts, and nothing else ([docs/policy.md](docs/policy.md)). The run
 exits with the command's exit code, and prints the session's id, its audit
