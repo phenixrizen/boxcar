@@ -28,6 +28,7 @@
 //! nothing for [`ACK_DEADLINE`] is taken as gone; the session's output init
 //! could not send then is counted on the console and in a `log` line.
 
+use crate::ptp::PtpKvm;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -77,7 +78,7 @@ pub fn hello() -> GuestMsg {
 }
 
 /// The clock `clock` in nanoseconds; 0 when it cannot be read.
-fn clock_ns(clock: libc::clockid_t) -> u64 {
+pub(crate) fn clock_ns(clock: libc::clockid_t) -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -185,6 +186,9 @@ impl Outbox {
 /// The control channel.
 pub struct Ctl {
     stream: File,
+    /// `ptp_kvm`'s clock, when the guest has one: each pong carries its
+    /// pair of the host's and the guest's clocks.
+    ptp: Option<PtpKvm>,
     lines: LineBuf,
     /// Messages read with the config, for the loop.
     pending: VecDeque<HostMsg>,
@@ -209,6 +213,7 @@ impl Ctl {
     fn over(fd: OwnedFd) -> Ctl {
         Ctl {
             stream: File::from(fd),
+            ptp: PtpKvm::open(),
             lines: LineBuf::new(MAX_LINE),
             pending: VecDeque::new(),
             out: Outbox::new(OUTBOX_CAP),
@@ -470,10 +475,14 @@ pub fn supervise(
                             ending = Some(begin_ending(session, grace_ms));
                         }
                     }
-                    HostMsg::Ping { id } => ctl.send(&GuestMsg::Pong {
-                        id,
-                        guest_mono_ns: clock_ns(libc::CLOCK_MONOTONIC),
-                    }),
+                    HostMsg::Ping { id } => {
+                        let pong = GuestMsg::Pong {
+                            id,
+                            guest_mono_ns: clock_ns(libc::CLOCK_MONOTONIC),
+                            ptp: ctl.ptp.as_ref().and_then(PtpKvm::pair),
+                        };
+                        ctl.send(&pong);
+                    }
                     // There is one session.
                     HostMsg::Config(_) => {}
                 }
@@ -675,7 +684,8 @@ mod tests {
         assert!(out.push(&GuestMsg::SessionStarted { pid: 7 }));
         assert!(out.push(&GuestMsg::Pong {
             id: 1,
-            guest_mono_ns: 2
+            guest_mono_ns: 2,
+            ptp: None,
         }));
         let mut sink = Trickle(Vec::new());
         while !out.is_empty() {

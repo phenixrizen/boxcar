@@ -37,6 +37,7 @@ mod cmdline;
 mod console;
 mod ctl;
 mod mounts;
+mod ptp;
 mod pty;
 mod reaper;
 mod resolver;

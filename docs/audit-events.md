@@ -185,7 +185,7 @@ session's process (uid and gid as configured).
 
 | Type | Fields | When |
 |---|---|---|
-| `sync` | `method` (`vsock_rtt`), `guest_mono_ns`, `host_mono_ns`, `offset_ns`, `rtt_ns` | The VMM pinged init over the control channel and init answered: the guest's `CLOCK_MONOTONIC` when it answered, the host's at the round trip's midpoint, `host_mono_ns - guest_mono_ns`, and the round trip, which bounds how sure the pairing is. The first comes right after the session's config, then one every 10 s. `ts_host_ns` stays the one timestamp that joins events across rings; `sync` says how the guest's `ts_guest_ns` relates to it. |
+| `sync` | `method` (`ptp_kvm` or `vsock_rtt`), `guest_mono_ns`, `host_mono_ns`, `offset_ns`, `rtt_ns` | The VMM pinged init over the control channel and init answered. With `ptp_kvm` (a guest whose KVM offers the `KVM virtual PTP` clock, which bare-metal hosts do; the guest runs on `kvm-clock` for it) init read the host's `CLOCK_REALTIME` and its own clocks from one read of the TSC: `guest_mono_ns` is the guest's `CLOCK_MONOTONIC` at that read, `host_mono_ns` the host's at it, and `rtt_ns` the window on the guest's clock the read was taken in, microseconds. With `vsock_rtt` (no such clock): the guest's `CLOCK_MONOTONIC` when it answered, the host's at the round trip's midpoint, and the round trip. Either way `offset_ns` is `host_mono_ns - guest_mono_ns`, and `rtt_ns` bounds how sure the pairing is. The first comes right after the session's config, then one every 10 s. `ts_host_ns` stays the one timestamp that joins events across rings; `sync` says how the guest's `ts_guest_ns` relates to it. |
 
 ## `proc.*` (guest, ring 1, src `sensor`)
 

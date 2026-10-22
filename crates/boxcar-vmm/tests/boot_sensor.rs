@@ -332,11 +332,16 @@ fn the_sensor_attaches_heartbeats_and_reports_the_sessions_processes() {
     assert_eq!(heartbeats[0].data["ringbuf_drops"], 0);
 
     // The host pinged init once the config was sent and init answered: the
-    // clocks are paired in the log, from the host's side.
+    // clocks are paired in the log, from the host's side, through ptp_kvm
+    // where the guest has its clock and by the round trip otherwise.
     let syncs = of_kind(&records, "sync");
     assert!(!syncs.is_empty(), "no sync record\n{}", run.describe());
     assert_eq!(syncs[0].ring, Ring::Host, "{:?}", syncs[0]);
-    assert_eq!(syncs[0].data["method"], "vsock_rtt", "{:?}", syncs[0]);
+    assert!(
+        syncs[0].data["method"] == "ptp_kvm" || syncs[0].data["method"] == "vsock_rtt",
+        "{:?}",
+        syncs[0]
+    );
     assert!(
         syncs[0].data["rtt_ns"].as_u64().unwrap() < 5_000_000_000,
         "{:?}",

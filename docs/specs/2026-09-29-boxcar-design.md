@@ -220,9 +220,22 @@ milestone 2.
 
 - Ownership fidelity inside the guest without a privileged host process.
 - Whether the overlay filesystem's whiteout handling needs CAP_MKNOD.
-- ptp_kvm availability on nested-virtualization hosts for clock pairing.
 
 ## 14. Amendments
+
+### 2026-10-21: clock pairing through `ptp_kvm` where the guest has it (#6)
+
+The guest kernel carries `ptp_kvm`, and on a bare-metal KVM host the
+guest gets its `KVM virtual PTP` clock; the VMM's command line keeps the
+guest on `kvm-clock`, the clocksource the kernel gives the cross
+timestamp against; init then answers each ping with
+the host's `CLOCK_REALTIME` and its own `CLOCK_MONOTONIC` read from one
+TSC read (`PTP_SYS_OFFSET_PRECISE`), and the `sync` record says
+`ptp_kvm`, bounded by the microseconds the read took rather than by a
+round trip that a loaded host stretches past the reconciler's 2 ms. A
+guest without the clock (a host whose KVM declines the pairing
+hypercall; this project's WSL2 host runs no KVM at all) pairs by the
+round trip as before, `vsock_rtt`. That was an open question above.
 
 ### 2026-10-21: ring 1 TLS corroboration stays with OpenSSL's functions (#11)
 

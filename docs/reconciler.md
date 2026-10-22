@@ -25,9 +25,11 @@ tool spans, writes each one's membership as `span.effects`, and answers
   (ring 1) carry the same 4-tuple; they join when they fall within 500 ms
   of each other, in either order.
 - **Time.** `ts_host_ns` is the one clock across rings. `sync` records say
-  how far the guest's clock stands from it and how surely; when the last
-  pairing's round trip was over 2 ms, no pairing came for 30 s while ring 1
-  was alive, or the reconciler missed records (its subscription lagged),
+  how far the guest's clock stands from it and how surely (`rtt_ns`: a
+  ping's round trip, or, through `ptp_kvm` where the guest has its clock,
+  the microseconds one read of the TSC took, whatever the load); when the
+  last pairing's bound was over 2 ms, no pairing came for 30 s while ring
+  1 was alive, or the reconciler missed records (its subscription lagged),
   findings that rest on a cross-ring join are marked `low_confidence` and
   lose 20 points.
 - **A degraded sensor.** `proc.sensor_status` says which programs

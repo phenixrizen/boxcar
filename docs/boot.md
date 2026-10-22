@@ -127,8 +127,11 @@ a typo leaves nothing behind.
    (1025, `boxcar.pty`), and, unless `--no-sensor`, the sensor's stream
    (1026, `boxcar.sensor`).
 8. The kernel command line: the base (`console=ttyS0 reboot=k panic=1
-   pci=off nomodule ... lockdown=integrity ... quiet loglevel=4
-   rdinit=/init`; `--debug-boot` swaps the quiet part for early printk);
+   pci=off nomodule ... lockdown=integrity ... clocksource=kvm-clock quiet
+   loglevel=4 rdinit=/init`; `--debug-boot` swaps the quiet part for early
+   printk; `clocksource=kvm-clock` keeps the guest on the paravirtual
+   clock, which `ptp_kvm`'s pairing of the clocks needs: see the `sync`
+   record in [audit-events.md](audit-events.md));
    with a network card, `ip=10.0.2.15::10.0.2.2:255.255.255.0:boxcar:eth0:off:10.0.2.2`
    and `boxcar.net=1`; then the `boxcar.*` keys and `--cmdline-extra`;
    then one `virtio_mmio.device=` entry per device. Then the zero page and

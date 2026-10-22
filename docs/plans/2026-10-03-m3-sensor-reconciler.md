@@ -201,7 +201,7 @@ Made while writing the plan, 2026-10-03:
 - **`intent_effect_mismatch` and `orphaned_work` wait for M4,** which brings `tool.*` spans; the roadmap's `phantom_write` and `orphan_after_span` fixtures come with them. `off_book_channel` covers `memfd_create` and `/dev/shm` opens in M3; opens of unlinked inodes are not detectable from ring 0 without inode tracking and are left out.
 - **`kill_guard` (`lsm/task_kill`) is added** to the roadmap's program table: the spec names self-protection, and a sensor root can `kill -9` is no corroboration. Init (tgid 1) and the sensor itself may still signal it.
 - **Golden fixtures use the repository's bless pattern** (`expected.jsonl`, `BOXCAR_BLESS=1`) instead of `insta`, which would add a dependency for the same check.
-- **`ptp_kvm` is not used;** `sync` comes from the ctl channel's ping round trip. The spec's open question about `ptp_kvm` on nested hosts stays open.
+- **`ptp_kvm` is not used;** `sync` comes from the ctl channel's ping round trip. The spec's open question about `ptp_kvm` on nested hosts stays open. (Answered by #6 on 2026-10-21: the guest uses `ptp_kvm` where its KVM offers the clock, bare-metal hosts among them, and the round trip otherwise.)
 - **The sensor binary is separate** (the spec's "two small guest binaries"), held open by init across `switch_root` and started with `fexecve`, so it is never on the audited filesystem and init keeps its three dependencies.
 - **Guest source port 1021** is the sensor's; 1023 and 1022 stay init's.
 - **`kernel.unprivileged_bpf_disabled = 1`** is set by init as a second layer under the LSM guard; the sensor is privileged and unaffected.

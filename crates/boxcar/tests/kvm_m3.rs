@@ -198,6 +198,53 @@ fn an_allowed_download_joins_its_process_and_finds_nothing() {
     );
 }
 
+/// The clocks pair through `ptp_kvm` where the guest has its clock (a
+/// bare-metal KVM host gives it one; a host whose KVM declines the pairing
+/// hypercall does not), by the ping's round trip otherwise, and the `sync`
+/// records say which: a `ptp_kvm` pair is bounded by the microseconds its
+/// read took, never by a round trip.
+#[test]
+fn the_clocks_pair_through_ptp_kvm_where_the_guest_has_it() {
+    let Some(guest) = guest_or_skip("the_clocks_pair_through_ptp_kvm_where_the_guest_has_it")
+    else {
+        return;
+    };
+    let scratch = Scratch::new();
+    let run = boxcar_run(
+        &guest,
+        &scratch,
+        &[],
+        &[
+            "/bin/sh",
+            "-c",
+            // The session outlives the first ping, which goes out once
+            // the config has: a session that ends at once has no sync.
+            "cat /sys/class/ptp/*/clock_name 2>/dev/null; echo clocks-listed; sleep 2",
+        ],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.describe());
+    assert!(run.stdout.contains("clocks-listed"), "{}", run.describe());
+    let has_clock = run.stdout.contains("KVM virtual PTP");
+    let records = run.records();
+    let syncs = of_kind(&records, "sync");
+    assert!(!syncs.is_empty(), "no sync: {}", run.describe());
+    let want = if has_clock { "ptp_kvm" } else { "vsock_rtt" };
+    for sync in &syncs {
+        assert_eq!(sync.data["method"], want, "{sync:?}\n{}", run.describe());
+        let bound = sync.data["rtt_ns"].as_u64().unwrap();
+        if has_clock {
+            assert!(bound < 10_000_000, "a read, not a round trip: {sync:?}");
+        }
+        assert_eq!(
+            sync.data["offset_ns"].as_i64().unwrap(),
+            sync.data["host_mono_ns"].as_i64().unwrap()
+                - sync.data["guest_mono_ns"].as_i64().unwrap(),
+            "{sync:?}"
+        );
+    }
+    eprintln!("sync method on this host: {want} ({} records)", syncs.len());
+}
+
 /// (c) Removing a shell history is an `indicator_removal` finding, with the
 /// unlink and the shell's exec as evidence.
 #[test]
