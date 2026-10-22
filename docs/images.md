@@ -97,16 +97,27 @@ then `GET /v2/<repository>/blobs/<digest>` for the config and each layer.
   redirected to a CDN, say) fails the pull with no credential sent; a
   second `401` fails it as `authentication failed for
   <registry>/<repository>`.
-- **Credentials** come only from the `auths` of
-  `$DOCKER_CONFIG/config.json` (when `DOCKER_CONFIG` is an absolute path)
-  or `~/.docker/config.json`: an entry's `auth` (base64 `user:password`) or
-  its `username` and `password`, under the registry's name (Docker Hub's
-  under `https://index.docker.io/v1/`, `index.docker.io`, `docker.io` or
-  `registry-1.docker.io`). They go to two places only: the token realm the
-  registry's own challenge named, and the registry's origin for Basic.
-  Credential helpers are not run: when authentication fails and the config
-  names one for the registry (`credsStore`, `credHelpers`), the error says
-  so. A config that does not parse fails a pull.
+- **Credentials** come from `$DOCKER_CONFIG/config.json` (when
+  `DOCKER_CONFIG` is an absolute path) or `~/.docker/config.json`, as
+  Docker reads it. The credential helper it names for the registry
+  (`credHelpers[<registry>]`, else `credsStore`) is asked first, once, at
+  the registry's first challenge, so a public image runs no helper:
+  `docker-credential-<name> get`, found on the PATH, the registry's name
+  on its stdin (Docker Hub's as `https://index.docker.io/v1/`), with this
+  process's environment and 60 s to answer. Its `Username` and `Secret`
+  are the credentials; a helper that says it has none leaves the `auths`
+  entry to answer, if there is one. One that is not on the PATH, cannot be
+  run, fails, times out, or answers with what boxcar cannot read (an
+  identity token among them) fails the pull, named, with nothing it wrote
+  repeated. Without a helper, the `auths` entry: its `auth` (base64
+  `user:password`) or its `username` and `password`, under the registry's
+  name (Docker Hub's under `https://index.docker.io/v1/`,
+  `index.docker.io`, `docker.io` or `registry-1.docker.io`). Credentials
+  go to two places only: the token realm the registry's own challenge
+  named, and the registry's origin for Basic. When authentication fails
+  the error says whether the helper had none for the registry, or gave
+  credentials the registry refused. A config that does not parse fails a
+  pull.
 - **Errors** name the registry, the repository, the request and the HTTP
   status, with the registry's error codes (`MANIFEST_UNKNOWN`, `DENIED`,
   `TOOMANYREQUESTS`, ...) in boxcar's own words. Nothing the registry sent
@@ -326,5 +337,5 @@ Two lines about the default cache (`doctor` takes no `--cache-dir`):
 | An image's defaults | 32 KiB |
 
 Not done: platforms other than `linux/amd64`, schema 1 manifests, sparse
-files, credential helpers, retries, signature verification, and presenting
-the image's ownership.
+files, identity tokens from a credential helper, retries, signature
+verification, and presenting the image's ownership.

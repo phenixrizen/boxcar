@@ -5,17 +5,22 @@
 //! bounded bodies, a deadline per transfer, and the token flow. A
 //! challenge is honoured only from the registry's own origin, and
 //! credentials go to two places only: the realm the registry's own
-//! challenge named, and the registry's origin for Basic. Nothing a
-//! registry sends is repeated in an error.
+//! challenge named, and the registry's origin for Basic. They come from
+//! the Docker config's credential helper for the registry, asked once, at
+//! the first challenge, else its `auths`. Nothing a registry sends, or a
+//! helper writes, is repeated in an error.
 
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls_pki_types::CertificateDer;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
-use super::auth::{self, Challenge, Credentials, DockerConfig};
+use super::auth::{
+    self, Challenge, Credentials, DockerConfig, Helper, HelperError, HELPER_TIMEOUT,
+};
 use super::manifest::{self, MAX_CONFIG, MAX_MANIFEST};
 use super::reference::{Digest, Reference};
 
@@ -55,11 +60,22 @@ pub enum ClientError {
         status: u16,
         codes: Vec<&'static str>,
     },
-    #[error("authentication failed for {registry}/{repository}{}", helper_hint(.helper))]
+    #[error("authentication failed for {registry}/{repository}{}", helper_hint(.helper, *.helper_gave))]
     Auth {
         registry: String,
         repository: String,
+        /// The credential helper the Docker config names for the registry.
         helper: Option<String>,
+        /// Whether that helper gave the credentials the registry refused.
+        helper_gave: bool,
+    },
+    /// The credential helper the Docker config names for the registry
+    /// could not be run, or gave nothing boxcar can use.
+    #[error("{registry}: {source}")]
+    Helper {
+        registry: String,
+        #[source]
+        source: HelperError,
     },
     #[error("a challenge came from somewhere other than {registry}; no credential was sent")]
     ChallengeFromElsewhere { registry: String },
@@ -135,13 +151,18 @@ fn describe(codes: &[&'static str]) -> String {
     }
 }
 
-fn helper_hint(helper: &Option<String>) -> String {
-    match helper {
-        Some(name) => format!(
-            "; its credentials are in the helper `{name}`, which boxcar does not run: `docker login` \
-             without a credential helper, or an `auths` entry in ~/.docker/config.json"
+fn helper_hint(helper: &Option<String>, gave: bool) -> String {
+    match (helper, gave) {
+        (Some(name), true) => {
+            format!(
+                "; the credential helper `docker-credential-{name}` gave credentials it refused"
+            )
+        }
+        (Some(name), false) => format!(
+            "; the credential helper `docker-credential-{name}` has none for it: `docker login`, \
+             or an `auths` entry in ~/.docker/config.json"
         ),
-        None => String::new(),
+        (None, _) => String::new(),
     }
 }
 
@@ -166,7 +187,14 @@ pub struct Client {
     registry: String,
     repository: String,
     credentials: Option<Credentials>,
+    /// The credential helper the Docker config names for the registry.
     helper: Option<String>,
+    /// Where the helper is looked for: the PATH's directories.
+    helper_dirs: Vec<PathBuf>,
+    /// The helper has been asked (once, at the first challenge), and gave
+    /// the credentials held.
+    helper_asked: bool,
+    helper_gave: bool,
     scheme: Scheme,
     /// Whether the registry is on the loopback, where plain HTTP is
     /// allowed when TLS is declined, as Docker allows its insecure local
@@ -193,8 +221,9 @@ impl Client {
     /// A client for `reference`'s repository, over HTTPS with `roots`;
     /// a registry on `localhost` or `127.0.0.0/8` is spoken to over plain
     /// HTTP, as Docker's insecure-by-default rule for local registries,
-    /// and over HTTPS when it declines that; nothing else is.
-    /// with the credentials `config` has for its registry.
+    /// and over HTTPS when it declines that; nothing else is. Its
+    /// credentials are what `config` has for its registry: the helper
+    /// it names, asked at the first challenge, else its `auths` entry.
     pub fn new(
         reference: &Reference,
         roots: Vec<CertificateDer<'static>>,
@@ -243,6 +272,9 @@ impl Client {
             repository: reference.repository().to_owned(),
             credentials,
             helper,
+            helper_dirs: Helper::path_dirs(),
+            helper_asked: false,
+            helper_gave: false,
             scheme: Scheme::None,
             loopback,
             timeout: TIMEOUT,
@@ -254,6 +286,42 @@ impl Client {
     pub fn with_timeout(mut self, timeout: Duration) -> Client {
         self.timeout = timeout;
         self
+    }
+
+    /// Where a test's credential helpers are, instead of the PATH.
+    #[cfg(test)]
+    pub fn with_helper_dirs(mut self, dirs: Vec<PathBuf>) -> Client {
+        self.helper_dirs = dirs;
+        self
+    }
+
+    /// Asks the credential helper the config names, once, at the first
+    /// challenge: its credentials replace the `auths` entry, as Docker
+    /// prefers the helper; none from it leaves the entry, if any. A helper
+    /// that cannot be run, or answers with nothing boxcar can use, fails
+    /// the request.
+    fn ask_helper(&mut self) -> Result<(), ClientError> {
+        if self.helper_asked {
+            return Ok(());
+        }
+        self.helper_asked = true;
+        let Some(name) = &self.helper else {
+            return Ok(());
+        };
+        let registry = self.registry.clone();
+        let fail = |source| ClientError::Helper {
+            registry: registry.clone(),
+            source,
+        };
+        let helper = Helper::find(name, &self.helper_dirs).map_err(fail)?;
+        let given = helper
+            .get(auth::helper_server(&self.registry), HELPER_TIMEOUT)
+            .map_err(fail)?;
+        if let Some(credentials) = given {
+            self.credentials = Some(credentials);
+            self.helper_gave = true;
+        }
+        Ok(())
     }
 
     /// `GET /v2/<repository>/manifests/<reference>`: the body (at most 4
@@ -441,6 +509,7 @@ impl Client {
                         registry: self.registry.clone(),
                     });
                 }
+                self.ask_helper()?;
                 let challenge = header(&response, "www-authenticate")
                     .and_then(|h| auth::parse_challenge(&h))
                     .ok_or_else(|| self.auth_failed())?;
@@ -542,6 +611,7 @@ impl Client {
             registry: self.registry.clone(),
             repository: self.repository.clone(),
             helper: self.helper.clone(),
+            helper_gave: self.helper_gave,
         }
     }
 
@@ -648,6 +718,7 @@ fn body_error(error: ureq::Error, what: &'static str, max: u64) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use boxcar_testreg::{config, layer_tar, tar_of, Auth, Faults, Registry, Tls};
 
     fn reference(registry: &Registry) -> Reference {
@@ -881,8 +952,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_helper_is_named_when_it_holds_the_credentials() {
+    /// A registry that wants `alice:pw` at its token realm, and an image.
+    fn locked_registry() -> Registry {
         let registry = Registry::start(
             Auth::Bearer {
                 token: "t".into(),
@@ -891,18 +962,196 @@ mod tests {
             Faults::default(),
         );
         image(&registry);
+        registry
+    }
+
+    fn helper_config(registry: &Registry, name: &str) -> DockerConfig {
+        DockerConfig::parse(&format!(
+            r#"{{"credHelpers": {{"{}": "{name}"}}}}"#,
+            registry.host()
+        ))
+        .unwrap()
+    }
+
+    /// The helper the config names for the registry is asked at the first
+    /// challenge, for the registry's name, and its credentials answer it.
+    #[test]
+    fn a_helpers_credentials_answer_the_challenge() {
+        use super::super::auth::tests::fake_helper;
+        let registry = locked_registry();
+        let tmp = tempfile::tempdir().unwrap();
+        let seen = tmp.path().join("server");
+        fake_helper(
+            tmp.path(),
+            "fake",
+            &format!(
+                "server=$(cat); printf '%s' \"$server\" > {}; printf '{{\"Username\":\"alice\",\"Secret\":\"pw\"}}'",
+                seen.display()
+            ),
+        );
+        let config = helper_config(&registry, "fake");
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(vec![tmp.path().to_owned()]);
+        client.manifest("latest").unwrap();
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), registry.host());
+        // Asked once: a second challenge-free request runs no helper.
+        std::fs::remove_file(&seen).unwrap();
+        client.manifest("latest").unwrap();
+        assert!(!seen.exists());
+        // The helper's credentials come before the config's `auths`.
+        let wrong = base64::engine::general_purpose::STANDARD.encode("alice:wrong");
         let config = DockerConfig::parse(&format!(
-            r#"{{"credHelpers": {{"{}": "gcloud"}}}}"#,
+            r#"{{"auths": {{"{0}": {{"auth": "{wrong}"}}}}, "credHelpers": {{"{0}": "fake"}}}}"#,
             registry.host()
         ))
         .unwrap();
-        let mut client = Client::new(&reference(&registry), vec![], Some(&config)).unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(vec![tmp.path().to_owned()]);
+        client.manifest("latest").unwrap();
+    }
+
+    /// A helper with no credentials for the registry leaves the `auths`
+    /// entry to answer; without one, the failure says the helper has none.
+    #[test]
+    fn a_helper_with_none_leaves_the_auths_entry() {
+        use super::super::auth::tests::fake_helper;
+        let registry = locked_registry();
+        let tmp = tempfile::tempdir().unwrap();
+        fake_helper(
+            tmp.path(),
+            "none",
+            "echo 'credentials not found in native keychain' >&2; exit 1",
+        );
+        let auth = base64::engine::general_purpose::STANDARD.encode("alice:pw");
+        let config = DockerConfig::parse(&format!(
+            r#"{{"auths": {{"{0}": {{"auth": "{auth}"}}}}, "credsStore": "none"}}"#,
+            registry.host()
+        ))
+        .unwrap();
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(vec![tmp.path().to_owned()]);
+        client.manifest("latest").unwrap();
+
+        let config = helper_config(&registry, "none");
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(vec![tmp.path().to_owned()]);
         let err = client.manifest("latest").unwrap_err();
         assert!(
-            matches!(err, ClientError::Auth { helper: Some(ref h), .. } if h == "gcloud"),
+            matches!(
+                err,
+                ClientError::Auth {
+                    helper: Some(ref h),
+                    helper_gave: false,
+                    ..
+                } if h == "none"
+            ),
             "{err}"
         );
-        assert!(err.to_string().contains("gcloud"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("the credential helper `docker-credential-none` has none for it"),
+            "{err}"
+        );
+    }
+
+    /// A helper that cannot be run, fails, or answers with what boxcar
+    /// cannot use fails the pull in boxcar's words, repeating nothing it
+    /// wrote; one whose credentials the registry refuses is named.
+    #[test]
+    fn a_helper_that_fails_or_is_refused_is_named_and_repeats_nothing() {
+        use super::super::auth::tests::fake_helper;
+        let registry = locked_registry();
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = || vec![tmp.path().to_owned()];
+        let config = helper_config(&registry, "absent");
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(dirs());
+        let err = client.manifest("latest").unwrap_err();
+        assert!(
+            matches!(err, ClientError::Helper { source: HelperError::Missing(ref n), .. } if n == "absent"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .ends_with("the credential helper `docker-credential-absent` is not on the PATH"),
+            "{err}"
+        );
+
+        fake_helper(tmp.path(), "broken", "echo 'hunter2 leaked' >&2; exit 7");
+        let config = helper_config(&registry, "broken");
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(dirs());
+        let err = client.manifest("latest").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Helper {
+                    source: HelperError::Failed(..),
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let text = format!("{err} {err:?}");
+        assert!(
+            text.contains("exit status 7") && !text.contains("hunter2"),
+            "{text}"
+        );
+
+        fake_helper(
+            tmp.path(),
+            "wrong",
+            r#"printf '{"Username":"alice","Secret":"not-the-password"}'"#,
+        );
+        let config = helper_config(&registry, "wrong");
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(dirs());
+        let err = client.manifest("latest").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Auth {
+                    helper_gave: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let text = format!("{err} {err:?}");
+        assert!(
+            text.contains("`docker-credential-wrong` gave credentials it refused")
+                && !text.contains("not-the-password"),
+            "{text}"
+        );
+    }
+
+    /// Without a challenge no helper runs: a public image costs no
+    /// keychain prompt.
+    #[test]
+    fn a_helper_is_not_run_without_a_challenge() {
+        use super::super::auth::tests::fake_helper;
+        let registry = Registry::start(Auth::None, Faults::default());
+        image(&registry);
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        fake_helper(
+            tmp.path(),
+            "fake",
+            &format!("touch {}; exit 1", marker.display()),
+        );
+        let config = helper_config(&registry, "fake");
+        let mut client = Client::new(&reference(&registry), vec![], Some(&config))
+            .unwrap()
+            .with_helper_dirs(vec![tmp.path().to_owned()]);
+        client.manifest("latest").unwrap();
+        assert!(!marker.exists());
     }
 
     #[test]
