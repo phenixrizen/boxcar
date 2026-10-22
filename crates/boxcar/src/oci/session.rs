@@ -27,6 +27,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
+use boxcar_fs::ownership::XATTR;
+
 use super::unpack::{children, delete_tree};
 
 /// The most links a path may go through before it is refused, as init's
@@ -162,6 +164,7 @@ fn copy_tree_inner(
     *created = true;
     let dst_root = openat(&dest_parent_fd, &dest_name, dir_flags, 0)?;
     drop(dest_parent_fd);
+    copy_override(&src_root, &dst_root)?;
 
     let mut copied = Copied::default();
     copied.dirs.push((Vec::new(), root_mode));
@@ -194,6 +197,7 @@ fn copy_tree_inner(
             check(unsafe { libc::mkdirat(cur_dst.as_raw_fd(), name.as_ptr(), 0o700) })?;
             let next_src = openat(&cur_src, &name, dir_flags, 0).map_err(from_source)?;
             let next_dst = openat(&cur_dst, &name, dir_flags, 0)?;
+            copy_override(&next_src, &next_dst)?;
             let kids = children(reopen(&next_src).map_err(from_source)?).map_err(from_source)?;
             copied.dirs.push((child_path.clone(), mode));
             cur_src = next_src;
@@ -258,7 +262,38 @@ fn copy_file(
     if !cloned {
         copy_data(&src, &dst, size)?;
     }
+    copy_override(&src, &dst)?;
     check(unsafe { libc::fchmod(dst.as_raw_fd(), mode as libc::mode_t) })
+}
+
+/// The most bytes an ownership override's text takes.
+const OVERRIDE_MAX: usize = 256;
+
+/// Carries the ownership override (`user.boxcar.stat`) from `src` to
+/// `dst`, where `src` has one: the image's owners, special bits and device
+/// nodes, as the unpacker wrote them. Anything too long to be one is left.
+fn copy_override(src: &OwnedFd, dst: &OwnedFd) -> io::Result<()> {
+    let name = CString::new(XATTR).expect("the xattr's name has no NUL");
+    let mut text = [0u8; OVERRIDE_MAX];
+    // SAFETY: fgetxattr writes at most `text.len()` bytes into `text`.
+    let len = unsafe {
+        libc::fgetxattr(
+            src.as_raw_fd(),
+            name.as_ptr(),
+            text.as_mut_ptr().cast(),
+            text.len(),
+        )
+    };
+    if len < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENODATA | libc::EOPNOTSUPP | libc::ERANGE) => Ok(()),
+            _ => Err(from_source(error)),
+        };
+    }
+    let len = len as usize;
+    // SAFETY: fsetxattr reads the NUL-terminated name and `len` bytes.
+    check(unsafe { libc::fsetxattr(dst.as_raw_fd(), name.as_ptr(), text.as_ptr().cast(), len, 0) })
 }
 
 /// The data of `src` into `dst`: `copy_file_range` while the kernel does
@@ -902,10 +937,50 @@ fn openat(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// The most bytes [`read_within`] reads.
+const READ_WITHIN_MAX: u64 = 1024 * 1024;
+
+/// The contents of `path` (relative) resolved beneath `root` as the guest
+/// would resolve it: a symlink is followed, but only within the tree.
+/// At most [`READ_WITHIN_MAX`] bytes; a file past that is an error.
+pub fn read_within(root: &Path, path: &str) -> io::Result<Vec<u8>> {
+    let root = OwnedFd::from(File::open(root)?);
+    let file = openat2_resolving(
+        &root,
+        &cstr(path.as_bytes())?,
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+    )?;
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    File::from(file)
+        .take(READ_WITHIN_MAX + 1)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > READ_WITHIN_MAX {
+        return Err(io::Error::other(format!("{path} is over 1 MiB")));
+    }
+    Ok(out)
+}
+
 /// `openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS |
 /// RESOLVE_NO_MAGICLINKS`: the path resolved beneath `root`, through no
 /// link at all.
 fn openat2(root: &OwnedFd, path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    openat2_resolving(
+        root,
+        path,
+        flags,
+        RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    )
+}
+
+/// `openat2` beneath `root` with the `resolve` flags given.
+fn openat2_resolving(
+    root: &OwnedFd,
+    path: &CStr,
+    flags: libc::c_int,
+    resolve: u64,
+) -> io::Result<OwnedFd> {
     use std::os::fd::FromRawFd;
     #[repr(C)]
     struct OpenHow {
@@ -916,7 +991,7 @@ fn openat2(root: &OwnedFd, path: &CStr, flags: libc::c_int) -> io::Result<OwnedF
     let how = OpenHow {
         flags: flags as u64,
         mode: 0,
-        resolve: RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+        resolve,
     };
     for _ in 0..8 {
         let fd = unsafe {
@@ -943,7 +1018,9 @@ fn openat2(root: &OwnedFd, path: &CStr, flags: libc::c_int) -> io::Result<OwnedF
 mod tests {
     use super::*;
     use crate::oci::framer::Framer;
-    use crate::oci::testutil::{self, dir, file, hardlink, layer, listing, symlink};
+    use crate::oci::testutil::{
+        self, device, dir, dir_as, file, file_as, hardlink, layer, listing, override_text, symlink,
+    };
     use crate::oci::unpack::{Finished, Unpacker};
     use std::cell::Cell;
     use std::fs;
@@ -963,6 +1040,37 @@ mod tests {
             framer.finish().unwrap();
         }
         unpacker.finish().unwrap()
+    }
+
+    #[test]
+    fn the_copy_carries_the_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("cache");
+        let finished = cached(
+            &src,
+            &[layer(&[
+                dir("./", 0o755),
+                dir_as("home/", 0o755, 1000, 1000),
+                file_as("home/f", 0o640, 1000, 7, b"x"),
+                device(tar::EntryType::Char, "dev/null", 0o666, 1, 3),
+            ])],
+        );
+        let dst = tmp.path().join("copy");
+        let copied = copy_all(&src, &dst, &finished.modes, Reflink::Never);
+        assert_eq!(copied.skipped, 0);
+        for (path, want) in [
+            ("", "uid=0 gid=0"),
+            ("home", "uid=1000 gid=1000"),
+            ("home/f", "uid=1000 gid=7"),
+            ("dev/null", "uid=0 gid=0 dev=c:1:3"),
+        ] {
+            assert_eq!(
+                override_text(&dst.join(path)).as_deref(),
+                Some(want),
+                "{path}"
+            );
+        }
+        assert!(fs::metadata(dst.join("dev/null")).unwrap().is_file());
     }
 
     fn copy_all(src: &Path, dst: &Path, modes: &[(String, u32)], reflink: Reflink) -> Copied {

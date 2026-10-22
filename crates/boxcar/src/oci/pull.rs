@@ -16,7 +16,7 @@ use super::decode::{self, Compression};
 use super::framer::Framer;
 use super::manifest::{self, Document, ManifestError};
 use super::reference::{Digest, Reference};
-use super::store::{ImageJson, LayerRef, Store};
+use super::store::{ImageJson, LayerRef, Store, OWNERSHIP_OVERRIDE};
 use super::unpack::Unpacker;
 
 /// The most decompressed bytes an image's layers may hold together.
@@ -280,6 +280,7 @@ pub fn pull_within(
         defaults: image_config.defaults,
         skipped: finished.skipped,
         modes: finished.modes,
+        ownership: Some(OWNERSHIP_OVERRIDE.to_owned()),
     };
     let dir = staging.publish(&json).map_err(PullError::Store)?;
     write_ref(store, reference, &manifest_digest)?;

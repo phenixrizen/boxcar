@@ -235,6 +235,19 @@ host's. A device node is an empty regular file on the host that the
 override names. Off by default. An image's ownership and device nodes,
 unpacked as the override, are #32's.
 
+### 2026-10-21: an image's ownership and its User (#32)
+
+The unpacker writes each entry's owner and special bits into the
+override and makes a device node as an empty file the override names;
+the session's copy carries the xattr; `image.json` says
+`ownership: "override"`. A session from an image runs as the image's
+`User` in the guest (root when it names none; `--user` overrides it)
+with the override on, so the image's root-owned files are root's to
+write and what the image did not claim is the session's own. The guest
+kernel checks against the session's identity, which has no capability,
+so the override is what the guest sees: `chown` and `mknod` from the
+guest stay refused.
+
 ### 2026-10-21: clock pairing through `ptp_kvm` where the guest has it (#6)
 
 The guest kernel carries `ptp_kvm`, and on a bare-metal KVM host the
