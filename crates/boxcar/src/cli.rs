@@ -754,7 +754,8 @@ pub struct RunArgs {
     /// The VMM process's seccomp filter, on every thread once the VM is
     /// built: `enforce` kills the process at a syscall off its allowlist (a
     /// crash: no `vmm.stop`, and `boxcar audit verify` may find the log's
-    /// tail cut); `log` has the kernel log such a call and lets it go
+    /// tail cut; a thread whose role opens no files gets `EACCES` for an
+    /// open instead); `log` has the kernel log such a call and lets it go
     /// ahead, for finding a call the list lacks; `off` installs none.
     /// `vmm.start` records it. Also read from `BOXCAR_SECCOMP`; the flag
     /// wins.

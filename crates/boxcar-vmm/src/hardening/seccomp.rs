@@ -379,6 +379,12 @@ impl Role {
         Role::Quiet,
     ];
 
+    /// Whether the role opens files by path: if not, a thread of it has its
+    /// opens answered `EACCES` under `enforce`, not killed.
+    pub fn opens_files(self) -> bool {
+        self.calls().contains(&libc::SYS_openat)
+    }
+
     /// The calls the role may make whatever their arguments, beyond
     /// [`RUNTIME`]; the filtered calls are added by [`role_rules`].
     fn calls(self) -> Vec<i64> {
@@ -532,9 +538,37 @@ pub fn confine_thread(role: Role) -> Result<(), SeccompError> {
     if !cfg!(all(target_arch = "x86_64", target_env = "gnu")) {
         return Err(SeccompError::Unsupported);
     }
+    if !role.opens_files() {
+        seccompiler::apply_filter(&no_files_filter(mode)?)?;
+    }
     let program = role_filter(mode, role, std::process::id())?;
     seccompiler::apply_filter(&program)?;
     Ok(())
+}
+
+/// The calls that open a file by its path.
+const OPENS: &[i64] = &[libc::SYS_openat, libc::SYS_openat2];
+
+/// For a role that opens no files: its opens answered `EACCES` under
+/// `enforce` (logged and let go under `log`), everything else left to the
+/// other filters. glibc opens a file of its own now and then on whatever
+/// thread gets there first (`free` reads `/proc/sys/vm/overcommit_memory`
+/// the first time a thread's arena shrinks, and keeps the answer): such a
+/// read fails, as glibc allows, where a kill would end the session. The
+/// role's own list lets [`OPENS`] through, so this filter's answer is the
+/// one the kernel takes.
+fn no_files_filter(mode: SeccompMode) -> Result<BpfProgram, BackendError> {
+    let answer = match mode {
+        SeccompMode::Log => SeccompAction::Log,
+        SeccompMode::Enforce | SeccompMode::Off => SeccompAction::Errno(libc::EACCES as u32),
+    };
+    let filter = SeccompFilter::new(
+        OPENS.iter().map(|&nr| (nr, Vec::new())).collect(),
+        SeccompAction::Allow,
+        answer,
+        TargetArch::x86_64,
+    )?;
+    BpfProgram::try_from(filter)
 }
 
 /// `role`'s filter: its calls whatever their arguments, and the filtered
@@ -594,6 +628,12 @@ fn role_rules(role: Role, pid: u32) -> Result<BTreeMap<i64, Vec<SeccompRule>>, B
         | Role::AuditForward
         | Role::GuestChannel
         | Role::Quiet => {}
+    }
+    // A role with no files: its opens are answered by `no_files_filter`.
+    if !role.opens_files() {
+        for &nr in OPENS {
+            rules.insert(nr, Vec::new());
+        }
     }
     Ok(rules)
 }

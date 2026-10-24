@@ -366,7 +366,13 @@ cannot read its flags, and glibc falls back to `clone`. The list is built
 for x86_64 glibc. Under `enforce` a call off the list kills the process:
 a crash, with no `vmm.stop` (see *Order and durability* in
 [audit-events.md](audit-events.md) for what `boxcar audit verify` then
-says). `log` has the kernel log such a call and lets it go ahead.
+says). One exception: a thread whose role opens no files (the net stack,
+the guest channels, the quiet workers) has its opens answered `EACCES`,
+since glibc opens a file of its own now and then on whatever thread
+gets there first (`free` reads `/proc/sys/vm/overcommit_memory` the
+first time an arena's heap shrinks); the read fails, as glibc allows,
+and the thread still opens nothing. `log` has the kernel log such a
+call and lets it go ahead.
 
 Guest memory is kept out of the process's core dumps.
 
