@@ -281,18 +281,41 @@ pub struct DumpThread {
     thread: JoinHandle<()>,
 }
 
+/// How a bounded worker-thread join ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadJoin {
+    /// The thread ended and joined normally.
+    Joined,
+    /// The thread was still running at the deadline.
+    TimedOut,
+    /// The thread ended by panicking.
+    Panicked,
+}
+
 impl DumpThread {
-    /// Waits at most `limit` for the thread to end, then joins it; one
-    /// still busy is left behind. Whether it was joined.
-    pub fn join(self, limit: Duration) -> bool {
+    /// Waits at most `limit` for the thread to end, then distinguishes a
+    /// clean join from a timeout or panic. A busy thread is left behind.
+    pub fn join(self, limit: Duration) -> ThreadJoin {
         let deadline = std::time::Instant::now() + limit;
         while !self.thread.is_finished() {
             if std::time::Instant::now() >= deadline {
-                return false;
+                return ThreadJoin::TimedOut;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        self.thread.join().is_ok()
+        match self.thread.join() {
+            Ok(()) => ThreadJoin::Joined,
+            Err(_) => ThreadJoin::Panicked,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocked() -> (DumpThread, std::sync::mpsc::Sender<()>) {
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        (DumpThread { thread }, release)
     }
 }
 
@@ -864,7 +887,7 @@ mod tests {
         assert!(dump.push_to_guest(&tcp4(host, guest, 0x18, &reply), true));
         assert!(dump.push_to_guest(&tcp4(host, guest, 0x18, &reply), false));
         drop(dump);
-        assert!(thread.join(Duration::from_secs(5)));
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
         let bytes = fs::read(dir.frames()).unwrap();
         let mut at = 24;
         let mut kept = Vec::new();
@@ -889,7 +912,7 @@ mod tests {
         let reply = [0x16, 0x03, 0x03, 0x00, 0x02, 9, 9];
         assert!(dump.push_to_guest(&tcp4((2, 443), (15, 40000), 0x18, &reply), true));
         drop(dump);
-        assert!(thread.join(Duration::from_secs(5)));
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
         let bytes = fs::read(dir.frames()).unwrap();
         assert_eq!(u32_at(&bytes, 24 + 8), 54);
     }
@@ -911,7 +934,7 @@ mod tests {
         assert!(dump.push_from_guest(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]));
         assert!(dump.push_from_guest(&[0xff; 20]));
         drop(dump);
-        assert!(thread.join(Duration::from_secs(5)));
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
         let mut bytes = Vec::new();
         File::open(dir.frames())
             .unwrap()

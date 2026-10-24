@@ -36,13 +36,13 @@ pub use audit::{
     Finding, FindingCategory, FsClose, FsCopyUp, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
     FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
     Hardening, Hash, HashStatus, HttpDegraded, HttpRequest, HttpResponse, ImageRef, LandlockStatus,
-    LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls,
-    NetUdp, OpResult, ParseHashError, Payload, PolicyChanged, PolicyException, PolicyLoaded,
-    ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
-    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo,
-    ProgramStatus, Record, Ring, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr,
-    ShareRef, Source, SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStart,
-    VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
+    LlmRequest, LlmResponse, NetClose, NetConnect, NetDegraded, NetDhcp, NetDns, NetDrop,
+    NetInspect, NetTls, NetUdp, OpResult, ParseHashError, Payload, PolicyChanged, PolicyException,
+    PolicyLoaded, ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork,
+    ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach,
+    ProcTlsIo, ProgramStatus, Record, Ring, SeccompMode, SensorPhase, SessionExit, SessionStart,
+    SetAttr, ShareRef, Source, SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict,
+    VmmStart, VmmStop, VsockClose, VsockConnect, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

@@ -19,11 +19,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use boxcar_net::dump::ThreadJoin;
 use boxcar_net::gate::{Direction, Message, Observer};
 use boxcar_net::{DumpDir, FrameDump, InspectConfig, Policy, SessionCa, Verdict};
 use boxcar_proto::{NetClose, NetDrop, NetInspect, NetTls, Payload};
-use common::rig::{host_peer, Rig};
-use common::{harness_gate, harness_gate_dump, resolve};
+use common::rig::{echo_server, host_peer, Rig};
+use common::{harness_gate, harness_gate_dump, harness_gate_flow_cap, resolve};
 use crossbeam_channel::Receiver;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
@@ -357,7 +358,7 @@ fn payload_mode_keeps_the_gates_tls_records_only() {
     rig.settle();
     assert_eq!(up.join().unwrap(), request);
     drop(rig.events());
-    assert!(thread.join(LIMIT));
+    assert_eq!(thread.join(LIMIT), ThreadJoin::Joined);
     let ports = payload_ports(&std::fs::read(dir.frames()).unwrap());
     assert!(!ports.is_empty(), "no payload kept");
     assert!(ports.iter().all(|p| *p == addr.port()), "{ports:?}");
@@ -391,7 +392,7 @@ fn payload_mode_keeps_no_plain_http() {
     assert_eq!(rig.seen(&peer).bytes, request);
     rig.settle();
     drop(rig.events());
-    assert!(thread.join(LIMIT));
+    assert_eq!(thread.join(LIMIT), ThreadJoin::Joined);
     let ports = payload_ports(&std::fs::read(dir.frames()).unwrap());
     assert!(ports.is_empty(), "{ports:?}");
 }
@@ -442,6 +443,42 @@ fn a_plain_http_flow_an_inspect_line_names_is_observed_as_it_is() {
     assert_eq!(data(&messages, Direction::ToHost), request);
     assert_eq!(data(&messages, Direction::ToGuest), reply);
     assert!(matches!(messages.last(), Some(Message::Close { .. })));
+}
+
+/// Evicting an inspected flow sends its terminal observer message before
+/// the replacement flow begins observation.
+#[test]
+fn an_evicted_inspected_flow_reaches_the_observer_as_closed() {
+    let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let addr = echo_server();
+    let (cfg, observer, rx) = gate(&[], 4096);
+    let policy = Policy::parse(&[
+        "default allow".to_owned(),
+        "allow 127.0.0.0/8".to_owned(),
+        "inspect example.com".to_owned(),
+    ])
+    .unwrap();
+    let mut rig = Rig::new(harness_gate_flow_cap(policy, Some((cfg, observer)), 1));
+    resolve(&mut rig.h, "example.com", std::net::Ipv4Addr::LOCALHOST);
+
+    let (first, _) = rig.connect(addr);
+    rig.send(first, request);
+    assert_eq!(rig.recv(first, request.len()), request);
+    let (second, _) = rig.connect(addr);
+    rig.send(second, request);
+    assert_eq!(rig.recv(second, request.len()), request);
+    drop(rig.events());
+
+    let messages = observed(rx);
+    let close_first = messages
+        .iter()
+        .position(|message| matches!(message, Message::Close { flow: 1, .. }))
+        .expect("the evicted flow's close");
+    let open_second = messages
+        .iter()
+        .position(|message| matches!(message, Message::Open { flow: 2, .. }))
+        .expect("the replacement flow's open");
+    assert!(close_first < open_second, "{messages:?}");
 }
 
 /// An observer that never reads: the relay moves at the host's pace, the

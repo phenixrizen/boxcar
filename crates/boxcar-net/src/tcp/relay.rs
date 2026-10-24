@@ -84,6 +84,7 @@ use super::flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending};
 use super::{TcpLimits, GUEST_TIMEOUT, KEEP_ALIVE, SOCKET_BUFFER};
 use crate::audit::{self, close_record, DropReason};
 use crate::frame;
+use crate::gate::observe::ObservationState;
 use crate::gate::{Direction, Inspect, InspectConfig, Message, Observer, Phase};
 use crate::http_host::{self, Request};
 use crate::policy::{Policy, Verdict};
@@ -580,6 +581,7 @@ impl Relay {
         let Some(mut flow) = self.table.remove(id) else {
             return;
         };
+        observe_close(cx, &mut flow);
         if !flow.ending() {
             cx.record(close_record(
                 id,
@@ -908,6 +910,7 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
                                 name: start.name,
                                 alpn: None,
                                 tls: false,
+                                state: ObservationState::default(),
                             };
                             flow.observe_open = flow.observed.open(observer, open);
                         }
@@ -1372,6 +1375,7 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
                     name,
                     alpn: negotiated.alpn,
                     tls: true,
+                    state: ObservationState::default(),
                 };
                 flow.observe_open = flow.observed.open(observer, open);
             }

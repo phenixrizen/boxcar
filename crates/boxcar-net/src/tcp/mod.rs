@@ -44,6 +44,8 @@ pub mod relay;
 
 use std::time::Duration;
 
+use crate::gate::observe::MAX_OBSERVED;
+
 pub use flow::{Flow, FlowId, FlowState, FlowTable, GateBuf, Pending, FLOW_ID_LIMIT};
 
 /// The [`FdChange`](crate::FdChange) token of flow 0's host socket; flow
@@ -121,6 +123,9 @@ impl TcpLimits {
         if self.flow_cap == 0 {
             return Err("tcp.flow_cap must be at least 1");
         }
+        if self.flow_cap > MAX_OBSERVED {
+            return Err("tcp.flow_cap must not exceed the observer's flow limit");
+        }
         if self.pending_cap == 0 {
             return Err("tcp.pending_cap must be at least 1");
         }
@@ -153,6 +158,10 @@ mod tests {
                 ..TcpLimits::default()
             },
             TcpLimits {
+                flow_cap: MAX_OBSERVED + 1,
+                ..TcpLimits::default()
+            },
+            TcpLimits {
                 pending_cap: 0,
                 ..TcpLimits::default()
             },
@@ -175,5 +184,22 @@ mod tests {
         ] {
             assert!(broken.check().is_err(), "{broken:?}");
         }
+    }
+
+    #[test]
+    fn flow_cap_does_not_exceed_the_observer_limit() {
+        let at_limit = TcpLimits {
+            flow_cap: MAX_OBSERVED,
+            ..TcpLimits::default()
+        };
+        assert_eq!(at_limit.check(), Ok(()));
+        let above_limit = TcpLimits {
+            flow_cap: MAX_OBSERVED + 1,
+            ..TcpLimits::default()
+        };
+        assert_eq!(
+            above_limit.check(),
+            Err("tcp.flow_cap must not exceed the observer's flow limit")
+        );
     }
 }

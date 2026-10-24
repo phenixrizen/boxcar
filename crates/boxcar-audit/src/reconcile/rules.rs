@@ -445,6 +445,7 @@ pub fn observe(
         }
         Payload::NetClose(_)
         | Payload::NetDrop(_)
+        | Payload::NetDegraded(_)
         | Payload::NetDhcp(_)
         | Payload::VsockClose(_) => {}
 

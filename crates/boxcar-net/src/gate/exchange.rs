@@ -345,6 +345,22 @@ impl Observation {
         self.handle(events, now, out);
     }
 
+    /// The flow disappeared without its terminal observer message: nothing
+    /// still open may be treated as a complete exchange.
+    pub fn unclosed(&mut self, now: Instant, out: &mut Vec<Emit>) {
+        let mut events = Vec::new();
+        self.conn.give_up("unclosed", &mut events);
+        if events.is_empty() {
+            out.push(Emit::plain(Payload::HttpDegraded(HttpDegraded {
+                flow: self.flow,
+                direction: "both".into(),
+                stream: None,
+                reason: "unclosed".into(),
+            })));
+        }
+        self.handle(events, now, out);
+    }
+
     /// The flow ended: what is open is recorded as it stands.
     pub fn close(&mut self, now: Instant, out: &mut Vec<Emit>) {
         let mut events = Vec::new();

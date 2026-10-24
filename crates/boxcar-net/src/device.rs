@@ -91,6 +91,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use boxcar_audit::AuditSink;
+use boxcar_proto::{NetDegraded, Payload};
 use boxcar_virtio::features::{EVENT_IDX, VERSION_1};
 use boxcar_virtio::{ActivateError, ActivatedQueue, IrqTrigger, VirtioDevice};
 use event_manager::{
@@ -103,7 +104,7 @@ use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
 use vmm_sys_util::timerfd::TimerFd;
 
 use crate::config::{ConfigError, NetConfig};
-use crate::dump::{DumpDir, DumpThread, FrameDump};
+use crate::dump::{DumpDir, DumpThread, FrameDump, ThreadJoin};
 use crate::gate::observe::ObserverThread;
 use crate::gate::{InspectConfig, Observer};
 use crate::policy::Policy;
@@ -455,31 +456,61 @@ impl VirtioNet {
     /// So every record they make is in the log before `vmm.stop`. Waits
     /// at most [`JOIN_LIMIT`] on each; a second call does nothing.
     pub fn shutdown(&mut self) {
+        self.shutdown_with_limit(JOIN_LIMIT);
+    }
+
+    fn shutdown_with_limit(&mut self, limit: Duration) {
         // No thread may outlive the device: the net thread first, then the
         // observer, which ends once the last sender (the stacks') is gone.
         self.reset();
         self.spare = None;
         self.observer = None;
         if let Some(thread) = self.observer_thread.take() {
-            if !thread.join(JOIN_LIMIT) {
-                boxcar_virtio::limited!(
-                    warn,
-                    "virtio-net: the observer thread did not stop within {JOIN_LIMIT:?}; leaving it \
-                     behind"
-                );
+            match thread.join(limit) {
+                ThreadJoin::Joined => {}
+                ThreadJoin::TimedOut => {
+                    boxcar_virtio::limited!(
+                        warn,
+                        "virtio-net: the observer thread did not stop within {limit:?}; leaving it \
+                         behind"
+                    );
+                    record_degraded(&self.sink, "observer", "shutdown_timeout");
+                }
+                ThreadJoin::Panicked => {
+                    // Recorded by the thread itself when it happened.
+                    boxcar_virtio::limited!(warn, "virtio-net: the observer thread panicked");
+                }
             }
         }
         // The dump thread ends once the last sender (the stacks') is gone.
         self.dump = None;
         if let Some(thread) = self.dump_thread.take() {
-            if !thread.join(JOIN_LIMIT) {
-                boxcar_virtio::limited!(
-                    warn,
-                    "virtio-net: the dump thread did not stop within {JOIN_LIMIT:?}; leaving it behind"
-                );
+            match thread.join(limit) {
+                ThreadJoin::Joined => {}
+                ThreadJoin::TimedOut => {
+                    boxcar_virtio::limited!(
+                        warn,
+                        "virtio-net: the dump thread did not stop within {limit:?}; leaving it behind"
+                    );
+                    record_degraded(&self.sink, "dump", "shutdown_timeout");
+                }
+                ThreadJoin::Panicked => {
+                    boxcar_virtio::limited!(warn, "virtio-net: the dump thread panicked");
+                    record_degraded(&self.sink, "dump", "panic");
+                }
             }
         }
     }
+}
+
+fn record_degraded(sink: &AuditSink, component: &str, reason: &str) {
+    crate::audit::record(
+        sink,
+        Payload::NetDegraded(NetDegraded {
+            component: component.into(),
+            reason: reason.into(),
+        }),
+    );
 }
 
 impl Drop for VirtioNet {
@@ -2211,6 +2242,7 @@ mod tests {
             name: Some("api.example".into()),
             alpn: None,
             tls: false,
+            state: crate::gate::observe::ObservationState::default(),
         });
         for _ in 0..200 {
             observer.send(Message::Data {
@@ -2238,5 +2270,42 @@ mod tests {
             .collect();
         assert_eq!(requests.len(), 200, "{}", requests.len());
         assert!(requests.iter().all(|&i| i < marker));
+    }
+
+    /// A worker that misses the shutdown deadline is in the log before
+    /// shutdown returns, for both network-side workers that may be left.
+    #[test]
+    fn shutdown_records_workers_left_behind() {
+        let session = Session::new();
+        let mut net = session.device();
+        let (observer, release_observer) = ObserverThread::blocked();
+        let (dump, release_dump) = DumpThread::blocked();
+        net.observer_thread = Some(observer);
+        net.dump_thread = Some(dump);
+
+        net.shutdown_with_limit(Duration::ZERO);
+        release_observer.send(()).unwrap();
+        release_dump.send(()).unwrap();
+        crate::audit::record(
+            &session.sink,
+            Payload::NetDrop(boxcar_proto::NetDrop {
+                reason: "marker".into(),
+                count: 1,
+            }),
+        );
+
+        let records = session.records();
+        let marker = records.iter().position(|r| r.kind == "net.drop").unwrap();
+        let degraded: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == "net.degraded")
+            .collect();
+        assert_eq!(degraded.len(), 2, "{degraded:?}");
+        assert!(degraded.iter().all(|(at, _)| *at < marker));
+        assert_eq!(degraded[0].1.data["component"], "observer");
+        assert_eq!(degraded[0].1.data["reason"], "shutdown_timeout");
+        assert_eq!(degraded[1].1.data["component"], "dump");
+        assert_eq!(degraded[1].1.data["reason"], "shutdown_timeout");
     }
 }
