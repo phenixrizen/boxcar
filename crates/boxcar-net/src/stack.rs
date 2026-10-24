@@ -45,7 +45,7 @@
 //! `revoke`). What the new policy still allows is left as it is.
 
 use std::collections::hash_map::RandomState;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::RawFd;
@@ -241,6 +241,7 @@ impl NetStack {
     /// every frame it is given is copied to it, never waiting; one the
     /// dump has no room for is counted (`net.drop{reason:"dump"}`).
     pub fn with_dump(mut self, dump: Option<FrameDump>) -> Self {
+        self.pipe.dump_payloads = dump.as_ref().is_some_and(FrameDump::payloads);
         self.dump = dump;
         self
     }
@@ -349,18 +350,18 @@ impl NetStack {
 
     /// The next frame for the guest, if any; a copy goes to the dump,
     /// whole in payload mode only on a flow whose TLS the gate is ending
-    /// as it goes (the gate's own records).
+    /// when the frame was queued (the gate's own records).
     pub fn pop_host_frame(&mut self) -> Option<Vec<u8>> {
-        let frame = self.pipe.to_guest.pop_front()?;
+        let HostFrame {
+            bytes,
+            dump_payload,
+        } = self.pipe.to_guest.pop_front()?;
         if let Some(dump) = self.dump.as_ref() {
-            let gate_tls = dump.payloads()
-                && crate::dump::tcp_ends(&frame)
-                    .is_some_and(|(remote, guest)| self.tcp.gate_tls(guest, remote));
-            if !dump.push_to_guest(&frame, gate_tls) {
+            if !dump.push_to_guest(&bytes, dump_payload) {
                 self.drop_frame(DropReason::Dump, Instant::now());
             }
         }
-        Some(frame)
+        Some(bytes)
     }
 
     /// How many frames wait for the guest: at most [`QUEUE_CAP`]. The
@@ -410,6 +411,8 @@ impl NetStack {
             tcp.expire(&mut cx);
             udp.expire(&mut cx);
         }
+        self.pipe
+            .set_dump_payload_flows(self.tcp.dump_payload_flows());
         self.iface.poll(stamp, &mut self.pipe, &mut self.sockets);
         {
             let Parts { tcp, mut cx, .. } = self.split(now);
@@ -895,6 +898,13 @@ fn smoltcp_time(epoch: Instant, now: Instant) -> SmolInstant {
     SmolInstant::from_micros(i64::try_from(since).unwrap_or(i64::MAX))
 }
 
+/// One frame waiting for the guest, with the payload-retention decision
+/// made when smoltcp queued it.
+struct HostFrame {
+    bytes: Vec<u8>,
+    dump_payload: bool,
+}
+
 /// smoltcp's device: two frame queues, one each way, and the relay's slot
 /// for a parked SYN.
 #[derive(Default)]
@@ -902,7 +912,12 @@ pub(crate) struct Pipe {
     /// Guest frames for smoltcp.
     to_stack: VecDeque<Vec<u8>>,
     /// Frames for the guest, from the dispatcher and from smoltcp.
-    to_guest: VecDeque<Vec<u8>>,
+    to_guest: VecDeque<HostFrame>,
+    /// Remote-to-guest TCP tuples whose payloads the dump may keep when
+    /// smoltcp queues a frame.
+    dump_payload_flows: HashSet<(SocketAddrV4, SocketAddrV4)>,
+    /// Whether smoltcp's frames need payload-retention decisions.
+    dump_payloads: bool,
     /// Frames smoltcp made that the full guest queue refused, since the
     /// stack last counted them.
     refused: u64,
@@ -916,8 +931,23 @@ impl Pipe {
         if !self.has_room() {
             return false;
         }
-        self.to_guest.push_back(frame);
+        self.to_guest.push_back(HostFrame {
+            bytes: frame,
+            dump_payload: false,
+        });
         true
+    }
+
+    /// Replaces the inspected TLS tuples used to mark smoltcp's next
+    /// frames for payload retention.
+    pub(crate) fn set_dump_payload_flows(
+        &mut self,
+        flows: impl Iterator<Item = (SocketAddrV4, SocketAddrV4)>,
+    ) {
+        self.dump_payload_flows.clear();
+        if self.dump_payloads {
+            self.dump_payload_flows.extend(flows);
+        }
     }
 
     /// Whether the guest's queue takes another frame.
@@ -954,6 +984,8 @@ impl phy::Device for Pipe {
                 TxToken {
                     queue: &mut self.to_guest,
                     refused: &mut self.refused,
+                    dump_payload_flows: &self.dump_payload_flows,
+                    dump_payloads: self.dump_payloads,
                 },
             ));
         }
@@ -966,6 +998,8 @@ impl phy::Device for Pipe {
             TxToken {
                 queue: &mut self.to_guest,
                 refused: &mut self.refused,
+                dump_payload_flows: &self.dump_payload_flows,
+                dump_payloads: self.dump_payloads,
             },
         ))
     }
@@ -979,6 +1013,8 @@ impl phy::Device for Pipe {
         Some(TxToken {
             queue: &mut self.to_guest,
             refused: &mut self.refused,
+            dump_payload_flows: &self.dump_payload_flows,
+            dump_payloads: self.dump_payloads,
         })
     }
 
@@ -1000,8 +1036,10 @@ impl phy::RxToken for RxToken {
 }
 
 pub(crate) struct TxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
+    queue: &'a mut VecDeque<HostFrame>,
     refused: &'a mut u64,
+    dump_payload_flows: &'a HashSet<(SocketAddrV4, SocketAddrV4)>,
+    dump_payloads: bool,
 }
 
 impl phy::TxToken for TxToken<'_> {
@@ -1012,7 +1050,13 @@ impl phy::TxToken for TxToken<'_> {
         let mut frame = vec![0; len];
         let result = f(&mut frame);
         if self.queue.len() < QUEUE_CAP {
-            self.queue.push_back(frame);
+            let dump_payload = self.dump_payloads
+                && crate::dump::tcp_ends(&frame)
+                    .is_some_and(|ends| self.dump_payload_flows.contains(&ends));
+            self.queue.push_back(HostFrame {
+                bytes: frame,
+                dump_payload,
+            });
         } else {
             *self.refused = self.refused.saturating_add(1);
         }
@@ -1110,6 +1154,45 @@ mod tests {
         let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
         let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
         (tcp.syn() && tcp.ack()).then_some(tcp.seq_number().0 as u32)
+    }
+
+    #[test]
+    fn queued_frames_keep_their_original_payload_decision() {
+        let cfg = NetConfig::default();
+        let guest = SocketAddrV4::new(cfg.guest_ip, 40_000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443);
+        let frame = segment(
+            &cfg,
+            remote,
+            guest,
+            TcpControl::Psh,
+            (10, Some(20)),
+            b"record",
+        );
+        let enqueue = |pipe: &mut Pipe| {
+            let token = smoltcp::phy::Device::transmit(pipe, SmolInstant::ZERO).unwrap();
+            smoltcp::phy::TxToken::consume(token, frame.len(), |bytes| {
+                bytes.copy_from_slice(&frame)
+            });
+        };
+
+        let mut pipe = Pipe {
+            dump_payloads: true,
+            ..Pipe::default()
+        };
+        pipe.set_dump_payload_flows([(remote, guest)].into_iter());
+        enqueue(&mut pipe);
+        // The tuple's next flow is not inspected before either frame is
+        // taken from the queue.
+        pipe.set_dump_payload_flows(std::iter::empty());
+        enqueue(&mut pipe);
+
+        let first = pipe.to_guest.pop_front().unwrap();
+        let second = pipe.to_guest.pop_front().unwrap();
+        assert!(first.dump_payload);
+        assert!(!second.dump_payload);
+        assert_eq!(first.bytes, frame);
+        assert_eq!(second.bytes, frame);
     }
 
     /// A ClientHello naming `name`, in one record.

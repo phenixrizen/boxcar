@@ -143,13 +143,16 @@ says why.
   `DebugNet`. Open it with Wireshark or `tcpdump -r`. Each frame is cut
   after its Ethernet, IP and TCP, UDP or ICMP headers, keeping its
   original length: a TCP payload (plain HTTP's included) is never written.
-  ARP, DNS and DHCP are kept whole. With `--dump-payloads` the frames
+  Well-formed, exactly sized ARP packets are kept whole, as are UDP
+  datagrams on port 53 whose payload parses as DNS and datagrams on ports
+  67 or 68 whose payload has a plausible DHCP header. Other frames using
+  those protocol numbers or ports are cut to their headers. With
+  `--dump-payloads` the frames
   the gate sends the guest on a flow whose TLS it ended are written
   whole: their payload is the gate's own TLS records, ciphertext whose
-  keys never leave the VMM. The stack asks the relay as it hands each
-  frame to the guest whether the gate is ending that flow's TLS at that
-  moment, so nothing is remembered that could outlive the flow. What the
-  guest sends is cut whatever it looks like, since a
+  keys never leave the VMM. The stack marks that state when each frame is
+  queued and carries the decision with the frame until the guest takes it.
+  What the guest sends is cut whatever it looks like, since a
   guest can dress anything as TLS, and so is every other flow's payload,
   a plain HTTP flow's included. A frame the dump's
   queue had no room for is dropped and counted (`net.drop{reason:"dump"}`);

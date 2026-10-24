@@ -8,10 +8,12 @@
 //!   gave it, as pcap 2.4 (little endian, microsecond timestamps,
 //!   Ethernet), cut after the frame's headers ([`headers_len`]): a TCP
 //!   payload is not written, plain HTTP's credentials included; each
-//!   record keeps the frame's original length. With `--dump-payloads`
+//!   record keeps the frame's original length. Well-formed ARP packets,
+//!   DNS messages, and DHCP messages with plausible headers are kept
+//!   whole. With `--dump-payloads`
 //!   ([`DumpDir::with_payloads`]) a frame the stack sends the guest on a
 //!   flow whose TLS the gate is ending at that moment is written whole
-//!   (the stack asks the relay as it hands the frame over,
+//!   (the stack records that state when it queues the frame,
 //!   [`FrameDump::push_to_guest`]): the gate's own TLS records,
 //!   ciphertext whose keys never leave the VMM. What the guest sends is
 //!   cut whatever it looks like, and so is every other flow's payload, a
@@ -48,6 +50,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use boxcar_proto::redact::{scrub_target, scrub_text};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use smoltcp::wire::{
+    ArpHardware, ArpPacket, ArpRepr, DhcpOpCode, DhcpPacket, EthernetFrame, EthernetProtocol,
+    IpProtocol, Ipv4Packet, UdpPacket,
+};
 
 use crate::http::headers::is_credential;
 use crate::http::SseParser;
@@ -389,14 +395,15 @@ pub fn tcp_ends(frame: &[u8]) -> Option<(SocketAddrV4, SocketAddrV4)> {
     ))
 }
 
-/// The UDP ports whose payload the frame dump keeps: DNS and DHCP, which
-/// the gateway answers itself.
-const KEPT_UDP_PORTS: [u16; 3] = [53, 67, 68];
+const DNS_PORT: u16 = 53;
+const DHCP_PORTS: [u16; 2] = [67, 68];
+const DHCP_MAGIC: u32 = 0x6382_5363;
 
 /// How much of an Ethernet frame the frame dump keeps: the Ethernet,
 /// IPv4 or IPv6, and TCP, UDP or ICMP headers, without the payload after
-/// them. ARP is kept whole, and so is UDP to or from ports 53, 67 and 68
-/// (DNS and DHCP).
+/// them. A well-formed, exactly sized ARP packet is kept whole, as is a
+/// well-formed UDP datagram to or from port 53 whose payload parses as DNS,
+/// or ports 67 and 68 whose payload has a plausible DHCP header.
 /// A frame too short for what its headers say is kept to its Ethernet
 /// header.
 pub fn headers_len(frame: &[u8]) -> usize {
@@ -407,7 +414,7 @@ pub fn headers_len(frame: &[u8]) -> usize {
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     let (proto, l4) = match ethertype {
-        0x0806 => return frame.len(),
+        0x0806 => return arp_len(frame).unwrap_or(ether_short),
         0x0800 => {
             let Some(&vihl) = frame.get(ETH) else {
                 return ether_short;
@@ -430,18 +437,10 @@ pub fn headers_len(frame: &[u8]) -> usize {
             None => return ether_short,
         },
         17 => {
-            let ports = frame.get(l4..l4 + 4).map(|p| {
-                [
-                    u16::from_be_bytes([p[0], p[1]]),
-                    u16::from_be_bytes([p[2], p[3]]),
-                ]
-            });
-            match ports {
-                Some(ports) if ports.iter().any(|p| KEPT_UDP_PORTS.contains(p)) => {
-                    return frame.len()
-                }
-                _ => l4 + 8,
+            if let Some(len) = kept_udp_len(frame) {
+                return len;
             }
+            l4 + 8
         }
         1 | 58 => l4 + 8,
         _ => l4,
@@ -451,6 +450,137 @@ pub fn headers_len(frame: &[u8]) -> usize {
     } else {
         len
     }
+}
+
+/// The length of an Ethernet/IPv4 ARP packet, when `frame` is exactly one.
+fn arp_len(frame: &[u8]) -> Option<usize> {
+    const ARP_FRAME_LEN: usize = 14 + 28;
+    if frame.len() != ARP_FRAME_LEN {
+        return None;
+    }
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Arp {
+        return None;
+    }
+    let packet = ArpPacket::new_checked(eth.payload()).ok()?;
+    matches!(ArpRepr::parse(&packet), Ok(ArpRepr::EthernetIpv4 { .. })).then_some(ARP_FRAME_LEN)
+}
+
+/// The end of a UDP DNS or DHCP message that reads as that protocol.
+fn kept_udp_len(frame: &[u8]) -> Option<usize> {
+    const ETH: usize = 14;
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    let (l4, payload) = match eth.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let packet = Ipv4Packet::new_checked(eth.payload()).ok()?;
+            // A fragment is no whole datagram, whatever its first bytes say.
+            if packet.next_header() != IpProtocol::Udp
+                || packet.more_frags()
+                || packet.frag_offset() != 0
+            {
+                return None;
+            }
+            (ETH + usize::from(packet.header_len()), packet.payload())
+        }
+        EthernetProtocol::Ipv6 => {
+            let packet = eth.payload();
+            if packet.first()? >> 4 != 6 || packet.get(6) != Some(&17) {
+                return None;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]));
+            (ETH + 40, packet.get(40..40 + payload_len)?)
+        }
+        _ => return None,
+    };
+    let udp = UdpPacket::new_checked(payload).ok()?;
+    let ports = [udp.src_port(), udp.dst_port()];
+    let message = udp.payload();
+    let dns = ports.contains(&DNS_PORT) && plausible_dns(message);
+    let dhcp = ports.iter().any(|port| DHCP_PORTS.contains(port)) && plausible_dhcp(message);
+    (dns || dhcp).then_some(l4 + usize::from(udp.len()))
+}
+
+/// Whether `message` is one complete DNS wire message: every question and
+/// record named by its header fits, and there are no bytes after them.
+fn plausible_dns(message: &[u8]) -> bool {
+    let Some(counts) = message.get(4..12) else {
+        return false;
+    };
+    let count = |at: usize| usize::from(u16::from_be_bytes([counts[at], counts[at + 1]]));
+    let mut at = 12;
+    for _ in 0..count(0) {
+        let Some(end) = dns_name_end(message, at).and_then(|end| end.checked_add(4)) else {
+            return false;
+        };
+        at = end;
+    }
+    let records = count(2) + count(4) + count(6);
+    for _ in 0..records {
+        let Some(name_end) = dns_name_end(message, at) else {
+            return false;
+        };
+        let Some(fixed) = message.get(name_end..name_end + 10) else {
+            return false;
+        };
+        let data_len = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let Some(end) = name_end
+            .checked_add(10)
+            .and_then(|start| start.checked_add(data_len))
+        else {
+            return false;
+        };
+        at = end;
+    }
+    at == message.len()
+}
+
+/// The first byte after a DNS name at `at`, following backward compression
+/// pointers to check their targets. A name is at most 255 wire bytes and 64
+/// pointers.
+fn dns_name_end(message: &[u8], at: usize) -> Option<usize> {
+    let mut cursor = at;
+    let mut end = None;
+    let mut bytes = 0usize;
+    let mut pointers = 0usize;
+    loop {
+        let &label = message.get(cursor)?;
+        match label {
+            0 => return Some(end.unwrap_or(cursor + 1)),
+            0xc0..=0xff => {
+                let &low = message.get(cursor + 1)?;
+                let pointer = (usize::from(label & 0x3f) << 8) | usize::from(low);
+                if pointer >= cursor || pointers == 64 {
+                    return None;
+                }
+                end.get_or_insert(cursor + 2);
+                pointers += 1;
+                bytes += 2;
+                cursor = pointer;
+            }
+            1..=63 => {
+                let next = cursor.checked_add(1 + usize::from(label))?;
+                message.get(cursor + 1..next)?;
+                bytes += 1 + usize::from(label);
+                cursor = next;
+            }
+            _ => return None,
+        }
+        if bytes > 255 {
+            return None;
+        }
+    }
+}
+
+/// Whether `message` has the fixed fields of a DHCP message carried over
+/// Ethernet. Options are left to the DHCP reader.
+fn plausible_dhcp(message: &[u8]) -> bool {
+    let Ok(packet) = DhcpPacket::new_checked(message) else {
+        return false;
+    };
+    matches!(packet.opcode(), DhcpOpCode::Request | DhcpOpCode::Reply)
+        && packet.hardware_type() == ArpHardware::Ethernet
+        && packet.hardware_len() == 6
+        && packet.magic_number() == DHCP_MAGIC
 }
 
 // --- the exchanges
@@ -473,7 +603,7 @@ pub fn write_exchange(
     file.write_all(head)?;
     file.write_all(b"\r\n")?;
     match body {
-        Ok(body) => file.write_all(&scrubbed_body(content_type, body))?,
+        Ok(body) => write_scrubbed_body(&mut file, content_type, body, false)?,
         Err(bytes) => writeln!(
             file,
             "[{bytes} bytes not written: the body was not kept whole]"
@@ -562,6 +692,18 @@ fn scrubbed_stream_body(body: &[u8]) -> Vec<u8> {
 }
 
 fn scrubbed_body_with(content_type: Option<&str>, body: &[u8], streamed: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Writing to a Vec cannot fail.
+    write_scrubbed_body(&mut out, content_type, body, streamed).expect("Vec write");
+    out
+}
+
+fn write_scrubbed_body<W: Write>(
+    out: &mut W,
+    content_type: Option<&str>,
+    body: &[u8],
+    streamed: bool,
+) -> io::Result<()> {
     let body = &body[..body.len().min(EXCHANGE_FILE_LIMIT)];
     let kind = content_type.unwrap_or("").trim().to_ascii_lowercase();
     let json_kind = kind == "application/json" || kind.ends_with("+json");
@@ -572,35 +714,34 @@ fn scrubbed_body_with(content_type: Option<&str>, body: &[u8], streamed: bool) -
         || kind == "application/json-seq";
     if kind == "text/event-stream" || lines_kind {
         let Ok(text) = std::str::from_utf8(body) else {
-            return format!("[{} bytes of {kind} not written]\n", body.len()).into_bytes();
+            return writeln!(out, "[{} bytes of {kind} not written]", body.len());
         };
         return if lines_kind {
-            lines(text)
+            out.write_all(lines(text).as_bytes())
         } else {
-            events(body)
-        }
-        .into_bytes();
+            write_events(out, body)
+        };
     }
     if let Some(clean) = json_text(body, streamed) {
-        return clean.into_bytes();
+        return out.write_all(clean.as_bytes());
     }
     if json_kind {
         // Said to be JSON and not: its member names cannot be read.
-        return format!("[{} bytes of {kind} that is not JSON]\n", body.len()).into_bytes();
+        return writeln!(out, "[{} bytes of {kind} that is not JSON]", body.len());
     }
     let Ok(text) = std::str::from_utf8(body) else {
-        return format!(
-            "[{} bytes of {} not written]\n",
+        return writeln!(
+            out,
+            "[{} bytes of {} not written]",
             body.len(),
             if kind.is_empty() { "binary" } else { &kind }
-        )
-        .into_bytes();
+        );
     };
     if looks_like_event_stream(text) {
-        return events(body).into_bytes();
+        return write_events(out, body);
     }
     if kind == "application/x-www-form-urlencoded" || looks_like_form(text) {
-        return form(text).into_bytes();
+        return out.write_all(form(text).as_bytes());
     }
     let markup_kind = kind == "text/html"
         || kind == "text/xml"
@@ -612,10 +753,10 @@ fn scrubbed_body_with(content_type: Option<&str>, body: &[u8], streamed: bool) -
         || kind.starts_with("text/")
         || kind == "application/javascript";
     if textual && !markup {
-        return scrub_text(text).into_bytes();
+        return out.write_all(scrub_text(text).as_bytes());
     }
     let description = if kind.is_empty() { "markup" } else { &kind };
-    format!("[{} bytes of {description} not written]\n", body.len()).into_bytes()
+    writeln!(out, "[{} bytes of {description} not written]", body.len())
 }
 
 /// `bytes` as JSON scrubbed by key and in every string, if it is JSON.
@@ -736,37 +877,48 @@ fn form(text: &str) -> String {
         .join("&")
 }
 
-/// An event stream, event by event as the observer reads it (`data:`
-/// lines joined): each event's data scrubbed as JSON when it is JSON, its
-/// size alone when it is not (`[DONE]` aside), so that one event's JSON
-/// split over several `data:` lines is never read as loose text.
-fn events(body: &[u8]) -> String {
+/// Writes an event stream event by event as the observer reads it (`data:`
+/// lines joined). Each event's data is scrubbed as JSON when it is JSON,
+/// and written as its size when it is not (`[DONE]` aside), so that one
+/// event's JSON split over several `data:` lines is never read as loose
+/// text. At most one completed event waits to be written.
+fn write_events<W: Write>(out: &mut W, body: &[u8]) -> io::Result<()> {
     let mut parser = SseParser::new();
-    let mut events = Vec::new();
-    parser.feed(body, &mut events);
-    parser.finish(&mut events);
-    let mut out = String::with_capacity(body.len());
-    for event in events {
-        if let Some(name) = &event.event {
-            out.push_str(&format!("event: {}\n", scrub_text(name)));
+    let mut parsed = Vec::with_capacity(1);
+    for line in body.split_inclusive(|byte| matches!(*byte, b'\n' | b'\r')) {
+        parser.feed(line, &mut parsed);
+        debug_assert!(parsed.len() <= 1);
+        if let Some(event) = parsed.pop() {
+            write_event(out, event)?;
         }
-        if let Some(id) = &event.id {
-            out.push_str(&format!("id: {}\n", scrub_text(id)));
-        }
-        if !event.data.is_empty() {
-            let data = match json_text(event.data.as_bytes(), true) {
-                Some(clean) => clean,
-                None if event.data.trim() == "[DONE]" => "[DONE]".to_owned(),
-                None => format!("[{} bytes]", event.data.len()),
-            };
-            out.push_str(&format!("data: {data}\n"));
-        }
-        out.push('\n');
+    }
+    parser.finish(&mut parsed);
+    debug_assert!(parsed.len() <= 1);
+    if let Some(event) = parsed.pop() {
+        write_event(out, event)?;
     }
     if parser.overflowed() {
-        out.push_str("[a line past the event limit was not written]\n");
+        out.write_all(b"[a line past the event limit was not written]\n")?;
     }
-    out
+    Ok(())
+}
+
+fn write_event<W: Write>(out: &mut W, event: crate::http::SseEvent) -> io::Result<()> {
+    if let Some(name) = &event.event {
+        writeln!(out, "event: {}", scrub_text(name))?;
+    }
+    if let Some(id) = &event.id {
+        writeln!(out, "id: {}", scrub_text(id))?;
+    }
+    if !event.data.is_empty() {
+        let data = match json_text(event.data.as_bytes(), true) {
+            Some(clean) => clean,
+            None if event.data.trim() == "[DONE]" => "[DONE]".to_owned(),
+            None => format!("[{} bytes]", event.data.len()),
+        };
+        writeln!(out, "data: {data}")?;
+    }
+    writeln!(out)
 }
 
 /// JSON lines, line by line: a line that is JSON scrubbed as JSON, any
@@ -981,11 +1133,20 @@ mod tests {
         frame.extend_from_slice(&0x0800u16.to_be_bytes());
         let mut ip = [0u8; 20];
         ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(20 + l4.len() as u16 + payload.len() as u16).to_be_bytes());
         ip[9] = proto;
         frame.extend_from_slice(&ip);
         frame.extend_from_slice(l4);
         frame.extend_from_slice(payload);
         frame
+    }
+
+    fn udp4(src: u16, dst: u16, payload: &[u8]) -> Vec<u8> {
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&src.to_be_bytes());
+        udp[2..4].copy_from_slice(&dst.to_be_bytes());
+        udp[4..6].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+        ipv4(17, &udp, payload)
     }
 
     #[test]
@@ -996,17 +1157,15 @@ mod tests {
         let frame = ipv4(6, &tcp, payload);
         assert_eq!(headers_len(&frame), 54);
 
-        let mut udp = [0u8; 8];
-        udp[0..2].copy_from_slice(&40000u16.to_be_bytes());
-        udp[2..4].copy_from_slice(&443u16.to_be_bytes());
-        assert_eq!(headers_len(&ipv4(17, &udp, b"quic")), 42);
-        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
-        let dns = ipv4(17, &udp, b"query");
+        assert_eq!(headers_len(&udp4(40000, 443, b"quic")), 42);
+        let dns = udp4(40000, 53, &[0; 12]);
         assert_eq!(headers_len(&dns), dns.len());
 
         let mut arp = vec![0u8; 12];
         arp.extend_from_slice(&0x0806u16.to_be_bytes());
-        arp.extend_from_slice(&[0u8; 28]);
+        arp.extend_from_slice(&[
+            0, 1, 8, 0, 6, 4, 0, 1, 0, 1, 2, 3, 4, 5, 10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 10, 0, 2, 2,
+        ]);
         assert_eq!(headers_len(&arp), arp.len());
 
         // A TCP header longer than the frame: only Ethernet is kept.
@@ -1014,6 +1173,42 @@ mod tests {
         bad[12] = 15 << 4;
         assert_eq!(headers_len(&ipv4(6, &bad, b"")), 14);
         assert_eq!(headers_len(&[1, 2, 3]), 3);
+    }
+
+    #[test]
+    fn only_well_formed_service_frames_are_kept_whole() {
+        let mut arp = vec![0u8; 12];
+        arp.extend_from_slice(&0x0806u16.to_be_bytes());
+        arp.extend_from_slice(&[
+            0, 1, 8, 0, 6, 4, 0, 1, 0, 1, 2, 3, 4, 5, 10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 10, 0, 2, 2,
+        ]);
+        let mut oversized_arp = arp.clone();
+        oversized_arp.push(1);
+        assert_eq!(headers_len(&oversized_arp), 14);
+        let mut malformed_arp = arp;
+        malformed_arp[14..42].fill(0);
+        assert_eq!(headers_len(&malformed_arp), 14);
+
+        let dns = udp4(40_000, DNS_PORT, &[0; 12]);
+        assert_eq!(headers_len(&dns), dns.len());
+        assert_eq!(headers_len(&udp4(40_000, DNS_PORT, b"short")), 42);
+        let mut trailing = vec![0; 12];
+        trailing.extend_from_slice(b"tail");
+        assert_eq!(headers_len(&udp4(40_000, DNS_PORT, &trailing)), 42);
+        // A fragment is no whole datagram, whatever its first bytes say.
+        let mut fragment = udp4(40_000, DNS_PORT, &[0; 12]);
+        fragment[14 + 6] |= 0x20;
+        assert_eq!(headers_len(&fragment), 42);
+
+        let mut dhcp = vec![0u8; 240];
+        dhcp[0] = 1;
+        dhcp[1] = 1;
+        dhcp[2] = 6;
+        dhcp[236..240].copy_from_slice(&DHCP_MAGIC.to_be_bytes());
+        let message = udp4(68, 67, &dhcp);
+        assert_eq!(headers_len(&message), message.len());
+        dhcp[236..240].fill(0);
+        assert_eq!(headers_len(&udp4(68, 67, &dhcp)), 42);
     }
 
     /// A TCP/IPv4 frame from `src` to `dst` (address' last byte, port)
@@ -1220,6 +1415,33 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[derive(Default)]
+    struct WriteSizes {
+        total: usize,
+        largest: usize,
+    }
+
+    impl std::io::Write for WriteSizes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.total += bytes.len();
+            self.largest = self.largest.max(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn many_tiny_events_are_written_incrementally() {
+        let body = b"data: {}\n\n".repeat(20_000);
+        let mut writes = WriteSizes::default();
+        write_scrubbed_body(&mut writes, Some("text/event-stream"), &body, false).unwrap();
+        assert_eq!(writes.total, body.len());
+        assert!(writes.largest < 1024, "largest write: {}", writes.largest);
     }
 
     #[test]

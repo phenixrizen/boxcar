@@ -324,8 +324,9 @@ Debian guest or a credential.
 
 `boxcar run --dump DIR` writes a debugging dump of the network beside the
 log: `frames.pcap` with every frame the guest sent and every frame it was
-given, each cut to its headers (open it with Wireshark or `tcpdump -r`),
-and for inspected flows
+given, each cut to its headers (open it with Wireshark or `tcpdump -r`);
+well-formed ARP and DNS messages and DHCP messages with plausible headers
+are kept whole, and for inspected flows
 each decoded exchange as `http/<flow>-<stream>.req` and `.resp` (the
 start line, headers with credential-looking values removed and URI
 references scrubbed, and a decoded body scrubbed by its shape and type)
