@@ -44,9 +44,9 @@ pub use payloads::{
     ArtifactRef, Attrib, Checkpoint, ClockSync, ControlConnect, ControlStop, Evidence, ExecRing1,
     Finding, FindingCategory, FsClose, FsCopyUp, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
     FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
-    Hardening, HashStatus, HttpRequest, HttpResponse, ImageRef, LandlockStatus, LlmRequest,
-    LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls, NetUdp,
-    OpResult, PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec,
+    Hardening, HashStatus, HttpDegraded, HttpRequest, HttpResponse, ImageRef, LandlockStatus,
+    LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls,
+    NetUdp, OpResult, PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec,
     ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd,
     ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SeccompMode,
     SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen,
@@ -496,6 +496,8 @@ pub enum Payload {
     HttpRequest(HttpRequest),
     #[serde(rename = "http.response")]
     HttpResponse(HttpResponse),
+    #[serde(rename = "http.degraded")]
+    HttpDegraded(HttpDegraded),
     #[serde(rename = "llm.request")]
     LlmRequest(LlmRequest),
     #[serde(rename = "llm.response")]
@@ -570,6 +572,7 @@ impl Payload {
             Payload::ProcTlsAttach(_) => "proc.tls_attach",
             Payload::HttpRequest(_) => "http.request",
             Payload::HttpResponse(_) => "http.response",
+            Payload::HttpDegraded(_) => "http.degraded",
             Payload::LlmRequest(_) => "llm.request",
             Payload::LlmResponse(_) => "llm.response",
             Payload::ToolOpen(_) => "tool.open",
@@ -637,6 +640,7 @@ impl Payload {
             | Payload::ProcTlsAttach(_) => Source::Sensor,
             Payload::HttpRequest(_)
             | Payload::HttpResponse(_)
+            | Payload::HttpDegraded(_)
             | Payload::LlmRequest(_)
             | Payload::LlmResponse(_)
             | Payload::ToolOpen(_)
@@ -668,7 +672,7 @@ impl Payload {
 /// The wire names of the typed payloads ([`Payload`]), in schema order: the
 /// kinds a log of this version can hold. A reader meets other kinds in a
 /// log written by a newer version.
-pub const KINDS: [&str; 61] = [
+pub const KINDS: [&str; 62] = [
     "vmm.start",
     "vmm.stop",
     "fs.mount",
@@ -724,6 +728,7 @@ pub const KINDS: [&str; 61] = [
     "proc.tls_attach",
     "http.request",
     "http.response",
+    "http.degraded",
     "llm.request",
     "llm.response",
     "tool.open",
@@ -1688,6 +1693,20 @@ mod tests {
                 }),
             ),
             (
+                Payload::HttpDegraded(HttpDegraded {
+                    flow: 7,
+                    direction: "to_host".into(),
+                    stream: Some(513),
+                    reason: "framing".into(),
+                }),
+                json!({
+                    "flow": 7,
+                    "direction": "to_host",
+                    "stream": 513,
+                    "reason": "framing",
+                }),
+            ),
+            (
                 Payload::LlmRequest(LlmRequest {
                     flow: 7,
                     stream: 1,
@@ -2331,6 +2350,23 @@ mod tests {
         let bytes = serde_json::to_vec(&data).unwrap().len();
         assert!(bytes < 8 * 1024, "{bytes}");
         assert!(bytes < crate::limits::MAX_RECORD_BYTES);
+    }
+
+    /// `http.degraded` is made only from fixed labels and numbers; its
+    /// largest producer-owned reason leaves ample room in a record.
+    #[test]
+    fn an_http_degraded_record_fits_its_limit() {
+        let payload = Payload::HttpDegraded(HttpDegraded {
+            flow: u64::MAX,
+            direction: "to_guest".into(),
+            stream: Some(u32::MAX),
+            reason: "ws_compressed_without_deflate".into(),
+        });
+        let (kind, data) = payload.into_parts();
+        let back = Payload::from_record(&record(&kind, Source::Gate, data.clone())).unwrap();
+        assert_eq!(back, payload);
+        assert!(serde_json::to_vec(&data).unwrap().len() < 256);
+        assert!(serde_json::to_vec(&data).unwrap().len() < crate::limits::MAX_RECORD_BYTES);
     }
 
     #[test]

@@ -103,11 +103,17 @@ pub enum Event {
     WsClosed {
         stream: u32,
     },
-    /// Something could not be read: the stream (or the connection, for
-    /// `None`) is observed no further.
+    /// Something could not be read. With `whole` the direction (both, for
+    /// a `direction` of `None`) is read no further; otherwise only
+    /// `stream` is. `stream` is `None` when no stream is concerned.
     Degraded {
+        /// The direction that stopped being read, or `None` for both.
+        direction: Option<Direction>,
         stream: Option<u32>,
         reason: &'static str,
+        /// The direction (or, with none, the connection) is read no
+        /// further, not only the stream.
+        whole: bool,
     },
 }
 
@@ -184,8 +190,10 @@ impl Connection {
                         }
                         Err(reason) => {
                             out.push(Event::Degraded {
+                                direction: None,
                                 stream: Some(upgrade.stream),
                                 reason,
+                                whole: true,
                             });
                             self.inner = Inner::Broken;
                         }
@@ -231,8 +239,10 @@ impl Connection {
         if !matches!(self.inner, Inner::Broken) {
             self.inner = Inner::Broken;
             out.push(Event::Degraded {
+                direction: None,
                 stream: None,
                 reason,
+                whole: true,
             });
         }
     }

@@ -85,6 +85,8 @@ struct Tracked {
     started: Instant,
     /// The request was recorded (its body ended).
     requested: bool,
+    /// The response was recorded (its body ended).
+    responded: bool,
     /// A streamed response under way.
     stream: Option<Stream>,
     /// The response is a stream (events), not one document.
@@ -136,6 +138,7 @@ impl Tracker {
                     provider,
                     started: now,
                     requested: false,
+                    responded: false,
                     stream: None,
                     sse: false,
                     ws: false,
@@ -165,6 +168,7 @@ impl Tracker {
             return;
         }
         tracked.requested = true;
+        let responded = tracked.responded;
         let summary = exchange
             .request_body
             .as_ref()
@@ -177,6 +181,9 @@ impl Tracker {
             .unwrap_or(&[]);
         if summary.bytes == 0 && !summary.truncated {
             // No body: an upgrade, or nothing a model API takes.
+            if responded {
+                self.forget(stream);
+            }
             return;
         }
         let parsed = if summary.truncated {
@@ -211,6 +218,9 @@ impl Tracker {
         })));
         for close in closes {
             out.push(self.close_record(stream, close));
+        }
+        if responded {
+            self.forget(stream);
         }
     }
 
@@ -299,10 +309,14 @@ impl Tracker {
         if let Some(reason) = tracked.degraded {
             info.degraded.get_or_insert(reason);
         }
+        tracked.responded = true;
         for open in opens {
             out.push(self.open_record(stream, open));
         }
         out.push(self.response_record(stream, tracked.provider, info, tracked.started, now));
+        if !tracked.requested {
+            self.streams.insert(stream, tracked);
+        }
     }
 
     /// The stream switched to WebSocket: requests and responses are
@@ -598,6 +612,59 @@ mod tests {
             tracker.streams.capacity() <= 16,
             "{}",
             tracker.streams.capacity()
+        );
+    }
+
+    #[test]
+    fn a_response_that_ends_first_keeps_the_request_records() {
+        let mut obs = observation();
+        let mut out = Vec::new();
+        let now = Instant::now();
+        let request = serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "ok"
+                }]
+            }]
+        })
+        .to_string();
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            request.len()
+        );
+        obs.data(Direction::ToHost, head.as_bytes(), now, &mut out);
+        obs.data(
+            Direction::ToGuest,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            now,
+            &mut out,
+        );
+        assert_eq!(kinds(&out), ["http.response", "llm.response"], "{out:?}");
+
+        obs.data(Direction::ToHost, request.as_bytes(), now, &mut out);
+        assert_eq!(
+            kinds(&out),
+            [
+                "http.response",
+                "llm.response",
+                "http.request",
+                "llm.request",
+                "tool.close"
+            ],
+            "{out:?}"
+        );
+        let close = out.iter().find_map(|emit| match &emit.payload {
+            Payload::ToolClose(close) => Some(close),
+            _ => None,
+        });
+        assert_eq!(
+            close.map(|close| close.tool_use_id.as_str()),
+            Some("toolu_1")
         );
     }
 
