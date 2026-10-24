@@ -1332,6 +1332,8 @@ pub enum SpanUnverifiedReason {
     NoLineage,
     /// A close could not be attributed and left the span open.
     CloseUnattributed,
+    /// Retained process lineage was released to keep aggregate bounds.
+    LineageEvicted,
 }
 
 impl SpanUnverifiedReason {
@@ -1340,6 +1342,7 @@ impl SpanUnverifiedReason {
         match self {
             SpanUnverifiedReason::NoLineage => "no_lineage",
             SpanUnverifiedReason::CloseUnattributed => "close_unattributed",
+            SpanUnverifiedReason::LineageEvicted => "lineage_evicted",
         }
     }
 }
@@ -1351,7 +1354,7 @@ pub const MAX_SPAN_PROCS: usize = 1024;
 pub const MAX_SPAN_EFFECTS: usize = 2048;
 /// The most attribution reasons a `span.effects` record carries. The fixed
 /// reason set and producer-side deduplication keep the list within this bound.
-pub const MAX_SPAN_UNVERIFIED_REASONS: usize = 2;
+pub const MAX_SPAN_UNVERIFIED_REASONS: usize = 3;
 
 /// `span.effects`: what a tool span held when it closed, or when the VM
 /// stopped with it still open: the processes the reconciler attributed to
@@ -1379,7 +1382,7 @@ pub struct SpanEffects {
     /// `proc.exec` of each process, and the `fs.*` and `net.connect`
     /// records their work made; at most 2048.
     pub effects: Vec<u64>,
-    /// Why process attribution for the span is not verified; at most two,
+    /// Why process attribution for the span is not verified; at most three,
     /// omitted when attribution was verified.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attribution_unverified: Vec<SpanUnverifiedReason>,

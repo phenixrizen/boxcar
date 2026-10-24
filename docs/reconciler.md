@@ -135,6 +135,13 @@ processes and ring 0 effects to the span:
   bounded at 64 parents; exhausting that bound is treated conservatively
   as reaching the agent, so a deeper descendant does not silently fall out
   of attribution.
+- **Lineage retention.** An exited process and its thread memberships are
+  released after the 10 s exec wait, the 2 s effect wait, the 500 ms join
+  window, every open or unsettled span reference, and every retained
+  descendant's ancestry no longer need them. The state keeps at most 16384
+  process generations and 64 MiB of their filename and argv text. If those
+  aggregate limits require an earlier release, an affected span records
+  `lineage_evicted` in `attribution_unverified`.
 - **An effect.** `fs.create`, `fs.close`, `fs.rename`, `fs.unlink`,
   `fs.mkdir` and `fs.setattr` join the span of the thread's process, and
   `net.connect` the span of the process its `proc.tcp_connect` named. A
@@ -228,8 +235,10 @@ the thread otherwise.
 - A process's first actions before the sensor attached (the sensor needs a
   moment at boot) are attributed only if their thread was later seen; the
   gated tests give it three seconds.
-- The reconciler keeps the last 65536 records' rings for the evidence and
-  prunes DNS answers after 60 s; a session is not a database.
+- The reconciler keeps the last 65536 records' rings for the evidence. DNS
+  associations are pruned after 60 s, with at most 4096 associations in all
+  and 16 names for one address, matching the live network cache; empty name
+  and address keys are removed.
 - A span lists at most 1024 processes and 2048 effect records, and the
   spans kept hold at most 64 MiB of effects between them, a settled span's
   let go; 4096 spans are kept in memory, the oldest settled one going

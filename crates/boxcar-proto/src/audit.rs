@@ -1812,6 +1812,7 @@ mod tests {
                     attribution_unverified: vec![
                         SpanUnverifiedReason::NoLineage,
                         SpanUnverifiedReason::CloseUnattributed,
+                        SpanUnverifiedReason::LineageEvicted,
                     ],
                     truncated: false,
                 }),
@@ -1819,7 +1820,9 @@ mod tests {
                     "span_id": "toolu_01", "tool_name": "Bash", "opened_seq": 40,
                     "closed_seq": 58, "executor_tgid": 212, "procs": [230, 231],
                     "effects": [41, 44, 52],
-                    "attribution_unverified": ["no_lineage", "close_unattributed"],
+                    "attribution_unverified": [
+                        "no_lineage", "close_unattributed", "lineage_evicted"
+                    ],
                     "truncated": false,
                 }),
             ),
@@ -2379,6 +2382,7 @@ mod tests {
         let reasons = vec![
             SpanUnverifiedReason::NoLineage,
             SpanUnverifiedReason::CloseUnattributed,
+            SpanUnverifiedReason::LineageEvicted,
         ];
         assert_eq!(reasons.len(), MAX_SPAN_UNVERIFIED_REASONS);
         let payload = Payload::SpanEffects(SpanEffects {
