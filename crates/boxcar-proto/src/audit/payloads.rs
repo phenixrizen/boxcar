@@ -1146,6 +1146,22 @@ pub struct ProcTlsAttach {
     pub error: Option<String>,
 }
 
+/// `http.degraded`: the observer stopped reading a direction, connection,
+/// or stream of an inspected flow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HttpDegraded {
+    /// The `flow` of the flow's `net.connect`.
+    pub flow: u64,
+    /// `to_host`, `to_guest`, or `both`.
+    pub direction: String,
+    /// HTTP/2's stream id, or an HTTP/1.1 request number; `null` when the
+    /// whole direction or connection stopped being read.
+    pub stream: Option<u32>,
+    /// The parser's bounded reason.
+    pub reason: String,
+}
+
 /// `http.request`: a request an inspected flow carried, once its body
 /// ended. Headers that carry a credential never reach the observer's
 /// records: their values are dropped at the parser.

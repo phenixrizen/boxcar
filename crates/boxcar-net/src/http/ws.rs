@@ -141,7 +141,7 @@ impl Ws {
                         OP_PING | OP_PONG => continue,
                         OP_TEXT | OP_BINARY => {
                             if side.partial.is_some() {
-                                return degrade(side, stream, "ws_fragment", out);
+                                return degrade(side, dir, stream, "ws_fragment", out);
                             }
                             side.partial = Some(Partial {
                                 text: opcode == OP_TEXT,
@@ -151,14 +151,14 @@ impl Ws {
                         }
                         OP_CONTINUATION => {
                             let Some(partial) = side.partial.as_mut() else {
-                                return degrade(side, stream, "ws_fragment", out);
+                                return degrade(side, dir, stream, "ws_fragment", out);
                             };
                             if partial.payload.len() + payload.len() > MAX_MESSAGE {
-                                return degrade(side, stream, "ws_message_too_large", out);
+                                return degrade(side, dir, stream, "ws_message_too_large", out);
                             }
                             partial.payload.append(&mut payload);
                         }
-                        _ => return degrade(side, stream, "ws_opcode", out),
+                        _ => return degrade(side, dir, stream, "ws_opcode", out),
                     }
                     if fin {
                         let Some(partial) = side.partial.take() else {
@@ -167,7 +167,7 @@ impl Ws {
                         let payload = if partial.compressed {
                             match inflate(side, &partial.payload) {
                                 Ok(payload) => payload,
-                                Err(reason) => return degrade(side, stream, reason, out),
+                                Err(reason) => return degrade(side, dir, stream, reason, out),
                             }
                         } else {
                             partial.payload
@@ -180,7 +180,7 @@ impl Ws {
                         });
                     }
                 }
-                Err(reason) => return degrade(side, stream, reason, out),
+                Err(reason) => return degrade(side, dir, stream, reason, out),
             }
         }
     }
@@ -188,17 +188,22 @@ impl Ws {
     /// Bytes were lost in `dir`: its frames cannot be found again.
     pub fn lost(&mut self, dir: Direction, out: &mut Vec<Event>) {
         let stream = self.stream;
-        degrade(self.side(dir), stream, "lost", out);
+        degrade(self.side(dir), dir, stream, "lost", out);
     }
 
     /// The connection ended.
     pub fn finish(&mut self, out: &mut Vec<Event>) {
         let stream = self.stream;
-        for side in [&mut self.c2s, &mut self.s2c] {
+        for (direction, side) in [
+            (Direction::ToHost, &mut self.c2s),
+            (Direction::ToGuest, &mut self.s2c),
+        ] {
             if side.partial.take().is_some() {
                 out.push(Event::Degraded {
+                    direction: Some(direction),
                     stream: Some(stream),
                     reason: "incomplete",
+                    whole: false,
                 });
             }
         }
@@ -212,13 +217,21 @@ impl Ws {
     }
 }
 
-fn degrade(side: &mut WsDir, stream: u32, reason: &'static str, out: &mut Vec<Event>) {
+fn degrade(
+    side: &mut WsDir,
+    direction: Direction,
+    stream: u32,
+    reason: &'static str,
+    out: &mut Vec<Event>,
+) {
     side.broken = true;
     side.buf.clear();
     side.partial = None;
     out.push(Event::Degraded {
+        direction: Some(direction),
         stream: Some(stream),
         reason,
+        whole: true,
     });
 }
 
@@ -609,8 +622,10 @@ mod tests {
         assert_eq!(
             out,
             [Event::Degraded {
+                direction: Some(Direction::ToGuest),
                 stream: Some(1),
-                reason: "ws_opcode"
+                reason: "ws_opcode",
+                whole: true,
             }]
         );
         let mut ws = Ws::new(1, &[]).unwrap();
@@ -619,8 +634,10 @@ mod tests {
         assert_eq!(
             out,
             [Event::Degraded {
+                direction: Some(Direction::ToGuest),
                 stream: Some(1),
-                reason: "ws_frame"
+                reason: "ws_frame",
+                whole: true,
             }]
         );
         // A compressed frame without the extension.
@@ -634,8 +651,10 @@ mod tests {
         assert_eq!(
             out,
             [Event::Degraded {
+                direction: Some(Direction::ToGuest),
                 stream: Some(1),
-                reason: "ws_compressed_without_deflate"
+                reason: "ws_compressed_without_deflate",
+                whole: true,
             }]
         );
     }

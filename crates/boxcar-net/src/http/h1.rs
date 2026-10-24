@@ -182,11 +182,16 @@ impl H1 {
             out.push(Event::ResponseEnd { stream });
             self.seen.retain(|s| s.stream != stream);
         }
-        for side in [&mut self.c2s, &mut self.s2c] {
+        for (direction, side) in [
+            (Direction::ToHost, &mut self.c2s),
+            (Direction::ToGuest, &mut self.s2c),
+        ] {
             if let Some((stream, _)) = side.body.take() {
                 out.push(Event::Degraded {
+                    direction: Some(direction),
                     stream: Some(stream),
                     reason: "incomplete",
+                    whole: false,
                 });
             }
         }
@@ -210,7 +215,12 @@ impl H1 {
         side.broken = true;
         side.body = None;
         side.buf.clear();
-        out.push(Event::Degraded { stream, reason });
+        out.push(Event::Degraded {
+            direction: Some(dir),
+            stream,
+            reason,
+            whole: true,
+        });
     }
 
     /// One step on the guest's side: a body's bytes, or a request head.
@@ -263,13 +273,9 @@ impl H1 {
         }
         let stream = self.next_stream;
         self.next_stream = self.next_stream.wrapping_add(1).max(1);
-        let framing = if headers.chunked() {
-            Framing::ChunkSize
-        } else {
-            match headers.content_length() {
-                Some(0) | None => Framing::None,
-                Some(n) => Framing::Length(n),
-            }
+        let framing = match message_framing(&headers, true) {
+            Ok(framing) => framing,
+            Err(reason) => return self.degrade(Direction::ToHost, None, reason, out),
         };
         self.seen.push_back(Seen {
             stream,
@@ -387,15 +393,14 @@ impl H1 {
             });
             return;
         }
+        // A response with no body by its request or status has no body
+        // whatever its fields say.
         let framing = if request.head || status == 204 || status == 304 {
             Framing::None
-        } else if headers.chunked() {
-            Framing::ChunkSize
         } else {
-            match headers.content_length() {
-                Some(0) => Framing::None,
-                Some(n) => Framing::Length(n),
-                None => Framing::UntilClose,
+            match message_framing(&headers, false) {
+                Ok(framing) => framing,
+                Err(reason) => return self.degrade(Direction::ToGuest, Some(stream), reason, out),
             }
         };
         out.push(Event::ResponseHead {
@@ -419,6 +424,179 @@ fn collect(parsed: &[httparse::Header<'_>]) -> Result<Headers, HeaderError> {
         headers.push(header.name, header.value)?;
     }
     Ok(headers)
+}
+
+/// A message's framing, as RFC 9112 has its recipient read it. A request
+/// is read as its server must read it, and one a server could read two
+/// ways (a length that is no number, two lengths, two coding fields, a
+/// length beside a coding, a coding that does not end in `chunked`) is not
+/// read at all. A response comes from the real host and is read as a
+/// client reads it: a coding over a length, a field repeated as one list.
+fn message_framing(headers: &Headers, request: bool) -> Result<Framing, &'static str> {
+    let lengths = headers.get_all("content-length");
+    let encodings = headers.get_all("transfer-encoding");
+    if request
+        && (lengths.len() > 1
+            || encodings.len() > 1
+            || !lengths.is_empty() && !encodings.is_empty())
+    {
+        return Err("framing");
+    }
+    if !encodings.is_empty() {
+        let chunked = transfer_encoding(&encodings.join(&b", "[..])).ok_or("framing")?;
+        return match (chunked, request) {
+            (true, _) => Ok(Framing::ChunkSize),
+            (false, true) => Err("framing"),
+            (false, false) => Ok(Framing::UntilClose),
+        };
+    }
+    // A response's lengths may come as a list of one number, as a field
+    // repeated and joined on the way.
+    let mut length = None;
+    for value in lengths {
+        let parts: Vec<&[u8]> = if request {
+            vec![value]
+        } else {
+            value.split(|b| *b == b',').collect()
+        };
+        for part in parts {
+            let n = decimal(part).ok_or("framing")?;
+            if length.is_some_and(|known| known != n) {
+                return Err("framing");
+            }
+            length = Some(n);
+        }
+    }
+    Ok(match length {
+        Some(0) => Framing::None,
+        Some(n) => Framing::Length(n),
+        None if request => Framing::None,
+        None => Framing::UntilClose,
+    })
+}
+
+fn decimal(value: &[u8]) -> Option<u64> {
+    let value = trim_ows(value);
+    (!value.is_empty() && value.iter().all(u8::is_ascii_digit))
+        .then(|| std::str::from_utf8(value).ok()?.parse().ok())?
+}
+
+/// Validates a `Transfer-Encoding` value and says whether its final coding
+/// is `chunked`.
+fn transfer_encoding(value: &[u8]) -> Option<bool> {
+    let mut at = 0;
+    let mut codings = 0;
+    let mut saw_chunked = false;
+    loop {
+        skip_ows(value, &mut at);
+        let start = at;
+        while value.get(at).is_some_and(|b| tchar(*b)) {
+            at += 1;
+        }
+        if at == start || saw_chunked {
+            return None;
+        }
+        let chunked = value[start..at].eq_ignore_ascii_case(b"chunked");
+        skip_ows(value, &mut at);
+        while value.get(at) == Some(&b';') {
+            at += 1;
+            skip_ows(value, &mut at);
+            let name = at;
+            while value.get(at).is_some_and(|b| tchar(*b)) {
+                at += 1;
+            }
+            if at == name {
+                return None;
+            }
+            skip_ows(value, &mut at);
+            if value.get(at) != Some(&b'=') {
+                return None;
+            }
+            at += 1;
+            skip_ows(value, &mut at);
+            if value.get(at) == Some(&b'"') {
+                quoted(value, &mut at)?;
+            } else {
+                let parameter = at;
+                while value.get(at).is_some_and(|b| tchar(*b)) {
+                    at += 1;
+                }
+                if at == parameter {
+                    return None;
+                }
+            }
+            skip_ows(value, &mut at);
+        }
+        codings += 1;
+        saw_chunked = chunked;
+        if at == value.len() {
+            return (codings > 0).then_some(chunked);
+        }
+        if value.get(at) != Some(&b',') {
+            return None;
+        }
+        at += 1;
+        if trim_ows(&value[at..]).is_empty() {
+            return None;
+        }
+    }
+}
+
+fn quoted(value: &[u8], at: &mut usize) -> Option<()> {
+    *at += 1;
+    loop {
+        let byte = *value.get(*at)?;
+        *at += 1;
+        match byte {
+            b'"' => return Some(()),
+            b'\\' => {
+                let escaped = *value.get(*at)?;
+                if !matches!(escaped, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff) {
+                    return None;
+                }
+                *at += 1;
+            }
+            b'\t' | b' ' | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | 0x80..=0xff => {}
+            _ => return None,
+        }
+    }
+}
+
+fn skip_ows(value: &[u8], at: &mut usize) {
+    while value.get(*at).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+        *at += 1;
+    }
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// One step of a body: moves what the buffer holds of it. `Ok(true)` when
@@ -619,6 +797,96 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_framing_fields_stop_the_direction() {
+        for request in [
+            b"POST / HTTP/1.1\r\nContent-Length: x\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+        ] {
+            let events = run(request, b"", 4096);
+            assert_eq!(
+                events,
+                [Event::Degraded {
+                    direction: Some(Direction::ToHost),
+                    stream: None,
+                    reason: "framing",
+                    whole: true,
+                }],
+                "{}",
+                String::from_utf8_lossy(request)
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_is_framed_as_a_client_frames_it() {
+        let request = b"GET / HTTP/1.1\r\n\r\n";
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1, 1\r\n\r\nx",
+        ] {
+            let events = run(request, response, 4096);
+            assert!(
+                events.iter().any(|e| matches!(e, Event::ResponseEnd { .. })),
+                "{events:?}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, Event::Degraded { .. })),
+                "{events:?}"
+            );
+        }
+        // No body by its request: its fields do not frame it.
+        let events = run(
+            b"HEAD / HTTP/1.1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n",
+            4096,
+        );
+        assert!(
+            events.contains(&Event::ResponseEnd { stream: 1 }),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Degraded { .. })),
+            "{events:?}"
+        );
+        let events = run(
+            request,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+            4096,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Degraded {
+                    reason: "framing",
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_transfer_coding_list_uses_its_final_coding() {
+        let events = run(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip; level=\"a,b\", chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nreply",
+            4096,
+        );
+        assert_eq!(bodies(&events, false), b"abc");
+        assert_eq!(bodies(&events, true), b"reply");
+        assert!(events.contains(&Event::RequestEnd { stream: 1 }));
+        assert!(events.contains(&Event::ResponseEnd { stream: 1 }));
+        assert!(!events.iter().any(|e| matches!(e, Event::Degraded { .. })));
+    }
+
+    #[test]
     fn pipelined_requests_pair_with_their_responses_in_order() {
         let c2s = b"HEAD /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\nGET /c HTTP/1.1\r\nHost: a\r\n\r\n";
         let s2c = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nHTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 200 OK\r\n\r\nuntil close";
@@ -672,8 +940,10 @@ mod tests {
             matches!(
                 events[0],
                 Event::Degraded {
+                    direction: Some(Direction::ToHost),
                     stream: None,
-                    reason: "bad_request_head"
+                    reason: "bad_request_head",
+                    whole: true,
                 }
             ),
             "{events:?}"
@@ -683,8 +953,10 @@ mod tests {
             matches!(
                 events[1],
                 Event::Degraded {
+                    direction: Some(Direction::ToGuest),
                     stream: None,
-                    reason: "unrequested_response"
+                    reason: "unrequested_response",
+                    whole: true,
                 }
             ),
             "{events:?}"
@@ -713,8 +985,10 @@ mod tests {
             events.iter().any(|e| matches!(
                 e,
                 Event::Degraded {
+                    direction: Some(Direction::ToHost),
                     stream: Some(1),
-                    reason: "bad_chunk"
+                    reason: "bad_chunk",
+                    whole: true,
                 }
             )),
             "{events:?}"
@@ -730,8 +1004,10 @@ mod tests {
         );
         assert_eq!(bodies(&events, false), b"abc");
         assert!(events.contains(&Event::Degraded {
+            direction: Some(Direction::ToHost),
             stream: Some(1),
-            reason: "incomplete"
+            reason: "incomplete",
+            whole: false,
         }));
         assert!(!events.contains(&Event::RequestEnd { stream: 1 }));
     }

@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use boxcar_audit::DeclaredArgs;
 use boxcar_proto::redact::{scrub_target, scrub_text};
-use boxcar_proto::{HttpRequest, HttpResponse, Payload, SpanRef};
+use boxcar_proto::{HttpDegraded, HttpRequest, HttpResponse, Payload, SpanRef};
 
 use super::Direction;
 use crate::dump::{self, DumpDir};
@@ -584,7 +584,39 @@ impl Observation {
                         }
                     }
                 }
-                Event::Degraded { stream, reason } => {
+                Event::Degraded {
+                    direction,
+                    stream,
+                    reason,
+                    whole,
+                } => {
+                    let direction = match direction {
+                        Some(Direction::ToHost) => "to_host",
+                        Some(Direction::ToGuest) => "to_guest",
+                        None => "both",
+                    };
+                    // A direction or the connection read no further, or a
+                    // stream whose exchange has no record left to say so.
+                    let carried = stream.is_some_and(|stream| {
+                        self.exchanges.get(&stream).is_some_and(|exchange| {
+                            let request = exchange.request.is_some() && !exchange.request_recorded;
+                            let response =
+                                exchange.response.is_some() && !exchange.response_recorded;
+                            match direction {
+                                "to_host" => request,
+                                "to_guest" => response,
+                                _ => request || response,
+                            }
+                        })
+                    });
+                    if whole || !carried {
+                        out.push(Emit::plain(Payload::HttpDegraded(HttpDegraded {
+                            flow: self.flow,
+                            direction: direction.to_owned(),
+                            stream,
+                            reason: reason.to_owned(),
+                        })));
+                    }
                     let streams: Vec<u32> = match stream {
                         Some(stream) => vec![stream],
                         None => self.exchanges.keys().copied().collect(),
@@ -802,6 +834,106 @@ mod tests {
         f.extend_from_slice(&stream.to_be_bytes());
         f.extend_from_slice(payload);
         f
+    }
+
+    fn degraded(out: &[Emit]) -> Vec<&HttpDegraded> {
+        out.iter()
+            .filter_map(|emit| match &emit.payload {
+                Payload::HttpDegraded(degraded) => Some(degraded),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_direction_that_stops_before_an_exchange_is_recorded() {
+        let now = Instant::now();
+
+        let mut h1 = observation(Some("http/1.1"));
+        let mut out = Vec::new();
+        h1.data(Direction::ToHost, b"NOT HTTP\r\n\r\n", now, &mut out);
+        let records = degraded(&out);
+        assert_eq!(records.len(), 1, "{out:?}");
+        assert_eq!(records[0].flow, 5);
+        assert_eq!(records[0].direction, "to_host");
+        assert_eq!(records[0].stream, None);
+        assert_eq!(records[0].reason, "bad_request_head");
+
+        let mut h1 = observation(Some("http/1.1"));
+        let mut out = Vec::new();
+        h1.data(
+            Direction::ToHost,
+            b"POST / HTTP/1.1\r\nContent-Length: no\r\n\r\n",
+            now,
+            &mut out,
+        );
+        let records = degraded(&out);
+        assert_eq!(records.len(), 1, "{out:?}");
+        assert_eq!(records[0].direction, "to_host");
+        assert_eq!(records[0].stream, None);
+        assert_eq!(records[0].reason, "framing");
+
+        let mut h2 = observation(Some("h2"));
+        let mut out = Vec::new();
+        let mut bytes = crate::http::h2::PREFACE.to_vec();
+        bytes.extend(h2_frame(4, 0, 0, &[]));
+        bytes.extend(h2_frame(1, 0x5, 1, &[0x3f]));
+        h2.data(Direction::ToHost, &bytes, now, &mut out);
+        let records = degraded(&out);
+        assert_eq!(records.len(), 1, "{out:?}");
+        assert_eq!(records[0].direction, "to_host");
+        assert_eq!(records[0].stream, Some(1));
+        assert_eq!(records[0].reason, "hpack");
+    }
+
+    #[test]
+    fn a_response_whose_framing_cannot_be_read_is_recorded() {
+        let mut obs = observation(Some("http/1.1"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        obs.data(
+            Direction::ToHost,
+            b"GET / HTTP/1.1\r\nHost: api.example\r\n\r\n",
+            now,
+            &mut out,
+        );
+        obs.data(
+            Direction::ToGuest,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+            now,
+            &mut out,
+        );
+        let records = degraded(&out);
+        assert_eq!(records.len(), 1, "{out:?}");
+        assert_eq!(records[0].direction, "to_guest");
+        assert_eq!(records[0].stream, Some(1));
+        assert_eq!(records[0].reason, "framing");
+    }
+
+    #[test]
+    fn a_stream_that_is_not_admitted_is_recorded() {
+        let mut obs = observation(Some("h2"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        let mut bytes = crate::http::h2::PREFACE.to_vec();
+        bytes.extend(h2_frame(4, 0, 0, &[]));
+        let mut encoder = fluke_hpack::Encoder::new();
+        for n in 0..=256u32 {
+            let stream = 2 * n + 1;
+            let block = encoder.encode([
+                (&b":method"[..], &b"POST"[..]),
+                (b":path", b"/v1/messages"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example"),
+            ]);
+            bytes.extend(h2_frame(1, 0x4, stream, &block));
+        }
+        obs.data(Direction::ToHost, &bytes, now, &mut out);
+        let records = degraded(&out);
+        assert_eq!(records.len(), 1, "{out:?}");
+        assert_eq!(records[0].direction, "to_host");
+        assert_eq!(records[0].stream, Some(513));
+        assert_eq!(records[0].reason, "streams");
     }
 
     #[test]
@@ -1233,8 +1365,13 @@ mod tests {
         );
         obs.lost(Direction::ToHost, now, &mut out);
         obs.close(now, &mut out);
-        assert_eq!(out.len(), 1, "{out:?}");
-        match &out[0].payload {
+        // The direction is read no further: said once, then the exchange.
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(
+            &out[0].payload,
+            Payload::HttpDegraded(d) if d.direction == "to_host" && d.reason == "lost"
+        ));
+        match &out[1].payload {
             Payload::HttpRequest(r) => {
                 assert_eq!(r.degraded.as_deref(), Some("lost"));
                 assert_eq!(r.body_bytes, 5);

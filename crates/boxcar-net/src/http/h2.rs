@@ -173,14 +173,24 @@ impl H2 {
     /// Bytes were lost: the HPACK tables are out of step with the peer's,
     /// so nothing more can be read either way.
     pub fn lost(&mut self, out: &mut Vec<Event>) {
+        // Each open stream is recorded as it stands at once; then the
+        // connection, which is read no further.
         for (stream, state) in &self.streams {
             if !state.done() {
                 out.push(Event::Degraded {
+                    direction: None,
                     stream: Some(*stream),
                     reason: "lost",
+                    whole: false,
                 });
             }
         }
+        out.push(Event::Degraded {
+            direction: None,
+            stream: None,
+            reason: "lost",
+            whole: true,
+        });
         self.streams.clear();
         self.c2s.broken = true;
         self.s2c.broken = true;
@@ -197,8 +207,10 @@ impl H2 {
         open.sort_unstable();
         for stream in open {
             out.push(Event::Degraded {
+                direction: None,
                 stream: Some(stream),
                 reason: "incomplete",
+                whole: false,
             });
         }
         self.streams.clear();
@@ -222,7 +234,12 @@ impl H2 {
         side.broken = true;
         side.buf.clear();
         side.pending = None;
-        out.push(Event::Degraded { stream, reason });
+        out.push(Event::Degraded {
+            direction: Some(dir),
+            stream,
+            reason,
+            whole: true,
+        });
     }
 
     fn frame(
@@ -295,8 +312,10 @@ impl H2 {
                 }
                 let promised = u32::from_be_bytes([rest[0] & 0x7f, rest[1], rest[2], rest[3]]);
                 out.push(Event::Degraded {
+                    direction: Some(dir),
                     stream: Some(promised),
                     reason: "push_promise",
+                    whole: false,
                 });
                 self.side(dir).pending = Some(Pending {
                     stream,
@@ -326,8 +345,10 @@ impl H2 {
                 if let Some(state) = self.streams.remove(&stream) {
                     if !state.done() {
                         out.push(Event::Degraded {
+                            direction: None,
                             stream: Some(stream),
                             reason: "rst_stream",
+                            whole: false,
                         });
                     }
                 }
@@ -437,8 +458,10 @@ impl H2 {
                     if self.open_streams() >= MAX_STREAMS {
                         self.refused += 1;
                         return out.push(Event::Degraded {
+                            direction: Some(dir),
                             stream: Some(stream),
                             reason: "streams",
+                            whole: false,
                         });
                     }
                     self.streams.insert(stream, Stream::default());
@@ -466,8 +489,10 @@ impl H2 {
                 if !known {
                     // A response to a request this side never saw.
                     return out.push(Event::Degraded {
+                        direction: Some(dir),
                         stream: Some(stream),
                         reason: "unrequested_response",
+                        whole: false,
                     });
                 }
                 let state = self.streams.entry(stream).or_default();
@@ -869,8 +894,10 @@ mod tests {
         let events = run(&c2s, &[], 4096);
         assert!(
             events.contains(&Event::Degraded {
+                direction: None,
                 stream: Some(1),
-                reason: "rst_stream"
+                reason: "rst_stream",
+                whole: false,
             }),
             "{events:?}"
         );
@@ -890,8 +917,10 @@ mod tests {
         let events = run(&c2s, &s2c, 4096);
         assert!(
             events.contains(&Event::Degraded {
+                direction: Some(Direction::ToGuest),
                 stream: Some(2),
-                reason: "push_promise"
+                reason: "push_promise",
+                whole: false,
             }),
             "{events:?}"
         );
@@ -912,8 +941,10 @@ mod tests {
         assert_eq!(
             events,
             [Event::Degraded {
+                direction: Some(Direction::ToHost),
                 stream: None,
-                reason: "no_preface"
+                reason: "no_preface",
+                whole: true,
             }]
         );
 
@@ -923,8 +954,10 @@ mod tests {
         let events = run(&c2s, &[], 4096);
         assert!(
             events.contains(&Event::Degraded {
+                direction: Some(Direction::ToHost),
                 stream: Some(1),
-                reason: "continuation"
+                reason: "continuation",
+                whole: true,
             }),
             "{events:?}"
         );
@@ -949,8 +982,10 @@ mod tests {
         let events = run(&c2s, &[], 4096);
         assert!(
             events.contains(&Event::Degraded {
+                direction: Some(Direction::ToHost),
                 stream: Some(1),
-                reason: "hpack"
+                reason: "hpack",
+                whole: true,
             }),
             "{events:?}"
         );
@@ -971,8 +1006,10 @@ mod tests {
         let events = run(&c2s, &[], 1 << 20);
         assert!(
             events.contains(&Event::Degraded {
+                direction: Some(Direction::ToHost),
                 stream: Some(3),
-                reason: "header_block_too_large"
+                reason: "header_block_too_large",
+                whole: true,
             }),
             "{events:?}"
         );
@@ -991,8 +1028,10 @@ mod tests {
         let events = run(&c2s, &[], 1 << 20);
         assert!(
             events.contains(&Event::Degraded {
+                direction: Some(Direction::ToHost),
                 stream: Some(1),
-                reason: "header_block_too_large"
+                reason: "header_block_too_large",
+                whole: true,
             }),
             "{events:?}"
         );

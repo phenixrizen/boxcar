@@ -980,6 +980,40 @@
         }
       ]
     },
+    "HttpDegraded": {
+      "description": "`http.degraded`: the observer stopped reading a direction, connection, or stream of an inspected flow.",
+      "type": "object",
+      "required": [
+        "direction",
+        "flow",
+        "reason"
+      ],
+      "properties": {
+        "direction": {
+          "description": "`to_host`, `to_guest`, or `both`.",
+          "type": "string"
+        },
+        "flow": {
+          "description": "The `flow` of the flow's `net.connect`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reason": {
+          "description": "The parser's bounded reason.",
+          "type": "string"
+        },
+        "stream": {
+          "description": "HTTP/2's stream id, or an HTTP/1.1 request number; `null` when the whole direction or connection stopped being read.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "HttpRequest": {
       "description": "`http.request`: a request an inspected flow carried, once its body ended. Headers that carry a credential never reach the observer's records: their values are dropped at the parser.",
       "type": "object",
@@ -2731,6 +2765,24 @@
               "type": "string",
               "enum": [
                 "http.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpDegraded"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.degraded"
               ]
             }
           }
@@ -4546,6 +4598,24 @@
               "type": "string",
               "enum": [
                 "http.response"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/HttpDegraded"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http.degraded"
               ]
             }
           }
