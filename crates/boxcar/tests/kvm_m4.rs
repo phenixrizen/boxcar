@@ -950,7 +950,8 @@ const AGENT_PROMPT: &str =
 
 /// Checks an agent run's log: the model request through the gate, the
 /// tool span with the shell's exec and the marker's write, no finding
-/// above 50, and the credential nowhere.
+/// above 50 and no `phantom_exec` (scored low, so judged by name), and the
+/// credential nowhere.
 fn check_agent_run(run: &kvm_harness::Run, provider: &str, scratch: &Scratch, secret: &str) {
     let records = run.records();
     let requests = of_kind(&records, "llm.request");
@@ -1069,6 +1070,15 @@ fn check_agent_run(run: &kvm_harness::Run, provider: &str, scratch: &Scratch, se
     assert!(
         loud.is_empty(),
         "findings above 50: {loud:?}\n{}",
+        run.describe()
+    );
+    let phantom: Vec<_> = of_kind(&records, "finding")
+        .into_iter()
+        .filter(|r| r.data["rule"] == "phantom_exec")
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "phantom_exec findings: {phantom:?}\n{}",
         run.describe()
     );
     let log_text = text_under(&run.session_dir());
