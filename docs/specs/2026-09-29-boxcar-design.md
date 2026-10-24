@@ -127,6 +127,14 @@ recorder sees bytes. Writes, creates, unlinks, renames, setattr, verdicts,
 spans, and findings are never sampled. Reads may be sampled and drops are
 counted in checkpoints.
 
+Host output is bounded per session: event segments and their checkpoint
+index total 8 GiB, a console file 64 MiB, and the optional network dump
+2 GiB and 100000 files. The run flags set each bound; zero removes it. The
+audit writer reserves a terminal record, checkpoint and checkpoint-index
+entry before stopping the VM, console bytes beyond its file
+bound are counted, and a dump that reaches either bound records one
+degradation and stops dumping while traffic continues.
+
 ## 7. Joins and findings
 
 Joins: a file or network effect joins a process by guest pid within the

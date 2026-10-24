@@ -269,6 +269,9 @@ impl VirtioNet {
         inspect: Option<Arc<InspectConfig>>,
         dump: Option<DumpDir>,
     ) -> Result<VirtioNet, ConfigError> {
+        if let Some(dir) = &dump {
+            dir.set_audit(sink.clone());
+        }
         let ids = FlowIds::default();
         let (observer, observer_thread) = match &inspect {
             Some(gate) => {

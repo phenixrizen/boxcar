@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 /// How many bytes of console output the ring holds.
 pub const RING_CAPACITY: usize = 256 * 1024;
 
+/// Default maximum for a console file: 64 MiB. Zero disables the limit.
+pub const DEFAULT_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The most the writer thread writes at a time.
 const CHUNK: usize = 64 * 1024;
 
@@ -80,9 +83,9 @@ impl ConsoleOut {
 pub struct ConsoleStats {
     /// Console bytes the guest wrote that were not written to the target:
     /// the oldest bytes dropped when the ring overflowed, the bytes of
-    /// writes that failed, and, when the writer was stuck at the deadline,
-    /// everything it had not delivered (the write it was stuck in
-    /// included, which may have been partly written).
+    /// writes that failed, bytes past a file's limit, and, when the writer
+    /// was stuck at the deadline, everything it had not delivered (the
+    /// write it was stuck in included, which may have been partly written).
     pub dropped_bytes: u64,
 }
 
@@ -235,19 +238,32 @@ impl ConsoleWriter {
     /// the writer stays with the VMM, which ends it with
     /// [`flush_and_join`](Self::flush_and_join).
     pub fn spawn(out: ConsoleOut) -> io::Result<(ConsoleSink, ConsoleWriter)> {
-        Self::spawn_with(out.open()?)
+        Self::spawn_with_limit(out, DEFAULT_FILE_MAX_BYTES)
+    }
+
+    /// Opens `out` and limits a file to `max_bytes`; zero leaves it
+    /// unlimited. Standard output is never limited here.
+    pub fn spawn_with_limit(
+        out: ConsoleOut,
+        max_bytes: u64,
+    ) -> io::Result<(ConsoleSink, ConsoleWriter)> {
+        let file_limit = matches!(out, ConsoleOut::File(_))
+            .then_some(max_bytes)
+            .filter(|&limit| limit != 0);
+        Self::spawn_sized(out.open()?, RING_CAPACITY, file_limit)
     }
 
     /// Like [`spawn`](Self::spawn), for any target.
     pub fn spawn_with(
         target: impl Write + Send + 'static,
     ) -> io::Result<(ConsoleSink, ConsoleWriter)> {
-        Self::spawn_sized(target, RING_CAPACITY)
+        Self::spawn_sized(target, RING_CAPACITY, None)
     }
 
     fn spawn_sized(
         target: impl Write + Send + 'static,
         capacity: usize,
+        file_limit: Option<u64>,
     ) -> io::Result<(ConsoleSink, ConsoleWriter)> {
         let shared = Arc::new(Shared::new(capacity));
         let thread = {
@@ -256,7 +272,7 @@ impl ConsoleWriter {
                 .name("console".into())
                 .spawn(move || {
                     boxcar_confine::at_thread_start();
-                    drain(&shared, target)
+                    drain(&shared, target, file_limit)
                 })?
         };
         Ok((
@@ -352,9 +368,11 @@ impl Drop for ConsoleWriter {
 
 /// The writer thread: delivers the ring to `target` until it is told to
 /// stop and the ring is empty.
-fn drain(shared: &Shared, mut target: impl Write) {
+fn drain(shared: &Shared, mut target: impl Write, file_limit: Option<u64>) {
     let mut chunk = Vec::with_capacity(CHUNK);
     let mut reported = false;
+    let mut cut_reported = false;
+    let mut written = 0u64;
     loop {
         chunk.clear();
         {
@@ -383,8 +401,26 @@ fn drain(shared: &Shared, mut target: impl Write) {
         }
 
         // Outside the lock: this is where a stalled target stalls.
-        let result =
-            write_out(&mut target, &chunk, &shared.abandoned).and_then(|()| target.flush());
+        let admitted = file_limit.map_or(chunk.len(), |limit| {
+            usize::try_from(limit.saturating_sub(written))
+                .unwrap_or(usize::MAX)
+                .min(chunk.len())
+        });
+        let cut = chunk.len() - admitted;
+        let outcome = if admitted == 0 {
+            ChunkOutcome::Complete { delivered: 0 }
+        } else {
+            let (delivered, result) = write_out(&mut target, &chunk[..admitted], &shared.abandoned);
+            match result {
+                Ok(()) => match target.flush() {
+                    Ok(()) => ChunkOutcome::Complete { delivered },
+                    Err(error) => ChunkOutcome::FlushFailed { delivered, error },
+                },
+                Err(error) => ChunkOutcome::WriteFailed { delivered, error },
+            }
+        };
+        let delivered = outcome.delivered();
+        written = written.saturating_add(delivered as u64);
 
         if shared.abandoned.load(Ordering::SeqCst) {
             return;
@@ -392,9 +428,20 @@ fn drain(shared: &Shared, mut target: impl Write) {
         let failure = {
             let mut state = shared.lock();
             state.in_flight = 0;
-            result
-                .err()
-                .inspect(|_| Shared::add_dropped(&mut state, chunk.len()))
+            match outcome {
+                ChunkOutcome::Complete { .. } => {
+                    Shared::add_dropped(&mut state, cut);
+                    None
+                }
+                ChunkOutcome::WriteFailed { delivered, error } => {
+                    Shared::add_dropped(&mut state, chunk.len() - delivered);
+                    Some(error)
+                }
+                ChunkOutcome::FlushFailed { error, .. } => {
+                    Shared::add_dropped(&mut state, chunk.len());
+                    Some(error)
+                }
+            }
         };
         // Outside the lock: the log may be as stalled as the target, and a
         // vCPU thread pushing into the ring must never wait on that.
@@ -404,27 +451,58 @@ fn drain(shared: &Shared, mut target: impl Write) {
                 tracing::warn!("console: cannot write the guest's output, dropping it: {error}");
             }
         }
+        if cut != 0 && !cut_reported {
+            cut_reported = true;
+            tracing::warn!(
+                max_bytes = file_limit.unwrap_or(0),
+                "console: file byte limit reached; dropping further output"
+            );
+        }
+    }
+}
+
+enum ChunkOutcome {
+    Complete { delivered: usize },
+    WriteFailed { delivered: usize, error: io::Error },
+    FlushFailed { delivered: usize, error: io::Error },
+}
+
+impl ChunkOutcome {
+    fn delivered(&self) -> usize {
+        match self {
+            ChunkOutcome::Complete { delivered }
+            | ChunkOutcome::WriteFailed { delivered, .. }
+            | ChunkOutcome::FlushFailed { delivered, .. } => *delivered,
+        }
     }
 }
 
 /// `write_all`, except that a target answering `WouldBlock` is waited on
 /// (the std version would fail the whole write), until `abandoned`.
-fn write_out(target: &mut impl Write, mut buf: &[u8], abandoned: &AtomicBool) -> io::Result<()> {
+fn write_out(
+    target: &mut impl Write,
+    mut buf: &[u8],
+    abandoned: &AtomicBool,
+) -> (usize, io::Result<()>) {
+    let mut written = 0;
     while !buf.is_empty() {
         match target.write(buf) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(count) => buf = &buf[count..],
+            Ok(0) => return (written, Err(io::ErrorKind::WriteZero.into())),
+            Ok(count) => {
+                written += count;
+                buf = &buf[count..];
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if abandoned.load(Ordering::SeqCst) {
-                    return Err(error);
+                    return (written, Err(error));
                 }
                 thread::sleep(WOULD_BLOCK_RETRY);
             }
-            Err(error) => return Err(error),
+            Err(error) => return (written, Err(error)),
         }
     }
-    Ok(())
+    (written, Ok(()))
 }
 
 #[cfg(test)]
@@ -630,7 +708,7 @@ mod tests {
         let drainer = {
             let shared = shared.clone();
             thread::spawn(move || {
-                tracing::subscriber::with_default(subscriber, || drain(&shared, Broken));
+                tracing::subscriber::with_default(subscriber, || drain(&shared, Broken, None));
             })
         };
         // Wait until it has taken the bytes and counted them dropped.
@@ -748,6 +826,33 @@ mod tests {
         assert_eq!(stats.dropped_bytes, 10_000);
     }
 
+    #[test]
+    fn a_flush_failure_counts_the_admitted_chunk() {
+        struct FlushFails {
+            got: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl Write for FlushFails {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.got.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let target = FlushFails { got: got.clone() };
+        let (mut sink, writer) = ConsoleWriter::spawn_with(target).unwrap();
+        sink.write_all(b"buffered output").unwrap();
+        let stats = writer.flush_and_join(Duration::from_secs(5));
+
+        assert_eq!(*got.lock().unwrap(), b"buffered output");
+        assert_eq!(stats.dropped_bytes, 15);
+    }
+
     /// Interrupted writes are retried, a target that is not ready is waited
     /// on, and short writes continue where they left off.
     #[test]
@@ -821,6 +926,18 @@ mod tests {
         let stats = writer.flush_and_join(Duration::from_secs(5));
         assert_eq!(stats, ConsoleStats::default());
         assert_eq!(std::fs::read(&path).unwrap(), b"login: root\r\n");
+    }
+
+    #[test]
+    fn the_console_file_stops_at_its_byte_limit_and_counts_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let (mut sink, writer) =
+            ConsoleWriter::spawn_with_limit(ConsoleOut::File(path.clone()), 9).unwrap();
+        sink.write_all(b"0123456789abcdef").unwrap();
+        let stats = writer.flush_and_join(Duration::from_secs(5));
+        assert_eq!(std::fs::read(path).unwrap(), b"012345678");
+        assert_eq!(stats.dropped_bytes, 7);
     }
 
     /// A file that cannot be created is the caller's error, as before.

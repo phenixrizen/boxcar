@@ -10,6 +10,12 @@ records; `proto/testdata/audit-v1.jsonl` is a golden six-record session.
 Records come from two rings: ring 0 is observed on the host, ring 1 is
 reported from inside the guest by its sensor (`proc.*`).
 
+All event segments and `checkpoints.jsonl` together are limited to 8 GiB
+per session by default (`boxcar run --audit-max-bytes N`; 0 removes the
+limit, and a nonzero limit is at least 2048). The writer reserves room for
+`vmm.audit_limit` and the checkpoint that covers it, including that
+checkpoint's index entry.
+
 ## The envelope
 
 | Field | Type | Meaning |
@@ -64,6 +70,7 @@ Common pieces:
 |---|---|---|
 | `vmm.start` | `version`, `kernel {path, blake3}`, `initramfs {path, blake3}` or null, `cmdline`, `vcpus`, `mem_mib`, `shares [{tag, host_root}]` (omitted when none), `inspect_ca_sha256` (omitted when the policy has no `inspect` rule), `image {reference, manifest_digest, config_digest}` (omitted unless the session boots from an image), `hardening {seccomp_threads` (present, `true`, when the worker threads each confine themselves to their role's list), `seccomp, landlock}` (omitted when the VM was built by another program than `boxcar run`, such as a test) | The VM was built and is about to run. `hardening` is how the VMM process is confined, both in force before the record is made: `seccomp` is `enforce` (a syscall off the allowlist kills the process: a crash, with no `vmm.stop`), `log` (the kernel logs such a call, which goes ahead) or `off` (`boxcar run --seccomp`); `landlock` is `full` (every right boxcar handles is enforced), `partial` (the kernel enforces some of them), `unsupported` (no usable Landlock: the process runs unconfined) or `off` (`--landlock off`). `image` names the image `--image` gave, normalized, and the manifest and config digests of the cached image whose tree the session's root share was copied from. `inspect_ca_sha256` is the SHA-256, lowercase hex, of the DER certificate of the session CA the guest was told to trust for the gate's certificates (`--inspect`). |
 | `vmm.stop` | `reason`, `exit_code` (or null), `console_dropped_bytes`, `stdin_dropped_bytes` | The VM stopped. What follows it is the reconciler's last records (its findings, and the `span.effects` of tool spans still open), then a closing checkpoint. `reason`: `guest_reset`, `guest_shutdown`, `signal`, `console_escape`, `stop_requested`, `vcpu_error`, `audit_failed`, `vmm_error`. The byte counts are console output the host never wrote out and console input it dropped (0 for a run without them). |
+| `vmm.audit_limit` | `max_bytes`, `written_bytes`, `next_record_bytes`, `pending_records` | The next record could not be appended while preserving the configured total's terminal room. `written_bytes` is the event-segment and checkpoint-index total before this terminal record; `next_record_bytes` includes the refused record's newline and, for a checkpoint, its index entry. `pending_records` counts submissions admission had already accepted but the writer did not write. The writer closes admission, appends this record and its checkpoint and index entry within the reserved room, signals an audit failure, and the VMM stops. |
 | `checkpoint` | `records_since`, `dropped`, `root_hash` | The writer's summary of the records since the previous checkpoint: every 1024 records or 2 s, at a segment seal, and at close. `root_hash` is blake3 over the raw hashes of those records; `dropped` counts droppable events (`fs.read`, `net.drop`) the full channel dropped. |
 
 ## `fs.*` (host, src `fs`)
@@ -144,7 +151,7 @@ either kind within a session.
 | `net.close` | `flow`, `tx`, `rx` (payload bytes the guest sent and received), `dur_ms`, `reason` | A TCP flow or UDP mapping ended. `reason`: `fin` (closed both ways), `reset` (the host or the guest reset it), `timeout` (a host connect took over 10 s, or the guest stayed silent 60 s), `gate` (the gate denied the name, or none was shown within 16 KiB or 5 s), `refused`, `unreachable`, `error` (the host connect failed, or the guest sent data after its FIN), `evicted` (the table was full), `idle` (a UDP mapping unused for 60 s), `policy` (a new policy denies it), `shutdown` (the VM stopped). |
 | `net.udp` | `flow`, `src`, `dst`, `names`, `verdict`, `rule` | The first datagram of a UDP 5-tuple was decided. A domain allow admits no UDP (nothing in a datagram shows a name); allow UDP by address. |
 | `net.drop` | `reason`, `count` | Guest frames were dropped: at most one record a second for each reason, counting every drop since the last. `reason`: `ipv6`, `icmp` (other than echo to the gateway), `dhcp`, `dns` (too short), `dns_bogus` (an upstream answer for no query), `udp_denied` (more datagrams on a tuple refused within the minute), `udp_send`, `udp_oversize`, `udp_table_full`, `queue_full`, `tcp_pending_full`, `src_spoof`, `observe` (plaintext bytes of an inspected flow the observer's channel had no room for: the flow went on, the observer's copy has a hole), `dump` (a frame the `--dump` queue had no room for: the dump has a hole, the traffic went on), `other`. Droppable: emitted without waiting, counted in `checkpoint.dropped` when the channel is full. |
-| `net.degraded` | `component` (`observer` or `dump`), `reason` (`panic` or `shutdown_timeout`) | The inspected-plaintext observer ended unexpectedly, or the observer or optional dump thread did not stop before the VMM's shutdown deadline. A shutdown record precedes `vmm.stop`. |
+| `net.degraded` | `component` (`observer` or `dump`), `reason` (`panic`, `shutdown_timeout` or `quota`) | The inspected-plaintext observer ended unexpectedly, the observer or optional dump thread did not stop before the VMM's shutdown deadline, or the optional dump reached its aggregate byte or file limit. A shutdown record precedes `vmm.stop`; the dump's quota record is made once and traffic continues. |
 
 Every allowed `net.connect` and `net.udp` has exactly one `net.close`. An
 inspected TLS flow has exactly one `net.inspect`, after its `net.tls` and
@@ -283,6 +290,11 @@ its first datagram does. Every record is on disk by the next checkpoint
 more are `fdatasync`ed at once. A writer that fails
 stops the VM (`boxcar run` exits 3) and cuts the log back to its last
 consistent record; `boxcar audit verify` accepts what is left.
+At the configured session limit the writer instead makes
+`vmm.audit_limit` and its checkpoint durable in reserved room before it
+signals the same stop; there may be no `vmm.stop` after it because the
+writer accepts nothing further. A writer reopening a log ending in that
+covered pair remains closed, regardless of its newly configured limit.
 
 A crash can end the log mid-write: a process killed while it writes keeps
 every `write(2)` that completed and loses the rest. A log cut at a record

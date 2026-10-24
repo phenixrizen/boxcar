@@ -50,8 +50,9 @@ pub use payloads::{
     ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
     ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo,
     ProgramStatus, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef,
-    SpanEffects, SpanUnverifiedReason, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose,
-    VsockConnect, MAX_SPAN_EFFECTS, MAX_SPAN_PROCS, MAX_SPAN_UNVERIFIED_REASONS,
+    SpanEffects, SpanUnverifiedReason, ToolClose, ToolOpen, Verdict, VmmAuditLimit, VmmStart,
+    VmmStop, VsockClose, VsockConnect, MAX_SPAN_EFFECTS, MAX_SPAN_PROCS,
+    MAX_SPAN_UNVERIFIED_REASONS,
 };
 
 /// The value of a record's `v` field.
@@ -391,6 +392,8 @@ pub enum Payload {
     VmmStart(VmmStart),
     #[serde(rename = "vmm.stop")]
     VmmStop(VmmStop),
+    #[serde(rename = "vmm.audit_limit")]
+    VmmAuditLimit(VmmAuditLimit),
     #[serde(rename = "fs.mount")]
     FsMount(FsMount),
     #[serde(rename = "fs.open")]
@@ -522,6 +525,7 @@ impl Payload {
         match self {
             Payload::VmmStart(_) => "vmm.start",
             Payload::VmmStop(_) => "vmm.stop",
+            Payload::VmmAuditLimit(_) => "vmm.audit_limit",
             Payload::FsMount(_) => "fs.mount",
             Payload::FsOpen(_) => "fs.open",
             Payload::FsCreate(_) => "fs.create",
@@ -594,7 +598,10 @@ impl Payload {
     /// variant does not compile until it is given one.
     pub fn source(&self) -> Source {
         match self {
-            Payload::VmmStart(_) | Payload::VmmStop(_) | Payload::Checkpoint(_) => Source::Vmm,
+            Payload::VmmStart(_)
+            | Payload::VmmStop(_)
+            | Payload::VmmAuditLimit(_)
+            | Payload::Checkpoint(_) => Source::Vmm,
             Payload::FsMount(_)
             | Payload::FsOpen(_)
             | Payload::FsCreate(_)
@@ -677,9 +684,10 @@ impl Payload {
 /// The wire names of the typed payloads ([`Payload`]), in schema order: the
 /// kinds a log of this version can hold. A reader meets other kinds in a
 /// log written by a newer version.
-pub const KINDS: [&str; 63] = [
+pub const KINDS: [&str; 64] = [
     "vmm.start",
     "vmm.stop",
+    "vmm.audit_limit",
     "fs.mount",
     "fs.open",
     "fs.create",
@@ -856,6 +864,20 @@ mod tests {
                     "exit_code": 0,
                     "console_dropped_bytes": 4096,
                     "stdin_dropped_bytes": 100,
+                }),
+            ),
+            (
+                Payload::VmmAuditLimit(VmmAuditLimit {
+                    max_bytes: 8 * 1024 * 1024 * 1024,
+                    written_bytes: 8 * 1024 * 1024 * 1024 - 4096,
+                    next_record_bytes: 8192,
+                    pending_records: 17,
+                }),
+                json!({
+                    "max_bytes": 8589934592u64,
+                    "written_bytes": 8589930496u64,
+                    "next_record_bytes": 8192,
+                    "pending_records": 17,
                 }),
             ),
             (
@@ -2438,6 +2460,24 @@ mod tests {
         assert_eq!(back, payload);
         assert!(serde_json::to_vec(&data).unwrap().len() < 128);
         assert!(serde_json::to_vec(&data).unwrap().len() < crate::limits::MAX_RECORD_BYTES);
+    }
+
+    /// `vmm.audit_limit` contains only bounded integers, including at
+    /// their widest, and leaves ample room in one record.
+    #[test]
+    fn a_vmm_audit_limit_record_fits_its_limit() {
+        let payload = Payload::VmmAuditLimit(VmmAuditLimit {
+            max_bytes: u64::MAX,
+            written_bytes: u64::MAX,
+            next_record_bytes: u64::MAX,
+            pending_records: u64::MAX,
+        });
+        let (kind, data) = payload.into_parts();
+        let record = record(&kind, Source::Vmm, data);
+        assert_eq!(Payload::from_record(&record).unwrap(), payload);
+        let bytes = serde_json::to_vec(&record).unwrap().len();
+        assert!(bytes < 1024, "{bytes}");
+        assert!(bytes <= crate::limits::MAX_RECORD_BYTES, "{bytes}");
     }
 
     #[test]

@@ -610,12 +610,34 @@ pub struct RunArgs {
     /// directory deeper in a session, such as its workspace, may be shared.
     #[arg(long, value_name = "DIR")]
     pub audit_dir: Option<PathBuf>,
+    /// Most bytes in all event segments and the checkpoint index for this
+    /// session. Default: 8 GiB
+    /// (8589934592). Zero means no limit; a nonzero value must be at least
+    /// 2048. Boxcar reserves room for a final `vmm.audit_limit` record,
+    /// checkpoint and index entry, then stops the VM at the limit as it does
+    /// when the log cannot be written.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = boxcar_audit::writer::DEFAULT_MAX_BYTES
+    )]
+    pub audit_max_bytes: u64,
     /// Write the serial console to PATH. Default: with the vsock device,
     /// `console.log` in the session's state directory (mode 0600), which
     /// stays there after the run; with `--no-vsock`, stdout (and when PATH
     /// is given instead, stdin is not forwarded to the guest).
     #[arg(long, value_name = "PATH", conflicts_with = "console_stdout")]
     pub console_log: Option<PathBuf>,
+    /// Most bytes written to the serial-console file. Default: 64 MiB
+    /// (67108864). Zero means no limit. Bytes after it are discarded and
+    /// counted in `vmm.stop.console_dropped_bytes`. Has no effect when the
+    /// console goes to stdout.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = boxcar_vmm::console::DEFAULT_FILE_MAX_BYTES
+    )]
+    pub console_max_bytes: u64,
     /// With the vsock device, write the serial console to stdout as well as
     /// the session's terminal, as M1 did: for debugging a boot. The two
     /// interleave.
@@ -707,6 +729,16 @@ pub struct RunArgs {
     /// empty, and may be neither a share nor inside one, nor hold one.
     #[arg(long, value_name = "DIR", conflicts_with = "no_net")]
     pub dump: Option<PathBuf>,
+    /// With --dump, most bytes across `frames.pcap`, HTTP exchange files
+    /// and WebSocket files. Default: 2 GiB (2147483648). Zero means no
+    /// byte limit. Reaching it stops the dump, not the traffic.
+    #[arg(long, value_name = "N", requires = "dump")]
+    pub dump_max_bytes: Option<u64>,
+    /// With --dump, most output files across the pcap, HTTP exchanges and
+    /// WebSocket streams. Default: 100000. Zero means no file-count limit.
+    /// Reaching it stops the dump, not the traffic.
+    #[arg(long, value_name = "N", requires = "dump")]
+    pub dump_max_files: Option<u64>,
     /// With --dump: keep in `frames.pcap` the payloads the gate sends the
     /// guest on flows whose TLS it ends: its own TLS records, ciphertext
     /// whose keys never leave the VMM. What the guest sends, and every
@@ -953,6 +985,35 @@ mod tests {
         assert_eq!((run_args(&cli).net, run_args(&cli).no_net), (false, true));
         let cli = run(&["--no-net", "--net"]).unwrap();
         assert_eq!((run_args(&cli).net, run_args(&cli).no_net), (true, false));
+    }
+
+    #[test]
+    fn host_output_limits_have_defaults_and_take_zero() {
+        let cli = run(&[]).unwrap();
+        let args = run_args(&cli);
+        assert_eq!(args.audit_max_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(args.console_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(args.dump_max_bytes, None);
+        assert_eq!(args.dump_max_files, None);
+
+        let cli = run(&[
+            "--audit-max-bytes",
+            "0",
+            "--console-max-bytes",
+            "0",
+            "--dump",
+            "dump",
+            "--dump-max-bytes",
+            "0",
+            "--dump-max-files",
+            "0",
+        ])
+        .unwrap();
+        let args = run_args(&cli);
+        assert_eq!(args.audit_max_bytes, 0);
+        assert_eq!(args.console_max_bytes, 0);
+        assert_eq!(args.dump_max_bytes, Some(0));
+        assert_eq!(args.dump_max_files, Some(0));
     }
 
     #[test]

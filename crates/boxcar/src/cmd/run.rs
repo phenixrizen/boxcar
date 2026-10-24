@@ -160,8 +160,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         tell("error: --dump needs --net: without a network there is nothing to dump");
         return Ok(ExitCode::from(USAGE_EXIT));
     }
-    let dump =
-        dump_dir(args.dump.as_deref(), &named)?.map(|dir| dir.with_payloads(args.dump_payloads));
+    let dump = dump_dir(args.dump.as_deref(), &named)?.map(|dir| {
+        dir.with_payloads(args.dump_payloads).with_limits(
+            args.dump_max_bytes
+                .unwrap_or(boxcar_net::dump::DEFAULT_MAX_BYTES),
+            args.dump_max_files
+                .unwrap_or(boxcar_net::dump::DEFAULT_MAX_FILES),
+        )
+    });
 
     // The image, found in the cache or pulled, before the session exists;
     // the cache stays locked shared until its tree is copied, so `rm` and
@@ -384,7 +390,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // takes it again when it is continued in the foreground.
     start_job_control().context("cannot start the terminal's job control")?;
 
-    let (sink, writer) = start_audit_log(WriterConfig::new(&audit_dir, session_id.clone()))
+    let mut writer_cfg = WriterConfig::new(&audit_dir, session_id.clone());
+    writer_cfg.max_bytes = args.audit_max_bytes;
+    let (sink, writer) = start_audit_log(writer_cfg)
         .with_context(|| format!("cannot start the audit log under {}", audit_dir.display()))?;
     // Outlives the writer, to ask it afterwards whether it failed.
     let audit = sink.clone();
@@ -439,6 +447,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         cmdline_extra,
         debug_boot: args.debug_boot,
         console,
+        console_max_bytes: args.console_max_bytes,
         // In vsock mode the session's terminal takes the input, not the
         // serial console.
         stdin: interactive && !relayed,

@@ -227,6 +227,9 @@ pub(crate) struct Resume {
     pub(crate) window: Window,
     /// The checkpoint records in the last segment, in order.
     pub(crate) checkpoints: Vec<IndexEntry>,
+    /// The intact tail is a limit record, optionally followed by the
+    /// checkpoint that covers it, so no records may follow it.
+    pub(crate) terminal: bool,
 }
 
 /// Appends records to the session's current segment and rotates segments.
@@ -249,6 +252,8 @@ pub struct SegmentWriter<S: Syncer = Fdatasync> {
     buf: Vec<u8>,
     /// Bytes in the current segment, buffered ones included.
     len: u64,
+    /// Bytes in every event segment, buffered bytes included.
+    total_len: u64,
     /// Bytes of the current segment known to be in the file, whole lines
     /// only: the length after the last flush that completed.
     written: u64,
@@ -334,12 +339,13 @@ impl<S: Syncer> SegmentWriter<S> {
         };
         write_meta(dir, &meta, &syncer)?;
         let file = create_segment(dir, 1, &syncer)?;
-        let writer = SegmentWriter::new(dir, meta, syncer, 1, file, 0, lock);
+        let writer = SegmentWriter::new(dir, meta, syncer, 1, file, (0, 0), lock);
         let resume = Resume {
             last_seq: 0,
             last_hash: genesis_prev(session_id),
             window: Window::default(),
             checkpoints: Vec::new(),
+            terminal: false,
         };
         Ok((writer, resume))
     }
@@ -402,6 +408,8 @@ impl<S: Syncer> SegmentWriter<S> {
         let mut reader = BufReader::with_capacity(1 << 20, File::open(&path)?);
         let mut window = Window::default();
         let mut checkpoints = Vec::new();
+        let mut terminal = false;
+        let mut last_was_limit = false;
         let mut kept = 0u64;
         let mut line = Vec::new();
         loop {
@@ -418,17 +426,32 @@ impl<S: Syncer> SegmentWriter<S> {
             }
             match raw.check_envelope(&session) {
                 Ok(Some(checkpoint)) => {
+                    let mut covered = window.clone();
+                    let expected = covered.take(checkpoint.dropped);
+                    terminal = last_was_limit
+                        && checkpoint.records_since == expected.records_since
+                        && checkpoint.root_hash == expected.root_hash;
                     checkpoints.push(IndexEntry::new(raw.seq, number, kept, &checkpoint));
                     window = Window::default();
                 }
-                Ok(None) => window.push(&raw.hash),
+                Ok(None) => {
+                    terminal = false;
+                    last_was_limit = raw.kind() == Some("vmm.audit_limit");
+                    window.push(&raw.hash);
+                }
                 Err(_) => break,
+            }
+            if raw.kind() == Some("checkpoint") {
+                last_was_limit = false;
             }
             next_seq += 1;
             prev = raw.hash;
             kept += n as u64;
         }
         drop(reader);
+        // The limit record itself closes the session. Its checkpoint may be
+        // absent or partial when the process stopped between the two lines.
+        terminal |= last_was_limit;
 
         let file = OpenOptions::new().append(true).open(&path)?;
         let len = file.metadata()?.len();
@@ -450,12 +473,26 @@ impl<S: Syncer> SegmentWriter<S> {
             write_meta(dir, &meta, &syncer)?;
         }
 
-        let writer = SegmentWriter::new(dir, meta, syncer, number, file, kept, lock);
+        let earlier = segments
+            .iter()
+            .copied()
+            .filter(|&segment| segment < number)
+            .try_fold(0u64, |total, segment| {
+                let len = fs::metadata(dir.join(segment_name(segment)))?.len();
+                total.checked_add(len).ok_or_else(|| {
+                    invalid_data(format!("{}: event segments are too large", dir.display()))
+                })
+            })?;
+        let total_len = earlier.checked_add(kept).ok_or_else(|| {
+            invalid_data(format!("{}: event segments are too large", dir.display()))
+        })?;
+        let writer = SegmentWriter::new(dir, meta, syncer, number, file, (kept, total_len), lock);
         let resume = Resume {
             last_seq: next_seq - 1,
             last_hash: prev,
             window,
             checkpoints,
+            terminal,
         };
         Ok((writer, resume))
     }
@@ -466,9 +503,10 @@ impl<S: Syncer> SegmentWriter<S> {
         syncer: S,
         number: u32,
         file: File,
-        len: u64,
+        lengths: (u64, u64),
         lock: File,
     ) -> Self {
+        let (len, total_len) = lengths;
         SegmentWriter {
             dir: dir.to_owned(),
             meta,
@@ -478,6 +516,7 @@ impl<S: Syncer> SegmentWriter<S> {
             file,
             buf: Vec::with_capacity(WRITE_BUFFER),
             len,
+            total_len,
             written: len,
             dirty: false,
             _lock: lock,
@@ -494,6 +533,7 @@ impl<S: Syncer> SegmentWriter<S> {
         let at = self.len;
         self.buf.extend_from_slice(line);
         self.len += line.len() as u64;
+        self.total_len += line.len() as u64;
         self.dirty = true;
         Ok((self.number, at))
     }
@@ -527,6 +567,11 @@ impl<S: Syncer> SegmentWriter<S> {
     /// Bytes in the current segment.
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Bytes in all event segments.
+    pub fn total_len(&self) -> u64 {
+        self.total_len
     }
 
     /// The current segment's number.
@@ -600,6 +645,7 @@ impl<S: Syncer> SegmentWriter<S> {
                 "cannot cut the audit log back to its last consistent record: {error}"
             ),
         }
+        self.total_len = self.total_len.saturating_sub(self.len.saturating_sub(keep));
         self.len = keep;
         self.written = keep;
         self.dirty = false;

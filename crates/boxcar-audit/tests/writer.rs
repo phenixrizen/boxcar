@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{
-    spawn, spawn_with_syncer, verify_session, EmitError, Incomplete, IncompleteKind, LogReader,
-    Priority, Submission, Syncer, VerifyError, VerifyReport, WriteFailure, WriterConfig,
+    spawn, spawn_with_syncer, verify_session, EmitError, HeadError, Incomplete, IncompleteKind,
+    LogReader, Priority, Submission, Syncer, VerifyError, VerifyReport, WriteFailure, WriterConfig,
 };
 use boxcar_proto::{
     Attrib, Checkpoint, FsIo, Hash, OpResult, Payload, Record, Ring, SessionId, Subject,
@@ -301,6 +301,281 @@ fn rotation_keeps_one_chain_across_segments() {
         (report.last_seq, report.last_hash),
         (stats.last_seq, stats.last_hash)
     );
+}
+
+#[test]
+fn the_session_byte_limit_ends_with_a_record_and_a_checkpoint() {
+    const MAX: u64 = boxcar_audit::writer::QUOTA_RESERVE + 8 * 1024;
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.max_bytes = MAX;
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    cfg.channel_capacity = 1;
+    let (sink, writer) = spawn(cfg).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+
+    let mut stopped = false;
+    for n in 0..1000 {
+        match sink.emit(event(n)) {
+            Ok(()) => {}
+            Err(EmitError::Failed | EmitError::Closed) => {
+                stopped = true;
+                break;
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+    }
+    assert!(stopped, "the small session limit was not reached");
+    let error = writer.close().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+
+    let records = read_records(&dir);
+    assert_eq!(records[records.len() - 2].kind, "vmm.audit_limit");
+    assert_eq!(records.last().unwrap().kind, "checkpoint");
+    assert_eq!(
+        records[records.len() - 2].data["max_bytes"].as_u64(),
+        Some(MAX)
+    );
+    let terminal_segment_bytes: usize = records[records.len() - 2..]
+        .iter()
+        .map(|record| serde_json::to_vec(record).unwrap().len() + 1)
+        .sum();
+    let index_line_bytes = fs::read_to_string(dir.join("checkpoints.jsonl"))
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .len()
+        + 1;
+    assert!(
+        terminal_segment_bytes + index_line_bytes <= boxcar_audit::writer::QUOTA_RESERVE as usize
+    );
+    let segment_bytes: u64 = segment_files(&dir)
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum();
+    let bytes = segment_bytes + fs::metadata(dir.join("checkpoints.jsonl")).unwrap().len();
+    assert!(bytes <= MAX, "{bytes} > {MAX}");
+    intact(&dir);
+}
+
+#[derive(Clone, Default)]
+struct SyncSteps(Arc<(Mutex<(u32, u32)>, Condvar)>);
+
+impl SyncSteps {
+    fn wait_for(&self, target: u32) {
+        let (lock, cv) = &*self.0;
+        let _state = cv
+            .wait_while(lock.lock().unwrap(), |state| state.0 < target)
+            .unwrap();
+    }
+
+    fn allow(&self, target: u32) {
+        let (lock, cv) = &*self.0;
+        lock.lock().unwrap().1 = target;
+        cv.notify_all();
+    }
+}
+
+impl Syncer for SyncSteps {
+    fn sync(&self, file: &File) -> io::Result<()> {
+        let (lock, cv) = &*self.0;
+        let mut state = lock.lock().unwrap();
+        state.0 += 1;
+        let entered = state.0;
+        cv.notify_all();
+        drop(cv.wait_while(state, |state| state.1 < entered).unwrap());
+        file.sync_data()
+    }
+}
+
+#[test]
+fn limit_closes_admission_and_reports_accepted_records() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.max_bytes = boxcar_audit::writer::QUOTA_RESERVE + 600;
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    cfg.channel_capacity = 4;
+    let steps = SyncSteps::default();
+    let (sink, writer) = spawn_with_syncer(cfg, steps.clone()).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+
+    sink.emit(critical(0)).unwrap();
+    steps.wait_for(1);
+    for n in 1..=4 {
+        assert!(sink.try_emit(event(n)), "event {n}");
+    }
+    let accepted = thread::spawn({
+        let sink = sink.clone();
+        move || sink.emit(event(5))
+    });
+
+    steps.allow(1);
+    steps.wait_for(2);
+    assert_eq!(accepted.join().unwrap(), Ok(()));
+    assert_eq!(sink.emit(event(6)), Err(EmitError::Closed));
+    steps.allow(2);
+
+    assert_eq!(
+        writer.close().unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
+    let records = read_records(&dir);
+    let limit = &records[records.len() - 2];
+    assert_eq!(limit.kind, "vmm.audit_limit");
+    assert_eq!(limit.data["pending_records"], 5);
+    let events: Vec<u64> = records
+        .iter()
+        .filter(|record| record.kind == "fs.write")
+        .map(event_number)
+        .collect();
+    assert_eq!(events, [0]);
+    intact(&dir);
+}
+
+#[test]
+fn a_terminal_session_reopens_closed_for_each_configured_limit() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.max_bytes = boxcar_audit::writer::QUOTA_RESERVE + 4 * 1024;
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    let (sink, writer) = spawn(cfg.clone()).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    for n in 0..100 {
+        if sink.emit(event(n)).is_err() {
+            break;
+        }
+    }
+    assert_eq!(
+        writer.close().unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
+    let before_segment = fs::read(segment_files(&dir).last().unwrap()).unwrap();
+    let before_index = fs::read(dir.join("checkpoints.jsonl")).unwrap();
+    let last = read_records(&dir).last().unwrap().clone();
+
+    for max_bytes in [boxcar_audit::writer::QUOTA_RESERVE, 0] {
+        cfg.max_bytes = max_bytes;
+        let (sink, writer) = spawn(cfg.clone()).unwrap();
+        assert_eq!(sink.emit(event(100)), Err(EmitError::Closed));
+        assert_eq!(sink.head(), Err(HeadError::Closed));
+        let stats = writer.close().unwrap();
+        assert_eq!(stats.records, 0);
+        assert_eq!((stats.last_seq, stats.last_hash), (last.seq, last.hash));
+        assert_eq!(
+            fs::read(segment_files(&dir).last().unwrap()).unwrap(),
+            before_segment
+        );
+        assert_eq!(
+            fs::read(dir.join("checkpoints.jsonl")).unwrap(),
+            before_index
+        );
+    }
+    intact(&dir);
+}
+
+#[test]
+fn a_complete_limit_record_with_an_incomplete_checkpoint_reopens_closed() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.max_bytes = boxcar_audit::writer::QUOTA_RESERVE + 4 * 1024;
+    cfg.checkpoint_every = u64::MAX;
+    cfg.checkpoint_interval = HOUR;
+    let (sink, writer) = spawn(cfg.clone()).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    for n in 0..100 {
+        if sink.emit(event(n)).is_err() {
+            break;
+        }
+    }
+    assert_eq!(
+        writer.close().unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
+
+    let segment = segment_files(&dir).pop().unwrap();
+    let mut lines = lines_with_offsets(&segment);
+    let (checkpoint_offset, checkpoint) = lines.pop().unwrap();
+    assert!(is_checkpoint(&parse(&checkpoint)));
+    let limit = parse(&lines.pop().unwrap().1);
+    assert_eq!(limit.kind, "vmm.audit_limit");
+    truncate(
+        &segment,
+        checkpoint_offset + u64::try_from(checkpoint.len() / 2).unwrap(),
+    );
+    truncate(&dir.join("checkpoints.jsonl"), 0);
+
+    cfg.max_bytes = boxcar_audit::writer::QUOTA_RESERVE;
+    let (sink, writer) = spawn(cfg).unwrap();
+    assert_eq!(sink.emit(event(100)), Err(EmitError::Closed));
+    assert_eq!(sink.head(), Err(HeadError::Closed));
+    let stats = writer.close().unwrap();
+    assert_eq!((stats.last_seq, stats.last_hash), (limit.seq, limit.hash));
+    assert_eq!(fs::metadata(segment).unwrap().len(), checkpoint_offset);
+    assert_eq!(
+        fs::metadata(dir.join("checkpoints.jsonl")).unwrap().len(),
+        0
+    );
+}
+
+#[test]
+fn checkpoint_index_bytes_share_the_session_limit() {
+    const MAX: u64 = boxcar_audit::writer::QUOTA_RESERVE + 8 * 1024;
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.max_bytes = MAX;
+    cfg.checkpoint_every = 1;
+    cfg.checkpoint_interval = HOUR;
+    let (sink, writer) = spawn(cfg).unwrap();
+    let dir = writer.session_dir().to_path_buf();
+    for n in 0..100 {
+        if sink.emit(event(n)).is_err() {
+            break;
+        }
+    }
+    assert_eq!(
+        writer.close().unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
+
+    let files = segment_files(&dir);
+    let mut segment_before_limit = 0u64;
+    let mut limit = None;
+    'files: for file in &files {
+        for (offset, line) in lines_with_offsets(file) {
+            let record = parse(&line);
+            if record.kind == "vmm.audit_limit" {
+                segment_before_limit += offset;
+                limit = Some(record);
+                break 'files;
+            }
+        }
+        segment_before_limit += fs::metadata(file).unwrap().len();
+    }
+    let limit = limit.unwrap();
+    let index = fs::read(dir.join("checkpoints.jsonl")).unwrap();
+    let mut index_lines: Vec<&[u8]> = index.split_inclusive(|byte| *byte == b'\n').collect();
+    assert!(index_lines.len() > 2);
+    let terminal_index_bytes = index_lines.pop().unwrap().len() as u64;
+    let prior_index_bytes: u64 = index_lines.iter().map(|line| line.len() as u64).sum();
+    assert_eq!(
+        limit.data["written_bytes"].as_u64(),
+        Some(segment_before_limit + prior_index_bytes)
+    );
+    let segment_bytes: u64 = files
+        .iter()
+        .map(|file| fs::metadata(file).unwrap().len())
+        .sum();
+    assert!(segment_bytes + index.len() as u64 <= MAX);
+    assert!(
+        segment_bytes + index.len() as u64 - limit.data["written_bytes"].as_u64().unwrap()
+            <= boxcar_audit::writer::QUOTA_RESERVE
+    );
+    assert!(terminal_index_bytes > 0);
+    intact(&dir);
 }
 
 // (c) One flipped byte.

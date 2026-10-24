@@ -40,15 +40,19 @@
 //! neither a share nor inside one, nor hold one: the audit directory's
 //! rule.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use boxcar_proto::redact::{scrub_target, scrub_text};
+use boxcar_proto::{NetDegraded, Payload};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use smoltcp::wire::{
     ArpHardware, ArpPacket, ArpRepr, DhcpOpCode, DhcpPacket, EthernetFrame, EthernetProtocol,
@@ -69,13 +73,182 @@ pub const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
 pub const LINKTYPE_ETHERNET: u32 = 1;
 /// The most bytes of a head or a body written to an exchange file.
 pub const EXCHANGE_FILE_LIMIT: usize = 16 * 1024 * 1024;
+/// Default byte total for all files in one dump: 2 GiB.
+pub const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default number of files in one dump.
+pub const DEFAULT_MAX_FILES: u64 = 100_000;
 
 /// The dump directory, checked and made.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DumpDir {
     path: PathBuf,
     /// `frames.pcap` keeps TLS connections' payloads (`--dump-payloads`).
     payloads: bool,
+    quota: Arc<DumpQuota>,
+}
+
+impl std::fmt::Debug for DumpDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DumpDir")
+            .field("path", &self.path)
+            .field("payloads", &self.payloads)
+            .field("max_bytes", &self.quota.max_bytes)
+            .field("max_files", &self.quota.max_files)
+            .finish_non_exhaustive()
+    }
+}
+
+struct DumpQuota {
+    max_bytes: u64,
+    max_files: u64,
+    bytes: AtomicU64,
+    files: AtomicU64,
+    stopped: AtomicBool,
+    paths: Mutex<HashSet<PathBuf>>,
+    audit: Mutex<Option<boxcar_audit::AuditSink>>,
+}
+
+impl DumpQuota {
+    fn new(max_bytes: u64, max_files: u64) -> Self {
+        DumpQuota {
+            max_bytes,
+            max_files,
+            bytes: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+            paths: Mutex::new(HashSet::new()),
+            audit: Mutex::new(None),
+        }
+    }
+
+    fn set_audit(&self, sink: boxcar_audit::AuditSink) {
+        *self.audit.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    fn stop(&self) -> bool {
+        self.stopped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn record_stop(&self, first: bool) {
+        if !first {
+            return;
+        }
+        if let Some(sink) = self
+            .audit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            crate::audit::record(
+                &sink,
+                Payload::NetDegraded(NetDegraded {
+                    component: "dump".into(),
+                    reason: "quota".into(),
+                }),
+            );
+        }
+    }
+
+    /// Claims an output path. `None` means dumping has stopped; otherwise
+    /// the bool says whether this is the path's first open.
+    fn claim_file(&self, path: &Path) -> Option<bool> {
+        let (claim, first_stop) = {
+            let mut paths = self.paths.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.stopped() {
+                (None, false)
+            } else if paths.contains(path) {
+                (Some(false), false)
+            } else if self.max_files != 0 && self.files.load(Ordering::Relaxed) >= self.max_files {
+                (None, self.stop())
+            } else {
+                self.files.fetch_add(1, Ordering::Relaxed);
+                paths.insert(path.to_owned());
+                (Some(true), false)
+            }
+        };
+        self.record_stop(first_stop);
+        claim
+    }
+
+    fn release_file(&self, path: &Path) {
+        let mut paths = self.paths.lock().unwrap_or_else(PoisonError::into_inner);
+        if paths.remove(path) {
+            self.files.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn reserve_bytes(&self, bytes: usize) -> bool {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        loop {
+            if self.stopped() {
+                return false;
+            }
+            let current = self.bytes.load(Ordering::Acquire);
+            let Some(next) = current.checked_add(bytes) else {
+                self.record_stop(self.stop());
+                return false;
+            };
+            if self.max_bytes != 0 && next > self.max_bytes {
+                self.record_stop(self.stop());
+                return false;
+            }
+            if self
+                .bytes
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if self.stopped() {
+                    self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    return false;
+                }
+                return true;
+            }
+        }
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+enum DumpFile {
+    File { file: File, quota: Arc<DumpQuota> },
+    Discard,
+}
+
+impl Write for DumpFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let DumpFile::File { file, quota } = self else {
+            return Ok(bytes.len());
+        };
+        if !quota.reserve_bytes(bytes.len()) {
+            return Ok(bytes.len());
+        }
+        match file.write(bytes) {
+            Ok(written) => {
+                quota.release_bytes(bytes.len() - written);
+                Ok(written)
+            }
+            Err(error) => {
+                quota.release_bytes(bytes.len());
+                Err(error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            DumpFile::File { file, .. } => file.flush(),
+            DumpFile::Discard => Ok(()),
+        }
+    }
 }
 
 impl DumpDir {
@@ -135,6 +308,7 @@ impl DumpDir {
         Ok(DumpDir {
             path: resolved,
             payloads: false,
+            quota: Arc::new(DumpQuota::new(DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES)),
         })
     }
 
@@ -143,6 +317,18 @@ impl DumpDir {
     pub fn with_payloads(mut self, payloads: bool) -> DumpDir {
         self.payloads = payloads;
         self
+    }
+
+    /// Applies one aggregate budget to every output file. Zero disables the
+    /// corresponding limit.
+    pub fn with_limits(mut self, max_bytes: u64, max_files: u64) -> DumpDir {
+        self.quota = Arc::new(DumpQuota::new(max_bytes, max_files));
+        self
+    }
+
+    /// Gives the shared budget the session log that records its one stop.
+    pub(crate) fn set_audit(&self, sink: boxcar_audit::AuditSink) {
+        self.quota.set_audit(sink);
     }
 
     /// Whether `frames.pcap` keeps TLS connections' payloads.
@@ -170,6 +356,54 @@ impl DumpDir {
     /// `http/<flow>-<stream>.ws`.
     pub fn ws_file(&self, flow: u64, stream: u32) -> PathBuf {
         self.path.join("http").join(format!("{flow}-{stream}.ws"))
+    }
+
+    fn create_file(&self, path: &Path) -> io::Result<DumpFile> {
+        let Some(new) = self.quota.claim_file(path) else {
+            return Ok(DumpFile::Discard);
+        };
+        if !new {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("dump file {} already exists", path.display()),
+            ));
+        }
+        match create(path) {
+            Ok(file) => Ok(DumpFile::File {
+                file,
+                quota: self.quota.clone(),
+            }),
+            Err(error) => {
+                self.quota.release_file(path);
+                Err(error)
+            }
+        }
+    }
+
+    fn append_file(&self, path: &Path) -> io::Result<DumpFile> {
+        let Some(new) = self.quota.claim_file(path) else {
+            return Ok(DumpFile::Discard);
+        };
+        let mut options = OpenOptions::new();
+        options
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600);
+        if new {
+            options.create_new(true);
+        }
+        match options.open(path) {
+            Ok(file) => Ok(DumpFile::File {
+                file,
+                quota: self.quota.clone(),
+            }),
+            Err(error) => {
+                if new {
+                    self.quota.release_file(path);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -229,13 +463,14 @@ pub struct FrameDump {
     tx: Sender<Frame>,
     /// `--dump-payloads`: the gate's TLS records are kept.
     payloads: bool,
+    quota: Arc<DumpQuota>,
 }
 
 impl FrameDump {
     /// Opens `frames.pcap` in `dir`, writes its header, and starts the
     /// `dump` thread that writes the frames.
     pub fn start(dir: &DumpDir) -> io::Result<(FrameDump, DumpThread)> {
-        let mut file = create(&dir.frames())?;
+        let mut file = dir.create_file(&dir.frames())?;
         file.write_all(&pcap_header())?;
         let (tx, rx) = bounded(FRAME_QUEUE);
         let payloads = dir.payloads();
@@ -243,7 +478,14 @@ impl FrameDump {
             boxcar_confine::at_thread_start();
             write_frames(rx, file)
         })?;
-        Ok((FrameDump { tx, payloads }, DumpThread { thread }))
+        Ok((
+            FrameDump {
+                tx,
+                payloads,
+                quota: dir.quota.clone(),
+            },
+            DumpThread { thread },
+        ))
     }
 
     /// Whether the gate's TLS records are kept (`--dump-payloads`).
@@ -271,6 +513,9 @@ impl FrameDump {
     }
 
     fn push(&self, bytes: &[u8], kept: usize) -> bool {
+        if self.quota.stopped() {
+            return true;
+        }
         let frame = Frame {
             at: SystemTime::now(),
             bytes: bytes[..kept].to_vec(),
@@ -329,7 +574,7 @@ impl DumpThread {
 
 /// The thread's body: each frame as a pcap record. A write that fails
 /// ends the file; the frames keep being taken so the queue drains.
-fn write_frames(rx: Receiver<Frame>, file: File) {
+fn write_frames(rx: Receiver<Frame>, file: DumpFile) {
     let mut out = io::BufWriter::new(file);
     let mut failed = false;
     for frame in rx {
@@ -598,7 +843,7 @@ pub fn write_exchange(
     content_type: Option<&str>,
     body: Result<&[u8], u64>,
 ) -> io::Result<()> {
-    let mut file = create(&dir.exchange_file(flow, stream, request))?;
+    let mut file = dir.create_file(&dir.exchange_file(flow, stream, request))?;
     let head = &head.as_bytes()[..head.len().min(EXCHANGE_FILE_LIMIT)];
     file.write_all(head)?;
     file.write_all(b"\r\n")?;
@@ -623,12 +868,7 @@ pub fn append_ws(
     text: bool,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(dir.ws_file(flow, stream))?;
+    let mut file = dir.append_file(&dir.ws_file(flow, stream))?;
     writeln!(
         file,
         "{direction} {} {}",
@@ -1087,7 +1327,36 @@ pub fn head_text<'a>(
 mod tests {
     use std::io::Read;
 
+    use boxcar_audit::{LogReader, WriterConfig};
+    use boxcar_proto::SessionId;
+
     use super::*;
+
+    fn audit() -> (
+        tempfile::TempDir,
+        boxcar_audit::AuditSink,
+        boxcar_audit::WriterHandle,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let (sink, writer) =
+            boxcar_audit::spawn(WriterConfig::new(data.path(), SessionId::new())).unwrap();
+        (data, sink, writer)
+    }
+
+    fn quota_records(writer: boxcar_audit::WriterHandle) -> usize {
+        let dir = writer.session_dir().to_owned();
+        writer.close().unwrap();
+        LogReader::open(&dir)
+            .unwrap()
+            .records()
+            .map(|record| record.unwrap())
+            .filter(|record| {
+                record.kind == "net.degraded"
+                    && record.data["component"] == "dump"
+                    && record.data["reason"] == "quota"
+            })
+            .count()
+    }
 
     fn u32_at(bytes: &[u8], at: usize) -> u32 {
         u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
@@ -1326,6 +1595,83 @@ mod tests {
     }
 
     #[test]
+    fn the_dump_byte_limit_stops_all_outputs_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[])
+            .unwrap()
+            .with_limits(60, 0);
+        let (_data, sink, writer) = audit();
+        dir.set_audit(sink);
+        let (dump, thread) = FrameDump::start(&dir).unwrap();
+        assert!(dump.push_from_guest(&[0; 14]));
+        assert!(dump.push_from_guest(&[0; 14]));
+        drop(dump);
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
+        assert!(fs::metadata(dir.frames()).unwrap().len() <= 60);
+
+        write_exchange(&dir, 1, 1, true, "GET / HTTP/1.1\r\n", None, Ok(b"body")).unwrap();
+        assert!(!dir.exchange_file(1, 1, true).exists());
+        assert_eq!(quota_records(writer), 1);
+    }
+
+    #[test]
+    fn the_dump_file_limit_is_shared_by_every_output_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[])
+            .unwrap()
+            .with_limits(0, 2);
+        let (_data, sink, writer) = audit();
+        dir.set_audit(sink);
+        let (dump, thread) = FrameDump::start(&dir).unwrap();
+        drop(dump);
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
+        write_exchange(&dir, 1, 1, true, "GET / HTTP/1.1\r\n", None, Ok(b"body")).unwrap();
+        append_ws(&dir, 1, 1, "c2s", true, b"{}").unwrap();
+        write_exchange(&dir, 2, 1, true, "GET / HTTP/1.1\r\n", None, Ok(b"body")).unwrap();
+
+        assert!(dir.frames().exists());
+        assert!(dir.exchange_file(1, 1, true).exists());
+        assert!(!dir.ws_file(1, 1).exists());
+        assert!(!dir.exchange_file(2, 1, true).exists());
+        assert_eq!(quota_records(writer), 1);
+    }
+
+    #[test]
+    fn frame_byte_claims_are_independent_and_exact() {
+        let quota = Arc::new(DumpQuota::new(100, 0));
+        let paths = quota.paths.lock().unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = thread::spawn({
+            let quota = quota.clone();
+            move || done.send(quota.reserve_bytes(1)).unwrap()
+        });
+        assert!(completed.recv_timeout(Duration::from_secs(1)).unwrap());
+        drop(paths);
+        worker.join().unwrap();
+        quota.release_bytes(1);
+
+        let ready = Arc::new(std::sync::Barrier::new(41));
+        let workers: Vec<_> = (0..40)
+            .map(|_| {
+                let quota = quota.clone();
+                let ready = ready.clone();
+                thread::spawn(move || {
+                    ready.wait();
+                    quota.reserve_bytes(3)
+                })
+            })
+            .collect();
+        ready.wait();
+        let admitted = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(admitted, 33);
+        assert_eq!(quota.bytes.load(Ordering::Acquire), 99);
+        assert!(quota.stopped());
+    }
+
+    #[test]
     fn a_full_channel_drops_and_counts() {
         // A queue nobody drains: once it is full, `push` says so at once
         // and never waits.
@@ -1333,6 +1679,7 @@ mod tests {
         let dump = FrameDump {
             tx,
             payloads: false,
+            quota: Arc::new(DumpQuota::new(0, 0)),
         };
         assert!(dump.push_from_guest(&[0; 14]));
         assert!(dump.push_from_guest(&[0; 14]));
