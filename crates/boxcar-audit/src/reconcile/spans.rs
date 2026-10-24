@@ -581,13 +581,14 @@ struct PendingExec {
     program: String,
     argv: Vec<String>,
     argv_complete: bool,
+    lineage_evicted: bool,
 }
 
 /// Who made an effect that joined no span yet.
 #[derive(Clone, Copy, Debug)]
 enum Who {
     /// The guest thread a filesystem record named.
-    Tid(u32),
+    Tid { tid: u32, proc_key: Option<ProcKey> },
     /// The process a flow's sensor connect named.
     Proc(ProcKey),
 }
@@ -599,6 +600,7 @@ struct RecentEffect {
     ts: u64,
     who: Who,
     kind: EffectKind,
+    lineage_evicted: bool,
 }
 
 /// A TLS write ring 1 reported, waiting for the request it carried.
@@ -892,6 +894,108 @@ impl Spans {
         self.open.len()
     }
 
+    /// Process entries that an open or unsettled span, or a pending join,
+    /// can still consult.
+    pub fn lineage_refs(&self, state: &State) -> HashSet<ProcKey> {
+        let mut refs = HashSet::new();
+        for span in self
+            .spans
+            .values()
+            .filter(|span| span.is_open() || !span.settled)
+        {
+            refs.extend(span.members.iter().map(|member| member.key));
+            refs.extend(span.executor);
+            refs.extend(span.mismatch.as_ref().map(|mismatch| mismatch.0));
+        }
+        refs.extend(self.pending_execs.iter().map(|pending| pending.key));
+        refs.extend(self.executors.values().map(|(key, _)| *key));
+        refs.extend(self.flow_owners.values().copied());
+        refs.extend(self.session_root);
+        for effect in &self.recent {
+            match effect.who {
+                Who::Proc(key) => {
+                    refs.insert(key);
+                }
+                Who::Tid { tid, proc_key } => {
+                    refs.extend(proc_key.or_else(|| state.attribute(tid, effect.ts)));
+                }
+            }
+        }
+        refs
+    }
+
+    /// Process entries a closed span still needs for its settlement checks.
+    /// These and their ancestors are not selected to make room until the
+    /// checks have run.
+    pub fn settlement_lineage_refs(&self) -> HashSet<ProcKey> {
+        let mut refs = HashSet::new();
+        let mut any = false;
+        for span in self
+            .spans
+            .values()
+            .filter(|span| !span.is_open() && !span.settled)
+        {
+            any = true;
+            refs.extend(span.members.iter().map(|member| member.key));
+            refs.extend(span.executor);
+            refs.extend(span.mismatch.as_ref().map(|mismatch| mismatch.0));
+            refs.extend(self.flow_owners.get(&span.request.0));
+        }
+        if any {
+            refs.extend(self.session_root);
+        }
+        refs
+    }
+
+    /// A process entry was released while a span or pending join could
+    /// still consult it. Mark affected spans and carry the loss with the
+    /// individual pending item until it joins.
+    pub fn lineage_evicted(&mut self, state: &State, evicted: ProcKey) {
+        for pending in &mut self.pending_execs {
+            pending.lineage_evicted |= state.lineage_depends_on(pending.key, evicted);
+        }
+        for effect in &mut self.recent {
+            effect.lineage_evicted |= match &mut effect.who {
+                Who::Proc(key) => state.lineage_depends_on(*key, evicted),
+                Who::Tid { tid, proc_key } => {
+                    let key = (*proc_key).or_else(|| state.attribute(*tid, effect.ts));
+                    *proc_key = key;
+                    key.is_some_and(|key| state.lineage_depends_on(key, evicted))
+                }
+            };
+        }
+        let affected: Vec<String> = self
+            .spans
+            .iter()
+            .filter(|(_, span)| span.is_open() || !span.settled)
+            .filter(|(_, span)| {
+                let root_replaced = self.session_root == Some(evicted) && span.executor_bound;
+                let depends_on = |key| {
+                    if root_replaced {
+                        key == evicted
+                    } else {
+                        state.lineage_depends_on(key, evicted)
+                    }
+                };
+                span.members.iter().any(|member| depends_on(member.key))
+                    || span.executor.is_some_and(depends_on)
+                    || span
+                        .mismatch
+                        .as_ref()
+                        .is_some_and(|mismatch| depends_on(mismatch.0))
+                    || (self.session_root == Some(evicted) && !span.executor_bound)
+                    || self
+                        .flow_owners
+                        .get(&span.request.0)
+                        .is_some_and(|key| depends_on(*key))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in affected {
+            self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+        }
+    }
+
     /// A `tool.open`: opens the span and takes what waited for it.
     pub fn open(&mut self, state: &State, record: &Record, open: &ToolOpen) -> Vec<Finding> {
         let id = open.tool_use_id.clone();
@@ -922,6 +1026,12 @@ impl Spans {
                 }
             }
         }
+        if span
+            .executor
+            .is_some_and(|key| state.is_lineage_evicted(key))
+        {
+            span.note_unverified(SpanUnverifiedReason::LineageEvicted);
+        }
         self.spans.insert(id.clone(), span);
         self.order.push_back(id.clone());
         self.open.push(id.clone());
@@ -938,14 +1048,17 @@ impl Spans {
                 &pending.argv,
                 pending.argv_complete,
             ) {
-                Some((_, true))
+                Some((_, true, _))
                     if record.ts_host_ns.saturating_sub(pending.ts) > JOIN_WINDOW_NS =>
                 {
                     if !self.by_proc.contains_key(&pending.key) {
                         self.pending_execs.push_back(pending);
                     }
                 }
-                Some((span_id, judge)) => {
+                Some((span_id, judge, ancestry_evicted)) => {
+                    if pending.lineage_evicted || ancestry_evicted {
+                        self.note_unverified(&span_id, SpanUnverifiedReason::LineageEvicted);
+                    }
                     let joined = self.join(state, &span_id, pending.key, Some(&pending));
                     if joined && judge {
                         findings.extend(self.judge_argv(&span_id, &pending));
@@ -960,6 +1073,11 @@ impl Spans {
         let waiting: Vec<RecentEffect> = self.recent.drain(..).collect();
         for effect in waiting {
             let owner = self.owner(state, effect.who, effect.ts);
+            if let Some((ref span_id, ancestry_evicted)) = owner {
+                if effect.lineage_evicted || ancestry_evicted {
+                    self.note_unverified(span_id, SpanUnverifiedReason::LineageEvicted);
+                }
+            }
             let taken = owner.is_none()
                 && self.take_agent_effect(state, effect.who, effect.ts, &effect.kind, effect.seq);
             if !taken {
@@ -1093,6 +1211,9 @@ impl Spans {
         }
         if let Some(id) = self.by_proc.get(&key).cloned() {
             // A member that exec'd again (a shell running its command).
+            if state.is_lineage_evicted(key) {
+                self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+            }
             let shell_written = self.shells_written();
             if let Some(span) = self.spans.get_mut(&id) {
                 span.note_exec(&exec.filename, &exec.argv, argv_complete, shell_written);
@@ -1115,13 +1236,20 @@ impl Spans {
             program: exec.filename.clone(),
             argv: exec.argv.clone(),
             argv_complete,
+            lineage_evicted: state.is_lineage_evicted(key),
         };
-        if let Some(id) = self.parent_span(state, key) {
+        if let Some((id, ancestry_evicted)) = self.parent_span(state, key) {
+            if pending.lineage_evicted || ancestry_evicted {
+                self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+            }
             self.join(state, &id, key, Some(&pending));
             return Vec::new();
         }
         match self.choose(state, key, &exec.filename, &exec.argv, argv_complete) {
-            Some((id, judge)) => {
+            Some((id, judge, ancestry_evicted)) => {
+                if pending.lineage_evicted || ancestry_evicted {
+                    self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+                }
                 self.join(state, &id, key, Some(&pending));
                 if judge {
                     self.judge_argv(&id, &pending)
@@ -1140,11 +1268,16 @@ impl Spans {
     }
 
     /// A `proc.fork` of a new process: a member's child joins its span.
-    pub fn fork(&mut self, state: &State, parent: Option<ProcKey>, child: ProcKey) {
-        let Some(id) = parent.and_then(|key| self.by_proc.get(&key).cloned()) else {
+    pub fn fork(&mut self, state: &State, parent: Option<(ProcKey, bool)>, child: ProcKey) {
+        let Some((id, ancestry_evicted)) = parent
+            .and_then(|(key, evicted)| self.by_proc.get(&key).cloned().map(|id| (id, evicted)))
+        else {
             return;
         };
         if self.spans.get(&id).is_some_and(Span::is_open) {
+            if ancestry_evicted {
+                self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+            }
             self.join(state, &id, child, None);
         }
     }
@@ -1160,17 +1293,30 @@ impl Spans {
         }
         self.note_written_shell(&kind);
         let (seq, ts) = (record.seq, record.ts_host_ns);
-        let who = Who::Tid(subject.pid);
+        let owner = state.attribute_lineage(subject.pid, ts);
+        let who = Who::Tid {
+            tid: subject.pid,
+            proc_key: owner.map(|(key, _)| key),
+        };
         match self.owner(state, who, ts) {
-            Some(id) => {
+            Some((id, ancestry_evicted)) => {
                 if self.spans.get(&id).is_some_and(Span::is_open) {
+                    if ancestry_evicted {
+                        self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+                    }
                     self.push_effect(state, &id, Effect { seq, kind });
                 }
                 // A member of a closed span: its later work is its own.
             }
             None => {
                 if !self.take_agent_effect(state, who, ts, &kind, seq) {
-                    self.remember(RecentEffect { seq, ts, who, kind });
+                    self.remember(RecentEffect {
+                        seq,
+                        ts,
+                        who,
+                        kind,
+                        lineage_evicted: owner.is_some_and(|(_, evicted)| evicted),
+                    });
                 }
             }
         }
@@ -1219,7 +1365,15 @@ impl Spans {
 
     /// A flow's `net.connect` met the `proc.tcp_connect` of `key`: `key`
     /// opened it, and the flow is an effect of its span.
-    pub fn flow(&mut self, state: &State, flow: u64, seq: u64, ts: u64, key: ProcKey) {
+    pub fn flow(
+        &mut self,
+        state: &State,
+        flow: u64,
+        seq: u64,
+        ts: u64,
+        key: ProcKey,
+        lineage_evicted: bool,
+    ) {
         if self.flow_owners.insert(flow, key).is_none() {
             self.flow_order.push_back(flow);
         }
@@ -1251,9 +1405,14 @@ impl Spans {
         // executor: its opener is theirs.
         for id in &self.open {
             if let Some(span) = self.spans.get_mut(id) {
-                if span.request.0 == flow && !span.executor_bound {
-                    span.executor = Some(key);
-                    span.executor_bound = true;
+                if span.request.0 == flow {
+                    if !span.executor_bound {
+                        span.executor = Some(key);
+                        span.executor_bound = true;
+                    }
+                    if lineage_evicted {
+                        span.note_unverified(SpanUnverifiedReason::LineageEvicted);
+                    }
                 }
             }
         }
@@ -1278,6 +1437,9 @@ impl Spans {
         match self.by_proc.get(&key).cloned() {
             Some(id) => {
                 if self.spans.get(&id).is_some_and(Span::is_open) {
+                    if lineage_evicted {
+                        self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+                    }
                     self.push_effect(state, &id, Effect { seq, kind });
                 }
             }
@@ -1287,6 +1449,7 @@ impl Spans {
                     ts,
                     who: Who::Proc(key),
                     kind,
+                    lineage_evicted: lineage_evicted || state.is_lineage_evicted(key),
                 });
             }
         }
@@ -1369,7 +1532,7 @@ impl Spans {
         program: &str,
         argv: &[String],
         argv_complete: bool,
-    ) -> Option<(String, bool)> {
+    ) -> Option<(String, bool, bool)> {
         if self.open.is_empty() {
             return None;
         }
@@ -1380,13 +1543,15 @@ impl Spans {
             })
         });
         if let Some(id) = by_argv {
-            if self.reaches_agent(state, key, id) {
-                return Some((id.clone(), false));
+            let (reaches, evicted) = self.reaches_agent(state, key, id);
+            if reaches {
+                return Some((id.clone(), false, evicted));
             }
         }
         if let [only] = self.open.as_slice() {
-            if self.reaches_agent(state, key, only) {
-                return Some((only.clone(), true));
+            let (reaches, evicted) = self.reaches_agent(state, key, only);
+            if reaches {
+                return Some((only.clone(), true, evicted));
             }
         }
         None
@@ -1411,7 +1576,7 @@ impl Spans {
     /// no span). With neither known there is nothing to reach: every
     /// process is the agent's. Exhausting the bounded walk counts as
     /// reaching it, so a deep descendant is not silently left out.
-    fn reaches_agent(&self, state: &State, key: ProcKey, span_id: &str) -> bool {
+    fn reaches_agent(&self, state: &State, key: ProcKey, span_id: &str) -> (bool, bool) {
         // A provisional executor (a TLS write's) is evidence, never the
         // agent: only one that opened the request's flow is.
         let executor = self
@@ -1420,7 +1585,7 @@ impl Spans {
             .filter(|span| span.executor_bound)
             .and_then(|span| span.executor);
         if executor.is_none() && self.session_pid.is_none() {
-            return true;
+            return (true, state.is_lineage_evicted(key));
         }
         // The agent: the bound executor by its identity (one that has
         // exited may have left its pid to another process), else the
@@ -1434,46 +1599,59 @@ impl Spans {
                 }),
         };
         let mut current = key;
+        let mut lineage_evicted = false;
         for depth in 0..MAX_ANCESTRY {
-            let Some(proc) = state.proc(current) else {
-                return false;
+            let Some((ppid, first_ts, evicted)) = state.lineage_proc(current) else {
+                return (false, lineage_evicted);
             };
-            if is_agent(proc.key) {
-                return depth > 0;
+            lineage_evicted |= evicted;
+            if is_agent(current) {
+                return (depth > 0, lineage_evicted);
             }
-            if proc.ppid <= 1 {
-                return false;
+            if ppid <= 1 {
+                return (false, lineage_evicted);
             }
-            match state.attribute(proc.ppid, proc.first_ts) {
-                Some(parent) if parent == current => return false,
-                Some(parent) if is_agent(parent) => return true,
-                Some(parent) => current = parent,
+            match state.lineage_parent(current, ppid, first_ts) {
+                Some((parent, _)) if parent == current => return (false, lineage_evicted),
+                Some((parent, parent_evicted)) if is_agent(parent) => {
+                    return (true, lineage_evicted || parent_evicted);
+                }
+                Some((parent, parent_evicted)) => {
+                    lineage_evicted |= parent_evicted;
+                    current = parent;
+                }
                 // A parent not on record: the session root, alone, is
                 // known by its pid.
                 None => {
-                    return executor.is_none()
-                        && self.session_root.is_none()
-                        && self.session_pid == Some(proc.ppid);
+                    return (
+                        executor.is_none()
+                            && self.session_root.is_none()
+                            && self.session_pid == Some(ppid),
+                        lineage_evicted,
+                    );
                 }
             }
         }
-        true
+        (true, lineage_evicted)
     }
 
     /// The open span of `key`'s parent, if the parent is in one.
-    fn parent_span(&self, state: &State, key: ProcKey) -> Option<String> {
-        let proc = state.proc(key)?;
-        let parent = state.attribute(proc.ppid, proc.first_ts)?;
+    fn parent_span(&self, state: &State, key: ProcKey) -> Option<(String, bool)> {
+        let (ppid, first_ts, current_evicted) = state.lineage_proc(key)?;
+        let (parent, parent_evicted) = state.lineage_parent(key, ppid, first_ts)?;
         let id = self.by_proc.get(&parent)?;
         self.spans
             .get(id)
             .filter(|span| span.is_open())
-            .map(|_| id.clone())
+            .map(|_| (id.clone(), current_evicted || parent_evicted))
     }
 
     /// `key` joins the span: its exec is an effect, the effects that
     /// waited for it follow, and so do its children that waited.
     fn join(&mut self, state: &State, id: &str, key: ProcKey, exec: Option<&PendingExec>) -> bool {
+        if exec.is_some_and(|pending| pending.lineage_evicted) {
+            self.note_unverified(id, SpanUnverifiedReason::LineageEvicted);
+        }
         let shell_written = self.shells_written();
         if let Some(member_of) = self.by_proc.get(&key).cloned() {
             // Already this span's: a later exec of the same process (one
@@ -1530,10 +1708,27 @@ impl Spans {
         let waiting: Vec<RecentEffect> = self.recent.drain(..).collect();
         for effect in waiting {
             let owner = match effect.who {
-                Who::Tid(tid) => state.attribute(tid, effect.ts),
+                Who::Tid { tid, proc_key } => {
+                    proc_key.or_else(|| state.attribute_lineage(tid, effect.ts).map(|(key, _)| key))
+                }
                 Who::Proc(proc) => Some(proc),
             };
             if owner == Some(key) {
+                if effect.lineage_evicted
+                    || match effect.who {
+                        Who::Tid { tid, proc_key } => proc_key
+                            .map(|key| state.is_lineage_evicted(key))
+                            .or_else(|| {
+                                state
+                                    .attribute_lineage(tid, effect.ts)
+                                    .map(|(_, evicted)| evicted)
+                            })
+                            .unwrap_or(false),
+                        Who::Proc(proc) => state.is_lineage_evicted(proc),
+                    }
+                {
+                    self.note_unverified(id, SpanUnverifiedReason::LineageEvicted);
+                }
                 self.push_effect(
                     state,
                     id,
@@ -1561,24 +1756,29 @@ impl Spans {
                 .enumerate()
                 .find_map(|(i, pending)| {
                     self.parent_span(state, pending.key)
-                        .map(|id| (i, id, pending.clone()))
+                        .map(|(id, evicted)| (i, id, evicted, pending.clone()))
                 });
-            let Some((index, id, pending)) = found else {
+            let Some((index, id, ancestry_evicted, pending)) = found else {
                 return;
             };
             self.pending_execs.remove(index);
+            if pending.lineage_evicted || ancestry_evicted {
+                self.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+            }
             self.join(state, &id, pending.key, Some(&pending));
         }
     }
 
     /// The span of the process behind an effect, if that process is in
     /// one.
-    fn owner(&self, state: &State, who: Who, ts: u64) -> Option<String> {
-        let key = match who {
-            Who::Tid(tid) => state.attribute(tid, ts)?,
-            Who::Proc(key) => key,
+    fn owner(&self, state: &State, who: Who, ts: u64) -> Option<(String, bool)> {
+        let (key, evicted) = match who {
+            Who::Tid { tid, proc_key } => proc_key
+                .map(|key| (key, state.is_lineage_evicted(key)))
+                .or_else(|| state.attribute_lineage(tid, ts))?,
+            Who::Proc(key) => (key, state.is_lineage_evicted(key)),
         };
-        self.by_proc.get(&key).cloned()
+        self.by_proc.get(&key).cloned().map(|id| (id, evicted))
     }
 
     /// A filesystem effect by no span's process, made by the agent (the
@@ -1601,7 +1801,7 @@ impl Spans {
         }
         if state.sensor.lineage_ok() {
             let key = match who {
-                Who::Tid(tid) => state.attribute(tid, ts),
+                Who::Tid { tid, proc_key } => proc_key.or_else(|| state.attribute(tid, ts)),
                 Who::Proc(key) => Some(key),
             };
             if !key.is_some_and(|key| self.is_agent(key)) {
@@ -3197,6 +3397,315 @@ mod tests {
             span.carried_by("/bin/bash", &words(&["bash", "-c", "ls -la"]), true, false,),
             Some(true)
         );
+    }
+
+    #[test]
+    fn a_span_records_when_retained_lineage_is_released() {
+        let key = ProcKey {
+            tgid: 200,
+            start_ns: 1,
+        };
+        let other = ProcKey {
+            tgid: 201,
+            start_ns: 2,
+        };
+        let mut state = State::with_process_limits(1, usize::MAX);
+        state.upsert_proc(key, 1, |_| {});
+        state.upsert_proc(other, 2, |_| {});
+        let open = ToolOpen {
+            flow: 1,
+            stream: 1,
+            tool_use_id: "toolu_1".into(),
+            tool_name: "Bash".into(),
+            args_b3: None,
+            args_summary: "{}".into(),
+            args: Some(json!({})),
+        };
+        let mut span = Span::new(&open, None, 1, 1);
+        span.members.push(Member {
+            key,
+            exec_seq: Some(2),
+        });
+        let mut spans = Spans::new(None, None);
+        spans.spans.insert(open.tool_use_id.clone(), span);
+        spans.order.push_back(open.tool_use_id.clone());
+        spans.open.push(open.tool_use_id.clone());
+
+        let refs = spans.lineage_refs(&state);
+        let evictions = state.process_evictions(2, &refs, &HashSet::new());
+        for eviction in evictions.iter().filter(|eviction| eviction.forced) {
+            spans.lineage_evicted(&state, eviction.key);
+        }
+        state.evict_processes(&evictions);
+        assert!(state.proc(key).is_none());
+        spans.stop();
+        let records = spans.take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].attribution_unverified,
+            [SpanUnverifiedReason::LineageEvicted]
+        );
+    }
+
+    #[test]
+    fn a_closed_span_keeps_its_lineage_until_settlement() {
+        let parent = ProcKey {
+            tgid: 100,
+            start_ns: 1,
+        };
+        let child = ProcKey {
+            tgid: 200,
+            start_ns: 2,
+        };
+        let other = ProcKey {
+            tgid: 300,
+            start_ns: 3,
+        };
+        let mut state = State::with_process_limits(1, usize::MAX);
+        state.upsert_proc(parent, 1, |_| {});
+        state.upsert_proc(child, 2, |proc| proc.ppid = parent.tgid);
+        state.upsert_proc(other, 3, |_| {});
+        let open = ToolOpen {
+            flow: 1,
+            stream: 1,
+            tool_use_id: "toolu_settling".into(),
+            tool_name: "Bash".into(),
+            args_b3: None,
+            args_summary: "{}".into(),
+            args: Some(json!({})),
+        };
+        let mut span = Span::new(&open, None, 1, 1);
+        span.closed = Some((2, 2));
+        span.members.push(Member {
+            key: child,
+            exec_seq: Some(3),
+        });
+        let mut spans = Spans::new(None, None);
+        spans.spans.insert(open.tool_use_id.clone(), span);
+        spans.order.push_back(open.tool_use_id.clone());
+
+        let refs = spans.lineage_refs(&state);
+        let protected = spans.settlement_lineage_refs();
+        let evictions = state.process_evictions(3, &refs, &protected);
+        assert!(!evictions.iter().any(|eviction| eviction.key == parent));
+        assert!(!evictions.iter().any(|eviction| eviction.key == child));
+        assert!(evictions.iter().any(|eviction| eviction.key == other));
+    }
+
+    #[test]
+    fn a_later_ancestry_walk_carries_released_lineage() {
+        let root = ProcKey {
+            tgid: 100,
+            start_ns: 1,
+        };
+        let middle = ProcKey {
+            tgid: 200,
+            start_ns: 2,
+        };
+        let child = ProcKey {
+            tgid: 300,
+            start_ns: 3,
+        };
+        let mut state = State::with_process_limits(2, usize::MAX);
+        state.upsert_proc(middle, 2, |proc| proc.ppid = root.tgid);
+        state.upsert_proc(root, 1, |_| {});
+        state.upsert_proc(child, 3, |proc| proc.ppid = middle.tgid);
+        let evictions = state.process_evictions(3, &HashSet::new(), &HashSet::new());
+        assert_eq!(evictions[0].key, middle);
+        state.evict_processes(&evictions);
+
+        let open = ToolOpen {
+            flow: 1,
+            stream: 1,
+            tool_use_id: "toolu_walk".into(),
+            tool_name: "Bash".into(),
+            args_b3: None,
+            args_summary: "{}".into(),
+            args: Some(json!({})),
+        };
+        let mut spans = Spans::new(None, None);
+        spans.session_started(root.tgid, Some(root));
+        spans
+            .spans
+            .insert(open.tool_use_id.clone(), Span::new(&open, None, 1, 1));
+        spans.order.push_back(open.tool_use_id.clone());
+        spans.open.push(open.tool_use_id.clone());
+
+        let (id, _, lineage_evicted) = spans
+            .choose(&state, child, "/bin/true", &["true".into()], true)
+            .expect("the child still reaches the session root");
+        assert_eq!(id, open.tool_use_id);
+        assert!(lineage_evicted);
+        spans.note_unverified(&id, SpanUnverifiedReason::LineageEvicted);
+        spans.stop();
+        assert_eq!(
+            spans.take_records()[0].attribution_unverified,
+            [SpanUnverifiedReason::LineageEvicted]
+        );
+    }
+
+    #[test]
+    fn a_pending_join_marks_only_its_span() {
+        let ancestor = ProcKey {
+            tgid: 100,
+            start_ns: 1,
+        };
+        let child = ProcKey {
+            tgid: 200,
+            start_ns: 2,
+        };
+        let mut state = State::default();
+        state.upsert_proc(ancestor, 1, |_| {});
+        state.upsert_proc(child, 2, |proc| proc.ppid = ancestor.tgid);
+        let mut spans = Spans::new(None, None);
+        for id in ["toolu_first", "toolu_second"] {
+            let open = ToolOpen {
+                flow: 1,
+                stream: 1,
+                tool_use_id: id.into(),
+                tool_name: "Bash".into(),
+                args_b3: None,
+                args_summary: "{}".into(),
+                args: Some(json!({})),
+            };
+            spans.spans.insert(id.into(), Span::new(&open, None, 1, 1));
+            spans.order.push_back(id.into());
+            spans.open.push(id.into());
+        }
+        spans.pending_execs.push_back(PendingExec {
+            key: child,
+            seq: 3,
+            ts: 3,
+            program: "/bin/true".into(),
+            argv: vec!["true".into()],
+            argv_complete: true,
+            lineage_evicted: false,
+        });
+
+        spans.lineage_evicted(&state, ancestor);
+        let pending = spans.pending_execs.pop_front().expect("pending exec");
+        assert!(pending.lineage_evicted);
+        spans.join(&state, "toolu_first", child, Some(&pending));
+        spans.stop();
+        let records = spans.take_records();
+        let first = records
+            .iter()
+            .find(|record| record.span_id == "toolu_first")
+            .expect("first span");
+        let second = records
+            .iter()
+            .find(|record| record.span_id == "toolu_second")
+            .expect("second span");
+        assert!(first
+            .attribution_unverified
+            .contains(&SpanUnverifiedReason::LineageEvicted));
+        assert!(!second
+            .attribution_unverified
+            .contains(&SpanUnverifiedReason::LineageEvicted));
+    }
+
+    #[test]
+    fn a_waiting_effect_keeps_its_resolved_process() {
+        let key = ProcKey {
+            tgid: 200,
+            start_ns: 1,
+        };
+        let mut state = State::default();
+        state.upsert_proc(key, 1, |_| {});
+        state.join_thread(201, key, 1);
+
+        let open = ToolOpen {
+            flow: 1,
+            stream: 1,
+            tool_use_id: "toolu_waiting".into(),
+            tool_name: "Bash".into(),
+            args_b3: None,
+            args_summary: "{}".into(),
+            args: Some(json!({})),
+        };
+        let mut spans = Spans::new(None, None);
+        spans
+            .spans
+            .insert(open.tool_use_id.clone(), Span::new(&open, None, 1, 1));
+        spans.order.push_back(open.tool_use_id.clone());
+        spans.open.push(open.tool_use_id.clone());
+        spans.recent.push_back(RecentEffect {
+            seq: 2,
+            ts: 2,
+            who: Who::Tid {
+                tid: 201,
+                proc_key: None,
+            },
+            kind: EffectKind::Net { flow: 9 },
+            lineage_evicted: false,
+        });
+
+        spans.lineage_evicted(&state, key);
+        state.evict_processes(&[super::super::state::ProcEviction { key, forced: true }]);
+        assert!(spans.join(&state, &open.tool_use_id, key, None));
+
+        let span = spans.get(&open.tool_use_id).expect("span");
+        assert!(span.effects.iter().any(|effect| effect.seq == 2));
+        assert!(span
+            .attribution_unverified
+            .contains(&SpanUnverifiedReason::LineageEvicted));
+    }
+
+    #[test]
+    fn a_bound_executor_replaces_the_session_root() {
+        let root = ProcKey {
+            tgid: 100,
+            start_ns: 1,
+        };
+        let executor = ProcKey {
+            tgid: 200,
+            start_ns: 2,
+        };
+        let worker = ProcKey {
+            tgid: 300,
+            start_ns: 3,
+        };
+        let mut state = State::default();
+        state.upsert_proc(root, 1, |_| {});
+        state.upsert_proc(executor, 2, |proc| proc.ppid = root.tgid);
+        state.upsert_proc(worker, 3, |proc| proc.ppid = executor.tgid);
+
+        let mut spans = Spans::new(None, None);
+        spans.session_started(root.tgid, Some(root));
+        for (id, flow) in [("toolu_root", 1), ("toolu_executor", 2)] {
+            let open = ToolOpen {
+                flow,
+                stream: 1,
+                tool_use_id: id.into(),
+                tool_name: "Bash".into(),
+                args_b3: None,
+                args_summary: "{}".into(),
+                args: Some(json!({})),
+            };
+            spans.spans.insert(id.into(), Span::new(&open, None, 1, 1));
+            spans.order.push_back(id.into());
+            spans.open.push(id.into());
+        }
+        let bound = spans.spans.get_mut("toolu_executor").expect("bound span");
+        bound.executor = Some(executor);
+        bound.executor_bound = true;
+        bound.members.push(Member {
+            key: worker,
+            exec_seq: Some(4),
+        });
+
+        spans.lineage_evicted(&state, root);
+
+        assert!(spans
+            .get("toolu_root")
+            .expect("root span")
+            .attribution_unverified
+            .contains(&SpanUnverifiedReason::LineageEvicted));
+        assert!(!spans
+            .get("toolu_executor")
+            .expect("executor span")
+            .attribution_unverified
+            .contains(&SpanUnverifiedReason::LineageEvicted));
     }
 
     #[test]

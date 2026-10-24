@@ -4971,7 +4971,7 @@
       ],
       "properties": {
         "attribution_unverified": {
-          "description": "Why process attribution for the span is not verified; at most two, omitted when attribution was verified.",
+          "description": "Why process attribution for the span is not verified; at most three, omitted when attribution was verified.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/SpanUnverifiedReason"
@@ -5047,6 +5047,13 @@
           "type": "string",
           "enum": [
             "close_unattributed"
+          ]
+        },
+        {
+          "description": "Retained process lineage was released to keep aggregate bounds.",
+          "type": "string",
+          "enum": [
+            "lineage_evicted"
           ]
         }
       ]

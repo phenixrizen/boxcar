@@ -133,16 +133,19 @@ pub fn observe(
         // A type this build does not know: nothing to join it with.
         return Vec::new();
     };
+    let lineage_changed = matches!(&payload, Payload::ProcFork(_) | Payload::ProcExec(_));
     let ts = record.ts_host_ns;
     let mut out = Vec::new();
     match &payload {
         // Ring 1: the lineage.
         Payload::ProcFork(fork) => {
-            let parent = state.attribute(fork.parent_tid, ts);
+            let parent = state.attribute_lineage(fork.parent_tid, ts);
             if fork.thread {
-                // A new thread of the parent's process.
-                if let Some(key) = parent {
-                    state.join_thread(fork.child_pid, key, ts);
+                // A new thread of a retained parent process.
+                if let Some((key, _)) = parent {
+                    if state.proc(key).is_some() {
+                        state.join_thread(fork.child_pid, key, ts);
+                    }
                 }
             } else {
                 let key = ProcKey {
@@ -189,8 +192,8 @@ pub fn observe(
             state.upsert_proc(key, ts, |p| {
                 p.ppid = exec.ppid;
                 p.uid = exec.uid;
-                p.filename.clone_from(&exec.filename);
-                p.argv.clone_from(&exec.argv);
+                p.filename = exec.filename.clone();
+                p.argv = exec.argv.clone();
                 p.argv_complete = argv_complete;
                 p.exec_seq = Some(seq);
             });
@@ -200,27 +203,29 @@ pub fn observe(
             out.extend(spans.exec(state, record, exec, argv_complete));
         }
         Payload::ProcExit(exit) => {
+            let key = ProcKey {
+                tgid: exit.tgid,
+                start_ns: exit.start_ns,
+            };
+            state.exit_thread(exit.tid, key, ts);
             if exit.group_dead {
-                let key = ProcKey {
-                    tgid: exit.tgid,
-                    start_ns: exit.start_ns,
-                };
                 if state.proc(key).is_some() {
                     spans.process_named(key);
                 }
-                if let Some(proc) = state.proc_mut(key) {
-                    proc.exit_ts = Some(ts);
-                }
+                state.exit_process(key, ts);
             }
         }
         Payload::ProcTcpConnect(connect) => {
             if let (IpAddr::V4(src), IpAddr::V4(dst)) = (connect.src, connect.dst) {
+                let owner = state.attribute_lineage(connect.tid, ts);
                 let sensor = SensorConnect {
                     seq: record.seq,
                     ts,
                     tid: connect.tid,
                     src: SocketAddrV4::new(src, connect.src_port),
                     dst: SocketAddrV4::new(dst, connect.dst_port),
+                    proc_key: owner.map(|(key, _)| key),
+                    lineage_evicted: owner.is_some_and(|(_, evicted)| evicted),
                 };
                 if let Some(flow_id) = join_flow_with_sensor(state, &sensor) {
                     flow_joined(state, spans, flow_id);
@@ -362,6 +367,7 @@ pub fn observe(
                     names: connect.names.clone(),
                     allowed: !verdict_denied(&connect.verdict),
                     proc_key: None,
+                    proc_lineage_evicted: false,
                     proc_seq: None,
                 },
             );
@@ -609,6 +615,9 @@ pub fn observe(
     out.extend(expire(state, cfg, ts));
     out.extend(silence(state, cfg, ts));
     out.extend(spans.tick(state, ts));
+    if lineage_changed && state.process_limits_exceeded() {
+        maintain_lineage(state, spans, ts);
+    }
     out
 }
 
@@ -619,11 +628,27 @@ pub fn on_tick(
     cfg: &ReconcileConfig,
     now: u64,
 ) -> Vec<Finding> {
+    state.dns.prune(now);
     let mut out = judge_connects(state, now);
     out.extend(expire(state, cfg, now));
     out.extend(silence(state, cfg, now));
     out.extend(spans.tick(state, now));
+    maintain_lineage(state, spans, now);
     out
+}
+
+/// Releases lineage after every possible join has settled, enforcing the
+/// aggregate bounds when retained work lasts longer.
+fn maintain_lineage(state: &mut State, spans: &mut Spans, now: u64) {
+    let referenced = spans.lineage_refs(state);
+    let protected = spans.settlement_lineage_refs();
+    let evictions = state.process_evictions(now, &referenced, &protected);
+    for eviction in evictions.iter().filter(|eviction| eviction.forced) {
+        state.note_lineage_eviction(eviction.key);
+        spans.lineage_evicted(state, eviction.key);
+    }
+    state.evict_processes(&evictions);
+    state.retire_thread_memberships(now);
 }
 
 /// `connect_without_dns` for the connects whose process the sensor has
@@ -686,7 +711,14 @@ fn fs_effect(
 fn flow_joined(state: &State, spans: &mut Spans, flow_id: u64) {
     if let Some(flow) = state.flows.get(&flow_id) {
         if let Some(key) = flow.proc_key {
-            spans.flow(state, flow_id, flow.seq, flow.ts, key);
+            spans.flow(
+                state,
+                flow_id,
+                flow.seq,
+                flow.ts,
+                key,
+                flow.proc_lineage_evicted,
+            );
         }
     }
 }
@@ -706,12 +738,15 @@ fn effect(state: &mut State, cfg: &ReconcileConfig, record: &Record, what: &str)
         return Vec::new();
     }
     if state.attribute(subject.pid, record.ts_host_ns).is_none() {
+        let owner = state.attribute_lineage(subject.pid, record.ts_host_ns);
         state.pending.push_back(PendingEffect {
             seq: record.seq,
             ts: record.ts_host_ns,
             tid: subject.pid,
             kind: record.kind.clone(),
             what: what.to_owned(),
+            proc_key: owner.map(|(key, _)| key),
+            lineage_evicted: owner.is_some_and(|(_, evicted)| evicted),
         });
     }
     Vec::new()
@@ -729,7 +764,9 @@ fn expire(state: &mut State, _cfg: &ReconcileConfig, now: u64) -> Vec<Finding> {
     state
         .expire_pending(now)
         .into_iter()
-        .filter(|effect| state.attribute(effect.tid, effect.ts).is_none())
+        .filter(|effect| {
+            effect.proc_key.is_none() && state.attribute_lineage(effect.tid, effect.ts).is_none()
+        })
         .map(|effect| {
             Draft::new(
                 FindingCategory::UnattributedEffect,
@@ -878,7 +915,10 @@ fn dns_spike(state: &mut State, seq: u64, ts: u64) -> Vec<Finding> {
 /// A `proc.tcp_connect` meets the `net.connect` with its 4-tuple, in
 /// either order within the window. Returns the flow it joined, if any.
 fn join_flow_with_sensor(state: &mut State, sensor: &SensorConnect) -> Option<u64> {
-    let key = state.attribute(sensor.tid, sensor.ts);
+    let owner = sensor
+        .proc_key
+        .map(|key| (key, sensor.lineage_evicted))
+        .or_else(|| state.attribute_lineage(sensor.tid, sensor.ts));
     let matches: Vec<u64> = state
         .flows
         .iter()
@@ -894,9 +934,10 @@ fn join_flow_with_sensor(state: &mut State, sensor: &SensorConnect) -> Option<u6
         .collect();
     if let [id] = matches.as_slice() {
         let flow = state.flows.get_mut(id)?;
-        flow.proc_key = key;
+        flow.proc_key = owner.map(|(key, _)| key);
+        flow.proc_lineage_evicted = owner.is_some_and(|(_, evicted)| evicted);
         flow.proc_seq = Some(sensor.seq);
-        return key.map(|_| *id);
+        return owner.map(|_| *id);
     }
     if !matches.is_empty() {
         return None;
@@ -933,12 +974,16 @@ fn join_flow_with_pending_sensor(state: &mut State, flow_id: u64) -> bool {
         .collect();
     if let [index] = matches.as_slice() {
         if let Some(sensor) = state.sensor_connects.remove(*index) {
-            let key = state.attribute(sensor.tid, sensor.ts);
+            let owner = sensor
+                .proc_key
+                .map(|key| (key, sensor.lineage_evicted))
+                .or_else(|| state.attribute_lineage(sensor.tid, sensor.ts));
             if let Some(flow) = state.flows.get_mut(&flow_id) {
-                flow.proc_key = key;
+                flow.proc_key = owner.map(|(key, _)| key);
+                flow.proc_lineage_evicted = owner.is_some_and(|(_, evicted)| evicted);
                 flow.proc_seq = Some(sensor.seq);
             }
-            return key.is_some();
+            return owner.is_some();
         }
     }
     false
