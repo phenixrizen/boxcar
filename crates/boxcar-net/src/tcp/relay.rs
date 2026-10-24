@@ -370,18 +370,19 @@ impl Relay {
         false
     }
 
-    /// The guest sent a FIN for `guest` → `dst` at sequence number `fin`.
-    /// The first a flow sees is where its stream ends.
-    /// Whether the gate is ending the TLS of the flow from `guest` to
-    /// `dst` now: what the stack sends the guest on it is the gate's own
-    /// TLS records.
-    pub(crate) fn gate_tls(&self, guest: SocketAddrV4, dst: SocketAddrV4) -> bool {
+    /// Remote-to-guest tuples whose frames carry the gate's own TLS
+    /// records while smoltcp queues them.
+    pub(crate) fn dump_payload_flows(
+        &self,
+    ) -> impl Iterator<Item = (SocketAddrV4, SocketAddrV4)> + '_ {
         self.table
-            .id_of(guest, dst)
-            .and_then(|id| self.table.get(id))
-            .is_some_and(|flow| flow.inspect.is_some())
+            .flows()
+            .filter(|flow| flow.inspect.is_some())
+            .map(|flow| (flow.dst, flow.guest))
     }
 
+    /// The guest sent a FIN for `guest` → `dst` at sequence number `fin`.
+    /// The first a flow sees is where its stream ends.
     pub(crate) fn guest_fin_at(&mut self, guest: SocketAddrV4, dst: SocketAddrV4, fin: u32) {
         let id = self.table.id_of(guest, dst);
         if let Some(flow) = id.and_then(|id| self.table.get_mut(id)) {
@@ -478,6 +479,7 @@ impl Relay {
             self.end(cx, id, step);
         }
         // The data, FINs and resets the relay queued go now.
+        cx.pipe.set_dump_payload_flows(self.dump_payload_flows());
         cx.iface.poll(cx.stamp, cx.pipe, cx.sockets);
         self.reap(cx);
     }
@@ -517,6 +519,7 @@ impl Relay {
             handles.push(flow.socket);
         }
         // The guest's resets, as far as its queue takes them.
+        cx.pipe.set_dump_payload_flows(std::iter::empty());
         cx.flush();
         for handle in handles {
             cx.sockets.remove(handle);
@@ -549,6 +552,7 @@ impl Relay {
         let Some(mut pending) = self.table.take_pending(id) else {
             return;
         };
+        cx.pipe.set_dump_payload_flows(self.dump_payload_flows());
         let Some(socket) = take_syn(cx, &pending) else {
             // smoltcp would not take the SYN (a destination port of 0).
             cx.reset_guest(&pending.syn);
@@ -597,6 +601,7 @@ impl Relay {
         if let Some(host) = flow.host.take() {
             self.discard(id, host, &mut flow.watched, true);
         }
+        cx.pipe.set_dump_payload_flows(self.dump_payload_flows());
         cx.flush();
         cx.sockets.remove(flow.socket);
         self.ending.retain(|ending| *ending != id);
