@@ -153,6 +153,7 @@ impl Reconciler {
     /// see cannot be joined, so findings stay low in confidence for a while.
     pub fn on_gap(&mut self, now_ns: u64) {
         self.state.lag_until = now_ns + LAG_UNSURE_NS;
+        self.state.lag_changes = self.state.lag_changes.saturating_add(1);
     }
 
     /// Whether `vmm.stop` has been seen.
