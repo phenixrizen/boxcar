@@ -1,0 +1,2 @@
+{"type":"span.effects","data":{"span_id":"toolu_01","tool_name":"Bash","opened_seq":4,"closed_seq":5,"executor_tgid":100,"procs":[],"effects":[],"truncated":false}}
+{"category":"intent_effect_mismatch","score":35,"rule":"phantom_exec","summary":"the Bash tool call toolu_01 ended ok, but no process joined it in the second after it closed","evidence":[{"seq":4,"ring":0},{"seq":5,"ring":0}],"span_id":"toolu_01","low_confidence":true}

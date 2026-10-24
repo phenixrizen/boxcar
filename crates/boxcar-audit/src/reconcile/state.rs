@@ -123,6 +123,15 @@ pub struct Sensor {
     pub attached: HashSet<String>,
     /// Host time and seq of the last heartbeat.
     pub heartbeat: Option<(u64, u64)>,
+    /// The latest heartbeat's cumulative ring-buffer drop count.
+    pub ringbuf_drops: Option<u64>,
+    /// How many heartbeats reported a drop count other than the one before
+    /// (a rise, or a sensor that started again from zero).
+    pub drop_changes: u64,
+    /// Heartbeat gaps longer than the silence threshold.
+    pub heartbeat_gaps: u64,
+    /// Changes between complete and incomplete lineage attachment.
+    pub lineage_changes: u64,
     /// A silence finding is open: no second one until a heartbeat comes.
     pub silence_open: bool,
     /// The never-attached finding was made.
@@ -155,6 +164,25 @@ impl Sensor {
         ]
         .iter()
         .all(|p| self.is_attached(p))
+    }
+
+    /// Notes a heartbeat and whether it ended a period of silence.
+    pub fn note_heartbeat(&mut self, ts: u64, seq: u64, ringbuf_drops: u64) {
+        if self
+            .heartbeat
+            .is_some_and(|(last, _)| ts.saturating_sub(last) > super::SILENCE_NS)
+        {
+            self.heartbeat_gaps = self.heartbeat_gaps.saturating_add(1);
+        }
+        self.heartbeat = Some((ts, seq));
+        if self
+            .ringbuf_drops
+            .is_some_and(|drops| drops != ringbuf_drops)
+        {
+            self.drop_changes = self.drop_changes.saturating_add(1);
+        }
+        self.ringbuf_drops = Some(ringbuf_drops);
+        self.silence_open = false;
     }
 }
 
@@ -191,6 +219,8 @@ pub struct State {
     pub last_sync: Option<(u64, u64)>,
     /// Until when a subscription gap keeps findings low in confidence.
     pub lag_until: u64,
+    /// Subscription gaps seen so spans can tell whether one crossed them.
+    pub lag_changes: u64,
     /// Until when the DNS spike rule stays quiet after firing.
     pub dns_quiet_until: u64,
     /// `vmm.stop` was seen.

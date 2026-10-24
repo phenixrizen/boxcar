@@ -32,8 +32,8 @@
 //!
 //! At close the span's membership is written as `span.effects`, and the
 //! rules judge it: `intent_effect_mismatch` (`argv` at the join,
-//! `hidden_net` at the close, `phantom_write` a second later) and
-//! `orphaned_work` (a second after the close). Findings inside a span
+//! `hidden_net` at the close, `phantom_write` and `phantom_exec` a second
+//! later) and `orphaned_work` (a second after the close). Findings inside a span
 //! carry its id. The [`SpanIndex`] is what the control socket's
 //! `span.list` reads; the reconciler keeps it current.
 
@@ -337,6 +337,13 @@ pub struct Span {
     pub worst_score: u8,
     /// The checks a second after the close ran.
     settled: bool,
+    /// Sensor state at the open, and whether it stayed clean through close.
+    sensor_lineage_changes: u64,
+    sensor_heartbeat_gaps: u64,
+    sensor_ringbuf_drops: Option<u64>,
+    sensor_drop_changes: u64,
+    lag_changes: u64,
+    sensor_clean: bool,
     /// The `argv` rule fired: once a span.
     argv_fired: bool,
     /// A shell the span took by ancestry alone whose command does not
@@ -359,7 +366,7 @@ pub struct Span {
 impl Span {
     /// A span for `open`, judged by `raw` (the arguments as sent) when the
     /// gate kept them, else by the record's scrubbed copy.
-    fn new(open: &ToolOpen, raw: Option<Declared>, seq: u64, ts: u64) -> Span {
+    fn new(open: &ToolOpen, raw: Option<Declared>, seq: u64, ts: u64, state: &State) -> Span {
         let name = open.tool_name.as_str();
         // What the record has, scrubbed: what findings quote.
         let (recorded_command, recorded_paths) = match open.args.as_ref() {
@@ -423,6 +430,17 @@ impl Span {
             truncated: false,
             worst_score: 0,
             settled: false,
+            sensor_lineage_changes: state.sensor.lineage_changes,
+            sensor_heartbeat_gaps: state.sensor.heartbeat_gaps,
+            sensor_ringbuf_drops: state.sensor.ringbuf_drops,
+            sensor_drop_changes: state.sensor.drop_changes,
+            lag_changes: state.lag_changes,
+            sensor_clean: state.sensor.lineage_ok()
+                && state
+                    .sensor
+                    .heartbeat
+                    .is_some_and(|(beat, _)| ts.saturating_sub(beat) <= super::SILENCE_NS)
+                && state.lag_until <= ts,
             argv_fired: false,
             mismatch: None,
             carried: false,
@@ -860,7 +878,7 @@ impl Spans {
             .declared
             .as_ref()
             .and_then(|declared| declared.take(&id));
-        let mut span = Span::new(open, raw, record.seq, record.ts_host_ns);
+        let mut span = Span::new(open, raw, record.seq, record.ts_host_ns, state);
         match self.executors.get(&(open.flow, open.stream)) {
             Some(&(key, bound)) if bound || !self.flow_owners.contains_key(&open.flow) => {
                 span.executor = Some(key);
@@ -999,6 +1017,13 @@ impl Spans {
         }
         span.closed = Some((record.seq, record.ts_host_ns));
         span.status = Some(close.status.clone());
+        span.sensor_clean &= state.sensor.lineage_ok()
+            && span.sensor_lineage_changes == state.sensor.lineage_changes
+            && span.sensor_heartbeat_gaps == state.sensor.heartbeat_gaps
+            && state.sensor.heartbeat.is_some_and(|(beat, _)| {
+                record.ts_host_ns.saturating_sub(beat) <= super::SILENCE_NS
+            })
+            && span.lag_changes == state.lag_changes;
         self.open.retain(|open| open != id);
         let mut findings = self.argv_at_close(state, id);
         findings.extend(self.args_lost_at_close(state, id, record));
@@ -1237,6 +1262,7 @@ impl Spans {
             if let Some(span) = self.spans.get_mut(&id) {
                 span.settled = true;
             }
+            findings.extend(self.phantom_exec(state, &id, now));
             findings.extend(self.phantom_write(state, &id, now));
             findings.extend(self.orphaned_work(state, &id, now));
             self.let_go_effects(&id);
@@ -1838,6 +1864,84 @@ impl Spans {
         )
         .evidence([span.opened.0, closed_seq])
         .span(id)
+        .finish(state);
+        self.note_finding(id, finding.score);
+        vec![finding]
+    }
+
+    /// `intent_effect_mismatch` / `phantom_exec`: a shell tool's call
+    /// said `ok`, and a second later no process has joined it.
+    fn phantom_exec(&mut self, state: &State, id: &str, _now: u64) -> Vec<Finding> {
+        let Some(span) = self.spans.get(id) else {
+            return Vec::new();
+        };
+        if !span.is_shell_tool()
+            || span.declared.is_none()
+            || span.status.as_deref() != Some("ok")
+            || !span.members.is_empty()
+            || !span.sensor_clean
+        {
+            return Vec::new();
+        }
+        let Some((closed_seq, closed_ts)) = span.closed else {
+            return Vec::new();
+        };
+        // The sensor and the subscription stayed whole through the second
+        // after the close too, the second the absence is judged over.
+        if span.sensor_ringbuf_drops.is_none()
+            || !state.sensor.lineage_ok()
+            || state.sensor.lineage_changes != span.sensor_lineage_changes
+            || state.sensor.heartbeat_gaps != span.sensor_heartbeat_gaps
+            || state.sensor.drop_changes != span.sensor_drop_changes
+            || state.lag_changes != span.lag_changes
+        {
+            return Vec::new();
+        }
+        // Another call with the same command open beside it may have taken
+        // its process.
+        let twin = self.spans.values().any(|other| {
+            other.id != span.id
+                && other.declared == span.declared
+                && other.opened.1 <= closed_ts
+                && other.closed.is_none_or(|(_, ts)| ts >= span.opened.1)
+        });
+        if twin {
+            return Vec::new();
+        }
+        // The declared command run, but recorded after the close: it waits
+        // among the execs that joined no span.
+        let shells_written = self.shells_written();
+        let ran_late = self.pending_execs.iter().any(|pending| {
+            pending.seq > span.opened.0
+                && state.proc(pending.key).is_some_and(|proc| {
+                    // Or one that cannot tell: a declared copy redacted.
+                    span.carried_by(&proc.filename, &proc.argv, shells_written) != Some(false)
+                })
+        });
+        if ran_late {
+            return Vec::new();
+        }
+        if state
+            .sensor
+            .heartbeat
+            .is_none_or(|(beat, _)| beat <= closed_ts)
+        {
+            return Vec::new();
+        }
+        let summary = format!(
+            "the {} tool call {id} ended ok, but no process joined it in the second after it \
+             closed",
+            span.tool_name
+        );
+        let finding = Draft::new(
+            FindingCategory::IntentEffectMismatch,
+            55,
+            "phantom_exec",
+            summary,
+        )
+        .evidence([span.opened.0, closed_seq])
+        .span(id)
+        .low_confidence(true)
         .finish(state);
         self.note_finding(id, finding.score);
         vec![finding]
@@ -3070,15 +3174,21 @@ mod tests {
         boxcar_proto::redact::scrub_deep(&mut scrubbed);
         let ran = words(&["bash", "-c", command]);
         // The record's copy alone: redacted, so it cannot tell.
-        let span = Span::new(&open(scrubbed.clone()), None, 1, 1);
+        let span = Span::new(&open(scrubbed.clone()), None, 1, 1, &State::default());
         assert_eq!(span.carried_by("/bin/bash", &ran, false), None);
         // With the call's arguments as sent: exact.
         let raw = Some(Declared::Json(json!({"command": command})));
-        let span = Span::new(&open(scrubbed), raw, 1, 1);
+        let span = Span::new(&open(scrubbed), raw, 1, 1, &State::default());
         assert_eq!(span.carried_by("/bin/bash", &ran, false), Some(true));
         assert!(!span.declared_display.unwrap().contains("k1"));
         // A copy with nothing redacted is the original.
-        let span = Span::new(&open(json!({"command": "ls -la"})), None, 1, 1);
+        let span = Span::new(
+            &open(json!({"command": "ls -la"})),
+            None,
+            1,
+            1,
+            &State::default(),
+        );
         assert_eq!(
             span.carried_by("/bin/bash", &words(&["bash", "-c", "ls -la"]), false,),
             Some(true)
@@ -3104,7 +3214,7 @@ mod tests {
             let mut scrubbed = json!({"command": command});
             boxcar_proto::redact::scrub_deep(&mut scrubbed);
             let raw = Some(Declared::Json(json!({"command": command})));
-            let span = Span::new(&open(scrubbed), raw, 1, 1);
+            let span = Span::new(&open(scrubbed), raw, 1, 1, &State::default());
             let display = span.declared_display.unwrap();
             assert!(
                 !display.contains("alpha") && !display.contains("beta"),
