@@ -27,38 +27,65 @@ const SECRET_STEMS: [&str; 9] = [
     "cookie",
 ];
 
-/// Whether `key` contains one of the stems used to identify values that
-/// should be redacted. Matching is case-insensitive and deliberately broad.
+/// Whole field names that hold secrets, lowercase. Unlike
+/// [`SECRET_STEMS`], these do not match inside a longer name.
+const SECRET_NAMES: [&str; 5] = ["key", "auth", "pass", "pwd", "passwd"];
+
+/// Whether `key` is an exact secret name or contains one of the stems used to
+/// identify values that should be redacted. Matching is case-insensitive;
+/// stem matching is deliberately broad.
 pub fn is_secret_key(key: &str) -> bool {
     let lower = key.to_lowercase();
-    SECRET_STEMS.iter().any(|stem| lower.contains(stem))
+    SECRET_STEMS.iter().any(|stem| lower.contains(stem)) || SECRET_NAMES.contains(&lower.as_str())
 }
 
 /// Replaces the value of every secret-looking key in `v` with `"[redacted]"`,
 /// however deeply the key is nested in objects and arrays.
 ///
-/// A key looks like a secret when its lowercase form contains `api_key`,
-/// `api-key`, `apikey`, `authorization`, `secret`, `token`, `bearer`,
-/// `password` or `cookie`. This is substring matching on purpose, so it
-/// over-matches: `tokenizer`, `max_tokens` and `secrets_count` are redacted
-/// along with `access_token`. For an audit log that is the right trade-off.
+/// A key looks like a secret when its lowercase form is exactly `key`,
+/// `auth`, `pass`, `pwd` or `passwd`, or contains `api_key`, `api-key`,
+/// `apikey`, `authorization`, `secret`, `token`, `bearer`, `password` or
+/// `cookie`. Stem matching is broad on purpose, so it over-matches:
+/// `tokenizer`, `max_tokens` and `secrets_count` are redacted along with
+/// `access_token`. For an audit log that is the right trade-off.
 /// The log is append-only and hash-chained, so a secret that slips through can
 /// never be taken back out, while a harmless value that gets redacted only
 /// costs some detail.
 ///
 /// The whole value under a matching key is replaced, whatever its shape.
-/// Keys are the only thing inspected: a secret inside a string value is not
-/// found here. [`scrub_deep`] adds [`scrub_text`] on every string, for
-/// values whose strings are free text (tool arguments, say).
+/// Every member name also goes through [`scrub_text`]; a changed name becomes
+/// `[redacted]`, with a numeric suffix when that name is already present.
+/// String values are not inspected here. [`scrub_deep`] adds [`scrub_text`]
+/// on every string, for values whose strings are free text (tool arguments,
+/// say).
 pub fn scrub(v: &mut Value) {
     match v {
         Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in &keys {
+                let Some(child) = map.get_mut(key) else {
+                    continue;
+                };
                 if is_secret_key(key) {
                     *child = Value::String(REDACTED.to_owned());
                 } else {
                     scrub(child);
                 }
+            }
+            let mut next_redacted_index = 1usize;
+            for key in keys {
+                if scrub_text(&key) == key {
+                    continue;
+                }
+                let Some(child) = map.remove(&key) else {
+                    continue;
+                };
+                let mut name = REDACTED.to_owned();
+                while map.contains_key(&name) {
+                    name = format!("{REDACTED}{next_redacted_index}");
+                    next_redacted_index += 1;
+                }
+                map.insert(name, child);
             }
         }
         Value::Array(items) => items.iter_mut().for_each(scrub),
@@ -125,12 +152,12 @@ impl Argv {
     /// `arg` as a record may keep it, after the arguments before it. A
     /// result a second scrub would still change goes whole, so an argv
     /// scrubs the same way twice (`docs/plans/argv-attached-values.md`,
-    /// I5); code keeps main's result as it is, so a script keeps its later
-    /// commands.
+    /// I5); code keeps [`Argv::one`]'s result as it is, so a script keeps its
+    /// later commands unless its leading secret assignment was cut.
     fn next(&mut self, arg: &str) -> String {
         let mut out = self.one(arg);
         if self.code {
-            // Code keeps main's result and main's reading of it for the
+            // Code keeps this pass's result and main's reading of it for the
             // next argument, from the argument as given: main's text rules
             // need not be a fixed point on a script, so reading its result
             // would let that reach the next argument on a second scrub.
@@ -157,8 +184,9 @@ impl Argv {
     }
 
     /// `arg` in this place: whole after a secret flag; else what main
-    /// makes of it here, then the cut, unless it is code (an argument
-    /// after a code flag is code by position, which no redaction changes).
+    /// makes of it here, then the cut. Code keeps main's result unless it
+    /// starts with a secret environment assignment, whose value goes to the
+    /// argument's end.
     fn one(&self, arg: &str) -> String {
         if self.flag {
             return REDACTED.to_owned();
@@ -168,12 +196,27 @@ impl Argv {
         } else {
             main_arg(arg)
         };
-        if self.code {
+        if self.code && !leading_secret_assignment(arg) {
             main
         } else {
             cut(arg, main)
         }
     }
+}
+
+/// Whether `arg` begins with a shell environment assignment whose name is
+/// secret-looking. The name follows the portable shell spelling: a letter or
+/// underscore, then letters, digits or underscores.
+fn leading_secret_assignment(arg: &str) -> bool {
+    let Some((name, _)) = arg.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && is_secret_key(name)
 }
 
 /// One argument as main records it: a user flag's attached value
@@ -202,10 +245,11 @@ fn cut(arg: &str, main: String) -> String {
 /// Where a value attached to a secret word starts in `arg`: the first `=`
 /// or `:` of `arg`'s first word that comes after a secret's stem (or
 /// `basic`, an auth scheme) in that word lowercased as [`is_secret_key`]
-/// reads it, when something follows it. The word is not read as a name,
-/// so any spelling holds: `--cookie=`, `+password=`, `'password'=`,
-/// `-Ddb[0].password=`, `--Db:Password=`, `Authorization: Basic …`. One
-/// pass, so a long argument costs a long argument's time.
+/// reads it, or follows an exact secret name. Stem-bearing words are not
+/// parsed as names, so any spelling holds: `--cookie=`, `+password=`,
+/// `'password'=`, `-Ddb[0].password=`, `--Db:Password=`,
+/// `Authorization: Basic …`. Exact names may have leading dashes. One pass,
+/// so a long argument costs a long argument's time.
 fn secret_cut(arg: &str) -> Option<usize> {
     let word = &arg[..arg.find(char::is_whitespace).unwrap_or(arg.len())];
     let lower: String = word.chars().flat_map(char::to_lowercase).collect();
@@ -213,19 +257,30 @@ fn secret_cut(arg: &str) -> Option<usize> {
         .iter()
         .chain(&["basic"])
         .filter_map(|stem| lower.find(stem).map(|at| at + stem.len()))
-        .min()?;
+        .min();
     // Back from the lowercased word to the word: the end of the char whose
     // lowercase ends the stem.
     let mut lowered = 0;
     let mut stem_end = word.len();
-    for (at, c) in word.char_indices() {
-        lowered += c.to_lowercase().map(char::len_utf8).sum::<usize>();
-        if lowered >= found {
-            stem_end = at + c.len_utf8();
-            break;
+    if let Some(found) = found {
+        for (at, c) in word.char_indices() {
+            lowered += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+            if lowered >= found {
+                stem_end = at + c.len_utf8();
+                break;
+            }
         }
     }
-    let cut = stem_end + word[stem_end..].find(['=', ':'])?;
+    let stem_cut = found.and_then(|_| word[stem_end..].find(['=', ':']).map(|at| stem_end + at));
+    let exact_cut = word.find(['=', ':']).filter(|&cut| {
+        let name = word[..cut].trim_start_matches('-').to_ascii_lowercase();
+        SECRET_NAMES.contains(&name.as_str())
+    });
+    let cut = match (stem_cut, exact_cut) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(cut), None) | (None, Some(cut)) => cut,
+        (None, None) => return None,
+    };
     (cut + 1 < arg.len()).then_some(cut)
 }
 
@@ -242,11 +297,19 @@ fn is_code_flag(arg: &str) -> bool {
 }
 
 /// Flags whose value is `user:password` (curl's, wget's): `-u`,
-/// `--user`, `-U`, `--proxy-user`.
+/// `--user`, `-U`, `--proxy-user`, or a short-option cluster ending in
+/// `u` or `U`.
 const USER_FLAGS: [&str; 4] = ["-u", "--user", "-U", "--proxy-user"];
 
 fn is_user_flag(arg: &str) -> bool {
     USER_FLAGS.contains(&arg)
+        || arg
+            .strip_prefix('-')
+            .filter(|flags| !arg.starts_with("--") && !flags.is_empty())
+            .is_some_and(|flags| {
+                flags.bytes().all(|b| b.is_ascii_alphabetic())
+                    && (flags.ends_with('u') || flags.ends_with('U'))
+            })
 }
 
 /// A user flag's `value` (`user:password`, quoted or not) with its
@@ -303,15 +366,37 @@ fn attached_user(word: &str) -> Option<(&str, &str)> {
 /// `=`. Words are read as a shell reads them: a quoted part, spaces and
 /// all, belongs to its word, and the value ends where the shell would end
 /// the word, at an operator outside quotes ([`value_end`]), so `'alice:pw';`
-/// keeps its closing quote and the `;` after it.
+/// keeps its closing quote and the `;` after it. A separate value may follow
+/// horizontal space and backslash-newline continuations.
 fn user_flags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut after_flag = false;
+    let mut separated = false;
     let mut i = 0;
     while let Some(c) = text[i..].chars().next() {
         if c.is_whitespace() {
+            if after_flag {
+                if is_horizontal_space(c) {
+                    separated = true;
+                } else {
+                    after_flag = false;
+                    separated = false;
+                }
+            }
             out.push(c);
             i += c.len_utf8();
+            continue;
+        }
+        let continuation = if after_flag && separated && text[i..].starts_with("\\\r\n") {
+            Some(3)
+        } else if after_flag && separated && text[i..].starts_with("\\\n") {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(len) = continuation {
+            out.push_str(&text[i..i + len]);
+            i += len;
             continue;
         }
         let end = word_end(text, i);
@@ -321,9 +406,11 @@ fn user_flags(text: &str) -> String {
             out.push_str(&user_value(value));
             out.push_str(rest);
             after_flag = false;
+            separated = false;
         } else if is_user_flag(word) {
             out.push_str(word);
             after_flag = true;
+            separated = false;
         } else if let Some((flag, value)) = attached_user(word) {
             let (value, rest) = value.split_at(value_end(value));
             out.push_str(flag);
@@ -391,20 +478,10 @@ fn is_secret_flag(arg: &str) -> bool {
         && is_secret_key(arg.trim_start_matches('-'))
 }
 
-/// Query parameter names that carry a credential without a secret stem in
-/// them (OAuth's `code`, signed URLs' `sig`, …), lowercase.
-const SECRET_PARAMS: [&str; 10] = [
-    "code",
-    "state",
-    "sig",
-    "signature",
-    "key",
-    "auth",
-    "session",
-    "sid",
-    "pass",
-    "pwd",
-];
+/// Query parameter names that carry a credential without a secret stem or
+/// exact secret name in them (OAuth's `code`, signed URLs' `sig`, …),
+/// lowercase.
+const SECRET_PARAMS: [&str; 6] = ["code", "state", "sig", "signature", "session", "sid"];
 
 /// The longest query value kept as it is.
 const QUERY_VALUE_KEPT: usize = 16;
@@ -559,6 +636,103 @@ fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '/' | '=' | '.' | '~' | '%')
 }
 
+fn is_horizontal_space(c: char) -> bool {
+    c.is_whitespace() && !matches!(c, '\n' | '\r')
+}
+
+/// The start of a shell word after a separate flag, including horizontal
+/// whitespace and backslash-newline continuations between them.
+fn shell_value_start(chars: &[char], start: usize) -> Option<usize> {
+    let mut at = start;
+    let mut separated = false;
+    loop {
+        while chars.get(at).is_some_and(|c| is_horizontal_space(*c)) {
+            separated = true;
+            at += 1;
+        }
+        if separated && chars.get(at..at + 2) == Some(&['\\', '\n']) {
+            at += 2;
+        } else if separated && chars.get(at..at + 3) == Some(&['\\', '\r', '\n']) {
+            at += 3;
+        } else {
+            break;
+        }
+    }
+    (separated && at < chars.len()).then_some(at)
+}
+
+/// Whitespace and continuations between `=` or `:` and its value.
+fn attached_value_start(chars: &[char], start: usize) -> usize {
+    let mut at = start;
+    loop {
+        while chars.get(at).is_some_and(|c| is_horizontal_space(*c)) {
+            at += 1;
+        }
+        if chars.get(at..at + 2) == Some(&['\\', '\n']) {
+            at += 2;
+        } else if chars.get(at..at + 3) == Some(&['\\', '\r', '\n']) {
+            at += 3;
+        } else {
+            return at;
+        }
+    }
+}
+
+/// The end of one shell word: quotes and backslash escapes join its parts;
+/// whitespace and shell operators outside quotes end it.
+fn shell_word_end_chars(chars: &[char], start: usize) -> usize {
+    let mut quote = None;
+    let mut at = start;
+    while at < chars.len() {
+        match (quote, chars[at]) {
+            (_, '\\') if at + 1 < chars.len() => at += 2,
+            (None, q @ ('\'' | '"')) => {
+                quote = Some(q);
+                at += 1;
+            }
+            (Some(q), c) if c == q => {
+                quote = None;
+                at += 1;
+            }
+            (None, c)
+                if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>') =>
+            {
+                break;
+            }
+            _ => at += 1,
+        }
+    }
+    at
+}
+
+/// Writes one shell word with its value replaced. Quotes stay only when one
+/// pair surrounds the whole word; mixed quoted and unquoted parts go whole.
+fn replace_shell_word(out: &mut String, chars: &[char], from: usize, value: usize, end: usize) {
+    if value == end {
+        out.extend(&chars[from..end]);
+        return;
+    }
+    let quote = chars
+        .get(value)
+        .copied()
+        .filter(|c| matches!(c, '\'' | '"'));
+    let whole_quote = quote.filter(|&q| quoted_end(chars, value + 1, q) + 1 == end);
+    let (secret_start, secret_end) = if whole_quote.is_some() {
+        (value + 1, end - 1)
+    } else {
+        (value, end)
+    };
+    out.extend(&chars[from..secret_start]);
+    if chars[secret_start..secret_end] == REDACTED_CHARS {
+        out.extend(&chars[secret_start..secret_end]);
+    } else if secret_start < secret_end {
+        out.push_str(REDACTED);
+    }
+    if let Some(q) = whole_quote {
+        out.push(q);
+    }
+}
+
 /// The first pass: values after secret-looking keys, words after a
 /// secret-looking flag or an auth scheme.
 fn key_values(text: &str) -> String {
@@ -582,50 +756,65 @@ fn key_values(text: &str) -> String {
         if !scheme && !is_secret_key(&key) {
             continue;
         }
-        // `"key": …` is JSON-like, `key: …` a header running to the end of
-        // its line.
+        // `"key": …` is JSON-like; an unquoted, non-flag `key: …` is a
+        // header running to the end of its line.
         let quoted_key = matches!(chars.get(i), Some('"' | '\''));
         let mut j = i;
         if quoted_key {
             j += 1;
-        }
-        while j < chars.len() && chars[j] == ' ' {
-            j += 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+        } else {
+            while j < chars.len() && is_horizontal_space(chars[j]) {
+                j += 1;
+            }
         }
         let sep = chars.get(j).copied();
         let (value_start, ends): (usize, fn(char) -> bool) = match sep {
             Some('=') | Some(':') => {
-                let mut k = j + 1;
-                while k < chars.len() && chars[k] == ' ' {
-                    k += 1;
+                let mut k = if quoted_key {
+                    j + 1
+                } else {
+                    attached_value_start(&chars, j + 1)
+                };
+                if quoted_key {
+                    while k < chars.len() && chars[k].is_whitespace() {
+                        k += 1;
+                    }
                 }
+                let header = sep == Some(':') && !quoted_key && !key.starts_with('-');
                 if let Some(&q) = chars.get(k).filter(|c| matches!(c, '"' | '\'')) {
-                    let end = quoted_end(&chars, k + 1, q);
-                    replace(&mut out, &chars, i, k + 1, end);
+                    let quote_end = quoted_end(&chars, k + 1, q);
+                    if quoted_key || header || quote_end + 1 == shell_word_end_chars(&chars, k) {
+                        replace(&mut out, &chars, i, k + 1, quote_end);
+                        i = quote_end;
+                        continue;
+                    }
+                }
+                if !header {
+                    let end = if quoted_key {
+                        unquoted_end(&chars, k, |c: char| {
+                            c.is_whitespace()
+                                || matches!(c, '"' | '\'' | '&' | ';' | ',' | '}' | ']')
+                        })
+                    } else {
+                        shell_word_end_chars(&chars, k)
+                    };
+                    replace_shell_word(&mut out, &chars, i, k, end);
                     i = end;
                     continue;
                 }
-                let header = sep == Some(':') && !quoted_key;
-                (
-                    k,
-                    if header {
-                        |c: char| matches!(c, '\n' | '\r' | '"' | '\'')
-                    } else {
-                        |c: char| {
-                            c.is_whitespace()
-                                || matches!(c, '"' | '\'' | '&' | ';' | ',' | '}' | ']')
-                        }
-                    },
-                )
+                (k, |c: char| matches!(c, '\n' | '\r' | '"' | '\''))
             }
-            Some(q @ ('"' | '\'')) if j > i && (scheme || key.starts_with('-')) => {
-                let end = quoted_end(&chars, j + 1, q);
-                replace(&mut out, &chars, i, j + 1, end);
+            _ if scheme || key.starts_with('-') => {
+                let Some(k) = shell_value_start(&chars, i) else {
+                    continue;
+                };
+                let end = shell_word_end_chars(&chars, k);
+                replace_shell_word(&mut out, &chars, i, k, end);
                 i = end;
                 continue;
-            }
-            Some(_) if j > i && (scheme || key.starts_with('-')) => {
-                (j, |c: char| c.is_whitespace() || matches!(c, '"' | '\''))
             }
             _ => continue,
         };
@@ -862,6 +1051,51 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_flags_text_value_is_one_shell_word() {
+        let cases = [
+            ("client --password\talpha", "client --password\t[redacted]"),
+            (
+                "client --password \\\n  alpha next",
+                "client --password \\\n  [redacted] next",
+            ),
+            (
+                "client --password alpha'beta' next",
+                "client --password [redacted] next",
+            ),
+            (
+                "client --password 'alpha'beta next",
+                "client --password [redacted] next",
+            ),
+            (
+                "client --password alpha\"beta gamma\"delta next",
+                "client --password [redacted] next",
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text:?}");
+            assert_eq!(scrub_text(want), want, "{text:?}: stable");
+        }
+    }
+
+    #[test]
+    fn colon_attached_flags_use_shell_word_boundaries() {
+        let cases = [
+            (
+                "client --password:alpha'beta gamma'delta next",
+                "client --password:[redacted] next",
+            ),
+            (
+                "Authorization: Bearer alpha beta\nnext",
+                "Authorization: [redacted]\nnext",
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text:?}");
+            assert_eq!(scrub_text(want), want, "{text:?}: stable");
+        }
+    }
+
+    #[test]
     fn targets_keep_names_and_plain_values() {
         let cases = [
             ("/v1/messages?beta=true", "/v1/messages?beta=true"),
@@ -873,6 +1107,10 @@ mod tests {
             ),
             ("/p?q=a-long-value-over-the-limit", "/p?q=[redacted]"),
             ("/p?x%74oken=a", "/p?x%74oken=[redacted]"),
+            (
+                "/p?passwd=short&mode=plain",
+                "/p?passwd=[redacted]&mode=plain",
+            ),
             ("/p?flag&n=", "/p?flag&n="),
             ("/p#access_token=t", "/p"),
             (
@@ -1037,6 +1275,42 @@ mod tests {
     }
 
     #[test]
+    fn bundled_user_flags_redact_passwords() {
+        for flag in ["-su", "-sSu", "-fsSLu", "-sU"] {
+            let text = format!("curl {flag} alice:short-pass https://example.test");
+            let want = format!("curl {flag} alice:[redacted] https://example.test");
+            assert_eq!(scrub_text(&text), want, "{flag}");
+
+            let argv =
+                ["curl", flag, "alice:short-pass", "https://example.test"].map(str::to_owned);
+            let expected = ["curl", flag, "alice:[redacted]", "https://example.test"];
+            assert_eq!(scrub_argv(&argv), expected, "{flag}");
+            let mut value = json!({"argv": argv});
+            scrub_deep(&mut value);
+            assert_eq!(value, json!({"argv": expected}), "{flag}");
+        }
+    }
+
+    #[test]
+    fn user_flags_keep_values_after_shell_separators() {
+        let cases = [
+            (
+                "curl -u \\\n  alice:short-pass next",
+                "curl -u \\\n  alice:[redacted] next",
+            ),
+            (
+                "curl -fsSLU\t\\\r\n  proxy:short-pass next",
+                "curl -fsSLU\t\\\r\n  proxy:[redacted] next",
+            ),
+            ("curl -u\nalice:short-pass", "curl -u\nalice:short-pass"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text:?}");
+            assert_eq!(scrub_text(want), want, "{text:?}: stable");
+        }
+    }
+
+    #[test]
     fn a_value_attached_to_a_secret_name_is_taken_whole_in_an_argv() {
         let argv: Vec<String> = [
             "curl",
@@ -1196,26 +1470,27 @@ mod tests {
         }
     }
 
-    /// Code after a code flag keeps its later commands: the text rules
-    /// redact its values and leave the rest. An assignment that follows no
-    /// code flag loses its whole value.
+    /// Code after a code flag keeps its later commands when it does not start
+    /// with a secret assignment: the text rules redact its values and leave
+    /// the rest. An assignment that follows no code flag loses its whole
+    /// value too.
     #[test]
     fn code_after_a_code_flag_stays_text() {
         for (argv, code) in [
             (
-                ["sh", "-c", "TOKEN=x; echo retained"],
-                "TOKEN=[redacted]; echo retained",
+                ["sh", "-c", "echo retained; TOKEN=x"],
+                "echo retained; TOKEN=[redacted]",
             ),
             (
-                ["bash", "-lc", "TOKEN=x && echo retained"],
-                "TOKEN=[redacted] && echo retained",
+                ["bash", "-lc", "echo retained && TOKEN=x"],
+                "echo retained && TOKEN=[redacted]",
             ),
             (
-                ["python3", "-c", "token='a'; run()"],
-                "token='[redacted]'; run()",
+                ["python3", "-c", "run(); token='a'"],
+                "run(); token='[redacted]'",
             ),
-            (["node", "-e", "token=1; run()"], "token=[redacted]; run()"),
-            (["sh", "-c", "TOKEN='a;b' env"], "TOKEN='[redacted]' env"),
+            (["node", "-e", "run(); token=1"], "run(); token=[redacted]"),
+            (["sh", "-c", "env TOKEN='a;b'"], "env TOKEN='[redacted]'"),
         ] {
             let argv: Vec<String> = argv.map(str::to_owned).to_vec();
             let scrubbed = scrub_argv(&argv);
@@ -1240,6 +1515,23 @@ mod tests {
             scrub_deep(&mut v);
             assert_eq!(v, json!(scrubbed), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn a_leading_secret_assignment_after_a_code_flag_is_cut() {
+        for flag in ["-c", "-e", "--command", "--eval", "-lc", "-ec"] {
+            let argv = ["runner", flag, "TOKEN=alpha beta; echo retained"].map(str::to_owned);
+            let want = ["runner", flag, "TOKEN=[redacted]"];
+            assert_eq!(scrub_argv(&argv), want, "{flag}");
+            let mut value = json!(argv);
+            scrub_deep(&mut value);
+            assert_eq!(value, json!(want), "{flag}");
+        }
+
+        let argv = ["runner", "--eval", "key=alpha beta"].map(str::to_owned);
+        assert_eq!(scrub_argv(&argv), ["runner", "--eval", "key=[redacted]"]);
+        let ordinary = ["runner", "--eval", "mode=alpha beta; run()"].map(str::to_owned);
+        assert_eq!(scrub_argv(&ordinary), ordinary);
     }
 
     /// A script whose credential main's text rules redact (a quoted
@@ -1498,6 +1790,53 @@ mod tests {
     }
 
     #[test]
+    fn exact_secret_names_are_redacted_without_matching_substrings() {
+        assert_all_redacted(&[
+            "key", "KEY", "auth", "AUTH", "pass", "PASS", "pwd", "PWD", "passwd", "PASSWD",
+        ]);
+        let cases = [
+            ("key=short", "key=[redacted]"),
+            ("auth=short", "auth=[redacted]"),
+            ("pass=short", "pass=[redacted]"),
+            ("pwd=short", "pwd=[redacted]"),
+            ("passwd=short", "passwd=[redacted]"),
+            ("keyboard=short", "keyboard=short"),
+            ("author=short", "author=short"),
+            ("passage=short", "passage=short"),
+            ("pwd_hint=short", "pwd_hint=short"),
+            ("passwd_file=short", "passwd_file=short"),
+            ("password_hint=short", "password_hint=[redacted]"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(scrub_text(text), want, "{text}");
+        }
+        assert_eq!(
+            scrub_argv(&["key=short value".to_owned(), "--auth=one two".to_owned()]),
+            ["key=[redacted]", "--auth=[redacted]"]
+        );
+    }
+
+    #[test]
+    fn json_member_names_are_scrubbed_without_colliding() {
+        let mut value = json!({
+            "[redacted]": "existing",
+            "password=first": "one",
+            "token=second": "two",
+            "nested": {"auth=third": "visible"},
+        });
+        scrub_deep(&mut value);
+        assert_eq!(
+            value,
+            json!({
+                "[redacted]": "existing",
+                "[redacted]1": "[redacted]",
+                "[redacted]2": "[redacted]",
+                "nested": {"[redacted]": "visible"},
+            })
+        );
+    }
+
+    #[test]
     fn matching_ignores_case() {
         assert_all_redacted(&[
             "Authorization",
@@ -1567,13 +1906,13 @@ mod tests {
             "n": 1,
             // A prefix of a stem is not the stem.
             "author": "me",
-            "pass": "x",
+            "passage": "x",
             "cook": "y",
             "tok": 1,
             "bear": "z",
             "secre": "w",
             "api": "v",
-            "key": "u",
+            "keyboard": "u",
             "": "empty key",
         });
         let mut v = original.clone();
