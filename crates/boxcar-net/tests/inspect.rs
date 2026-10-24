@@ -17,27 +17,35 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boxcar_net::dump::ThreadJoin;
 use boxcar_net::gate::{Direction, Message, Observer};
 use boxcar_net::{DumpDir, FrameDump, InspectConfig, Policy, SessionCa, Verdict};
 use boxcar_proto::{NetClose, NetDrop, NetInspect, NetTls, Payload};
-use common::rig::{echo_server, host_peer, Rig};
+use common::rig::{echo_server, host_peer, RawGuest, Rig};
 use common::{harness_gate, harness_gate_dump, harness_gate_flow_cap, resolve};
 use crossbeam_channel::Receiver;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use smoltcp::iface::SocketHandle;
+use smoltcp::wire::TcpControl;
 
 /// The name the guest asks for and the test upstream answers to.
 const NAME: &str = "api.example";
 const LIMIT: Duration = Duration::from_secs(30);
 
+struct UpstreamRead {
+    bytes: Vec<u8>,
+    /// Its reading ended at the client's TLS close (`close_notify`).
+    notified: bool,
+}
+
 /// A TLS upstream on the loopback for [`NAME`], offering `alpn`, that
 /// reads `expect` bytes of plaintext, writes `reply`, and closes. Its
-/// certificate, which the gate must be told to trust, and what it read.
+/// certificate, which the gate must be told to trust, what it read, and
+/// whether the peer's TLS close arrived.
 fn upstream(
     alpn: &[&str],
     expect: usize,
@@ -45,7 +53,7 @@ fn upstream(
 ) -> (
     SocketAddrV4,
     CertificateDer<'static>,
-    thread::JoinHandle<Vec<u8>>,
+    thread::JoinHandle<UpstreamRead>,
 ) {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let params = CertificateParams::new(vec![NAME.to_owned(), "127.0.0.1".to_owned()]).unwrap();
@@ -72,9 +80,13 @@ fn upstream(
         let mut tls = rustls::StreamOwned::new(conn, stream);
         let mut got = Vec::new();
         let mut buf = vec![0; 16384];
+        let mut notified = false;
         while got.len() < expect {
             match tls.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    notified = true;
+                    break;
+                }
                 Ok(n) => got.extend_from_slice(&buf[..n]),
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
                 Err(error) => panic!("upstream read: {error}"),
@@ -86,12 +98,17 @@ fn upstream(
         tls.conn.send_close_notify();
         let _ = tls.flush();
         let _ = tls.sock.shutdown(std::net::Shutdown::Write);
-        while let Ok(n) = tls.read(&mut buf) {
-            if n == 0 {
-                break;
+        // Until the peer has closed too.
+        loop {
+            match tls.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
         }
-        got
+        UpstreamRead {
+            bytes: got,
+            notified,
+        }
     });
     (addr, cert_der, thread)
 }
@@ -210,6 +227,81 @@ fn data(messages: &[Message], dir: Direction) -> Vec<u8> {
         .collect()
 }
 
+fn client_output(client: &mut ClientConnection) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while client.wants_write() {
+        client.write_tls(&mut bytes).unwrap();
+    }
+    bytes
+}
+
+fn client_input(raw: &mut RawGuest, client: &mut ClientConnection) {
+    let bytes = std::mem::take(&mut raw.received);
+    if bytes.is_empty() {
+        return;
+    }
+    let mut input = bytes.as_slice();
+    while !input.is_empty() {
+        client.read_tls(&mut input).unwrap();
+    }
+    client.process_new_packets().unwrap();
+}
+
+/// Starts both TLS legs and stops with the guest's last handshake record
+/// still waiting to be sent.
+fn guest_ready_to_finish(raw: &mut RawGuest, client: &mut ClientConnection) {
+    let hello = client_output(client);
+    assert!(!hello.is_empty());
+    raw.send(TcpControl::Psh, &hello);
+    let started = Instant::now();
+    while client.is_handshaking() {
+        assert!(started.elapsed() < LIMIT, "the guest handshake stalled");
+        client_input(raw, client);
+        if !client.is_handshaking() {
+            break;
+        }
+        let bytes = client_output(client);
+        if bytes.is_empty() {
+            raw.turn();
+        } else {
+            raw.send(TcpControl::Psh, &bytes);
+        }
+        raw.send(TcpControl::None, &[]);
+    }
+    assert!(client.wants_write(), "the last handshake record is pending");
+}
+
+fn raw_inspected(
+    expect: usize,
+    reply: Vec<u8>,
+) -> (
+    RawGuest,
+    ClientConnection,
+    thread::JoinHandle<UpstreamRead>,
+    Receiver<Message>,
+) {
+    let (addr, cert, up) = upstream(&["http/1.1"], expect, reply);
+    let (cfg, observer, rx) = gate(&[cert], 4096);
+    let client = guest_client(cfg.ca(), &["http/1.1"]);
+    let policy = Policy::parse(&[
+        "allow 127.0.0.0/8".to_owned(),
+        format!("inspect 127.0.0.1:{}", addr.port()),
+    ])
+    .unwrap();
+    let raw = RawGuest::connect(harness_gate(policy, Some((cfg, observer))), addr);
+    (raw, client, up, rx)
+}
+
+fn settle_raw(raw: &mut RawGuest) {
+    let started = Instant::now();
+    while raw.h.stack.open_flows() > 0 {
+        assert!(started.elapsed() < LIMIT, "the flow stayed open");
+        raw.events
+            .dispatch(&mut raw.h.stack, Duration::from_millis(2));
+        raw.send(TcpControl::None, &[]);
+    }
+}
+
 /// The whole path: the guest's TLS ends in the stack, the upstream is
 /// reached with the stack's own TLS, the request and the reply pass
 /// unchanged, the observer gets both, and the log has the three records
@@ -248,7 +340,7 @@ fn an_inspected_tls_flow_is_ended_relayed_and_recorded() {
     });
     rig.socket(handle).close();
     rig.settle();
-    assert_eq!(up.join().unwrap(), request);
+    assert_eq!(up.join().unwrap().bytes, request);
 
     let events = rig.events();
     let tls = tls_records(&events);
@@ -295,6 +387,114 @@ fn an_inspected_tls_flow_is_ended_relayed_and_recorded() {
         matches!(messages.last(), Some(Message::Close { .. })),
         "{messages:?}"
     );
+}
+
+#[test]
+fn an_inspected_flow_closes_after_data_beyond_its_fin() {
+    let request = b"request";
+    // The host reads past the request, so its reading ends at the TLS close.
+    let (mut raw, mut client, up, rx) = raw_inspected(request.len() + 1, Vec::new());
+    guest_ready_to_finish(&mut raw, &mut client);
+    client.writer().write_all(request).unwrap();
+    let finished_and_request = client_output(&mut client);
+
+    let fin = raw.segment(TcpControl::Fin, &finished_and_request);
+    raw.seq = raw.seq.wrapping_add(finished_and_request.len() as u32 + 1);
+    let following = raw.segment(TcpControl::Psh, b"x");
+    raw.h.stack.push_guest_frame(&fin);
+    raw.h.stack.push_guest_frame(&following);
+    raw.turn();
+    assert!(raw.resets > 0, "the guest is reset");
+    settle_raw(&mut raw);
+    let upstream = up.join().unwrap();
+    assert_eq!(upstream.bytes, request);
+    // The request, then the TLS close. What the host sends after that
+    // may meet a reset: the guest is gone and the host's socket is closed
+    // once its FIN has gone, as on the plain relay.
+    assert!(upstream.notified, "the host gets the TLS close");
+
+    let events = raw.h.events();
+    let inspects = inspect_records(&events);
+    assert_eq!(inspects.len(), 1, "{inspects:?}");
+    assert_eq!(inspects[0].result, "ok");
+    let closes = close_records(&events);
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(closes[0].reason, "error");
+    assert_eq!(closes[0].tx, finished_and_request.len() as u64);
+    let at_inspect = position(&events, |event| matches!(event, Payload::NetInspect(_)));
+    let at_close = position(&events, |event| matches!(event, Payload::NetClose(_)));
+    assert!(at_inspect < at_close);
+
+    let messages = observed(rx);
+    assert!(matches!(messages.first(), Some(Message::Open { .. })));
+    assert_eq!(data(&messages, Direction::ToHost), request);
+    assert!(matches!(messages.last(), Some(Message::Close { .. })));
+}
+
+#[test]
+fn a_fin_before_the_guest_handshake_finishes_is_rejected_with_following_data() {
+    let (mut raw, mut client, up, rx) = raw_inspected(1, Vec::new());
+    guest_ready_to_finish(&mut raw, &mut client);
+    let finished = client_output(&mut client);
+
+    let fin = raw.segment(TcpControl::Fin, &[]);
+    raw.seq = raw.seq.wrapping_add(1);
+    let following = raw.segment(TcpControl::Psh, &finished);
+    raw.h.stack.push_guest_frame(&fin);
+    raw.h.stack.push_guest_frame(&following);
+    raw.turn();
+    assert!(raw.resets > 0, "the guest is reset");
+    settle_raw(&mut raw);
+    // The host's leg is reset too: its thread is not joined.
+    drop(up);
+
+    let events = raw.h.events();
+    let inspects = inspect_records(&events);
+    assert_eq!(inspects.len(), 1, "{inspects:?}");
+    assert_eq!(inspects[0].result, "guest_rejected");
+    let closes = close_records(&events);
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(closes[0].reason, "inspect");
+    // Only the gate's own handshake went to the guest; no plaintext moved.
+    let relayed: Vec<Message> = rx.try_iter().collect();
+    assert!(
+        !relayed.iter().any(|m| matches!(m, Message::Data { .. })),
+        "nothing was relayed: {relayed:?}"
+    );
+}
+
+#[test]
+fn a_request_with_the_guest_handshake_finish_and_fin_gets_its_response_through_the_relay() {
+    let request = b"request";
+    let reply = b"response";
+    let (mut raw, mut client, up, _rx) = raw_inspected(request.len(), reply.to_vec());
+    guest_ready_to_finish(&mut raw, &mut client);
+    client.writer().write_all(request).unwrap();
+    let finished_and_request = client_output(&mut client);
+
+    raw.send(TcpControl::Fin, &finished_and_request);
+    let mut received = Vec::new();
+    let started = Instant::now();
+    while received.len() < reply.len() {
+        assert!(started.elapsed() < LIMIT, "the response stalled");
+        client_input(&mut raw, &mut client);
+        let mut buf = [0; 32];
+        match client.reader().read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {}
+            Err(error) => panic!("guest read: {error}"),
+        }
+        raw.send(TcpControl::None, &[]);
+    }
+    assert_eq!(received, reply);
+    settle_raw(&mut raw);
+    assert_eq!(up.join().unwrap().bytes, request);
+
+    let events = raw.h.events();
+    assert_eq!(inspect_records(&events)[0].result, "ok");
+    assert_eq!(close_records(&events)[0].reason, "fin");
 }
 
 /// The source ports of the TCP/IPv4 records in `pcap` that hold payload.
@@ -356,7 +556,7 @@ fn payload_mode_keeps_the_gates_tls_records_only() {
     });
     rig.socket(handle).close();
     rig.settle();
-    assert_eq!(up.join().unwrap(), request);
+    assert_eq!(up.join().unwrap().bytes, request);
     drop(rig.events());
     assert_eq!(thread.join(LIMIT), ThreadJoin::Joined);
     let ports = payload_ports(&std::fs::read(dir.frames()).unwrap());

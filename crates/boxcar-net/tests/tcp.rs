@@ -23,7 +23,7 @@ use boxcar_net::tcp::GUEST_TIMEOUT;
 use boxcar_net::upstream::{HostAddrs, BUILTIN_HOST_LOCAL};
 use boxcar_net::{Interest, Policy, Verdict, TCP_TOKEN_BASE};
 use boxcar_proto::{NetClose, NetConnect, NetTls, Payload};
-use common::rig::{echo_server, host_peer, v4, Rig};
+use common::rig::{echo_server, host_peer, v4, RawGuest, Rig};
 use common::{
     drops, guest_arp, harness_config, harness_with, resolve, segment, syn, tcp as tcp_segment, udp,
     FakeEventLoop, Harness, Segment, GATEWAY, GATEWAY_MAC, GUEST,
@@ -1249,130 +1249,6 @@ fn frames_from_another_source_are_dropped_as_spoofed() {
         })
         .sum();
     assert_eq!(spoofed, 3);
-}
-
-/// A guest that plays TCP by hand, one segment at a time: what the stack
-/// last acknowledged and offered, and the resets it sent.
-struct RawGuest {
-    h: Harness,
-    events: FakeEventLoop,
-    guest: SocketAddrV4,
-    server: SocketAddrV4,
-    /// The next sequence number the guest sends, and what it acknowledges.
-    seq: u32,
-    ack: u32,
-    acked: u32,
-    window: u32,
-    resets: usize,
-}
-
-impl RawGuest {
-    /// A guest connected through `h` to `server`.
-    fn connect(h: Harness, server: SocketAddrV4) -> RawGuest {
-        let mut raw = RawGuest {
-            h,
-            events: FakeEventLoop::new(),
-            guest: SocketAddrV4::new(GUEST, 40_000),
-            server,
-            seq: 1000,
-            ack: 0,
-            acked: 0,
-            window: 0,
-            resets: 0,
-        };
-        raw.turn();
-        raw.h.stack.push_guest_frame(&guest_arp());
-        raw.h.drain();
-        raw.h.stack.push_guest_frame(&syn(raw.guest, server, 1000));
-        let start = Instant::now();
-        while raw.ack == 0 {
-            assert!(start.elapsed() < Duration::from_secs(5), "no SYN-ACK");
-            raw.events
-                .dispatch(&mut raw.h.stack, Duration::from_millis(10));
-            raw.turn();
-        }
-        raw.seq = 1001;
-        raw.send(TcpControl::None, &[]);
-        raw
-    }
-
-    /// The stack's turn: its poll, the host fds, its poll again; what it
-    /// sent the guest is read.
-    fn turn(&mut self) {
-        let outcome = self.h.stack.poll(Instant::now());
-        self.events.apply(&outcome.fd_changes);
-        self.events.dispatch(&mut self.h.stack, Duration::ZERO);
-        let outcome = self.h.stack.poll(Instant::now());
-        self.events.apply(&outcome.fd_changes);
-        for frame in self.h.drain() {
-            let Some(s) = segment(&frame) else { continue };
-            if s.rst {
-                self.resets += 1;
-            } else if s.syn && s.ack {
-                self.ack = s.seq.wrapping_add(1);
-                self.acked = s.ack_number;
-                self.window = u32::from(s.window);
-            } else if s.ack {
-                self.acked = s.ack_number;
-                self.window = u32::from(s.window);
-            }
-        }
-    }
-
-    /// The guest sends `payload` (and `control`) at its next sequence
-    /// number, and the stack takes its turn.
-    fn send(&mut self, control: TcpControl, payload: &[u8]) {
-        let frame = self.segment(control, payload);
-        self.h.stack.push_guest_frame(&frame);
-        self.seq = self
-            .seq
-            .wrapping_add(payload.len() as u32 + u32::from(control == TcpControl::Fin));
-        self.turn();
-    }
-
-    /// A segment at the guest's next sequence number, acknowledging
-    /// everything (no window scaling).
-    fn segment(&self, control: TcpControl, payload: &[u8]) -> Vec<u8> {
-        let repr = smoltcp::wire::TcpRepr {
-            src_port: self.guest.port(),
-            dst_port: self.server.port(),
-            control,
-            seq_number: smoltcp::wire::TcpSeqNumber(self.seq as i32),
-            ack_number: Some(smoltcp::wire::TcpSeqNumber(self.ack as i32)),
-            window_len: 65_535,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None, None, None],
-            timestamp: None,
-            payload,
-        };
-        common::ipv4(
-            GATEWAY_MAC,
-            *self.guest.ip(),
-            *self.server.ip(),
-            smoltcp::wire::IpProtocol::Tcp,
-            repr.buffer_len(),
-            |buf| {
-                repr.emit(
-                    &mut TcpPacket::new_unchecked(buf),
-                    &(*self.guest.ip()).into(),
-                    &(*self.server.ip()).into(),
-                    &smoltcp::phy::ChecksumCapabilities::default(),
-                )
-            },
-        )
-    }
-
-    /// Room in the stack's window at the guest's next sequence number.
-    fn room(&self) -> u32 {
-        let room = self.acked.wrapping_add(self.window).wrapping_sub(self.seq);
-        if room < 1 << 30 {
-            room
-        } else {
-            0
-        }
-    }
 }
 
 /// What a stalled peer got: how many bytes, its last 16, and how its

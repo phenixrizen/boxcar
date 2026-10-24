@@ -688,8 +688,15 @@ impl Relay {
                     return;
                 };
                 // Recorded with what the host is owed: every byte before
-                // the guest's FIN.
-                let owed = flow.tx.saturating_add(flow.tail.len() as u64);
+                // the guest's FIN. An inspected flow has already counted
+                // every accepted wire byte in `tx`; a plain flow may still
+                // hold some of its bytes in `tail`.
+                let inspected = flow.inspect.is_some();
+                let owed = if inspected {
+                    flow.tx
+                } else {
+                    flow.tx.saturating_add(flow.tail.len() as u64)
+                };
                 cx.record(close_record(
                     id,
                     owed,
@@ -701,8 +708,9 @@ impl Relay {
                 cx.sockets.get_mut::<tcp::Socket>(flow.socket).abort();
                 flow.state = FlowState::Ending("error");
                 flow.gate = None;
-                flow.inspect = None;
-                observe_close(cx, flow);
+                if !inspected {
+                    observe_close(cx, flow);
+                }
                 self.ending.push(id);
                 // The host keeps its socket until it has them.
                 self.pump_one(cx, id);
@@ -711,6 +719,8 @@ impl Relay {
                 let Some(flow) = self.table.get_mut(id) else {
                     return;
                 };
+                observe_close(cx, flow);
+                flow.inspect = None;
                 if let Some(host) = flow.host.take() {
                     discard(
                         &mut self.fd_changes,
@@ -822,9 +832,15 @@ fn watch(fd_changes: &mut Vec<FdChange>, flow: &mut Flow, socket: &tcp::Socket) 
             writable: !flow.host_writable && (socket.can_recv() || !flow.tail.is_empty()),
         },
         // An ending flow whose host is still owed bytes.
-        (Some(_), FlowState::Ending(_)) => Interest {
-            readable: false,
-            writable: !flow.host_writable && !flow.tail.is_empty(),
+        (Some(_), FlowState::Ending(_)) => match &flow.inspect {
+            Some(inspect) => Interest {
+                readable: false,
+                writable: !flow.host_writable && inspect.wants_host_write(),
+            },
+            None => Interest {
+                readable: false,
+                writable: !flow.host_writable && !flow.tail.is_empty(),
+            },
         },
         // The upstream leg says what it waits on; rustls's buffers and the
         // guest socket's room hold it back.
@@ -855,7 +871,11 @@ fn watch(fd_changes: &mut Vec<FdChange>, flow: &mut Flow, socket: &tcp::Socket) 
 fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
     use tcp::State;
     if flow.ending() {
-        return drain(flow);
+        return if flow.inspect.is_some() {
+            drain_inspected(flow, env)
+        } else {
+            drain(flow)
+        };
     }
     let state = socket.state();
     if matches!(
@@ -875,20 +895,18 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
         return Step::Done(if flow.guest_rst { "reset" } else { "timeout" });
     }
     if flow.state == FlowState::Gating {
+        let before_fin = flow.guest_fin.then(|| {
+            let next = flow.first_seq.wrapping_add(flow.taken);
+            flow.fin_at
+                .and_then(|fin| usize::try_from(fin.wrapping_sub(next) as i32).ok())
+                .unwrap_or(0)
+        });
         let Some(held) = flow.gate.as_mut() else {
             // Not reached: a gated flow has its gate.
             return Step::Abort("error");
         };
         let before = held.seen.len();
-        let step = gate(
-            flow.id,
-            flow.dst,
-            flow.gated,
-            held,
-            flow.guest_fin,
-            socket,
-            env,
-        );
+        let step = gate(flow.id, flow.dst, flow.gated, held, before_fin, socket, env);
         flow.taken = flow.taken.wrapping_add(count(held.seen.len() - before));
         match step {
             GateStep::Wait => return Step::Open,
@@ -1162,21 +1180,27 @@ fn gate(
     dst: SocketAddrV4,
     gated: bool,
     held: &mut GateBuf,
-    guest_fin: bool,
+    before_fin: Option<usize>,
     socket: &mut tcp::Socket,
     env: &Env,
 ) -> GateStep {
     let port = dst.port();
-    while held.seen.len() < env.gate_limit && socket.can_recv() {
-        let room = env.gate_limit - held.seen.len();
+    let guest_fin = before_fin.is_some();
+    let mut before_fin = before_fin.unwrap_or(usize::MAX);
+    while held.seen.len() < env.gate_limit && before_fin > 0 && socket.can_recv() {
+        let room = (env.gate_limit - held.seen.len()).min(before_fin);
         let taken = socket.recv(|data| {
             let part = data.get(..room).unwrap_or(data);
             held.seen.extend_from_slice(part);
             (part.len(), part.len())
         });
-        if !matches!(taken, Ok(n) if n > 0) {
+        let Ok(taken) = taken else {
+            break;
+        };
+        if taken == 0 {
             break;
         }
+        before_fin = before_fin.saturating_sub(taken);
     }
     let shown = read_new(held).flatten();
     let Shown { name, alpn, hello } = match shown {
@@ -1270,13 +1294,43 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
     let Some(host) = flow.host.as_mut() else {
         return Step::Open;
     };
-    // Guest TLS bytes in, as far as rustls takes them; the rest wait in
-    // the socket, and the guest's window closes as it fills.
-    while inspect.wants_guest_read() && socket.can_recv() {
-        let taken = socket.recv(|data| match inspect.guest_in(data) {
-            Ok(n) => (n, n),
-            Err(_) => (0, 0),
-        });
+    // Guest TLS bytes in, as far as rustls takes them and no farther than
+    // the guest's FIN; the rest wait in the socket, and the guest's window
+    // closes as it fills.
+    let mut past_fin = false;
+    while !flow.fin_taken && inspect.wants_guest_read() && socket.can_recv() {
+        let limit = if flow.guest_fin {
+            let Some(fin) = flow.fin_at else {
+                // Not reached: the dispatcher sees every FIN before
+                // smoltcp does.
+                past_fin = true;
+                break;
+            };
+            let next = flow.first_seq.wrapping_add(flow.taken);
+            let ahead = fin.wrapping_sub(next) as i32;
+            let Ok(ahead) = usize::try_from(ahead) else {
+                past_fin = true;
+                break;
+            };
+            if ahead > socket.recv_queue() {
+                past_fin = true;
+                break;
+            }
+            ahead
+        } else {
+            usize::MAX
+        };
+        if limit == 0 {
+            flow.fin_taken = true;
+            inspect.guest_eof();
+            break;
+        }
+        let taken = socket.recv(
+            |data| match inspect.guest_in(&data[..data.len().min(limit)]) {
+                Ok(n) => (n, n),
+                Err(_) => (0, 0),
+            },
+        );
         match taken {
             Ok(n) if n > 0 => {
                 flow.taken = flow.taken.wrapping_add(count(n));
@@ -1286,8 +1340,23 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
             _ => break,
         }
     }
-    // The guest's FIN, once every byte before it is in.
-    if flow.guest_fin && !flow.fin_taken && !socket.can_recv() {
+    // The guest's FIN, once every byte before it is in. Anything queued
+    // after that point ends the flow and is never given to rustls.
+    if flow.guest_fin && !flow.fin_taken && !past_fin {
+        if let Some(fin) = flow.fin_at {
+            let next = flow.first_seq.wrapping_add(flow.taken);
+            if fin == next {
+                flow.fin_taken = true;
+                inspect.guest_eof();
+            }
+        } else {
+            // Not reached: the dispatcher sees every FIN before smoltcp
+            // does.
+            past_fin = true;
+        }
+    }
+    past_fin |= flow.fin_taken && socket.recv_queue() > 0;
+    if past_fin && !flow.fin_taken {
         flow.fin_taken = true;
         inspect.guest_eof();
     }
@@ -1340,7 +1409,7 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
             break;
         }
     }
-    match phase {
+    let failed = match phase {
         Phase::Failed(reason) => {
             if !flow.inspect_recorded {
                 flow.inspect_recorded = true;
@@ -1356,7 +1425,7 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
                     ),
                 );
             }
-            return Step::Abort("inspect");
+            true
         }
         Phase::Relaying if !flow.inspect_recorded => {
             flow.inspect_recorded = true;
@@ -1384,9 +1453,10 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
                 };
                 flow.observe_open = flow.observed.open(observer, open);
             }
+            false
         }
-        _ => {}
-    }
+        _ => false,
+    };
     // The plaintext, after the Open that announces it.
     if !plain.is_empty() {
         flow.last_active = env.now;
@@ -1396,6 +1466,14 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
                 flow.observe_dropped = flow.observe_dropped.saturating_add(dropped);
             }
         }
+    }
+    // A leg that failed ends as any failed inspection does, with
+    // nothing relayed; one that did not keeps what came before the FIN.
+    if failed {
+        return Step::Abort("inspect");
+    }
+    if past_fin {
+        return Step::Violation;
     }
     // The host's close reaches the guest as a FIN once its close_notify
     // has gone; the guest's reaches the host once its close_notify has.
@@ -1409,6 +1487,67 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
     let done = matches!(socket.state(), State::TimeWait | State::Closed);
     if flow.guest_fin && flow.host_eof && flow.host_shut && done {
         return Step::Done("fin");
+    }
+    Step::Open
+}
+
+/// Finishes an inspected flow's guest-to-host leg after the guest has
+/// been aborted: plaintext already accepted from the guest, followed by
+/// the TLS close, is written with the usual host back-pressure.
+fn drain_inspected(flow: &mut Flow, env: &Env) -> Step {
+    let Some(inspect) = flow.inspect.as_mut() else {
+        return Step::Drained { reset: true };
+    };
+    let Some(host) = flow.host.as_mut() else {
+        return Step::Open;
+    };
+    let mut plain = Vec::new();
+    let mut phase = inspect.phase();
+    for _ in 0..INSPECT_ROUNDS {
+        let mut readable = false;
+        let mut writable = flow.host_writable;
+        let io = inspect.host_io(host, &mut readable, &mut writable);
+        flow.host_writable = writable;
+        if io.error.is_some() {
+            return Step::Drained { reset: true };
+        }
+        let before = (
+            plain.len(),
+            inspect.to_host_bytes,
+            inspect.to_guest_bytes,
+            phase,
+        );
+        phase = inspect.step(&mut plain);
+        let after = (
+            plain.len(),
+            inspect.to_host_bytes,
+            inspect.to_guest_bytes,
+            phase,
+        );
+        if after == before && !inspect.wants_host_write() {
+            break;
+        }
+    }
+    if !plain.is_empty() {
+        flow.last_active = env.now;
+        if let Some(observer) = env.observer {
+            // The guest is gone: only what goes to the host is relayed.
+            for (dir, bytes) in plain {
+                if dir != Direction::ToHost {
+                    continue;
+                }
+                let dropped = flow.observed.data(observer, flow.id.0, dir, &bytes);
+                flow.observe_dropped = flow.observe_dropped.saturating_add(dropped);
+            }
+        }
+    }
+    if matches!(phase, Phase::Failed(_)) {
+        return Step::Drained { reset: true };
+    }
+    if inspect.host_notified() && !inspect.wants_host_write() {
+        flow.host_shut = true;
+        let _ = host.shutdown(Shutdown::Write);
+        return Step::Drained { reset: false };
     }
     Step::Open
 }

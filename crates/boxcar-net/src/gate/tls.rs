@@ -502,11 +502,14 @@ impl Inspect {
         io
     }
 
-    /// The guest's TCP stream ended (its FIN): during the handshakes that
-    /// is a rejection; while relaying, the host is told with a
-    /// `close_notify` once the guest's plaintext has gone.
+    /// The guest's TCP stream ended (its FIN): before the guest's handshake
+    /// is done that is a rejection; after it (relaying, or the step to
+    /// relaying still to come when the FIN came in the same read as the
+    /// guest's `Finished`), the host is told with a `close_notify` once
+    /// the guest's plaintext has gone.
     pub fn guest_eof(&mut self) {
         match self.phase {
+            Phase::Guest if self.guest_ready() => self.guest_fin = true,
             Phase::Upstream | Phase::Guest => self.fail("guest_rejected"),
             Phase::Relaying => self.guest_fin = true,
             Phase::Failed(_) => {}
@@ -540,7 +543,7 @@ impl Inspect {
                 }
             }
             Phase::Guest => {
-                if matches!(&self.guest, Guest::Open(conn) if !conn.is_handshaking()) {
+                if self.guest_ready() {
                     self.phase = Phase::Relaying;
                 }
             }
@@ -551,6 +554,11 @@ impl Inspect {
             self.relay(out);
         }
         self.phase
+    }
+
+    /// Whether the guest leg's handshake is done.
+    fn guest_ready(&self) -> bool {
+        matches!(&self.guest, Guest::Open(conn) if !conn.is_handshaking())
     }
 
     /// The upstream handshake is done: the guest leg gets the leaf for the
@@ -1111,6 +1119,104 @@ pub(crate) mod tests {
         }
         assert_eq!(up.thread.join().unwrap(), b"bye");
         assert_eq!(inspect.to_host_bytes, 3);
+    }
+
+    /// A guest FIN after the upstream handshake, but before the guest has
+    /// finished its handshake, is still a rejection.
+    #[test]
+    fn a_guest_fin_during_the_guest_handshake_is_rejected() {
+        let up = upstream(&[], 0, Vec::new());
+        let cfg = config(std::slice::from_ref(&up.cert));
+        let mut guest = make_guest(trust(cfg.ca()), &[]);
+        let hello = hello_of(&mut guest);
+        let mut inspect =
+            Inspect::new(&cfg, Some(NAME.into()), Ipv4Addr::LOCALHOST, &[], &hello).unwrap();
+        let mut host = connect(up.addr);
+        let mut plain = Vec::new();
+        let started = Instant::now();
+        while inspect.phase() != Phase::Guest {
+            drive(&mut inspect, &mut guest, &mut host, &mut plain);
+            assert!(started.elapsed() < DEADLINE);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(guest.is_handshaking());
+
+        inspect.guest_eof();
+
+        assert_eq!(inspect.phase(), Phase::Failed("guest_rejected"));
+        assert!(plain.is_empty());
+        drop(host);
+        let _ = up.thread.join();
+    }
+
+    /// A request sent with the guest's handshake finish, followed by its
+    /// FIN, reaches the host and the response still reaches the guest.
+    #[test]
+    fn a_request_with_the_guest_handshake_finish_and_fin_gets_its_response() {
+        let request = b"request";
+        let reply = b"response";
+        let up = upstream(&[], request.len(), reply.to_vec());
+        let cfg = config(std::slice::from_ref(&up.cert));
+        let mut guest = make_guest(trust(cfg.ca()), &[]);
+        let hello = hello_of(&mut guest);
+        let mut inspect =
+            Inspect::new(&cfg, Some(NAME.into()), Ipv4Addr::LOCALHOST, &[], &hello).unwrap();
+        let mut host = connect(up.addr);
+        let mut plain = Vec::new();
+        let started = Instant::now();
+        while guest.is_handshaking() {
+            let phase = drive(&mut inspect, &mut guest, &mut host, &mut plain);
+            assert!(!matches!(phase, Phase::Failed(_)), "{phase:?}");
+            assert!(started.elapsed() < DEADLINE);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(inspect.phase(), Phase::Guest);
+
+        // Leave most of the request pending on the upstream leg when the
+        // flow first advances to relaying.
+        inspect.host.set_buffer_limit(Some(1));
+        guest.writer().write_all(request).unwrap();
+        let mut finished_and_request = Vec::new();
+        while guest.wants_write() {
+            guest.write_tls(&mut finished_and_request).unwrap();
+        }
+        assert_eq!(
+            inspect.guest_in(&finished_and_request).unwrap(),
+            finished_and_request.len()
+        );
+        inspect.guest_eof();
+        assert_eq!(inspect.phase(), Phase::Guest);
+        assert_eq!(inspect.step(&mut plain), Phase::Relaying);
+        assert!(!inspect.host_notified());
+        inspect.host.set_buffer_limit(Some(PLAINTEXT_BUFFER));
+
+        let mut received = Vec::new();
+        while received.len() < reply.len() || !inspect.host_notified() || !inspect.guest_notified()
+        {
+            let phase = drive(&mut inspect, &mut guest, &mut host, &mut plain);
+            assert!(!matches!(phase, Phase::Failed(_)), "{phase:?}");
+            let mut buf = [0; 32];
+            match guest.reader().read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => {}
+                Err(error) => panic!("guest read: {error}"),
+            }
+            assert!(started.elapsed() < DEADLINE);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // What the last step queued goes out.
+        for _ in 0..3 {
+            drive(&mut inspect, &mut guest, &mut host, &mut plain);
+        }
+
+        assert_eq!(up.thread.join().unwrap(), request);
+        assert_eq!(received, reply);
+        assert_eq!(inspect.to_host_bytes, request.len() as u64);
+        assert_eq!(inspect.to_guest_bytes, reply.len() as u64);
+        assert!(inspect.host_notified());
+        assert!(inspect.guest_notified());
     }
 
     /// The guest's last record and its FIN taken in the same round: the
