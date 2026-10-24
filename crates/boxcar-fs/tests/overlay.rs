@@ -263,6 +263,224 @@ fn the_merge_shows_both_layers_the_upper_first_and_what_whiteouts_hide_not_at_al
 }
 
 #[test]
+fn a_large_directory_read_in_pieces_lists_every_entry_once() {
+    let over = overlay(&[]);
+    let path = over.lower.join("large");
+    fs::create_dir(&path).unwrap();
+    let mut expected = Vec::new();
+    for i in 0..2048 {
+        let name = format!("entry-{i:04}");
+        File::create(path.join(&name)).unwrap();
+        expected.push(name);
+    }
+
+    let fs = &over.fs;
+    let dir = ino(fs, ROOT_ID, "large");
+    let (handle, _) = fs.opendir(&CTX, dir, libc::O_RDONLY as u32).unwrap();
+    let handle = handle.unwrap();
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let mut accepted = 0;
+        let mut next = offset;
+        fs.readdir(&CTX, dir, handle, 128, offset, &mut |entry| {
+            if accepted == 17 {
+                return Ok(0);
+            }
+            accepted += 1;
+            next = entry.offset;
+            if entry.name != b"." && entry.name != b".." {
+                seen.push(String::from_utf8(entry.name.to_vec()).unwrap());
+            }
+            Ok(1)
+        })
+        .unwrap();
+        if accepted == 0 {
+            break;
+        }
+        assert!(next > offset);
+        offset = next;
+    }
+    fs.releasedir(&CTX, dir, 0, handle).unwrap();
+
+    seen.sort_unstable();
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn directory_listing_limits_apply_and_released_handles_return_capacity() {
+    let over = overlay(&[]);
+    let path = over.lower.join("many");
+    fs::create_dir(&path).unwrap();
+    let name = |i| format!("{i:04}-{}", "x".repeat(250));
+    for i in 0..4200 {
+        File::create(path.join(name(i))).unwrap();
+    }
+
+    // The bounds set small: 1 MiB a listing, 16 MiB for all of them.
+    let small = OverlayFs::new(
+        layer(&over.lower),
+        open_dir(&over.lower),
+        layer(&over.upper),
+        open_dir(&over.upper),
+        &[],
+    )
+    .with_listing_limits(1024 * 1024, 16 * 1024 * 1024);
+    let fs = &small;
+    let dir = ino(fs, ROOT_ID, "many");
+    assert_eq!(
+        errno(fs.opendir(&CTX, dir, libc::O_RDONLY as u32)),
+        libc::ENOMEM
+    );
+
+    for i in 0..1200 {
+        fs::remove_file(path.join(name(i))).unwrap();
+    }
+    let mut handles = Vec::new();
+    loop {
+        match fs.opendir(&CTX, dir, libc::O_RDONLY as u32) {
+            Ok((Some(handle), _)) => handles.push(handle),
+            Ok((None, _)) => panic!("opendir returned no handle"),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOMEM));
+                break;
+            }
+        }
+        assert!(handles.len() < 64, "the total limit was not reached");
+    }
+    assert!(handles.len() > 1, "the per-handle listing fits");
+
+    let released = handles.pop().unwrap();
+    fs.releasedir(&CTX, dir, 0, released).unwrap();
+    let replacement = fs
+        .opendir(&CTX, dir, libc::O_RDONLY as u32)
+        .unwrap()
+        .0
+        .unwrap();
+    fs.releasedir(&CTX, dir, 0, replacement).unwrap();
+    for handle in handles {
+        fs.releasedir(&CTX, dir, 0, handle).unwrap();
+    }
+}
+
+#[test]
+fn a_reader_keeps_listing_capacity_until_its_read_finishes() {
+    let over = overlay(&[]);
+    let path = over.lower.join("held");
+    fs::create_dir(&path).unwrap();
+    for i in 0..300 {
+        File::create(path.join(format!("{i:04}-{}", "x".repeat(120)))).unwrap();
+    }
+    let fs = OverlayFs::new(
+        layer(&over.lower),
+        open_dir(&over.lower),
+        layer(&over.upper),
+        open_dir(&over.upper),
+        &[],
+    )
+    .with_listing_limits(128 * 1024, 64 * 1024);
+    let dir = ino(&fs, ROOT_ID, "held");
+    let handle = fs
+        .opendir(&CTX, dir, libc::O_RDONLY as u32)
+        .unwrap()
+        .0
+        .unwrap();
+
+    std::thread::scope(|scope| {
+        let (reading, reading_started) = std::sync::mpsc::channel();
+        let (finish_read, finish) = std::sync::mpsc::channel();
+        let fs = &fs;
+        let reader = scope.spawn(move || {
+            let mut first = true;
+            fs.readdir(&CTX, dir, handle, 4096, 0, &mut |_| {
+                if first {
+                    first = false;
+                    reading.send(()).unwrap();
+                    finish.recv().unwrap();
+                }
+                Ok(0)
+            })
+            .unwrap();
+        });
+        reading_started.recv().unwrap();
+        fs.releasedir(&CTX, dir, 0, handle).unwrap();
+        assert_eq!(
+            errno(fs.opendir(&CTX, dir, libc::O_RDONLY as u32)),
+            libc::ENOMEM
+        );
+        finish_read.send(()).unwrap();
+        reader.join().unwrap();
+    });
+
+    let replacement = fs
+        .opendir(&CTX, dir, libc::O_RDONLY as u32)
+        .unwrap()
+        .0
+        .unwrap();
+    fs.releasedir(&CTX, dir, 0, replacement).unwrap();
+}
+
+#[test]
+fn internal_directory_work_is_independent_of_listing_limits() {
+    let over = overlay(&[]);
+    let long_name = |i| format!("{i:04}-{}", "x".repeat(80));
+
+    let visible = over.lower.join("visible");
+    fs::create_dir(&visible).unwrap();
+    for i in 0..24 {
+        File::create(visible.join(long_name(i))).unwrap();
+    }
+
+    let removable_lower = over.lower.join("removable");
+    let removable_upper = over.upper.join("removable");
+    fs::create_dir(&removable_lower).unwrap();
+    fs::create_dir(&removable_upper).unwrap();
+    for i in 0..24 {
+        let name = long_name(i);
+        File::create(removable_lower.join(&name)).unwrap();
+        File::create(removable_upper.join(format!(".wh.{name}"))).unwrap();
+    }
+
+    fs::create_dir(over.lower.join("from")).unwrap();
+    let to_lower = over.lower.join("to");
+    let to_upper = over.upper.join("to");
+    fs::create_dir(&to_lower).unwrap();
+    fs::create_dir(&to_upper).unwrap();
+    for i in 0..24 {
+        let name = long_name(i);
+        File::create(to_lower.join(&name)).unwrap();
+        File::create(to_upper.join(format!(".wh.{name}"))).unwrap();
+    }
+
+    let fs = OverlayFs::new(
+        layer(&over.lower),
+        open_dir(&over.lower),
+        layer(&over.upper),
+        open_dir(&over.upper),
+        &[],
+    )
+    .with_listing_limits(256, 1024);
+
+    let visible = ino(&fs, ROOT_ID, "visible");
+    assert_eq!(
+        errno(fs.opendir(&CTX, visible, libc::O_RDONLY as u32)),
+        libc::ENOMEM
+    );
+    assert_eq!(
+        errno(fs.rmdir(&CTX, ROOT_ID, &cstr("visible"))),
+        libc::ENOTEMPTY
+    );
+
+    fs.rmdir(&CTX, ROOT_ID, &cstr("removable")).unwrap();
+    assert!(!over.upper.join("removable").exists());
+    assert!(over.upper.join(".wh.removable").exists());
+
+    fs.rename(&CTX, ROOT_ID, &cstr("from"), ROOT_ID, &cstr("to"), 0)
+        .unwrap();
+    assert_eq!(names(&fs, ino(&fs, ROOT_ID, "to")), Vec::<String>::new());
+}
+
+#[test]
 fn an_opaque_directory_shows_nothing_below_it() {
     let over = overlay(&[]);
     fs::create_dir(over.upper.join("d")).unwrap();

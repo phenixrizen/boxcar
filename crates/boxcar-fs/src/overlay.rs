@@ -41,7 +41,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64, CreateIn};
@@ -65,6 +65,16 @@ const RENAME_WHITEOUT: u32 = 4;
 
 /// Bytes a directory listing is read in at a time.
 const LIST_CHUNK: u32 = 64 * 1024;
+
+/// The most memory one open directory's saved listing may account for, by
+/// default: room for some 100000 entries of long names.
+pub const MAX_DIR_LISTING_BYTES: usize = 32 * 1024 * 1024;
+/// The most memory all open directories' saved listings may account for,
+/// by default.
+pub const MAX_OPEN_DIR_LISTING_BYTES: usize = 256 * 1024 * 1024;
+/// The fixed allocation held for one shared directory listing.
+const DIR_LISTING_BASE_BYTES: usize =
+    2 * std::mem::size_of::<usize>() + std::mem::size_of::<DirListing>();
 
 /// The context of the overlay's own lookups on a layer (the layers take
 /// root's credentials from `AuditFs` anyway).
@@ -199,7 +209,111 @@ impl Nodes {
 /// An open file or directory.
 enum Opened {
     File { which: Which, ino: u64, handle: u64 },
-    Dir(Vec<Listed>),
+    Dir { listing: Arc<DirListing> },
+}
+
+/// A saved directory listing. Its aggregate charge lasts as long as any
+/// reader retains the listing, including after its handle is released.
+struct DirListing {
+    entries: Box<[Listed]>,
+    _charge: ListingCharge,
+}
+
+/// Aggregate capacity held by a listing under construction or in use.
+struct ListingCharge {
+    total: Arc<Mutex<usize>>,
+    bytes: usize,
+}
+
+impl ListingCharge {
+    fn new(total: Arc<Mutex<usize>>, limit: usize, bytes: usize) -> io::Result<Self> {
+        let mut used = total.lock().unwrap_or_else(PoisonError::into_inner);
+        *used = used
+            .checked_add(bytes)
+            .filter(|used| *used <= limit)
+            .ok_or_else(|| errno(libc::ENOMEM))?;
+        drop(used);
+        Ok(Self { total, bytes })
+    }
+
+    fn grow(&mut self, limit: usize, bytes: usize) -> io::Result<()> {
+        let charge = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| errno(libc::ENOMEM))?;
+        let mut used = self.total.lock().unwrap_or_else(PoisonError::into_inner);
+        *used = used
+            .checked_add(bytes)
+            .filter(|used| *used <= limit)
+            .ok_or_else(|| errno(libc::ENOMEM))?;
+        self.bytes = charge;
+        Ok(())
+    }
+}
+
+impl Drop for ListingCharge {
+    fn drop(&mut self) {
+        let mut used = self.total.lock().unwrap_or_else(PoisonError::into_inner);
+        *used -= self.bytes;
+    }
+}
+
+/// A listing and its capacity reservation while it is assembled.
+struct ListingBuilder {
+    entries: Vec<Listed>,
+    bytes: usize,
+    per_directory_limit: usize,
+    total_limit: usize,
+    charge: Option<ListingCharge>,
+}
+
+impl ListingBuilder {
+    fn new(
+        per_directory_limit: usize,
+        total_limit: usize,
+        total: Arc<Mutex<usize>>,
+    ) -> io::Result<Self> {
+        if DIR_LISTING_BASE_BYTES > per_directory_limit {
+            return Err(errno(libc::ENOMEM));
+        }
+        Ok(Self {
+            entries: Vec::new(),
+            bytes: DIR_LISTING_BASE_BYTES,
+            per_directory_limit,
+            total_limit,
+            charge: Some(ListingCharge::new(
+                total,
+                total_limit,
+                DIR_LISTING_BASE_BYTES,
+            )?),
+        })
+    }
+
+    fn push(&mut self, entry: Listed) -> io::Result<()> {
+        let held = entry.held_bytes()?;
+        let bytes = self
+            .bytes
+            .checked_add(held)
+            .filter(|bytes| *bytes <= self.per_directory_limit)
+            .ok_or_else(|| errno(libc::ENOMEM))?;
+        self.charge
+            .as_mut()
+            .expect("an unfinished listing has its charge")
+            .grow(self.total_limit, held)?;
+        self.bytes = bytes;
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Arc<DirListing> {
+        Arc::new(DirListing {
+            entries: self.entries.into_boxed_slice(),
+            _charge: self
+                .charge
+                .take()
+                .expect("an unfinished listing has its charge"),
+        })
+    }
 }
 
 /// One entry of a listing.
@@ -208,6 +322,27 @@ struct Listed {
     name: Vec<u8>,
     ino: u64,
     type_: u32,
+}
+
+impl Listed {
+    fn held_bytes(&self) -> io::Result<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.name.capacity())
+            .ok_or_else(|| errno(libc::ENOMEM))
+    }
+}
+
+/// Open handles.
+struct Handles {
+    by_id: HashMap<u64, Opened>,
+}
+
+impl Handles {
+    fn new() -> Handles {
+        Handles {
+            by_id: HashMap::new(),
+        }
+    }
 }
 
 /// Told of each copy-up: the path from the root and the bytes copied.
@@ -224,9 +359,13 @@ pub struct OverlayFs<L: Layer, U: Layer> {
     /// from the root, shown until the guest sets the entry's mode.
     modes: Mutex<HashMap<Vec<u8>, u32>>,
     nodes: Mutex<Nodes>,
-    handles: Mutex<HashMap<u64, Opened>>,
+    handles: Mutex<Handles>,
+    listing_bytes: Arc<Mutex<usize>>,
     next_handle: AtomicU64,
     copy_up_hook: Option<CopyUpHook>,
+    /// The most one open directory's listing, and all of them, may hold.
+    listing_limit: usize,
+    listings_limit: usize,
 }
 
 impl<L: Layer, U: Layer> OverlayFs<L, U> {
@@ -252,10 +391,23 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
                     .collect(),
             ),
             nodes: Mutex::new(Nodes::new()),
-            handles: Mutex::new(HashMap::new()),
+            handles: Mutex::new(Handles::new()),
+            listing_bytes: Arc::new(Mutex::new(0)),
             next_handle: AtomicU64::new(1),
             copy_up_hook: None,
+            listing_limit: MAX_DIR_LISTING_BYTES,
+            listings_limit: MAX_OPEN_DIR_LISTING_BYTES,
         }
+    }
+
+    /// Bounds what open directories' listings hold: `per_directory` for
+    /// one, `total` for all of them (past either, `opendir` fails
+    /// `ENOMEM`). [`MAX_DIR_LISTING_BYTES`] and
+    /// [`MAX_OPEN_DIR_LISTING_BYTES`] unless set.
+    pub fn with_listing_limits(mut self, per_directory: usize, total: usize) -> Self {
+        self.listing_limit = per_directory;
+        self.listings_limit = total;
+        self
     }
 
     /// Tells `hook` of every copy-up.
@@ -275,7 +427,7 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
         self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Opened>> {
+    fn handles(&self) -> std::sync::MutexGuard<'_, Handles> {
         self.handles.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -758,26 +910,45 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
         }
     }
 
-    /// Every entry of one layer's directory, as the layer lists it.
-    fn list_layer(&self, ctx: &Context, which: Which, ino: u64) -> io::Result<Vec<Listed>> {
+    /// Passes every entry of one layer's directory to `add` in the order
+    /// the layer lists it.
+    fn for_each_layer_entry(
+        &self,
+        ctx: &Context,
+        which: Which,
+        ino: u64,
+        add: &mut dyn FnMut(Listed) -> io::Result<()>,
+    ) -> io::Result<()> {
         let layer = self.layer(which);
         let (handle, _) = layer.opendir(ctx, ino, libc::O_RDONLY as u32)?;
         let handle = handle.unwrap_or(0);
-        let mut out: Vec<Listed> = Vec::new();
         let mut offset = 0;
         let result = loop {
             let mut got = 0;
             let mut last = offset;
+            // The first error `add` gives, which is the answer whatever
+            // the layer returns: a layer may end its listing at an error
+            // from this callback and say nothing of it (fuse-backend-rs's
+            // passthrough does once it has passed an entry on).
+            let mut failed = None;
             let read = layer.readdir(ctx, ino, handle, LIST_CHUNK, offset, &mut |entry| {
-                out.push(Listed {
+                let added = add(Listed {
                     name: entry.name.to_vec(),
                     ino: entry.ino,
                     type_: entry.type_,
                 });
+                if let Err(error) = added {
+                    let stop = errno(error.raw_os_error().unwrap_or(libc::EIO));
+                    failed = Some(error);
+                    return Err(stop);
+                }
                 last = entry.offset;
                 got += 1;
                 Ok(entry.name.len() + 24)
             });
+            if let Some(error) = failed {
+                break Err(error);
+            }
             if let Err(error) = read {
                 break Err(error);
             }
@@ -787,61 +958,121 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
             offset = last;
         };
         let _ = layer.releasedir(ctx, ino, 0, handle);
-        result?;
+        result
+    }
+
+    /// Every entry of one layer, retained without the `opendir` bounds for
+    /// an internal operation which must finish inspecting the directory.
+    fn list_layer_unbounded(
+        &self,
+        ctx: &Context,
+        which: Which,
+        ino: u64,
+    ) -> io::Result<Vec<Listed>> {
+        let mut out = Vec::new();
+        self.for_each_layer_entry(ctx, which, ino, &mut |entry| {
+            out.push(entry);
+            Ok(())
+        })?;
         Ok(out)
+    }
+
+    /// Passes one layer's entries on for `opendir`, enforcing its
+    /// per-directory construction bound while they are inspected.
+    fn for_each_open_layer_entry(
+        &self,
+        ctx: &Context,
+        which: Which,
+        ino: u64,
+        add: &mut dyn FnMut(Listed) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut bytes = DIR_LISTING_BASE_BYTES;
+        self.for_each_layer_entry(ctx, which, ino, &mut |entry| {
+            bytes = bytes
+                .checked_add(entry.held_bytes()?)
+                .filter(|bytes| *bytes <= self.listing_limit)
+                .ok_or_else(|| errno(libc::ENOMEM))?;
+            add(entry)
+        })
     }
 
     /// The merge of the directory `ino`: the upper entries, then the
     /// lower ones nothing above hides; neither `.` nor `..`, nor the
     /// overlay's own marks.
-    fn list_merged(&self, ctx: &Context, ino: u64) -> io::Result<Vec<Listed>> {
+    fn for_each_merged_entry(
+        &self,
+        ctx: &Context,
+        ino: u64,
+        bounded: bool,
+        add: &mut dyn FnMut(Listed) -> io::Result<()>,
+    ) -> io::Result<()> {
         let node = self.node(ino)?;
         if !node.dir {
             return Err(errno(libc::ENOTDIR));
         }
-        let mut out = Vec::new();
         let mut names = std::collections::HashSet::new();
         let mut whiteouts = std::collections::HashSet::new();
         let mut opaque = node.opaque;
         if let Some(side) = node.upper {
-            for entry in self.list_layer(ctx, Which::Upper, side.ino)? {
+            let visit = &mut |entry: Listed| {
                 if entry.name == b"." || entry.name == b".." {
-                    continue;
+                    return Ok(());
                 }
                 if entry.name == OPAQUE_MARK {
                     opaque = true;
-                    continue;
+                    return Ok(());
                 }
                 if let Some(hidden) = entry.name.strip_prefix(WHITEOUT_PREFIX) {
                     whiteouts.insert(hidden.to_vec());
-                    continue;
+                    return Ok(());
                 }
                 names.insert(entry.name.clone());
-                out.push(entry);
+                add(entry)
+            };
+            if bounded {
+                self.for_each_open_layer_entry(ctx, Which::Upper, side.ino, visit)?;
+            } else {
+                self.for_each_layer_entry(ctx, Which::Upper, side.ino, visit)?;
             }
         }
         if !opaque {
             if let Some(side) = node.lower {
-                for entry in self.list_layer(ctx, Which::Lower, side.ino)? {
+                let visit = &mut |entry: Listed| {
                     if entry.name == b"."
                         || entry.name == b".."
                         || is_reserved(&entry.name)
                         || names.contains(&entry.name)
                         || whiteouts.contains(&entry.name)
                     {
-                        continue;
+                        return Ok(());
                     }
-                    out.push(entry);
+                    add(entry)
+                };
+                if bounded {
+                    self.for_each_open_layer_entry(ctx, Which::Lower, side.ino, visit)?;
+                } else {
+                    self.for_each_layer_entry(ctx, Which::Lower, side.ino, visit)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The merged entries retained without the `opendir` bounds for an
+    /// internal operation.
+    fn list_merged_unbounded(&self, ctx: &Context, ino: u64) -> io::Result<Vec<Listed>> {
+        let mut out = Vec::new();
+        self.for_each_merged_entry(ctx, ino, false, &mut |entry| {
+            out.push(entry);
+            Ok(())
+        })?;
         Ok(out)
     }
 
     /// Removes the overlay's marks from the upper directory `upper_dir`,
     /// before it is removed or renamed over.
     fn clear_marks(&self, ctx: &Context, upper_dir: u64) -> io::Result<()> {
-        for entry in self.list_layer(ctx, Which::Upper, upper_dir)? {
+        for entry in self.list_layer_unbounded(ctx, Which::Upper, upper_dir)? {
             if is_reserved(&entry.name) {
                 self.upper.unlink(ctx, upper_dir, &cstring(&entry.name)?)?;
             }
@@ -904,7 +1135,7 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
 
     /// The layer and layer handle behind `handle`.
     fn file_handle(&self, handle: u64) -> io::Result<(Which, u64, u64)> {
-        match self.handles().get(&handle) {
+        match self.handles().by_id.get(&handle) {
             Some(Opened::File { which, ino, handle }) => Ok((*which, *ino, *handle)),
             _ => Err(errno(libc::EBADF)),
         }
@@ -912,14 +1143,20 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
 
     fn new_handle(&self, opened: Opened) -> u64 {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.handles().insert(id, opened);
+        self.handles().by_id.insert(id, opened);
+        id
+    }
+
+    fn new_dir_handle(&self, listing: Arc<DirListing>) -> u64 {
+        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handles().by_id.insert(id, Opened::Dir { listing });
         id
     }
 
     /// The listing behind a directory handle, `.` and `..` first.
-    fn dir_handle(&self, handle: u64) -> io::Result<Vec<Listed>> {
-        match self.handles().get(&handle) {
-            Some(Opened::Dir(entries)) => Ok(entries.clone()),
+    fn dir_handle(&self, handle: u64) -> io::Result<Arc<DirListing>> {
+        match self.handles().by_id.get(&handle) {
+            Some(Opened::Dir { listing }) => Ok(Arc::clone(listing)),
             _ => Err(errno(libc::EBADF)),
         }
     }
@@ -961,7 +1198,7 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
             if !src_node.dir && dst_node.dir {
                 return Err(errno(libc::EISDIR));
             }
-            if dst_node.dir && !self.list_merged(ctx, dst)?.is_empty() {
+            if dst_node.dir && !self.list_merged_unbounded(ctx, dst)?.is_empty() {
                 return Err(errno(libc::ENOTEMPTY));
             }
         }
@@ -1210,7 +1447,7 @@ impl<L: Layer, U: Layer> FileSystem for OverlayFs<L, U> {
         if !node.dir {
             return Err(errno(libc::ENOTDIR));
         }
-        if !self.list_merged(ctx, ino)?.is_empty() {
+        if !self.list_merged_unbounded(ctx, ino)?.is_empty() {
             return Err(errno(libc::ENOTEMPTY));
         }
         let upper_parent = self.ensure_upper(ctx, parent)?;
@@ -1373,7 +1610,7 @@ impl<L: Layer, U: Layer> FileSystem for OverlayFs<L, U> {
         lock_owner: Option<u64>,
     ) -> io::Result<()> {
         let (which, ino, layer_handle) = self.file_handle(handle)?;
-        self.handles().remove(&handle);
+        self.handles().by_id.remove(&handle);
         self.layer(which).release(
             ctx,
             ino,
@@ -1440,20 +1677,23 @@ impl<L: Layer, U: Layer> FileSystem for OverlayFs<L, U> {
             let (pwhich, pino) = self.primary(node.parent)?;
             self.layer(pwhich).getattr(ctx, pino, None)?.0.st_ino
         };
-        let mut entries = vec![
-            Listed {
-                name: b".".to_vec(),
-                ino: own.st_ino,
-                type_: libc::DT_DIR as u32,
-            },
-            Listed {
-                name: b"..".to_vec(),
-                ino: parent_ino,
-                type_: libc::DT_DIR as u32,
-            },
-        ];
-        entries.extend(self.list_merged(ctx, inode)?);
-        let id = self.new_handle(Opened::Dir(entries));
+        let mut listing = ListingBuilder::new(
+            self.listing_limit,
+            self.listings_limit,
+            Arc::clone(&self.listing_bytes),
+        )?;
+        listing.push(Listed {
+            name: b".".to_vec(),
+            ino: own.st_ino,
+            type_: libc::DT_DIR as u32,
+        })?;
+        listing.push(Listed {
+            name: b"..".to_vec(),
+            ino: parent_ino,
+            type_: libc::DT_DIR as u32,
+        })?;
+        self.for_each_merged_entry(ctx, inode, true, &mut |entry| listing.push(entry))?;
+        let id = self.new_dir_handle(listing.finish());
         Ok((Some(id), OpenOptions::empty()))
     }
 
@@ -1467,7 +1707,7 @@ impl<L: Layer, U: Layer> FileSystem for OverlayFs<L, U> {
         add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let entries = self.dir_handle(handle)?;
-        for (i, listed) in entries.iter().enumerate().skip(offset as usize) {
+        for (i, listed) in entries.entries.iter().enumerate().skip(offset as usize) {
             let entry = DirEntry {
                 ino: listed.ino,
                 offset: i as u64 + 1,
@@ -1491,7 +1731,7 @@ impl<L: Layer, U: Layer> FileSystem for OverlayFs<L, U> {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let entries = self.dir_handle(handle)?;
-        for (i, listed) in entries.iter().enumerate().skip(offset as usize) {
+        for (i, listed) in entries.entries.iter().enumerate().skip(offset as usize) {
             let dots = listed.name == b"." || listed.name == b"..";
             let looked_up = if dots {
                 Entry::default()
@@ -1536,10 +1776,11 @@ impl<L: Layer, U: Layer> FileSystem for OverlayFs<L, U> {
     }
 
     fn releasedir(&self, _ctx: &Context, _inode: u64, _flags: u32, handle: u64) -> io::Result<()> {
-        match self.handles().remove(&handle) {
-            Some(Opened::Dir(_)) => Ok(()),
+        let mut handles = self.handles();
+        match handles.by_id.remove(&handle) {
+            Some(Opened::Dir { .. }) => Ok(()),
             Some(opened) => {
-                self.handles().insert(handle, opened);
+                handles.by_id.insert(handle, opened);
                 Err(errno(libc::EBADF))
             }
             None => Err(errno(libc::EBADF)),
@@ -2057,4 +2298,170 @@ fn copy_xattrs(src: &OwnedFd, dst: &OwnedFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{passthrough_config, CachePolicyKind, FsShareConfig};
+    use fuse_backend_rs::passthrough::PassthroughFs;
+
+    /// A passthrough whose `readdir` ends at an error from its callback
+    /// and returns `Ok`, as a `FileSystem` may.
+    struct QuietReaddir {
+        inner: PassthroughFs,
+    }
+
+    impl FileSystem for QuietReaddir {
+        type Inode = u64;
+        type Handle = u64;
+
+        forward! {
+            init: forward,
+            destroy: forward,
+            lookup: forward,
+            forget: forward,
+            batch_forget: forward,
+            getattr: forward,
+            setattr: forward,
+            readlink: forward,
+            symlink: forward,
+            mknod: forward,
+            mkdir: forward,
+            unlink: forward,
+            rmdir: forward,
+            rename: forward,
+            link: forward,
+            open: forward,
+            create: forward,
+            read: forward,
+            write: forward,
+            flush: forward,
+            fsync: forward,
+            fallocate: forward,
+            release: forward,
+            statfs: forward,
+            setxattr: forward,
+            getxattr: forward,
+            listxattr: forward,
+            removexattr: forward,
+            opendir: forward,
+            readdir: audited,
+            readdirplus: forward,
+            fsyncdir: forward,
+            releasedir: forward,
+            setupmapping: forward,
+            removemapping: forward,
+            access: forward,
+            lseek: forward,
+            getlk: forward,
+            setlk: forward,
+            setlkw: forward,
+            ioctl: forward,
+            bmap: forward,
+            poll: forward,
+            notify_reply: forward,
+            id_remap: forward,
+        }
+
+        fn readdir(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            size: u32,
+            offset: u64,
+            add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+        ) -> io::Result<()> {
+            // `Ok(0)` ends the passthrough's listing without an error.
+            self.inner
+                .readdir(ctx, inode, handle, size, offset, &mut |entry| {
+                    Ok(add_entry(entry).unwrap_or(0))
+                })
+        }
+    }
+
+    fn quiet_layer(root: &std::path::Path) -> QuietReaddir {
+        let config = passthrough_config(&FsShareConfig {
+            tag: "root".into(),
+            host_dir: root.to_path_buf(),
+            guest_path: "/".into(),
+            cache: CachePolicyKind::Always,
+            lower: None,
+        });
+        let inner = PassthroughFs::<()>::new(config).unwrap();
+        inner.import().unwrap();
+        QuietReaddir { inner }
+    }
+
+    /// Past the bound, `opendir` fails even over a layer that says nothing
+    /// of the callback's error, and holds no listing cut short.
+    #[test]
+    fn a_listing_past_its_bound_fails_whatever_the_layer_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lower = dir.path().join("lower");
+        let upper = dir.path().join("upper");
+        std::fs::create_dir_all(lower.join("many")).unwrap();
+        std::fs::create_dir(&upper).unwrap();
+        for i in 0..24 {
+            std::fs::write(
+                lower
+                    .join("many")
+                    .join(format!("{i:04}-{}", "x".repeat(80))),
+                b"",
+            )
+            .unwrap();
+        }
+        let open = |path: &std::path::Path| OwnedFd::from(std::fs::File::open(path).unwrap());
+        let fs = OverlayFs::new(
+            quiet_layer(&lower),
+            open(&lower),
+            quiet_layer(&upper),
+            open(&upper),
+            &[],
+        )
+        .with_listing_limits(512, 4096);
+        fs.init(FsOptions::empty()).unwrap();
+        let many = fs.lookup(&ROOT_CTX, ROOT_ID, c"many").unwrap().inode;
+        let opened = fs.opendir(&ROOT_CTX, many, libc::O_RDONLY as u32);
+        assert_eq!(
+            opened.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ENOMEM)
+        );
+        assert_eq!(*fs.listing_bytes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn listing_construction_holds_and_returns_aggregate_capacity() {
+        let total = Arc::new(Mutex::new(0));
+        let entry = Listed {
+            name: vec![0; 48],
+            ino: 1,
+            type_: libc::DT_REG as u32,
+        };
+        let total_limit = DIR_LISTING_BASE_BYTES + entry.held_bytes().unwrap();
+        let mut listing = ListingBuilder::new(1024, total_limit, Arc::clone(&total)).unwrap();
+        listing.push(entry).unwrap();
+        assert_eq!(
+            ListingBuilder::new(1024, total_limit, Arc::clone(&total))
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOMEM)
+        );
+        drop(listing);
+        assert_eq!(*total.lock().unwrap(), 0);
+
+        let result = (|| -> io::Result<()> {
+            let mut listing = ListingBuilder::new(128, 1024, Arc::clone(&total))?;
+            listing.push(Listed {
+                name: vec![0; 256],
+                ino: 2,
+                type_: libc::DT_REG as u32,
+            })?;
+            Ok(())
+        })();
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOMEM));
+        assert_eq!(*total.lock().unwrap(), 0);
+    }
 }
