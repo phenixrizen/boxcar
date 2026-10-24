@@ -19,6 +19,14 @@ pub struct SseEvent {
     pub id: Option<String>,
 }
 
+/// One ordered result from splitting an event stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SseItem {
+    Event(SseEvent),
+    /// A line was not retained, so the event under way was discarded.
+    DroppedLine,
+}
+
 /// The splitter's state across chunks.
 #[derive(Debug, Default)]
 pub struct SseParser {
@@ -27,12 +35,16 @@ pub struct SseParser {
     has_data: bool,
     /// A line ran past [`MAX_EVENT_BYTES`] without ending: its bytes are
     /// dropped until it ends.
-    skipping: bool,
+    skipping_line: bool,
+    /// The skipped line ended in a CR at the end of the previous chunk;
+    /// a leading LF still belongs to that line ending.
+    skipping_line_cr: bool,
+    /// The event containing a dropped line is ignored through its blank
+    /// terminator.
+    discarding_event: bool,
     /// Some line was dropped so, or for want of room in the observer's
     /// budget.
     overflowed: bool,
-    /// A line was dropped since [`SseParser::take_drop`] last asked.
-    dropped: bool,
     /// What the buffered line and the event under way take of the
     /// observer's budget.
     share: Share,
@@ -57,12 +69,34 @@ impl SseParser {
 
     /// Takes `bytes`, appending the events they complete to `out`.
     pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<SseEvent>) {
+        let mut ordered = Vec::new();
+        self.feed_ordered(bytes, &mut ordered);
+        out.extend(ordered.into_iter().filter_map(|item| match item {
+            SseItem::Event(event) => Some(event),
+            SseItem::DroppedLine => None,
+        }));
+    }
+
+    /// Takes `bytes`, preserving dropped lines among the completed events.
+    pub fn feed_ordered(&mut self, bytes: &[u8], out: &mut Vec<SseItem>) {
         let mut bytes = bytes;
-        if self.skipping {
+        if self.skipping_line && self.skipping_line_cr {
+            if bytes.is_empty() {
+                return;
+            }
+            self.skipping_line = false;
+            self.skipping_line_cr = false;
+            bytes = bytes.strip_prefix(b"\n").unwrap_or(bytes);
+        }
+        if self.skipping_line {
             // The rest of the over-long line goes, up to its end.
             match bytes.iter().position(|&b| b == b'\n' || b == b'\r') {
                 Some(at) => {
-                    self.skipping = false;
+                    if bytes[at] == b'\r' && bytes.get(at + 1).is_none() {
+                        self.skipping_line_cr = true;
+                        return;
+                    }
+                    self.skipping_line = false;
                     // Past the line's end, CRLF as one.
                     let crlf = bytes[at] == b'\r' && bytes.get(at + 1) == Some(&b'\n');
                     bytes = &bytes[at + if crlf { 2 } else { 1 }..];
@@ -71,8 +105,14 @@ impl SseParser {
             }
         }
         self.buf.extend_from_slice(bytes);
-        while let Some((line, rest)) = split_line(&self.buf).map(|(l, r)| (l.to_vec(), r.len())) {
+        while let Some((line_len, rest)) = split_line(&self.buf).map(|(l, r)| (l.len(), r.len())) {
             let at = self.buf.len() - rest;
+            if line_len > MAX_EVENT_BYTES {
+                self.buf.drain(..at);
+                self.discard_event(out);
+                continue;
+            }
+            let line = self.buf[..line_len].to_vec();
             self.buf.drain(..at);
             self.line(&line, out);
         }
@@ -80,14 +120,12 @@ impl SseParser {
         if self.buf.len() > MAX_EVENT_BYTES || !self.share.set(self.held()) {
             // Too long, or no room left: the line goes, to its end, and
             // with no room the event under way goes too.
-            if self.buf.len() <= MAX_EVENT_BYTES {
-                self.current = SseEvent::default();
-                self.has_data = false;
-            }
+            self.discard_event(out);
+            self.skipping_line = !self.buf.is_empty();
+            // A CR that ends the buffer ended the line; an LF after it
+            // belongs to it.
+            self.skipping_line_cr = self.buf.last() == Some(&b'\r');
             self.buf = Vec::new();
-            self.skipping = true;
-            self.overflowed = true;
-            self.dropped = true;
             self.share.set(self.held());
         }
     }
@@ -101,31 +139,47 @@ impl SseParser {
             + self.current.id.as_ref().map_or(0, String::capacity)
     }
 
-    /// Whether a line was dropped for running past [`MAX_EVENT_BYTES`].
+    /// Whether a line was dropped for its size or for want of observer room.
     pub fn overflowed(&self) -> bool {
         self.overflowed
-    }
-
-    /// Whether a line was dropped since the last call: the stream has a
-    /// hole there, and what was being gathered across it is not whole.
-    pub fn take_drop(&mut self) -> bool {
-        std::mem::take(&mut self.dropped)
     }
 
     /// The event under way, if any: a stream that ended without a blank
     /// line.
     pub fn finish(&mut self, out: &mut Vec<SseEvent>) {
-        if !self.buf.is_empty() {
+        let mut ordered = Vec::new();
+        self.finish_ordered(&mut ordered);
+        out.extend(ordered.into_iter().filter_map(|item| match item {
+            SseItem::Event(event) => Some(event),
+            SseItem::DroppedLine => None,
+        }));
+    }
+
+    /// Finishes the stream, preserving a final dropped line in order.
+    pub fn finish_ordered(&mut self, out: &mut Vec<SseItem>) {
+        if !self.skipping_line && !self.discarding_event && !self.buf.is_empty() {
             let line = std::mem::take(&mut self.buf);
             self.line(&line, out);
         }
-        self.dispatch(out);
+        if !self.discarding_event {
+            self.dispatch(out);
+        }
+        self.buf.clear();
         self.share.clear();
     }
 
-    fn line(&mut self, line: &[u8], out: &mut Vec<SseEvent>) {
+    fn line(&mut self, line: &[u8], out: &mut Vec<SseItem>) {
         if line.is_empty() {
+            if self.discarding_event {
+                self.discarding_event = false;
+                self.current = SseEvent::default();
+                self.has_data = false;
+                return;
+            }
             return self.dispatch(out);
+        }
+        if self.discarding_event {
+            return;
         }
         if line[0] == b':' {
             return;
@@ -141,12 +195,22 @@ impl SseParser {
         let value = String::from_utf8_lossy(value);
         match field {
             b"data" => {
-                if self.current.data.len() + value.len() < MAX_EVENT_BYTES {
-                    if self.has_data {
-                        self.current.data.push('\n');
-                    }
-                    self.current.data.push_str(&value);
+                let separator = usize::from(self.has_data);
+                let fits = self
+                    .current
+                    .data
+                    .len()
+                    .checked_add(separator)
+                    .and_then(|len| len.checked_add(value.len()))
+                    .is_some_and(|len| len <= MAX_EVENT_BYTES);
+                if !fits {
+                    self.discard_event(out);
+                    return;
                 }
+                if self.has_data {
+                    self.current.data.push('\n');
+                }
+                self.current.data.push_str(&value);
                 self.has_data = true;
             }
             b"event" => self.current.event = Some(value.into_owned()),
@@ -155,9 +219,19 @@ impl SseParser {
         }
     }
 
-    fn dispatch(&mut self, out: &mut Vec<SseEvent>) {
+    fn discard_event(&mut self, out: &mut Vec<SseItem>) {
+        self.overflowed = true;
+        if !self.discarding_event {
+            out.push(SseItem::DroppedLine);
+        }
+        self.current = SseEvent::default();
+        self.has_data = false;
+        self.discarding_event = true;
+    }
+
+    fn dispatch(&mut self, out: &mut Vec<SseItem>) {
         if self.has_data || self.current.event.is_some() || self.current.id.is_some() {
-            out.push(std::mem::take(&mut self.current));
+            out.push(SseItem::Event(std::mem::take(&mut self.current)));
         }
         self.has_data = false;
     }
@@ -244,16 +318,114 @@ mod tests {
     #[test]
     fn a_line_past_the_limit_is_dropped_to_its_end() {
         let mut parser = SseParser::new();
-        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut ordered = Vec::new();
         let chunk = vec![b'x'; 1024 * 1024];
-        parser.feed(b"data: ", &mut out);
+        parser.feed_ordered(b"data: ", &mut ordered);
         for _ in 0..(MAX_EVENT_BYTES / chunk.len() + 2) {
-            parser.feed(&chunk, &mut out);
+            parser.feed_ordered(&chunk, &mut ordered);
             assert!(parser.buf.len() <= MAX_EVENT_BYTES + chunk.len());
         }
         assert!(parser.overflowed());
-        parser.feed(b"tail\n\ndata: ok\n\n", &mut out);
-        assert_eq!(out.last().map(|e| e.data.as_str()), Some("ok"));
+        parser.feed_ordered(b"tail\n\ndata: ok\n\n", &mut ordered);
+        assert_eq!(
+            ordered
+                .iter()
+                .filter(|item| matches!(item, SseItem::DroppedLine))
+                .count(),
+            1
+        );
+        for item in ordered {
+            if let SseItem::Event(event) = item {
+                events.push(event);
+            }
+        }
+        assert_eq!(events.last().map(|e| e.data.as_str()), Some("ok"));
+    }
+
+    #[test]
+    fn a_budget_drop_follows_events_completed_in_the_same_feed() {
+        let retained = Retained::with_limit(512);
+        let mut parser = SseParser::with_retained(retained);
+        let mut out = Vec::new();
+        let mut bytes = b"data: first\n\n".to_vec();
+        bytes.extend_from_slice(b"data: ");
+        bytes.extend(std::iter::repeat_n(b'x', 1024));
+        parser.feed_ordered(&bytes, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [SseItem::Event(_), SseItem::DroppedLine]
+        ));
+    }
+
+    #[test]
+    fn a_split_crlf_ends_a_skipped_line_once() {
+        let retained = Retained::with_limit(512);
+        let mut parser = SseParser::with_retained(retained);
+        let mut out = Vec::new();
+        let mut line = b"data: ".to_vec();
+        line.extend(std::iter::repeat_n(b'x', 1024));
+        parser.feed_ordered(&line, &mut out);
+        parser.feed_ordered(b"tail\r", &mut out);
+        parser.feed_ordered(b"\ndata: same event\n\ndata: next\n\n", &mut out);
+        assert_eq!(
+            out,
+            [
+                SseItem::DroppedLine,
+                SseItem::Event(SseEvent {
+                    event: None,
+                    data: "next".to_owned(),
+                    id: None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_cut_at_its_cr_ends_there() {
+        let retained = Retained::with_limit(512);
+        let mut parser = SseParser::with_retained(retained);
+        let mut out = Vec::new();
+        let mut line = b"data: ".to_vec();
+        line.extend(std::iter::repeat_n(b'x', 1024));
+        line.push(b'\r');
+        parser.feed_ordered(&line, &mut out);
+        parser.feed_ordered(b"\rdata: next\n\n", &mut out);
+        assert_eq!(
+            out,
+            [
+                SseItem::DroppedLine,
+                SseItem::Event(SseEvent {
+                    event: None,
+                    data: "next".to_owned(),
+                    id: None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_event_past_the_aggregate_limit_is_discarded() {
+        let mut parser = SseParser::new();
+        let mut out = Vec::new();
+        let value = vec![b'x'; MAX_EVENT_BYTES / 2];
+        let mut line = b"data: ".to_vec();
+        line.extend_from_slice(&value);
+        line.push(b'\n');
+        parser.feed_ordered(&line, &mut out);
+        parser.feed_ordered(&line, &mut out);
+        parser.feed_ordered(b"\ndata: ok\n\n", &mut out);
+        assert_eq!(
+            out,
+            [
+                SseItem::DroppedLine,
+                SseItem::Event(SseEvent {
+                    event: None,
+                    data: "ok".to_owned(),
+                    id: None,
+                }),
+            ]
+        );
     }
 
     /// A long line, once read, leaves neither its allocation nor its

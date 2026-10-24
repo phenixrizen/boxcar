@@ -32,7 +32,7 @@ pub mod zstd;
 pub use body::{BodySink, BodySummary, Coding, ContentDecoder, BODY_KEEP};
 pub use headers::{is_credential, Headers};
 pub use retain::{Retained, Share, RETAINED_LIMIT};
-pub use sse::{SseEvent, SseParser};
+pub use sse::{SseEvent, SseItem, SseParser};
 
 use crate::gate::Direction;
 

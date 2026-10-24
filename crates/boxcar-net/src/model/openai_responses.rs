@@ -12,7 +12,7 @@
 //! its arguments are whole (`response.output_item.done`, or the
 //! `function_call_arguments.done` for it).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -170,9 +170,12 @@ struct Call {
     name: String,
     arguments: String,
     done: bool,
-    /// A piece of the arguments found no room: lost until a whole value
-    /// (a `done` event's) replaces them.
+    /// A piece of the item found no room: lost until a whole value (a
+    /// `done` event's) replaces it.
     lost: bool,
+    /// The item itself found no room. Later events for its index are
+    /// ignored, and it does not describe a tool use.
+    tombstone: bool,
 }
 
 /// A streamed response, event by event; the same for the events of a
@@ -182,6 +185,10 @@ pub struct Stream {
     info: ResponseInfo,
     text: Text,
     calls: BTreeMap<u64, Call>,
+    /// Indexes first seen after the call-count limit. This is bounded by
+    /// the same limit as `calls`; once full, all new indexes stay ignored.
+    refused: BTreeSet<u64>,
+    refuse_new: bool,
     budget: CallBudget,
     degraded: Option<&'static str>,
     completed: bool,
@@ -219,10 +226,25 @@ impl Stream {
         self.value(&data)
     }
 
-    /// Whether the call at `index` is under way, or one more may be.
+    /// Whether the call at `index` is under way, reserving a bounded entry
+    /// for it when it is new.
     fn room(&mut self, index: u64) -> bool {
-        self.calls.contains_key(&index)
-            || CallBudget::admit_call(self.calls.len(), &mut self.degraded)
+        if let Some(call) = self.calls.get(&index) {
+            return !call.tombstone;
+        }
+        if self.refuse_new || self.refused.contains(&index) {
+            return false;
+        }
+        if !CallBudget::admit_call(self.calls.len(), &mut self.degraded) {
+            if self.refused.len() < super::STREAM_CALLS {
+                self.refused.insert(index);
+            } else {
+                self.refuse_new = true;
+            }
+            return false;
+        }
+        self.calls.insert(index, Call::default());
+        true
     }
 
     /// One event as a parsed value (a WebSocket message carries one).
@@ -248,37 +270,52 @@ impl Stream {
                         .unwrap_or("")
                 };
                 let (item_id, call_id, name) = (text("id"), text("call_id"), text("name"));
-                if is_call(item)
-                    && self.room(index)
-                    && self.budget.admit(
-                        item_id.len() + call_id.len() + name.len(),
-                        &mut self.degraded,
-                    )
-                {
-                    let call = self.calls.entry(index).or_default();
-                    call.item_id = item_id.to_owned();
-                    call.call_id = call_id.to_owned();
-                    call.name = name.to_owned();
-                    if let Some(args) = item
-                        .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
-                        .and_then(Value::as_str)
-                    {
-                        if self.budget.admit(args.len(), &mut self.degraded) {
-                            call.arguments = args.to_owned();
-                        } else {
-                            call.lost = true;
-                        }
+                if !is_call(item) || !self.room(index) {
+                    return opens;
+                }
+                if !self.budget.admit(
+                    item_id.len() + call_id.len() + name.len(),
+                    &mut self.degraded,
+                ) {
+                    if let Some(call) = self.calls.get_mut(&index) {
+                        *call = Call {
+                            tombstone: true,
+                            ..Call::default()
+                        };
                     }
+                    return opens;
+                }
+                let args = item
+                    .and_then(|i| i.get("arguments").or_else(|| i.get("input")))
+                    .and_then(Value::as_str);
+                let args_admitted = args
+                    .map(|args| self.budget.admit(args.len(), &mut self.degraded))
+                    .unwrap_or(true);
+                let Some(call) = self.calls.get_mut(&index) else {
+                    return opens;
+                };
+                call.item_id = item_id.to_owned();
+                call.call_id = call_id.to_owned();
+                call.name = name.to_owned();
+                if let Some(args) = args.filter(|_| args_admitted) {
+                    call.arguments = args.to_owned();
+                } else if args.is_some() {
+                    call.lost = true;
+                    call.arguments = String::new();
                 }
             }
             "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                     if self.room(index) {
+                        if self.calls.get(&index).is_some_and(|call| call.lost) {
+                            return opens;
+                        }
                         let admitted = self.budget.admit(delta.len(), &mut self.degraded);
-                        let call = self.calls.entry(index).or_default();
-                        if call.lost {
-                        } else if admitted {
+                        let Some(call) = self.calls.get_mut(&index) else {
+                            return opens;
+                        };
+                        if admitted {
                             call.arguments.push_str(delta);
                         } else {
                             call.lost = true;
@@ -296,7 +333,9 @@ impl Stream {
                 {
                     if self.room(index) && self.budget.admit(args.len(), &mut self.degraded) {
                         // A whole value: what was lost is whole again.
-                        let call = self.calls.entry(index).or_default();
+                        let Some(call) = self.calls.get_mut(&index) else {
+                            return opens;
+                        };
                         call.arguments = args.to_owned();
                         call.lost = false;
                     }
@@ -305,6 +344,14 @@ impl Stream {
             "response.output_item.done" => {
                 let index = u64_of(data.get("output_index")).unwrap_or(0);
                 let item = data.get("item");
+                // Refused, by its index or (the refused set full) as any
+                // index never admitted, or set aside: no call.
+                if self.refused.contains(&index)
+                    || (self.refuse_new && !self.calls.contains_key(&index))
+                    || self.calls.get(&index).is_some_and(|call| call.tombstone)
+                {
+                    return opens;
+                }
                 let text = |key: &str| item.and_then(|i| i.get(key)).and_then(Value::as_str);
                 let added = text("call_id").map_or(0, str::len)
                     + text("name").map_or(0, str::len)
@@ -377,7 +424,7 @@ impl Stream {
     pub fn finish(mut self) -> (ResponseInfo, Vec<ToolOpen>) {
         let mut opens = Vec::new();
         for (_, call) in std::mem::take(&mut self.calls) {
-            if call.done {
+            if call.done || call.tombstone {
                 continue;
             }
             self.degraded.get_or_insert("call_unfinished");
@@ -387,7 +434,11 @@ impl Stream {
             } else {
                 &call.call_id
             };
-            opens.push(tool_open_text(id, &call.name, &call.arguments));
+            opens.push(if call.lost {
+                tool_open_lost(id, &call.name)
+            } else {
+                tool_open_text(id, &call.name, &call.arguments)
+            });
         }
         if !self.completed {
             self.degraded.get_or_insert("stream_unfinished");
@@ -551,6 +602,80 @@ mod tests {
         assert_eq!(opens.len(), 1);
         let (info, _) = stream.finish();
         assert_eq!(info.degraded, Some("stream_unfinished"));
+    }
+
+    #[test]
+    fn an_unfinished_call_that_lost_a_piece_keeps_no_arguments() {
+        let mut stream = Stream::new();
+        stream.value(&serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "call_id": "call_l", "name": "shell"}}));
+        stream.value(&serde_json::json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{\"command\":"}));
+        stream.lose_calls();
+        let (info, opens) = stream.finish();
+        assert_eq!(info.degraded, Some("call_unfinished"));
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].args, None);
+        assert_eq!(opens[0].args_summary, "[arguments not kept whole]");
+    }
+
+    #[test]
+    fn an_unretained_item_is_not_a_tool_use() {
+        let retained = Retained::with_limit(1);
+        let mut stream = Stream::new().with_retained(retained.clone());
+        stream.value(&serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "call_id": "ab", "name": "shell"}}));
+        stream.value(&serde_json::json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "x"}));
+        assert_eq!(retained.held(), 0, "the ignored delta takes no room");
+        let (info, opens) = stream.finish();
+        assert!(opens.is_empty());
+        assert_eq!(info.tool_uses, 0);
+    }
+
+    #[test]
+    fn an_index_past_the_call_limit_stays_ignored() {
+        use crate::model::STREAM_CALLS;
+
+        let mut stream = Stream::new();
+        for index in 0..STREAM_CALLS {
+            stream.value(&serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {"type": "function_call", "call_id": format!("call_{index}"), "name": "shell"}
+            }));
+        }
+        stream.value(&serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": STREAM_CALLS,
+            "item": {"type": "function_call", "call_id": "call_later", "name": "shell"}
+        }));
+        let first = stream.value(&serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_0", "name": "shell", "arguments": "{}"}
+        }));
+        assert_eq!(first.len(), 1);
+        stream.value(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": STREAM_CALLS,
+            "delta": "tail"
+        }));
+        let later = stream.value(&serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": STREAM_CALLS,
+            "item": {"type": "function_call", "call_id": "call_later", "name": "shell", "arguments": "tail"}
+        }));
+        assert!(later.is_empty());
+        assert!(!stream.calls.contains_key(&(STREAM_CALLS as u64)));
+        assert!(stream.refused.contains(&(STREAM_CALLS as u64)));
+        // With the refused set full, any index never admitted stays out.
+        stream.refuse_new = true;
+        let unseen = stream.value(&serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": STREAM_CALLS + 100,
+            "item": {"type": "function_call", "call_id": "call_unseen", "name": "shell", "arguments": "{}"}
+        }));
+        assert!(unseen.is_empty());
+        let (info, opens) = stream.finish();
+        assert_eq!(opens.len(), STREAM_CALLS - 1);
+        assert_eq!(info.tool_uses, STREAM_CALLS as u32);
     }
 
     /// A done event's metadata counts against the reply's budget: done
