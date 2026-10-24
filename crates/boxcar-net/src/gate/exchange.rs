@@ -1316,6 +1316,34 @@ mod tests {
     }
 
     #[test]
+    fn request_targets_are_scrubbed_in_records_and_dumps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump = DumpDir::prepare(&tmp.path().join("dump"), &[]).unwrap();
+        let request_file = dump.exchange_file(5, 1, true);
+        let mut obs = observation(Some("http/1.1")).with_dump(Some(dump));
+        let mut out = Vec::new();
+        obs.data(
+            Direction::ToHost,
+            b"GET /items?key=short&view=plain HTTP/1.1\r\nHost: api.example\r\n\r\n",
+            Instant::now(),
+            &mut out,
+        );
+
+        let path = out.iter().find_map(|emit| match &emit.payload {
+            Payload::HttpRequest(request) => request.path.as_deref(),
+            _ => None,
+        });
+        assert_eq!(path, Some("/items?key=[redacted]&view=plain"));
+        let dumped = std::fs::read_to_string(request_file).unwrap();
+        assert!(
+            dumped.starts_with(
+                "GET /items?key=[redacted]&view=plain HTTP/1.1\r\nhost: api.example\r\n"
+            ),
+            "{dumped:?}"
+        );
+    }
+
+    #[test]
     fn a_flow_that_closes_mid_exchange_records_what_it_has_as_degraded() {
         let mut obs = observation(None);
         let mut out = Vec::new();
