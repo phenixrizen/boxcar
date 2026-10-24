@@ -67,7 +67,7 @@
       }
     },
     "ClockSync": {
-      "description": "`sync`: a pairing of the guest's clock with the host's. The VMM pings init over the control channel and times the pong: the guest's `CLOCK_MONOTONIC` when it answered, against the host's at the round trip's midpoint. `ts_host_ns` stays the one timestamp that joins events across rings; this says how far the guest's clock stands from the host's, and how surely.",
+      "description": "`sync`: a pairing of the guest's clock with the host's. The VMM pings init over the control channel and times the pong: the guest's `CLOCK_MONOTONIC` when it answered, against the host's at a checked PTP read or the round trip's midpoint. `ts_host_ns` stays the one timestamp that joins events across rings; this says how far the guest's clock stands from the host's, and how surely.",
       "type": "object",
       "required": [
         "guest_mono_ns",
@@ -99,7 +99,7 @@
           "format": "int64"
         },
         "rtt_ns": {
-          "description": "What bounds the pair, in nanoseconds: the round trip, or the window on the guest's clock within which its read was taken. The pairing is no surer than this.",
+          "description": "What bounds the pair, in nanoseconds: the host-measured round trip. The pairing is no surer than this.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -4970,6 +4970,13 @@
         "truncated"
       ],
       "properties": {
+        "attribution_unverified": {
+          "description": "Why process attribution for the span is not verified; at most two, omitted when attribution was verified.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SpanUnverifiedReason"
+          }
+        },
         "closed_seq": {
           "description": "The seq of the `tool.close`; `null` for a span still open at `vmm.stop`.",
           "type": [
@@ -4980,7 +4987,7 @@
           "minimum": 0.0
         },
         "effects": {
-          "description": "The seqs of the records attributed to the span, ascending: the `proc.exec` of each process, and the `fs.*` and `net.connect` records their work made; at most 4096.",
+          "description": "The seqs of the records attributed to the span, ascending: the `proc.exec` of each process, and the `fs.*` and `net.connect` records their work made; at most 2048.",
           "type": "array",
           "items": {
             "type": "integer",
@@ -5024,6 +5031,25 @@
           "type": "boolean"
         }
       }
+    },
+    "SpanUnverifiedReason": {
+      "description": "Why a `span.effects` record's process attribution is not verified.",
+      "oneOf": [
+        {
+          "description": "A close or retained effect was accepted without process lineage.",
+          "type": "string",
+          "enum": [
+            "no_lineage"
+          ]
+        },
+        {
+          "description": "A close could not be attributed and left the span open.",
+          "type": "string",
+          "enum": [
+            "close_unattributed"
+          ]
+        }
+      ]
     },
     "StopMode": {
       "description": "How to stop.",

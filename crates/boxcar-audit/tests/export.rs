@@ -270,6 +270,7 @@ fn effects(id: &str, opened: u64, closed: Option<u64>, procs: Vec<u32>, fx: Vec<
         executor_tgid: Some(100),
         procs,
         effects: fx,
+        attribution_unverified: Vec::new(),
         truncated: false,
     })
 }

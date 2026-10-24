@@ -892,10 +892,10 @@ pub struct SessionExit {
 
 /// `sync`: a pairing of the guest's clock with the host's. The VMM pings
 /// init over the control channel and times the pong: the guest's
-/// `CLOCK_MONOTONIC` when it answered, against the host's at the round
-/// trip's midpoint. `ts_host_ns` stays the one timestamp that joins events
-/// across rings; this says how far the guest's clock stands from the host's,
-/// and how surely.
+/// `CLOCK_MONOTONIC` when it answered, against the host's at a checked PTP
+/// read or the round trip's midpoint. `ts_host_ns` stays the one timestamp
+/// that joins events across rings; this says how far the guest's clock stands
+/// from the host's, and how surely.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ClockSync {
@@ -911,9 +911,8 @@ pub struct ClockSync {
     pub host_mono_ns: u64,
     /// `host_mono_ns` minus `guest_mono_ns`.
     pub offset_ns: i64,
-    /// What bounds the pair, in nanoseconds: the round trip, or the
-    /// window on the guest's clock within which its read was taken. The
-    /// pairing is no surer than this.
+    /// What bounds the pair, in nanoseconds: the host-measured round trip.
+    /// The pairing is no surer than this.
     pub rtt_ns: u64,
 }
 
@@ -1324,6 +1323,36 @@ pub struct ToolClose {
     pub result_summary: String,
 }
 
+/// Why a `span.effects` record's process attribution is not verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpanUnverifiedReason {
+    /// A close or retained effect was accepted without process lineage.
+    NoLineage,
+    /// A close could not be attributed and left the span open.
+    CloseUnattributed,
+}
+
+impl SpanUnverifiedReason {
+    /// The reason as the record writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpanUnverifiedReason::NoLineage => "no_lineage",
+            SpanUnverifiedReason::CloseUnattributed => "close_unattributed",
+        }
+    }
+}
+
+/// The most processes a `span.effects` record lists.
+pub const MAX_SPAN_PROCS: usize = 1024;
+/// The most effect records a `span.effects` record lists. Together with the
+/// other field limits, this keeps the serialized record within 64 KiB.
+pub const MAX_SPAN_EFFECTS: usize = 2048;
+/// The most attribution reasons a `span.effects` record carries. The fixed
+/// reason set and producer-side deduplication keep the list within this bound.
+pub const MAX_SPAN_UNVERIFIED_REASONS: usize = 2;
+
 /// `span.effects`: what a tool span held when it closed, or when the VM
 /// stopped with it still open: the processes the reconciler attributed to
 /// it and the records of their effects. A membership record: the effects
@@ -1348,8 +1377,12 @@ pub struct SpanEffects {
     pub procs: Vec<u32>,
     /// The seqs of the records attributed to the span, ascending: the
     /// `proc.exec` of each process, and the `fs.*` and `net.connect`
-    /// records their work made; at most 4096.
+    /// records their work made; at most 2048.
     pub effects: Vec<u64>,
+    /// Why process attribution for the span is not verified; at most two,
+    /// omitted when attribution was verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribution_unverified: Vec<SpanUnverifiedReason>,
     /// Whether a process or an effect was left out for the limits.
     pub truncated: bool,
 }

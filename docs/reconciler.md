@@ -26,9 +26,10 @@ tool spans, writes each one's membership as `span.effects`, and answers
   and port and both destination address and port match within 500 ms, in
   either order.
 - **Time.** `ts_host_ns` is the one clock across rings. `sync` records say
-  how far the guest's clock stands from it and how surely (`rtt_ns`: a
-  ping's round trip, or, through `ptp_kvm` where the guest has its clock,
-  the microseconds one read of the TSC took, whatever the load); when the
+  how far the guest's clock stands from it and how surely (`rtt_ns` is the
+  host-measured ping round trip). A `ptp_kvm` clock pair is used only when
+  its host time maps inside that ping-to-pong interval; otherwise the VMM
+  uses the round-trip midpoint. When the
   last pairing's bound was over 2 ms, no pairing came for 30 s while ring
   1 was alive, or the reconciler missed records (its subscription lagged),
   findings that rest on a cross-ring join are marked `low_confidence` and
@@ -82,7 +83,9 @@ processes and ring 0 effects to the span:
   opener, and nothing then shows the close is the executor's. A span
   whose request flow is not on record in a log that never let one go (a
   log without the gate's flows), or a session without the sensor's
-  lineage programs, takes any close: there is nothing to hold it to.
+  lineage programs, takes any close: there is nothing to hold it to. A
+  close taken without lineage records `no_lineage`; a close left unresolved
+  records `close_unattributed` when the span is written at stop.
 - **Bounds.** At most 256 spans are open at once: past that the oldest
   open span gets its `span.effects` as it stands (`closed_seq` null,
   `truncated`) and takes nothing more, nor its `tool.close`.
@@ -146,13 +149,14 @@ processes and ring 0 effects to the span:
   span (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `apply_patch`), or
   the write tool span whose declared path it touches; a shell tool's work
   is its process's, and what the agent itself writes meanwhile (Codex
-  installs plugins in the background) is nobody's. An effect that joins
-  nothing waits 2 s for its process to join a span. The agent's own
-  connections join no span.
+  installs plugins in the background) is nobody's. A process or effect
+  retained while lineage is unavailable records `no_lineage` on the span.
+  An effect that joins nothing waits 2 s for its process to join a span.
+  The agent's own connections join no span.
 - **The record.** At the close, and at `vmm.stop` for a span still open,
   the reconciler writes `span.effects`: the span's processes by tgid (at
   most 1024) and the seqs of its records (each process's `proc.exec`
-  and the effects above, at most 4096), with `truncated` set when a limit
+  and the effects above, at most 2048), with `truncated` set when a limit
   cut the list: the count, or the 64 MiB that the effects of every span
   kept may hold at once, paths included. A span's effects are let go
   once it has settled (its count stays for `span.list`). The effects
@@ -226,7 +230,7 @@ the thread otherwise.
   gated tests give it three seconds.
 - The reconciler keeps the last 65536 records' rings for the evidence and
   prunes DNS answers after 60 s; a session is not a database.
-- A span lists at most 1024 processes and 4096 effect records, and the
+- A span lists at most 1024 processes and 2048 effect records, and the
   spans kept hold at most 64 MiB of effects between them, a settled span's
   let go; 4096 spans are kept in memory, the oldest settled one going
   first; `span.list`

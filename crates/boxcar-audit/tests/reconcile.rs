@@ -21,7 +21,8 @@ use boxcar_proto::{
     HashStatus, HttpRequest, NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec,
     ProcExecDenied, ProcExit, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
     ProcTcpConnect, ProcTlsIo, ProgramStatus, Record, Ring, SensorPhase, SessionId, SessionStart,
-    SpanEffects, SpanRef, Subject, ToolClose, ToolOpen, Verdict, VmmStop, VsockConnect,
+    SpanEffects, SpanRef, SpanUnverifiedReason, Subject, ToolClose, ToolOpen, Verdict, VmmStop,
+    VsockConnect,
 };
 use serde_json::{json, Value};
 
@@ -1774,6 +1775,63 @@ fn span_effects_at_stop() {
     check_all("span_effects_at_stop", &out);
 }
 
+/// A span records that its close and retained work were accepted while
+/// process lineage was unavailable, whether the sensor was disabled,
+/// reported a partial attachment, or had not reported its status yet.
+#[test]
+fn spans_record_when_lineage_was_unavailable() {
+    for state in ["disabled", "partial", "pending"] {
+        let mut log = Log::new();
+        let mut steps = vec![log.session_start(0, 100)];
+        if state == "partial" {
+            let without_exec: Vec<&str> = PROGRAMS
+                .iter()
+                .copied()
+                .filter(|program| *program != "sched_process_exec")
+                .collect();
+            steps.push(log.sensor_status(100, &without_exec));
+        }
+        steps.push(log.tool_open(2000, "toolu_close", "Bash", json!({"command": "true"})));
+        steps.push(log.tool_close(2050, "toolu_close", "ok"));
+        steps.push(log.tool_open(
+            2100,
+            "toolu_effect",
+            "Write",
+            json!({"file_path": "/workspace/out.txt"}),
+        ));
+        steps.push(log.fs_create(2200, 999, "/workspace/out.txt"));
+        if state == "pending" {
+            steps.push(log.sensor_status(2300, &PROGRAMS));
+        }
+        steps.push(log.vmm_stop(2400));
+        let (out, _) = run_all(state != "disabled", steps);
+        let spans = spans_of(&out);
+        assert_eq!(spans.len(), 2, "{state}: {out:?}");
+        let close = spans
+            .iter()
+            .find(|span| span.span_id == "toolu_close")
+            .unwrap();
+        assert!(close.closed_seq.is_some(), "{state}: {out:?}");
+        assert!(close.effects.is_empty(), "{state}: {out:?}");
+        assert_eq!(
+            close.attribution_unverified,
+            [SpanUnverifiedReason::NoLineage],
+            "{state}: {out:?}"
+        );
+        let effect = spans
+            .iter()
+            .find(|span| span.span_id == "toolu_effect")
+            .unwrap();
+        assert_eq!(effect.closed_seq, None, "{state}: {out:?}");
+        assert_eq!(effect.effects.len(), 1, "{state}: {out:?}");
+        assert_eq!(
+            effect.attribution_unverified,
+            [SpanUnverifiedReason::NoLineage],
+            "{state}: {out:?}"
+        );
+    }
+}
+
 /// A command is compared as the model sent it: two that differ only in
 /// what the record redacts are told apart. With only the record's copy,
 /// which redacted it, the `argv` rule cannot tell and says nothing.
@@ -2281,12 +2339,16 @@ fn a_span_whose_request_flow_was_let_go_takes_no_close() {
         steps.push(log.heartbeat(at));
         steps.push(Step::Tick(at));
     }
+    steps.push(log.vmm_stop(5100));
     let (out, _) = run_all(true, steps);
-    let closed: Vec<_> = spans_of(&out)
-        .into_iter()
-        .filter(|s| s.closed_seq.is_some())
-        .collect();
-    assert!(closed.is_empty(), "{closed:?}");
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert_eq!(spans[0].closed_seq, None, "{out:?}");
+    assert_eq!(
+        spans[0].attribution_unverified,
+        [SpanUnverifiedReason::CloseUnattributed],
+        "{out:?}"
+    );
 }
 
 /// A close that comes before the sensor says who opened the span's own
