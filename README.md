@@ -327,9 +327,11 @@ log: `frames.pcap` with every frame the guest sent and every frame it was
 given, each cut to its headers (open it with Wireshark or `tcpdump -r`),
 and for inspected flows
 each decoded exchange as `http/<flow>-<stream>.req` and `.resp` (the
-start line, the headers the observer kept, the decoded body with
-secret-looking fields scrubbed) and, for one upgraded to WebSocket, its
-messages as `.ws`. DIR is made 0700, its files 0600; it must be new or
+start line, headers with credential-looking values removed and URI
+references scrubbed, and a decoded body scrubbed by its shape and type)
+and, for one upgraded to WebSocket, its messages as `.ws`. Structured
+bodies stay readable; streamed string payloads and markup are represented
+by size. DIR is made 0700, its files 0600; it must be new or
 empty, and may be neither a share nor inside one. The dump is an aid, not part of
 the audit log: nothing in it is hashed or chained. Filesystem traffic has
 its own dump, `--audit-level verbose`. With `--dump-payloads`,

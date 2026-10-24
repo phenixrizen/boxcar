@@ -27,7 +27,9 @@ const SECRET_STEMS: [&str; 9] = [
     "cookie",
 ];
 
-fn is_secret_key(key: &str) -> bool {
+/// Whether `key` contains one of the stems used to identify values that
+/// should be redacted. Matching is case-insensitive and deliberately broad.
+pub fn is_secret_key(key: &str) -> bool {
     let lower = key.to_lowercase();
     SECRET_STEMS.iter().any(|stem| lower.contains(stem))
 }

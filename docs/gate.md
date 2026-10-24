@@ -156,29 +156,29 @@ says why.
   the net thread never waits on the dump.
 - `http/<flow>-<stream>.req` and `.resp`: each decoded exchange of an
   inspected flow, by its `net.connect` flow id and stream: the start line,
-  the headers as the observer keeps them (a credential's value is already
-  gone, and the rest are scrubbed as free text, any URL in them losing its
+  the headers as the observer keeps them (a value under a credential-looking
+  header name is already gone, and the rest are scrubbed as free text;
+  absolute URLs and URI references in URL-bearing headers lose their
   credential query values as `http.request.path` does), with the request
   target's query values scrubbed the same way, a blank line, the decoded body
-  scrubbed by its type: JSON by key and in every string; an event stream
-  event by event as the observer reads it (its `data:` lines joined),
-  JSON lines line by line, data that is not JSON written as its size, and
-  a streamed fragment (anything under a `delta`, a `partial_json`)
-  written as its size, since a secret split across fragments is whole in
-  none of them; a body the observer did not keep whole (past 16 MiB, or
-  past its budget) written as its size;
-  other text through the free-text scrub, except markup (HTML, XML),
-  whose elements and attributes that scrub cannot read as keys; markup,
-  and a body that is not text, is not written, a line saying how many
-  bytes it was takes its place. A form
-  body (the shape of an OAuth token exchange) has its credential fields'
-  values replaced, a field's name read decoded (`%70assword` is
-  `password`; a name that does not decode counts as a credential's), and
-  the rest scrubbed as text.
+  scrubbed by its shape and type. JSON keeps its structure and is scrubbed
+  by key and in every string. An event stream is read event by event (its
+  `data:` lines joined), JSON lines are read line by line, and each string
+  payload in a streamed JSON item is written as its size while a `type`
+  discriminator is kept. Non-JSON stream data is also written as its size.
+  JSON, event-stream, form and markup shapes are recognized even when the
+  content type is missing or generic. Other text goes through the free-text
+  scrub. Markup (HTML, XML), a body that is not text, and a body the observer
+  did not keep whole (past 16 MiB, or past its budget) are not written; a line
+  saying how many bytes they held takes their place. A form body (the shape
+  of an OAuth token exchange) has its credential fields' values replaced; a
+  field's name is decoded and bracketed components are read before it is
+  classified, and the rest is scrubbed as text.
   The raw plaintext is not written: it would hold what the records never
   do. An exchange upgraded to WebSocket gets `http/<flow>-<stream>.ws` as
-  well: its messages one after another, each with its direction and size
-  and, for a text message, the text scrubbed the same way.
+  well: its messages one after another, each with its direction and size.
+  A JSON text message keeps its structure and sizes its string payloads;
+  other text messages use the same shape-aware body scrubber.
 
 DIR is made mode 0700 and every file 0600. It must be new or empty, so a
 run's dump is its own: each file is created where nothing was, never

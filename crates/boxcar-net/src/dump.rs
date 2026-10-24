@@ -23,14 +23,16 @@
 //! - `http/<flow>-<stream>.req` and `.resp`: each decoded exchange of an
 //!   inspected flow, written by the observer thread: the start line, the
 //!   headers as the observer keeps them (a credential header's value never
-//!   reaches it), a blank line, the decoded body, with a JSON body's
-//!   secret-looking fields and a form body's credential fields scrubbed.
+//!   reaches it), a blank line, the decoded body. JSON, event streams,
+//!   markup and forms are recognized by shape as well as content type;
+//!   other text takes the free-text scrubber and other bodies are represented
+//!   by size.
 //!   The raw plaintext is not written: it would hold the credentials the
 //!   records never do.
 //! - `http/<flow>-<stream>.ws`: the messages of an exchange upgraded to
 //!   WebSocket, one after another, each as a line naming the direction
-//!   (`c2s`, `s2c`) and the size, then the text (scrubbed as a JSON body
-//!   is) for a text message.
+//!   (`c2s`, `s2c`) and the size, then a scrubbed representation for a text
+//!   message. A JSON message keeps its structure and sizes its string payloads.
 //!
 //! The directory is made mode 0700, every file 0600, and it may be
 //! neither a share nor inside one, nor hold one: the audit directory's
@@ -504,8 +506,14 @@ pub fn append_ws(
         payload.len()
     )?;
     if text {
-        // A text message: JSON when it parses, text otherwise.
-        file.write_all(&scrubbed_body(None, payload))?;
+        // What the client sends is a whole message; what the server sends
+        // may be a piece of a reply.
+        let clean = if direction == "c2s" {
+            scrubbed_body(None, payload)
+        } else {
+            scrubbed_stream_body(payload)
+        };
+        file.write_all(&clean)?;
         file.write_all(b"\n")?;
     }
     file.flush()
@@ -526,13 +534,13 @@ const FORM_SECRETS: [&str; 10] = [
     "code",
 ];
 
-/// `body` as the dump writes it, never as it came: scrubbed by its
-/// content type, cut at [`EXCHANGE_FILE_LIMIT`] first.
+/// `body` as the dump writes it, never as it came: scrubbed by its shape
+/// and content type, cut at [`EXCHANGE_FILE_LIMIT`] first.
 ///
 /// - JSON: by key and in every string (`redact::scrub_deep`, the audit
 ///   log's rule for tool arguments).
 /// - An event stream, or newline-delimited JSON: line by line, each
-///   `data:` payload (or line) that is JSON as JSON, the rest as text.
+///   `data:` payload (or line) that is JSON as JSON, the rest by size.
 /// - A form (`application/x-www-form-urlencoded`, an OAuth token
 ///   exchange's shape): a credential field's value replaced, the others
 ///   scrubbed as text.
@@ -540,16 +548,45 @@ const FORM_SECRETS: [&str; 10] = [
 ///   an element or an attribute as a key; one line says how many bytes
 ///   it was.
 /// - Other text (`text/*`, JavaScript; or no type, valid UTF-8): through
-///   `redact::scrub_text`.
+///   `redact::scrub_text`. JSON, event streams, forms and markup are
+///   recognized by shape before this fallback, even without their type.
 /// - Anything else: not written; one line says how many bytes it was.
 pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
+    scrubbed_body_with(content_type, body, false)
+}
+
+/// A WebSocket text message as the dump writes it. A JSON message is one
+/// streamed item, so its string payloads are represented by size.
+fn scrubbed_stream_body(body: &[u8]) -> Vec<u8> {
+    scrubbed_body_with(None, body, true)
+}
+
+fn scrubbed_body_with(content_type: Option<&str>, body: &[u8], streamed: bool) -> Vec<u8> {
     let body = &body[..body.len().min(EXCHANGE_FILE_LIMIT)];
     let kind = content_type.unwrap_or("").trim().to_ascii_lowercase();
     let json_kind = kind == "application/json" || kind.ends_with("+json");
-    if json_kind || kind.is_empty() {
-        if let Some(clean) = json_text(body) {
-            return clean.into_bytes();
+    // A stream's label decides before its shape: one event or line of it
+    // is still a piece.
+    let lines_kind = kind == "application/x-ndjson"
+        || kind == "application/jsonl"
+        || kind == "application/json-seq";
+    if kind == "text/event-stream" || lines_kind {
+        let Ok(text) = std::str::from_utf8(body) else {
+            return format!("[{} bytes of {kind} not written]\n", body.len()).into_bytes();
+        };
+        return if lines_kind {
+            lines(text)
+        } else {
+            events(body)
         }
+        .into_bytes();
+    }
+    if let Some(clean) = json_text(body, streamed) {
+        return clean.into_bytes();
+    }
+    if json_kind {
+        // Said to be JSON and not: its member names cannot be read.
+        return format!("[{} bytes of {kind} that is not JSON]\n", body.len()).into_bytes();
     }
     let Ok(text) = std::str::from_utf8(body) else {
         return format!(
@@ -559,32 +596,17 @@ pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
         )
         .into_bytes();
     };
-    if kind == "text/event-stream" {
+    if looks_like_event_stream(text) {
         return events(body).into_bytes();
     }
-    if kind == "application/x-ndjson"
-        || kind == "application/jsonl"
-        || kind == "application/json-seq"
-    {
-        return lines(text).into_bytes();
+    if kind == "application/x-www-form-urlencoded" || looks_like_form(text) {
+        return form(text).into_bytes();
     }
-    if kind == "application/x-www-form-urlencoded" {
-        let fields: Vec<String> = text
-            .split('&')
-            .map(|field| match field.split_once('=') {
-                Some((name, _)) if form_name(name).is_none_or(|name| form_secret(&name)) => {
-                    format!("{name}=[redacted]")
-                }
-                Some((name, value)) => format!("{name}={}", scrub_text(value)),
-                None => scrub_text(field),
-            })
-            .collect();
-        return fields.join("&").into_bytes();
-    }
-    let markup = kind == "text/html"
+    let markup_kind = kind == "text/html"
         || kind == "text/xml"
         || kind == "application/xml"
         || kind.ends_with("+xml");
+    let markup = markup_kind || looks_like_markup(text);
     let textual = json_kind
         || kind.is_empty()
         || kind.starts_with("text/")
@@ -592,56 +614,126 @@ pub fn scrubbed_body(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
     if textual && !markup {
         return scrub_text(text).into_bytes();
     }
-    format!("[{} bytes of {kind} not written]\n", body.len()).into_bytes()
+    let description = if kind.is_empty() { "markup" } else { &kind };
+    format!("[{} bytes of {description} not written]\n", body.len()).into_bytes()
 }
 
-/// `bytes` as JSON scrubbed by key and in every string, its streamed
-/// fragments by their size only ([`without_fragments`]), if it is JSON.
-fn json_text(bytes: &[u8]) -> Option<String> {
+/// `bytes` as JSON scrubbed by key and in every string, if it is JSON.
+/// In a streamed item, every string is written by its size, whatever field
+/// carries it, but those of [`STREAM_WHOLE`]: a secret split across
+/// streamed pieces is in none of them whole, where no scrub finds it.
+fn json_text(bytes: &[u8], streamed: bool) -> Option<String> {
     let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
-    without_fragments(&mut value);
+    if streamed {
+        size_stream_strings(&mut value, false);
+    }
     boxcar_proto::redact::scrub_deep(&mut value);
     Some(value.to_string())
 }
 
-/// A streamed piece of a reply (anything under a `delta`, Anthropic's
-/// `partial_json`) is a fragment: a secret split across fragments is in
-/// none of them whole, where no scrub finds it. The dump writes each
-/// fragment's strings as their size; the whole values, where a reply
-/// gives them (a call's arguments when it is done, the full response),
-/// are written scrubbed.
-fn without_fragments(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                if key == "delta" || key == "partial_json" {
-                    sizes(child);
-                } else {
-                    without_fragments(child);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(without_fragments),
-        _ => {}
-    }
-}
+/// The fields of a streamed item that come whole, never in pieces: what
+/// the item is and what it belongs to (its kind, ids, model, role, how it
+/// ended). A tool's `name` is not one: Chat Completions streams it. They stay readable, scrubbed as the rest
+/// of a JSON body is.
+const STREAM_WHOLE: [&str; 10] = [
+    "type",
+    "object",
+    "id",
+    "item_id",
+    "call_id",
+    "model",
+    "role",
+    "status",
+    "stop_reason",
+    "finish_reason",
+];
 
-/// Every string in `value` but a `type` replaced by its size.
-fn sizes(value: &mut serde_json::Value) {
+/// String payloads in one streamed item, written by their size; those of
+/// [`STREAM_WHOLE`] kept so the sequence stays readable.
+fn size_stream_strings(value: &mut serde_json::Value, keep: bool) {
     match value {
-        serde_json::Value::String(text) => {
+        serde_json::Value::String(text) if !keep => {
             *text = format!("[{} bytes]", text.len());
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                if key != "type" {
-                    sizes(child);
-                }
+                size_stream_strings(child, STREAM_WHOLE.contains(&key.as_str()));
             }
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(sizes),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| size_stream_strings(item, false)),
         _ => {}
     }
+}
+
+/// Whether `text` has the line shape of a server-sent event stream.
+fn looks_like_event_stream(text: &str) -> bool {
+    // Every line a field (a name of field characters, then `:` or
+    // nothing), a comment or blank, and at least one `data` field. Names
+    // other than the four the format defines are ignored by a reader, as
+    // here.
+    let mut data = false;
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let field = line.split_once(':').map_or(line, |(field, _)| field);
+        if field.is_empty()
+            || !field
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            return false;
+        }
+        data |= field == "data";
+    }
+    data
+}
+
+/// Whether `text` has form fields with names that can be read without
+/// ambiguity. Values may contain any UTF-8 accepted by the form format.
+fn looks_like_form(text: &str) -> bool {
+    let name_ok = |name: &str| {
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b'.' | b'%' | b'+' | b'[' | b']')
+            })
+    };
+    let mut pairs = false;
+    for field in text.split('&') {
+        match field.split_once('=') {
+            Some((name, _)) if name_ok(name) => pairs = true,
+            Some(_) => return false,
+            None if field.is_empty() || name_ok(field) => {}
+            None => return false,
+        }
+    }
+    pairs
+}
+
+/// Whether `text` holds markup: an HTML or XML element anywhere.
+fn looks_like_markup(text: &str) -> bool {
+    // An element's or a declaration's start anywhere (`<a`, `</a`, `<!`,
+    // `<?`): a preamble before it changes nothing.
+    text.as_bytes().windows(2).any(|pair| {
+        pair[0] == b'<' && (pair[1].is_ascii_alphabetic() || matches!(pair[1], b'!' | b'?' | b'/'))
+    })
+}
+
+fn form(text: &str) -> String {
+    text.split('&')
+        .map(|field| match field.split_once('=') {
+            Some((name, _)) if form_name(name).is_none_or(|name| form_secret(&name)) => {
+                format!("{name}=[redacted]")
+            }
+            Some((name, value)) => format!("{name}={}", scrub_text(value)),
+            None => scrub_text(field),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// An event stream, event by event as the observer reads it (`data:`
@@ -662,7 +754,7 @@ fn events(body: &[u8]) -> String {
             out.push_str(&format!("id: {}\n", scrub_text(id)));
         }
         if !event.data.is_empty() {
-            let data = match json_text(event.data.as_bytes()) {
+            let data = match json_text(event.data.as_bytes(), true) {
                 Some(clean) => clean,
                 None if event.data.trim() == "[DONE]" => "[DONE]".to_owned(),
                 None => format!("[{} bytes]", event.data.len()),
@@ -685,7 +777,7 @@ fn lines(text: &str) -> String {
         let content = line.trim_end_matches(['\n', '\r']);
         let end = &line[content.len()..];
         if !content.trim().is_empty() {
-            match json_text(content.trim().as_bytes()) {
+            match json_text(content.trim().as_bytes(), true) {
                 Some(clean) => out.push_str(&clean),
                 None => out.push_str(&format!("[{} bytes]", content.len())),
             }
@@ -725,18 +817,94 @@ fn form_name(name: &str) -> Option<String> {
 /// Whether a form field's name names a credential.
 fn form_secret(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    FORM_SECRETS.contains(&lower.as_str()) || is_credential(&lower.replace('_', "-"))
+    lower
+        .split(['[', ']'])
+        .filter(|part| !part.is_empty())
+        .any(|part| FORM_SECRETS.contains(&part) || is_credential(&part.replace('_', "-")))
 }
 
 /// Headers whose value is a URL, scrubbed as a request target is.
-pub const URL_HEADERS: [&str; 4] = ["location", "content-location", "referer", "origin"];
+pub const URL_HEADERS: [&str; 5] = [
+    "location",
+    "content-location",
+    "referer",
+    "origin",
+    "destination",
+];
+
+/// A `Link` value with each angle-bracketed URI reference scrubbed as a
+/// request target and the rest scrubbed as text.
+fn link_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open + 1..].find('>').map(|at| open + 1 + at) else {
+            break;
+        };
+        out.push_str(&scrub_text(&rest[..open + 1]));
+        out.push_str(&scrub_target(&rest[open + 1..close]));
+        out.push('>');
+        rest = &rest[close + 1..];
+    }
+    out.push_str(&scrub_text(rest));
+    out
+}
+
+/// A `Refresh` value with its `url = URI-reference` value scrubbed as a
+/// request target and the delay and separators scrubbed as text.
+fn refresh_text(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let Some(after) = lower.match_indices("url").find_map(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
+            return None;
+        }
+        let mut after = at + 3;
+        while lower
+            .as_bytes()
+            .get(after)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            after += 1;
+        }
+        (lower.as_bytes().get(after) == Some(&b'=')).then_some(after + 1)
+    }) else {
+        return scrub_text(value);
+    };
+    let mut start = after;
+    while value
+        .as_bytes()
+        .get(start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        start += 1;
+    }
+    let quote = value
+        .as_bytes()
+        .get(start)
+        .copied()
+        .filter(|b| matches!(b, b'\'' | b'"'));
+    let target_start = start + usize::from(quote.is_some());
+    let target_end = quote
+        .and_then(|quote| {
+            value.as_bytes()[target_start..]
+                .iter()
+                .position(|&byte| byte == quote)
+                .map(|end| target_start + end)
+        })
+        .unwrap_or(value.len());
+    let mut out = scrub_text(&value[..target_start]);
+    out.push_str(&scrub_target(&value[target_start..target_end]));
+    out.push_str(&scrub_text(&value[target_end..]));
+    out
+}
 
 /// The head text of a request or response as the dump writes it: the
 /// start line, then each header as `name: value`, each line ending in
 /// CRLF. `headers` are the observer's, which never hold a credential's
-/// value; each value is also scrubbed as free text, and a header that
-/// carries a URL ([`URL_HEADERS`]) as a request target is (its query
-/// values kept only when short, plain and under an ordinary name).
+/// value; each value is also scrubbed as free text. A header that carries a
+/// URL ([`URL_HEADERS`]) is scrubbed as a request target, as are URI
+/// references inside `Link` and `Refresh` values.
 pub fn head_text<'a>(
     start_line: &str,
     headers: impl Iterator<Item = (&'a str, &'a [u8])>,
@@ -746,10 +914,15 @@ pub fn head_text<'a>(
     text.push_str("\r\n");
     for (name, value) in headers {
         let value = String::from_utf8_lossy(value);
+        let lower = name.to_ascii_lowercase();
         text.push_str(name);
         text.push_str(": ");
-        if URL_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        if URL_HEADERS.contains(&lower.as_str()) {
             text.push_str(&scrub_target(value.trim()));
+        } else if lower == "link" {
+            text.push_str(&link_text(&value));
+        } else if lower == "refresh" {
+            text.push_str(&refresh_text(&value));
         } else {
             text.push_str(&scrub_text(&value));
         }
@@ -1116,24 +1289,143 @@ mod tests {
         assert!(text.contains("content-type: text/html\r\n"), "{text}");
     }
 
-    /// A secret split across streamed fragments is in none of them in
-    /// the dump: fragments are written as their size.
     #[test]
-    fn streamed_fragments_are_written_as_their_size() {
+    fn uri_reference_headers_scrub_query_values() {
+        let headers = [
+            ("Link", &b"</next?sig=abc>; rel=next"[..]),
+            ("link", &b"<//cdn.example/item?key=k1>; rel=preload"[..]),
+            ("Refresh", &b"0; url=?code=c1&view=full"[..]),
+            ("Destination", &b"/copy?state=s1&part=2"[..]),
+        ];
+        let text = head_text("HTTP/1.1 200", headers.into_iter());
+        for value in ["sig=abc", "key=k1", "code=c1", "state=s1"] {
+            assert!(!text.contains(value), "{text}");
+        }
+        assert!(text.contains("view=full"), "{text}");
+        assert!(text.contains("part=2"), "{text}");
+    }
+
+    #[test]
+    fn streamed_strings_are_written_as_their_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[]).unwrap();
         let mut sse = String::new();
         for part in ["{\\\"password\\\": \\\"", "demo-pass", "\\\"}"] {
             sse.push_str(&format!(
-                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{part}\"}}}}\n\n"
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"piece\":{{\"type\":\"input_json_delta\",\"content\":\"{part}\"}}}}\n\n"
             ));
         }
-        let out =
-            String::from_utf8(scrubbed_body(Some("text/event-stream"), sse.as_bytes())).unwrap();
+        write_exchange(
+            &dir,
+            4,
+            1,
+            false,
+            "HTTP/1.1 200\r\n",
+            Some("text/event-stream"),
+            Ok(sse.as_bytes()),
+        )
+        .unwrap();
+        let out = fs::read_to_string(dir.exchange_file(4, 1, false)).unwrap();
         assert!(!out.contains("demo-pass"), "{out}");
         assert!(out.contains("\"type\":\"input_json_delta\""), "{out}");
         assert!(out.contains("[9 bytes]"), "{out}");
-        let ws = br#"{"type":"response.function_call_arguments.delta","delta":"demo-pass"}"#;
-        let out = String::from_utf8(scrubbed_body(None, ws)).unwrap();
+        let ws = br#"{"type":"response.output.delta","piece":"demo-pass"}"#;
+        append_ws(&dir, 4, 2, "s2c", true, ws).unwrap();
+        let out = fs::read_to_string(dir.ws_file(4, 2)).unwrap();
         assert!(!out.contains("demo-pass"), "{out}");
+        assert!(out.contains("\"type\":\"response.output.delta\""), "{out}");
+        assert!(out.contains("\"piece\":\"[9 bytes]\""), "{out}");
+        // What an item is stays readable; its pieces do not.
+        let ws = br#"{"type":"response.output_text.delta","item_id":"msg_1","model":"m-1","delta":"demo-pass"}"#;
+        append_ws(&dir, 4, 3, "s2c", true, ws).unwrap();
+        let out = fs::read_to_string(dir.ws_file(4, 3)).unwrap();
+        assert!(out.contains("\"item_id\":\"msg_1\""), "{out}");
+        assert!(out.contains("\"model\":\"m-1\""), "{out}");
+        assert!(out.contains("\"delta\":\"[9 bytes]\""), "{out}");
+    }
+
+    #[test]
+    fn shapes_are_read_as_their_readers_read_them() {
+        // A tool's name streamed in pieces is sized like any piece.
+        let chunk = br#"{"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"function":{"name":"plain-value"}}]}}]}"#;
+        let out = String::from_utf8(scrubbed_body(Some("application/x-ndjson"), chunk)).unwrap();
+        assert!(!out.contains("plain-value"), "{out}");
+        assert!(
+            out.contains("\"object\":\"chat.completion.chunk\""),
+            "{out}"
+        );
+        // Said to be JSON and not: only its size.
+        let broken = b"{\"pass\\u0077ord\": \"plain-value\"";
+        let out = String::from_utf8(scrubbed_body(Some("application/json"), broken)).unwrap();
+        assert!(!out.contains("plain-value"), "{out}");
+        // A field the format does not define is still an event stream.
+        let sse = b"x-note: 1\ndata: {\"type\":\"t\",\"piece\":\"plain-value\"}\n\n";
+        let out = String::from_utf8(scrubbed_body(Some("text/plain"), sse)).unwrap();
+        assert!(!out.contains("plain-value"), "{out}");
+        assert!(out.contains("\"type\":\"t\""), "{out}");
+        // A form with a bare field is still a form.
+        let out =
+            String::from_utf8(scrubbed_body(None, b"flag&user[password]=plain-value")).unwrap();
+        assert!(!out.contains("plain-value"), "{out}");
+        // Markup after a preamble is markup.
+        let page = b"note: <form><input name=password value=plain-value></form>";
+        let out = String::from_utf8(scrubbed_body(Some("text/plain"), page)).unwrap();
+        assert!(!out.contains("plain-value"), "{out}");
+    }
+
+    #[test]
+    fn a_websocket_request_is_scrubbed_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[]).unwrap();
+        let request = br#"{"type":"response.create","input":"say hello","api_key":"plain-value"}"#;
+        append_ws(&dir, 4, 2, "c2s", true, request).unwrap();
+        let out = fs::read_to_string(dir.ws_file(4, 2)).unwrap();
+        assert!(out.contains("\"input\":\"say hello\""), "{out}");
+        assert!(!out.contains("plain-value"), "{out}");
+    }
+
+    #[test]
+    fn untyped_bodies_are_scrubbed_by_shape() {
+        let markup = b"<login><password>plain-value</password></login>";
+        for kind in [None, Some("text/plain"), Some("application/octet-stream")] {
+            let out = String::from_utf8(scrubbed_body(kind, markup)).unwrap();
+            assert!(!out.contains("plain-value"), "{out}");
+            assert!(out.contains(&format!("[{} bytes", markup.len())), "{out}");
+        }
+
+        let event = b"event: update\ndata: {\"type\":\"update\",\"piece\":\"plain-value\"}\n\n";
+        let out = String::from_utf8(scrubbed_body(Some("text/plain"), event)).unwrap();
+        assert!(out.contains("event: update"), "{out}");
+        assert!(out.contains("\"type\":\"update\""), "{out}");
+        assert!(!out.contains("plain-value"), "{out}");
+
+        let json = br#"{"type":"update","password":"plain-value"}"#;
+        let out = String::from_utf8(scrubbed_body(Some("text/plain"), json)).unwrap();
+        assert!(out.contains("\"type\":\"update\""), "{out}");
+        assert!(!out.contains("plain-value"), "{out}");
+
+        let form = scrubbed_body(
+            Some("text/plain"),
+            b"user[name]=me&user[password]=plain-value",
+        );
+        assert_eq!(form, b"user[name]=me&user[password]=[redacted]".as_slice());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DumpDir::prepare(&tmp.path().join("dump"), &[]).unwrap();
+        append_ws(&dir, 8, 1, "s2c", true, markup).unwrap();
+        let out = fs::read_to_string(dir.ws_file(8, 1)).unwrap();
+        assert!(!out.contains("plain-value"), "{out}");
+        assert!(out.contains(&format!("[{} bytes", markup.len())), "{out}");
+    }
+
+    #[test]
+    fn bracketed_form_names_are_recognized() {
+        let form = b"user[password]=plain-value&password[]=second&account%5Bpassword%5D=third&profile[name]=boxcar";
+        let out = scrubbed_body(Some("application/x-www-form-urlencoded"), form);
+        assert_eq!(
+            out,
+            b"user[password]=[redacted]&password[]=[redacted]&account%5Bpassword%5D=[redacted]&profile[name]=boxcar".as_slice()
+        );
     }
 
     #[test]
@@ -1148,11 +1440,12 @@ mod tests {
         let out = scrubbed_body("application/json; charset=utf-8".split(';').next(), json);
         assert!(!String::from_utf8_lossy(&out).contains("at-1"));
         assert!(String::from_utf8_lossy(&out).contains("\"ok\":true"));
+        // Said to be JSON and not: only its size.
         let bad_json = b"{not json, \"token\": \"t-1\"";
         let out = scrubbed_body(Some("application/json"), bad_json);
         assert_eq!(
             String::from_utf8_lossy(&out),
-            "{not json, \"token\": \"[redacted]\""
+            "[25 bytes of application/json that is not JSON]\n"
         );
         let nested = br#"{"input":{"command":"curl -H 'Authorization: Bearer q1' u"}}"#;
         let out = String::from_utf8(scrubbed_body(Some("application/json"), nested)).unwrap();
