@@ -1522,6 +1522,24 @@
         }
       }
     },
+    "NetDegraded": {
+      "description": "`net.degraded`: a network-side worker no longer provides part of the session's record or diagnostic output.",
+      "type": "object",
+      "required": [
+        "component",
+        "reason"
+      ],
+      "properties": {
+        "component": {
+          "description": "`observer` for inspected plaintext, or `dump` for the optional packet and exchange dump.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "`panic` or `shutdown_timeout`.",
+          "type": "string"
+        }
+      }
+    },
     "NetDhcp": {
       "description": "`net.dhcp`: the network stack answered a guest DHCP message with the session's static lease.",
       "type": "object",
@@ -2333,6 +2351,24 @@
               "type": "string",
               "enum": [
                 "net.drop"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/NetDegraded"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "net.degraded"
               ]
             }
           }

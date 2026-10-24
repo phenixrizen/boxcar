@@ -45,12 +45,12 @@ pub use payloads::{
     Finding, FindingCategory, FsClose, FsCopyUp, FsCreate, FsDenied, FsFallocate, FsIo, FsLink,
     FsMkdir, FsMknod, FsMount, FsOpen, FsPathOp, FsRename, FsSetattr, FsSymlink, FsXattr,
     Hardening, HashStatus, HttpDegraded, HttpRequest, HttpResponse, ImageRef, LandlockStatus,
-    LlmRequest, LlmResponse, NetClose, NetConnect, NetDhcp, NetDns, NetDrop, NetInspect, NetTls,
-    NetUdp, OpResult, PolicyChanged, PolicyException, PolicyLoaded, ProcConnectAttempt, ProcExec,
-    ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd,
-    ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo, ProgramStatus, SeccompMode,
-    SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef, SpanEffects, ToolClose, ToolOpen,
-    Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    LlmRequest, LlmResponse, NetClose, NetConnect, NetDegraded, NetDhcp, NetDns, NetDrop,
+    NetInspect, NetTls, NetUdp, OpResult, PolicyChanged, PolicyException, PolicyLoaded,
+    ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
+    ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo,
+    ProgramStatus, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef,
+    SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
 };
 
 /// The value of a record's `v` field.
@@ -448,6 +448,8 @@ pub enum Payload {
     NetClose(NetClose),
     #[serde(rename = "net.drop")]
     NetDrop(NetDrop),
+    #[serde(rename = "net.degraded")]
+    NetDegraded(NetDegraded),
     #[serde(rename = "net.udp")]
     NetUdp(NetUdp),
     #[serde(rename = "vsock.connect")]
@@ -548,6 +550,7 @@ impl Payload {
             Payload::NetInspect(_) => "net.inspect",
             Payload::NetClose(_) => "net.close",
             Payload::NetDrop(_) => "net.drop",
+            Payload::NetDegraded(_) => "net.degraded",
             Payload::NetUdp(_) => "net.udp",
             Payload::VsockConnect(_) => "vsock.connect",
             Payload::VsockClose(_) => "vsock.close",
@@ -618,6 +621,7 @@ impl Payload {
             | Payload::NetInspect(_)
             | Payload::NetClose(_)
             | Payload::NetDrop(_)
+            | Payload::NetDegraded(_)
             | Payload::NetUdp(_) => Source::Net,
             Payload::VsockConnect(_) | Payload::VsockClose(_) => Source::Vsock,
             Payload::SessionStart(_) | Payload::SessionExit(_) => Source::Session,
@@ -672,7 +676,7 @@ impl Payload {
 /// The wire names of the typed payloads ([`Payload`]), in schema order: the
 /// kinds a log of this version can hold. A reader meets other kinds in a
 /// log written by a newer version.
-pub const KINDS: [&str; 62] = [
+pub const KINDS: [&str; 63] = [
     "vmm.start",
     "vmm.stop",
     "fs.mount",
@@ -704,6 +708,7 @@ pub const KINDS: [&str; 62] = [
     "net.inspect",
     "net.close",
     "net.drop",
+    "net.degraded",
     "net.udp",
     "vsock.connect",
     "vsock.close",
@@ -1288,6 +1293,13 @@ mod tests {
                     count: 12,
                 }),
                 json!({"reason": "ipv6", "count": 12}),
+            ),
+            (
+                Payload::NetDegraded(NetDegraded {
+                    component: "observer".into(),
+                    reason: "shutdown_timeout".into(),
+                }),
+                json!({"component": "observer", "reason": "shutdown_timeout"}),
             ),
             (
                 Payload::NetUdp(NetUdp {
@@ -2366,6 +2378,21 @@ mod tests {
         let back = Payload::from_record(&record(&kind, Source::Gate, data.clone())).unwrap();
         assert_eq!(back, payload);
         assert!(serde_json::to_vec(&data).unwrap().len() < 256);
+        assert!(serde_json::to_vec(&data).unwrap().len() < crate::limits::MAX_RECORD_BYTES);
+    }
+
+    /// `net.degraded` uses fixed component and reason labels, so its largest
+    /// form has ample room in one record.
+    #[test]
+    fn a_net_degraded_record_fits_its_limit() {
+        let payload = Payload::NetDegraded(NetDegraded {
+            component: "observer".into(),
+            reason: "shutdown_timeout".into(),
+        });
+        let (kind, data) = payload.into_parts();
+        let back = Payload::from_record(&record(&kind, Source::Net, data.clone())).unwrap();
+        assert_eq!(back, payload);
+        assert!(serde_json::to_vec(&data).unwrap().len() < 128);
         assert!(serde_json::to_vec(&data).unwrap().len() < crate::limits::MAX_RECORD_BYTES);
     }
 

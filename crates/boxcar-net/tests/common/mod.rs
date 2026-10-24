@@ -63,6 +63,22 @@ pub fn harness_gate(
     harness_gate_dump(policy, gate, None)
 }
 
+/// [`harness_gate`] with a TCP flow cap of its own.
+pub fn harness_gate_flow_cap(
+    policy: Policy,
+    gate: Option<(Arc<boxcar_net::InspectConfig>, boxcar_net::gate::Observer)>,
+    flow_cap: usize,
+) -> Harness {
+    let mut h = harness_config(policy, |cfg| cfg.tcp.flow_cap = flow_cap);
+    let mut cfg = NetConfig::default();
+    cfg.tcp.flow_cap = flow_cap;
+    cfg.dns_upstreams = vec![h.upstream.local_addr().unwrap()];
+    h.stack = NetStack::new(cfg, h.sink.clone(), Arc::clone(&h.policy))
+        .unwrap()
+        .with_inspect(gate);
+    h
+}
+
 /// [`harness_gate`] with the frame dump.
 pub fn harness_gate_dump(
     policy: Policy,

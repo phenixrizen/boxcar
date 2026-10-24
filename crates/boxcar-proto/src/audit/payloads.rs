@@ -780,6 +780,18 @@ pub struct NetDrop {
     pub count: u64,
 }
 
+/// `net.degraded`: a network-side worker no longer provides part of the
+/// session's record or diagnostic output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct NetDegraded {
+    /// `observer` for inspected plaintext, or `dump` for the optional packet
+    /// and exchange dump.
+    pub component: String,
+    /// `panic` or `shutdown_timeout`.
+    pub reason: String,
+}
+
 /// `net.udp`: the first datagram of a guest UDP flow, and the policy's
 /// verdict on it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -16,19 +16,24 @@
 //! end. A flow whose `Open` still finds no room is not observed: its
 //! plaintext is counted dropped from then on. A `Close` that finds no room
 //! leaves its flow with the observer, which holds at most
-//! [`MAX_OBSERVED`] and records the oldest as it stands to make room.
+//! [`MAX_OBSERVED`] and records an ended flow as unclosed to make room.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::SocketAddrV4;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use boxcar_audit::{AuditSink, DeclaredArgs};
+use boxcar_proto::{NetDegraded, Payload};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use crate::dump::DumpDir;
+use crate::dump::{DumpDir, ThreadJoin};
 use crate::http::Retained;
 
 use super::exchange::Observation;
@@ -39,9 +44,8 @@ pub const CHUNK_MAX: usize = 64 * 1024;
 pub const CHANNEL_CAP: usize = 4096;
 /// The places at the channel's end only `Open` and `Close` may take.
 pub const CONTROL_RESERVE: usize = 1024;
-/// The most flows the observer holds open; past it the oldest is recorded
-/// as it stands and let go. Above the TCP flow cap, so only flows whose
-/// `Close` was lost are ever let go this way.
+/// The most flows the observer holds open. Above the TCP flow cap, so an
+/// ended flow whose `Close` was lost can make room for each new one.
 pub const MAX_OBSERVED: usize = 8192;
 
 /// Which way plaintext moved.
@@ -52,6 +56,62 @@ pub enum Direction {
     /// From the host to the guest: a response.
     ToGuest,
 }
+
+/// Lifecycle state shared by a flow's `Open` and its net-thread state. The
+/// loss counts and ended mark remain visible when their messages cannot be
+/// queued.
+#[derive(Clone, Default)]
+pub struct ObservationState {
+    inner: Arc<SharedState>,
+}
+
+#[derive(Default)]
+struct SharedState {
+    losses: [AtomicU64; 2],
+    ended: AtomicBool,
+}
+
+impl ObservationState {
+    fn count_loss(&self, dir: Direction) {
+        let _ = self.inner.losses[dir.index()].fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |count| Some(count.saturating_add(1)),
+        );
+    }
+
+    fn losses(&self) -> [u64; 2] {
+        [
+            self.inner.losses[0].load(Ordering::Acquire),
+            self.inner.losses[1].load(Ordering::Acquire),
+        ]
+    }
+
+    fn end(&self) {
+        self.inner.ended.store(true, Ordering::Release);
+    }
+
+    fn ended(&self) -> bool {
+        self.inner.ended.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for ObservationState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObservationState")
+            .field("losses", &self.losses())
+            .field("ended", &self.ended())
+            .finish()
+    }
+}
+
+impl PartialEq for ObservationState {
+    fn eq(&self, other: &Self) -> bool {
+        self.losses() == other.losses() && self.ended() == other.ended()
+    }
+}
+
+impl Eq for ObservationState {}
 
 impl Direction {
     /// As the dump names it.
@@ -84,6 +144,8 @@ pub enum Message {
         alpn: Option<String>,
         /// Whether the flow was TLS (ended here) or plain HTTP.
         tls: bool,
+        /// Lifecycle state shared with the flow until it ends.
+        state: ObservationState,
     },
     /// Plaintext, in order within its direction.
     Data {
@@ -93,10 +155,8 @@ pub enum Message {
     },
     /// A chunk was dropped before this: the direction's stream has a hole.
     Lost { flow: u64, dir: Direction },
-    /// The flow ended; nothing more comes for it. `lost` says, for each
-    /// direction (to the host, to the guest), that a chunk was dropped
-    /// after the last message that went: the stream ends with a hole.
-    Close { flow: u64, lost: [bool; 2] },
+    /// The flow ended; nothing more comes for it.
+    Close { flow: u64 },
 }
 
 impl Message {
@@ -180,6 +240,9 @@ pub struct Observed {
     closed: bool,
     /// The flow's `Open` found no room: its plaintext is all dropped.
     refused: bool,
+    /// Also carried by `Open`, so observer-side finalization can recover
+    /// lifecycle state whose message did not fit in the channel.
+    state: ObservationState,
 }
 
 impl Observed {
@@ -200,7 +263,9 @@ impl Observed {
         }
         if self.lost[i] {
             match observer.send(Message::Lost { flow, dir }) {
-                Sent::Ok => self.lost[i] = false,
+                Sent::Ok => {
+                    self.lost[i] = false;
+                }
                 Sent::Dropped => {
                     self.dropped[i] = self.dropped[i].saturating_add(bytes.len() as u64);
                     return bytes.len() as u64;
@@ -221,7 +286,10 @@ impl Observed {
             }) {
                 Sent::Ok => sent += chunk.len(),
                 Sent::Dropped => {
-                    self.lost[i] = true;
+                    if !self.lost[i] {
+                        self.lost[i] = true;
+                        self.state.count_loss(dir);
+                    }
                     break;
                 }
                 Sent::Closed => {
@@ -244,6 +312,9 @@ impl Observed {
     /// Announces the flow (`msg` is its `Open`). Whether the observer will
     /// hear of it: if not, its plaintext is counted dropped from here.
     pub fn open(&mut self, observer: &Observer, msg: Message) -> bool {
+        if let Message::Open { state, .. } = &msg {
+            self.state = state.clone();
+        }
         match observer.send(msg) {
             Sent::Ok => true,
             Sent::Dropped => {
@@ -261,13 +332,11 @@ impl Observed {
     /// queued is dropped: the observer ends the flow at the VM's stop, or
     /// sooner past [`MAX_OBSERVED`].
     pub fn close(&mut self, observer: &Observer, flow: u64) -> Sent {
+        self.state.end();
         if self.closed {
             return Sent::Closed;
         }
-        let sent = observer.send(Message::Close {
-            flow,
-            lost: self.lost,
-        });
+        let sent = observer.send(Message::Close { flow });
         if sent == Sent::Closed {
             self.closed = true;
         }
@@ -279,7 +348,7 @@ impl Observed {
 /// long as a sender lives.
 pub struct ObserverThread {
     done: mpsc::Receiver<()>,
-    thread: JoinHandle<()>,
+    thread: JoinHandle<bool>,
 }
 
 impl ObserverThread {
@@ -297,27 +366,82 @@ impl ObserverThread {
         let thread = thread::Builder::new()
             .name("gate-observe".into())
             .spawn(move || {
-                boxcar_confine::at_thread_start();
                 // Dropped when the thread ends, however it ends.
                 let _stopped = stopped;
-                run(
-                    rx,
-                    &sink,
-                    &trace_id,
-                    dump.as_ref(),
-                    declared.as_ref(),
-                    keep_args,
-                );
+                let clean = guarded_run(|| {
+                    boxcar_confine::at_thread_start();
+                    run(
+                        rx,
+                        &sink,
+                        &trace_id,
+                        dump.as_ref(),
+                        declared.as_ref(),
+                        keep_args,
+                        MAX_OBSERVED,
+                    );
+                });
+                if !clean {
+                    // In the log when it happens; the join says so too.
+                    crate::audit::record(
+                        &sink,
+                        Payload::NetDegraded(NetDegraded {
+                            component: "observer".into(),
+                            reason: "panic".into(),
+                        }),
+                    );
+                }
+                clean
             })?;
         Ok(ObserverThread { done, thread })
     }
 
-    /// Waits at most `limit` for the thread to end, then joins it; a thread
-    /// still busy is left behind. Whether it was joined.
-    pub fn join(self, limit: Duration) -> bool {
+    /// Waits at most `limit` for the thread to end, then distinguishes a
+    /// clean join from a timeout or panic. A busy thread is left behind.
+    pub fn join(self, limit: Duration) -> ThreadJoin {
         match self.done.recv_timeout(limit) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => self.thread.join().is_ok(),
-            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => match self.thread.join() {
+                Ok(true) => ThreadJoin::Joined,
+                Ok(false) | Err(_) => ThreadJoin::Panicked,
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => ThreadJoin::TimedOut,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocked() -> (ObserverThread, mpsc::Sender<()>) {
+        let (stopped, done) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let _stopped = stopped;
+            let _ = wait.recv();
+            true
+        });
+        (ObserverThread { done, thread }, release)
+    }
+}
+
+/// Contains the observer's whole thread body. Unwinding drops `rx`, and every
+/// later plaintext send is counted lost by the net thread; the join reports
+/// the panic to device shutdown for recording.
+fn guarded_run(work: impl FnOnce()) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(work)).is_ok()
+}
+
+struct ObservedFlow {
+    observation: Observation,
+    state: ObservationState,
+    applied_losses: [u64; 2],
+}
+
+impl ObservedFlow {
+    fn apply_pending_losses(&mut self, now: Instant, out: &mut Vec<super::exchange::Emit>) {
+        for (dir, (counted, applied)) in [Direction::ToHost, Direction::ToGuest]
+            .into_iter()
+            .zip(self.state.losses().into_iter().zip(self.applied_losses))
+        {
+            if counted > applied {
+                self.observation.lost(dir, now, out);
+            }
         }
     }
 }
@@ -325,8 +449,8 @@ impl ObserverThread {
 /// The observer's work: each open flow's HTTP exchanges
 /// ([`Observation`]), whose records go into the log with the blocking
 /// emit (a full writer stalls this thread, never the net thread). At the
-/// end, when the senders are gone, what is still open is recorded as it
-/// stands.
+/// end, when the senders are gone, what is still open is recorded as
+/// unclosed.
 fn run(
     rx: Receiver<Message>,
     sink: &AuditSink,
@@ -334,8 +458,9 @@ fn run(
     dump: Option<&DumpDir>,
     declared: Option<&DeclaredArgs>,
     keep_args: bool,
+    max_observed: usize,
 ) {
-    let mut flows: HashMap<u64, Observation> = HashMap::new();
+    let mut flows: HashMap<u64, ObservedFlow> = HashMap::new();
     // One budget for what every flow keeps.
     let retained = Retained::default();
     let mut out = Vec::new();
@@ -347,44 +472,60 @@ fn run(
                 name,
                 alpn,
                 tls,
+                state,
             }) => {
-                if flows.len() >= MAX_OBSERVED {
-                    if let Some(oldest) = flows.keys().min().copied() {
-                        if let Some(mut observation) = flows.remove(&oldest) {
-                            observation.close(Instant::now(), &mut out);
+                if flows.len() >= max_observed {
+                    // A flow the net thread has ended goes first; the oldest
+                    // only if none has, so the map stays bounded.
+                    let ended = flows
+                        .iter()
+                        .filter_map(|(&flow, observed)| observed.state.ended().then_some(flow))
+                        .min();
+                    if let Some(gone) = ended.or_else(|| flows.keys().min().copied()) {
+                        if let Some(mut observed) = flows.remove(&gone) {
+                            finish_unclosed(&mut observed, Instant::now(), &mut out);
                         }
                     }
                 }
                 flows.insert(
                     flow,
-                    Observation::new(flow, dst, name, alpn.as_deref(), tls, trace_id)
+                    ObservedFlow {
+                        observation: Observation::new(
+                            flow,
+                            dst,
+                            name,
+                            alpn.as_deref(),
+                            tls,
+                            trace_id,
+                        )
                         .with_dump(dump.cloned())
                         .with_declared(declared.cloned())
                         .with_keep_args(keep_args)
                         .with_retained(retained.clone()),
+                        state,
+                        applied_losses: [0; 2],
+                    },
                 );
             }
             Ok(Message::Data { flow, dir, bytes }) => {
-                if let Some(observation) = flows.get_mut(&flow) {
-                    observation.data(dir, &bytes, Instant::now(), &mut out);
+                if let Some(observed) = flows.get_mut(&flow) {
+                    observed
+                        .observation
+                        .data(dir, &bytes, Instant::now(), &mut out);
                 }
             }
             Ok(Message::Lost { flow, dir }) => {
-                if let Some(observation) = flows.get_mut(&flow) {
-                    observation.lost(dir, Instant::now(), &mut out);
+                if let Some(observed) = flows.get_mut(&flow) {
+                    observed.observation.lost(dir, Instant::now(), &mut out);
+                    let applied = &mut observed.applied_losses[dir.index()];
+                    *applied = applied.saturating_add(1);
                 }
             }
-            Ok(Message::Close { flow, lost }) => {
-                if let Some(mut observation) = flows.remove(&flow) {
-                    for (dir, lost) in [Direction::ToHost, Direction::ToGuest]
-                        .into_iter()
-                        .zip(lost)
-                    {
-                        if lost {
-                            observation.lost(dir, Instant::now(), &mut out);
-                        }
-                    }
-                    observation.close(Instant::now(), &mut out);
+            Ok(Message::Close { flow }) => {
+                if let Some(mut observed) = flows.remove(&flow) {
+                    let now = Instant::now();
+                    observed.apply_pending_losses(now, &mut out);
+                    observed.observation.close(now, &mut out);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -395,12 +536,22 @@ fn run(
         }
     }
     let now = Instant::now();
-    for (_, mut observation) in flows.drain() {
-        observation.close(now, &mut out);
+    for (_, mut observed) in flows.drain() {
+        finish_unclosed(&mut observed, now, &mut out);
     }
     for emit in out.drain(..) {
         crate::audit::record_in_span(sink, emit.payload, emit.span);
     }
+}
+
+fn finish_unclosed(
+    observed: &mut ObservedFlow,
+    now: Instant,
+    out: &mut Vec<super::exchange::Emit>,
+) {
+    observed.apply_pending_losses(now, out);
+    observed.observation.unclosed(now, out);
+    observed.observation.close(now, out);
 }
 
 #[cfg(test)]
@@ -414,12 +565,17 @@ mod tests {
     }
 
     fn open_msg(flow: u64) -> Message {
+        open_msg_with_state(flow, ObservationState::default())
+    }
+
+    fn open_msg_with_state(flow: u64, state: ObservationState) -> Message {
         Message::Open {
             flow,
             dst: dst(),
             name: None,
             alpn: None,
             tls: true,
+            state,
         }
     }
 
@@ -612,7 +768,7 @@ mod tests {
         drop(observer);
         let thread =
             ObserverThread::spawn(rx, sink, "trace-test".into(), None, None, true).unwrap();
-        assert!(thread.join(Duration::from_secs(5)));
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
         writer.close().unwrap();
         let response = boxcar_audit::LogReader::open(&session_dir)
             .unwrap()
@@ -621,6 +777,228 @@ mod tests {
             .find(|r| r.kind == "http.response")
             .unwrap();
         assert_eq!(response.data["degraded"], "lost", "{:?}", response.data);
+    }
+
+    /// A close that has no channel room leaves an explicitly unclosed flow,
+    /// while its last pending loss still reaches the response record.
+    #[test]
+    fn a_dropped_close_keeps_loss_count_and_marks_the_flow_unclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            dir.path().join("data"),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let (observer, rx) = Observer::with_capacity(4);
+        let mut flow = Observed::default();
+        assert!(flow.open(&observer, open_msg(1)));
+        assert_eq!(
+            flow.data(
+                &observer,
+                1,
+                Direction::ToHost,
+                b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            ),
+            0
+        );
+        assert_eq!(
+            flow.data(
+                &observer,
+                1,
+                Direction::ToGuest,
+                b"HTTP/1.1 200 OK\r\n\r\nstart",
+            ),
+            0
+        );
+        assert_eq!(observer.send(open_msg(2)), Sent::Ok);
+        assert_eq!(flow.data(&observer, 1, Direction::ToGuest, b"missing"), 7);
+        assert_eq!(flow.close(&observer, 1), Sent::Dropped);
+        drop(observer);
+
+        let thread =
+            ObserverThread::spawn(rx, sink, "trace-test".into(), None, None, true).unwrap();
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
+        writer.close().unwrap();
+        let records: Vec<_> = boxcar_audit::LogReader::open(&session_dir)
+            .unwrap()
+            .records()
+            .map(Result::unwrap)
+            .collect();
+        let response = records
+            .iter()
+            .find(|r| r.kind == "http.response" && r.data["flow"] == 1)
+            .unwrap();
+        assert_eq!(response.data["degraded"], "lost", "{:?}", response.data);
+        assert!(records.iter().any(|r| {
+            r.kind == "http.degraded" && r.data["flow"] == 1 && r.data["reason"] == "unclosed"
+        }));
+    }
+
+    /// An HTTP/2 parser that has already stopped still records the flow's
+    /// missing terminal message separately.
+    #[test]
+    fn an_ended_broken_flow_records_unclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            dir.path().join("data"),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let (observer, rx) = Observer::with_capacity(4);
+        let mut flow = Observed::default();
+        assert!(flow.open(
+            &observer,
+            Message::Open {
+                flow: 1,
+                dst: dst(),
+                name: None,
+                alpn: Some("h2".into()),
+                tls: true,
+                state: ObservationState::default(),
+            }
+        ));
+        assert_eq!(
+            observer.send(Message::Lost {
+                flow: 1,
+                dir: Direction::ToHost,
+            }),
+            Sent::Ok
+        );
+        assert_eq!(observer.send(open_msg(2)), Sent::Ok);
+        assert_eq!(observer.send(open_msg(3)), Sent::Ok);
+        assert_eq!(flow.close(&observer, 1), Sent::Dropped);
+        drop(observer);
+
+        let thread =
+            ObserverThread::spawn(rx, sink, "trace-test".into(), None, None, true).unwrap();
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
+        writer.close().unwrap();
+        let records: Vec<_> = boxcar_audit::LogReader::open(&session_dir)
+            .unwrap()
+            .records()
+            .map(Result::unwrap)
+            .collect();
+        assert!(records.iter().any(|r| {
+            r.kind == "http.degraded" && r.data["flow"] == 1 && r.data["reason"] == "lost"
+        }));
+        assert!(records.iter().any(|r| {
+            r.kind == "http.degraded" && r.data["flow"] == 1 && r.data["reason"] == "unclosed"
+        }));
+    }
+
+    /// A full observer keeps the oldest flow while it is still live and
+    /// makes room with an ended flow. The next open may arrive before that
+    /// flow's queued loss marker.
+    #[test]
+    fn a_full_observer_keeps_the_live_oldest_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            dir.path().join("data"),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let (observer, rx) = Observer::with_capacity(16);
+        let live = ObservationState::default();
+        let ended = ObservationState::default();
+        assert_eq!(
+            observer.send(open_msg_with_state(1, live.clone())),
+            Sent::Ok
+        );
+        assert_eq!(
+            observer.send(Message::Data {
+                flow: 1,
+                dir: Direction::ToHost,
+                bytes: b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec(),
+            }),
+            Sent::Ok
+        );
+        assert_eq!(
+            observer.send(open_msg_with_state(2, ended.clone())),
+            Sent::Ok
+        );
+
+        // The net side loses a chunk and ends flow 2 while a full channel
+        // refuses its close. Its shared state accompanies the earlier open.
+        let (full, _full_rx) = Observer::with_capacity(4);
+        for flow in 20..23 {
+            assert_eq!(full.send(open_msg(flow)), Sent::Ok);
+        }
+        let mut ended_side = Observed {
+            state: ended,
+            ..Observed::default()
+        };
+        assert_eq!(ended_side.data(&full, 2, Direction::ToGuest, b"missing"), 7);
+        assert_eq!(full.send(open_msg(23)), Sent::Ok);
+        assert_eq!(ended_side.close(&full, 2), Sent::Dropped);
+
+        // Open 3 reaches the observer before flow 2's loss marker.
+        assert_eq!(observer.send(open_msg(3)), Sent::Ok);
+        assert_eq!(
+            observer.send(Message::Lost {
+                flow: 2,
+                dir: Direction::ToGuest,
+            }),
+            Sent::Ok
+        );
+        assert_eq!(
+            observer.send(Message::Data {
+                flow: 1,
+                dir: Direction::ToHost,
+                bytes: b"\r\n".to_vec(),
+            }),
+            Sent::Ok
+        );
+        assert_eq!(observer.send(Message::Close { flow: 1 }), Sent::Ok);
+        drop(observer);
+
+        run(rx, &sink, "trace-test", None, None, true, 2);
+        drop(sink);
+        writer.close().unwrap();
+        let records: Vec<_> = boxcar_audit::LogReader::open(&session_dir)
+            .unwrap()
+            .records()
+            .map(Result::unwrap)
+            .collect();
+        assert!(records
+            .iter()
+            .any(|r| r.kind == "http.request" && r.data["flow"] == 1));
+        assert!(records.iter().any(|r| {
+            r.kind == "http.degraded" && r.data["flow"] == 2 && r.data["reason"] == "lost"
+        }));
+        assert!(records.iter().any(|r| {
+            r.kind == "http.degraded" && r.data["flow"] == 2 && r.data["reason"] == "unclosed"
+        }));
+        assert!(!records.iter().any(|r| {
+            r.kind == "http.degraded" && r.data["flow"] == 1 && r.data["reason"] == "unclosed"
+        }));
+    }
+
+    /// A top-level observer panic is reported, and dropping its receiver
+    /// makes later plaintext count as lost on the net-thread side.
+    #[test]
+    fn an_observer_panic_is_reported_and_later_plaintext_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, writer) = boxcar_audit::spawn(boxcar_audit::WriterConfig::new(
+            dir.path().join("data"),
+            boxcar_proto::SessionId::new(),
+        ))
+        .unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        let (observer, rx) = Observer::channel();
+        assert!(!guarded_run(move || {
+            let _rx = rx;
+            panic!("observer test panic");
+        }));
+        let mut flow = Observed::default();
+        assert_eq!(flow.data(&observer, 1, Direction::ToHost, b"after"), 5);
+        assert_eq!(flow.dropped, [5, 0]);
+        drop(observer);
+        drop(sink);
+        writer.close().unwrap();
+        assert!(boxcar_audit::LogReader::open(&session_dir).is_ok());
     }
 
     /// The thread ends once every sender is gone, and is joined; what it
@@ -643,7 +1021,8 @@ mod tests {
                 dst: dst(),
                 name: None,
                 alpn: None,
-                tls: true
+                tls: true,
+                state: ObservationState::default(),
             }),
             Sent::Ok
         );
@@ -662,7 +1041,7 @@ mod tests {
         );
         flow.close(&observer, 1);
         drop(observer);
-        assert!(thread.join(Duration::from_secs(5)));
+        assert_eq!(thread.join(Duration::from_secs(5)), ThreadJoin::Joined);
         writer.close().unwrap();
         let kinds: Vec<String> = boxcar_audit::LogReader::open(&session_dir)
             .map(|r| r.records().map(|r| r.unwrap().kind).collect())
@@ -683,6 +1062,7 @@ mod tests {
             name: Some("api.example".into()),
             alpn: Some("h2".into()),
             tls: true,
+            state: ObservationState::default(),
         };
         assert_eq!(observer.send(open.clone()), Sent::Ok);
         let mut flow = Observed::default();
