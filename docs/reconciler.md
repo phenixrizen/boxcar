@@ -103,16 +103,16 @@ processes and ring 0 effects to the span:
   after `cmd:` or `command:` in the arguments' summary) the exec
   carries, compared exactly: a declared argv is the exec's argv, the file
   run being the program it names; a declared command line is the `-c`
-  command of a shell the kernel ran (`proc.exec.filename`, never
-  `argv[0]`, which the caller sets), its options read as the shell reads
-  them (they end at the first operand or `--`, `-o` takes one, and `-n`
-  or `-o noexec` runs nothing) (spaces at either end aside), or
+  command of a supported shell the kernel ran from `/bin`, `/usr/bin` or
+  `/usr/local/bin` (`proc.exec.filename`, never `argv[0]`, which the caller
+  sets), provided the session has changed none of those shells; only known
+  options that still run the command are accepted (spaces at either end
+  aside), or
   Claude Code's wrapper around exactly it read as a shell reads
-  it (its own setup as whole `&&` parts, then `eval '<command>' <
-  /dev/null && pwd -P >| <file>`, nothing after; the setup varies by
-  version and shell, as sourcing its shell snapshot, `export`s, `shopt`
-  or `setopt`, an `unalias` group, and is not judged beyond each part
-  being there; the forms of 2.1.290, 2.1.304 and 2.1.306 are tested; the
+  it (allow-listed shell-snapshot `source`, `export`, `shopt` or `setopt`,
+  and `unalias` setup parts, then an expansion-free `eval '<command>' <
+  /dev/null && pwd -P >| <file>`, nothing after and no here-document; the
+  forms of 2.1.290, 2.1.304 and 2.1.306 are tested; the
   `>nul` rewrite of Windows and `CLAUDE_CODE_SHELL_PREFIX` are not read),
   or, run without a shell, the exec's argv is its words. The declared command appearing
   elsewhere in the shell's text (a comment, beside other commands, inside
@@ -189,7 +189,7 @@ inside each.
 | `network_anomaly` | `dns_entropy` | 20 or more queries within 10 s whose first labels carry over 3.5 bits of entropy on average; then quiet for 10 s | 70 |
 | `privilege_probe` | `lsm_deny` | any `proc.lsm_deny`: a `bpf()` call, or a signal to the sensor, refused | 80 |
 | `policy_denial` | `policy_denial` | `net.dns`, `net.connect`, `net.tls`, `net.udp` or `vsock.connect` with `verdict: "deny"`, `fs.denied`, or `proc.exec_denied` | 40 |
-| `intent_effect_mismatch` | `argv` | a shell tool's span took a shell by ancestry alone (it was the only open span) whose command does not carry the declared one, and no exec in the span carried the declared command by its close (a runtime's helper shell before the command is no mismatch); once a span | 70 |
+| `intent_effect_mismatch` | `argv` | a shell tool's span took an exec by ancestry alone (it was the only open span) whose shell command does not carry the declared one, or whose direct argv is exact but its explicit program path names another file, and no exec in the span carried the declared command by its close (a runtime's helper shell before the command is no mismatch); once a span | 70 |
 | `intent_effect_mismatch` | `phantom_write` | a write tool's call said `ok`, and a second after its close no `fs.create`, `fs.close` with bytes written, `fs.rename` or `fs.unlink` among its effects touched a declared path (`file_path`, `notebook_path`, `path`, `filename`, or the files an `apply_patch` names) | 65 |
 | `intent_effect_mismatch` | `hidden_net` | a span's process made an allowed `net.connect` whose names and address appear nowhere in the call's arguments, and the call said `ok`; judged at the close | 55 |
 | `orphaned_work` | `orphaned_work` | a span's process is still running a second after the span closed, while the sensor reports exits; once a span | 50 |

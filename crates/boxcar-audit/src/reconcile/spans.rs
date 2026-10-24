@@ -37,7 +37,7 @@
 //! carry its id. The [`SpanIndex`] is what the control socket's
 //! `span.list` reads; the reconciler keeps it current.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_proto::control::{SpanEntry, MAX_SPAN_LIST};
@@ -92,6 +92,8 @@ const SHELL_TOOLS: [&str; 6] = [
 const WRITE_TOOLS: [&str; 5] = ["Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"];
 /// Programs whose `-c` argument is the command they run.
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ash", "ksh"];
+/// System directories from which a shell may establish what ran.
+const SHELL_DIRS: [&str; 3] = ["/bin", "/usr/bin", "/usr/local/bin"];
 /// How much of a command a summary quotes.
 const QUOTE_LIMIT: usize = 120;
 
@@ -338,9 +340,10 @@ pub struct Span {
     /// The `argv` rule fired: once a span.
     argv_fired: bool,
     /// A shell the span took by ancestry alone whose command does not
-    /// carry the declared one: (the shell, its exec's seq, its host time,
-    /// its command). Judged at the close.
-    mismatch: Option<(ProcKey, u64, u64, String)>,
+    /// carry the declared one, or a direct argv whose explicit program
+    /// path does not name the file run: (the exec, its seq, its host time,
+    /// its command, whether it was a shell). Judged at the close.
+    mismatch: Option<(ProcKey, u64, u64, String, bool)>,
     /// An exec that carries the declared command joined the span.
     carried: bool,
     /// Its `span.effects` was written.
@@ -442,8 +445,8 @@ impl Span {
     }
 
     /// An exec joined the span: notes whether it ran the declared command.
-    fn note_exec(&mut self, program: &str, argv: &[String]) {
-        if self.carried_by(program, argv) == Some(true) {
+    fn note_exec(&mut self, program: &str, argv: &[String], shell_written: bool) {
+        if self.carried_by(program, argv, shell_written) == Some(true) {
             self.carried = true;
         }
     }
@@ -454,12 +457,12 @@ impl Span {
     /// puts in the redaction mark, so such a copy is the original). `None`
     /// when that cannot tell: no declared command, or a copy with a
     /// redacted part (two different values read the same once redacted).
-    fn carried_by(&self, program: &str, argv: &[String]) -> Option<bool> {
+    fn carried_by(&self, program: &str, argv: &[String], shell_written: bool) -> Option<bool> {
         let declared = self.declared.as_ref()?;
         if !self.declared_raw && declared.mentions(REDACTED) {
             return None;
         }
-        Some(carries(declared, program, argv))
+        Some(carries(declared, program, argv, shell_written))
     }
 
     fn has_member(&self, key: ProcKey) -> bool {
@@ -616,6 +619,11 @@ pub struct Spans {
     effect_bytes: usize,
     /// Findings a deferred close made, for the next tick to hand over.
     deferred_findings: Vec<Finding>,
+    /// The system shells written during the session, by name. Any one of
+    /// them sets every system shell aside: one shell's name may be a link
+    /// to another (`/bin/sh` to `dash`), and `/bin` is often `/usr/bin`.
+    /// Only [`SHELLS`] can enter it.
+    written_shells: HashSet<String>,
 }
 
 /// What becomes of a `tool.close`.
@@ -656,6 +664,7 @@ impl Spans {
             pending_closes: VecDeque::new(),
             effect_bytes: 0,
             deferred_findings: Vec::new(),
+            written_shells: HashSet::new(),
         }
     }
 
@@ -1014,8 +1023,9 @@ impl Spans {
         }
         if let Some(id) = self.by_proc.get(&key).cloned() {
             // A member that exec'd again (a shell running its command).
+            let shell_written = self.shells_written();
             if let Some(span) = self.spans.get_mut(&id) {
-                span.note_exec(&exec.filename, &exec.argv);
+                span.note_exec(&exec.filename, &exec.argv, shell_written);
                 span.push_effect(
                     Effect {
                         seq,
@@ -1069,6 +1079,7 @@ impl Spans {
             // The sensor's own reads are no tool's work.
             return;
         }
+        self.note_written_shell(&kind);
         let (seq, ts) = (record.seq, record.ts_host_ns);
         let who = Who::Tid(subject.pid);
         match self.owner(state, who, ts) {
@@ -1084,6 +1095,47 @@ impl Spans {
                 }
             }
         }
+    }
+
+    /// Remembers a system shell file written by the session. Once written,
+    /// that path is not trusted as evidence for the rest of the session.
+    fn note_written_shell(&mut self, kind: &EffectKind) {
+        let EffectKind::Fs {
+            mount,
+            path,
+            to,
+            wrote: true,
+            ..
+        } = kind
+        else {
+            return;
+        };
+        if mount != "root" {
+            return;
+        }
+        for path in std::iter::once(path.as_str()).chain(to.as_deref()) {
+            let path = format!("/{}", path.trim_start_matches('/'));
+            if system_shell(&path) {
+                self.written_shells.insert(base_name(&path).to_owned());
+            }
+        }
+    }
+
+    /// A successful file change not kept as a span effect, which still
+    /// disqualifies a system shell file as evidence.
+    pub fn file_written(&mut self, mount: &str, path: &str) {
+        if mount != "root" {
+            return;
+        }
+        let path = format!("/{}", path.trim_start_matches('/'));
+        if system_shell(&path) {
+            self.written_shells.insert(base_name(&path).to_owned());
+        }
+    }
+
+    /// Whether the session wrote a system shell: then none counts.
+    fn shells_written(&self) -> bool {
+        !self.written_shells.is_empty()
     }
 
     /// A flow's `net.connect` met the `proc.tcp_connect` of `key`: `key`
@@ -1230,10 +1282,11 @@ impl Spans {
         if self.open.is_empty() {
             return None;
         }
+        let shell_written = self.shells_written();
         let by_argv = self.open.iter().find(|id| {
             self.spans
                 .get(*id)
-                .is_some_and(|span| span.carried_by(program, argv) == Some(true))
+                .is_some_and(|span| span.carried_by(program, argv, shell_written) == Some(true))
         });
         if let Some(id) = by_argv {
             if self.reaches_agent(state, key, id) {
@@ -1339,6 +1392,7 @@ impl Spans {
             }
             return;
         }
+        let shell_written = self.shells_written();
         {
             let Some(span) = self.spans.get_mut(id) else {
                 return;
@@ -1353,7 +1407,7 @@ impl Spans {
             span.members.push(Member { key, exec_seq });
             if exec_seq.is_some() {
                 if let Some(proc) = state.proc(key) {
-                    span.note_exec(&proc.filename, &proc.argv);
+                    span.note_exec(&proc.filename, &proc.argv, shell_written);
                 }
             }
             if let Some(seq) = exec_seq {
@@ -1565,7 +1619,7 @@ impl Spans {
 
     // --- the rules
 
-    /// Notes a shell the span took by ancestry alone whose command does
+    /// Notes an exec the span took by ancestry alone whose command does
     /// not carry the declared one; [`Spans::argv_at_close`] judges it.
     fn judge_argv(
         &mut self,
@@ -1576,29 +1630,42 @@ impl Spans {
         program: &str,
         argv: &[String],
     ) -> Vec<Finding> {
+        let shell_written = self.shells_written();
         let Some(span) = self.spans.get_mut(id) else {
             return Vec::new();
         };
         if span.declared.is_none() || !span.is_shell_tool() || span.mismatch.is_some() {
             return Vec::new();
         }
-        // The finding quotes the command scrubbed, as a record would.
-        let Some(command) = shell_command(program, argv) else {
+        let Some(declared) = span.declared.as_ref() else {
             return Vec::new();
         };
-        match span.carried_by(program, argv) {
+        // The finding quotes the command scrubbed, as a record would. A
+        // direct argv is a mismatch here only when its words are exact and
+        // its explicit program path names another file.
+        let (command, shell) = match direct_program_mismatch(declared, program, argv) {
+            Some(command) => (command, false),
+            None => {
+                let Some(command) = shell_command(program, argv) else {
+                    return Vec::new();
+                };
+                (command, true)
+            }
+        };
+        match span.carried_by(program, argv, shell_written) {
             Some(true) => span.carried = true,
-            Some(false) => span.mismatch = Some((key, exec_seq, ts, command)),
+            Some(false) => span.mismatch = Some((key, exec_seq, ts, command, shell)),
             None => {}
         }
         Vec::new()
     }
 
     /// `intent_effect_mismatch` / `argv`, at the close: a shell tool's span
-    /// took a shell by ancestry alone whose command does not carry the
-    /// declared one, and no exec in the span ever carried it (a runtime's
-    /// helper shell before the command, as Claude Code under Node runs
-    /// `bash -c env`, is no mismatch).
+    /// took a shell whose command does not carry the declared one, or a
+    /// direct argv whose explicit program path did not name the file run,
+    /// and no exec in the span ever carried it. A runtime's helper shell
+    /// before the command, as Claude Code under Node runs `bash -c env`,
+    /// is no mismatch once the command itself joins.
     fn argv_at_close(&mut self, state: &State, id: &str) -> Vec<Finding> {
         let Some(span) = self.spans.get(id) else {
             return Vec::new();
@@ -1606,15 +1673,16 @@ impl Spans {
         if span.carried || span.argv_fired {
             return Vec::new();
         }
-        let (Some((key, exec_seq, ts, command)), Some(declared)) =
+        let (Some((key, exec_seq, ts, command, shell)), Some(declared)) =
             (span.mismatch.clone(), span.declared_display.clone())
         else {
             return Vec::new();
         };
         let opened_seq = span.opened.0;
         let tool = span.tool_name.clone();
+        let kind = if shell { "shell" } else { "program" };
         let summary = format!(
-            "the {tool} tool call {id} declared \"{}\", but the shell it ran (pid {}) was given \
+            "the {tool} tool call {id} declared \"{}\", but the {kind} it ran (pid {}) was given \
              \"{}\", and nothing in the call ran the declared command",
             quote(&declared),
             key.tgid,
@@ -1956,17 +2024,124 @@ fn mounted(path: &str) -> (String, String) {
     ("workspace".to_owned(), path.to_owned())
 }
 
-/// The command a shell was given with `-c` (or `-lc`, `-ec`...), as
-/// given; `None` for a program that is no shell, or a shell without one.
-/// The program is the file the kernel ran (`proc.exec.filename`), never
-/// `argv[0]`, which the caller sets as it likes.
+/// The command a trusted system shell was given with `-c` (or `-lc`,
+/// `-ec`...), as given. The program is the file the kernel ran
+/// (`proc.exec.filename`), never `argv[0]`, which the caller sets as it
+/// likes.
 ///
-/// The options are read as a POSIX shell reads them: they end at the
-/// first operand or `--`; `-o` and `-O` (and bash's `--rcfile`,
-/// `--init-file`) take one; `-c` makes the first operand the command; and
-/// `-n` (or `-o noexec`) reads the command without running it, so no
-/// command is run at all.
+/// Only options known to leave command execution in place are accepted.
+/// An operand or `--` ends option reading, `-c` takes the next argument,
+/// `-o` takes an allow-listed shell option, and an unknown or non-running
+/// option makes the command unusable as evidence.
 fn shell_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
+    if !system_shell(program) {
+        return None;
+    }
+    let shell = base_name(program);
+    let mut command = false;
+    let mut at = 1;
+    while let Some(arg) = argv.get(at) {
+        if arg == "--" || arg == "-" {
+            at += 1;
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if shell != "bash" {
+                return None;
+            }
+            at += match long {
+                "login" | "noprofile" | "norc" | "posix" => 1,
+                "rcfile" | "init-file" if argv.get(at + 1).is_some() => 2,
+                _ => return None,
+            };
+            continue;
+        }
+        let (set, flags) = match (arg.strip_prefix('-'), arg.strip_prefix('+')) {
+            (Some(flags), _) => (true, flags),
+            (None, Some(flags)) => (false, flags),
+            (None, None) => break,
+        };
+        if flags.is_empty() {
+            break;
+        }
+        at += 1;
+        for (n, flag) in flags.char_indices() {
+            match flag {
+                'c' if set => command = true,
+                'e' | 'u' | 'x' | 'v' | 'l' | 'i' | 'p' if set => {}
+                'n' if !set => {}
+                'o' => {
+                    // The operand: the rest of the cluster, else the next
+                    // argument.
+                    let rest = &flags[n + 1..];
+                    let operand = if rest.is_empty() {
+                        at += 1;
+                        argv.get(at - 1).map(String::as_str)
+                    } else {
+                        Some(rest)
+                    };
+                    let operand = operand?;
+                    if !shell_option(shell, operand) || set && operand == "noexec" {
+                        return None;
+                    }
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    if command {
+        argv.get(at)
+    } else {
+        None
+    }
+}
+
+/// Whether `name` is a known `-o` setting for `shell`. `noexec` is known
+/// so `+o noexec` can turn it off; setting it is rejected by the caller.
+fn shell_option(shell: &str, name: &str) -> bool {
+    const POSIX: [&str; 12] = [
+        "allexport",
+        "errexit",
+        "ignoreeof",
+        "monitor",
+        "noclobber",
+        "noexec",
+        "noglob",
+        "nounset",
+        "verbose",
+        "vi",
+        "xtrace",
+        "privileged",
+    ];
+    POSIX.contains(&name)
+        || matches!(
+            (shell, name),
+            (
+                "bash",
+                "braceexpand"
+                    | "errtrace"
+                    | "functrace"
+                    | "hashall"
+                    | "histexpand"
+                    | "history"
+                    | "keyword"
+                    | "nolog"
+                    | "notify"
+                    | "onecmd"
+                    | "physical"
+                    | "pipefail"
+                    | "posix"
+                    | "emacs"
+            ) | ("zsh" | "ksh", "pipefail")
+        )
+}
+
+/// A shell-looking exec's `-c` operand for the mismatch report. Unlike
+/// [`shell_argument`], this deliberately accepts an untrusted path or an
+/// unknown option: either must fail command matching, but the supplied
+/// command still lets the existing `argv` rule explain the mismatch.
+fn shell_candidate_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
     if !SHELLS.contains(&base_name(program)) {
         return None;
     }
@@ -1997,19 +2172,9 @@ fn shell_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
         for (n, flag) in flags.char_indices() {
             match flag {
                 'c' if set => command = true,
-                'n' if set => return None,
                 'o' | 'O' => {
-                    // The operand: the rest of the cluster, else the next
-                    // argument.
-                    let rest = &flags[n + 1..];
-                    let operand = if rest.is_empty() {
+                    if n + 1 == flags.len() {
                         at += 1;
-                        argv.get(at - 1).map(String::as_str)
-                    } else {
-                        Some(rest)
-                    };
-                    if set && flag == 'o' && operand == Some("noexec") {
-                        return None;
                     }
                     break;
                 }
@@ -2017,10 +2182,11 @@ fn shell_argument<'a>(program: &str, argv: &'a [String]) -> Option<&'a String> {
             }
         }
     }
-    if !command {
-        return None;
+    if command {
+        argv.get(at)
+    } else {
+        None
     }
-    argv.get(at)
 }
 
 /// The last part of a path.
@@ -2028,39 +2194,73 @@ fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Whether the file the kernel ran is the program `arg0` names.
+/// Whether `path` is one of the supported shells at an accepted system
+/// location.
+fn system_shell(path: &str) -> bool {
+    path.rsplit_once('/')
+        .is_some_and(|(dir, file)| SHELL_DIRS.contains(&dir) && SHELLS.contains(&file))
+}
+
+/// Whether the file the kernel ran is the program `arg0` names: an
+/// explicit path matches whole, while a bare name matches the basename.
 fn same_program(program: &str, arg0: &str) -> bool {
-    !program.is_empty() && base_name(program) == base_name(arg0)
+    !program.is_empty()
+        && if arg0.contains('/') {
+            program == arg0
+        } else {
+            base_name(program) == arg0
+        }
 }
 
 /// The shell's `-c` command scrubbed as a record's arguments are, on one
 /// line: what a finding quotes.
 fn shell_command(program: &str, argv: &[String]) -> Option<String> {
-    let command = one_line(&scrub_text(shell_argument(program, argv)?));
+    let command = one_line(&scrub_text(shell_candidate_argument(program, argv)?));
     (!command.is_empty()).then_some(command)
+}
+
+/// A direct command whose argv is exact but whose explicit program path
+/// does not name the file the kernel ran, formatted for a finding.
+fn direct_program_mismatch(declared: &Command, program: &str, argv: &[String]) -> Option<String> {
+    let words = match declared {
+        Command::Argv(words) => (words == argv).then_some(words.as_slice()),
+        Command::Text(text) => lex(text.trim()).and_then(|tokens| {
+            (tokens.len() == argv.len()
+                && tokens
+                    .iter()
+                    .zip(argv)
+                    .all(|(token, arg)| matches!(token, Tok::Word { text, .. } if text == arg)))
+            .then_some(argv)
+        }),
+    }?;
+    let arg0 = words.first()?;
+    (arg0.contains('/') && !same_program(program, arg0))
+        .then(|| one_line(&scrub_text(&argv.join(" "))))
 }
 
 /// Whether an exec of `program` with `argv` carries the declared command,
 /// compared exactly, the shell's quoting kept: a declared argv is the
 /// exec's argv, the file run being the program it names; a declared
-/// command line is the `-c` command of a shell the kernel ran (spaces at
-/// either end aside), or Claude Code's wrapper around exactly it
-/// ([`wraps`]), or, run without a shell, the exec's argv is its words and
-/// the file run their program. The declared command merely appearing in
-/// the shell's text (in a comment, beside other commands, inside a longer
-/// `eval`) is not carrying it, nor is a command that reads the same once
-/// its quotes are dropped, nor one given to a program that only calls
-/// itself a shell.
-fn carries(declared: &Command, program: &str, argv: &[String]) -> bool {
+/// command line is the `-c` command of an unchanged system shell (spaces
+/// at either end aside), or Claude Code's recognized wrapper around
+/// exactly it ([`wraps`]), or, run without a shell, the exec's argv is its
+/// words and the file run their program. An unrecognized shell option or
+/// wrapper part is not carrying it. Neither is the declared command merely
+/// appearing in the shell's text, a command that reads the same once its
+/// quotes are dropped, or one given to a program that only calls itself a
+/// shell.
+fn carries(declared: &Command, program: &str, argv: &[String], shell_written: bool) -> bool {
     match declared {
         Command::Argv(words) => {
             argv == words.as_slice() && words.first().is_some_and(|w| same_program(program, w))
         }
         Command::Text(text) => {
             let text = text.trim();
-            if let Some(given) = shell_argument(program, argv) {
-                if given.trim() == text || wraps(given, text) {
-                    return true;
+            if !shell_written {
+                if let Some(given) = shell_argument(program, argv) {
+                    if given.trim() == text || wraps(given, text) {
+                        return true;
+                    }
                 }
             }
             lex(text).is_some_and(|tokens| {
@@ -2069,20 +2269,18 @@ fn carries(declared: &Command, program: &str, argv: &[String]) -> bool {
                     && tokens
                         .iter()
                         .zip(argv)
-                        .all(|(token, arg)| matches!(token, Tok::Word(word) if word == arg))
+                        .all(|(token, arg)| matches!(token, Tok::Word { text, .. } if text == arg))
             })
         }
     }
 }
 
-/// Whether the shell command `text` ends as Claude Code's wrapper around
+/// Whether the shell command `text` is Claude Code's wrapper around
 /// exactly `declared`, read as a shell reads it (quotes, escapes,
-/// comments): its last `&&` part `pwd -P >| <file>`, the one before it
-/// `eval <one word>` (and `< /dev/null` unless the command reads its own
-/// input) whose word, unquoted, is the declared command. The parts before
-/// are the runtime's own setup and are not judged here, but each must be
-/// there: a comment or an open quote that swallows the rest is no
-/// wrapper.
+/// comments): its last `&&` part is `pwd -P >| <file>`, the one before it
+/// is `eval <one expansion-free word>` (and `< /dev/null` unless the
+/// command reads its own input), and every earlier part has a recognized
+/// setup shape. Here-documents are not wrapper syntax.
 ///
 /// The setup is what the Claude Code at hand puts there, and it changes
 /// between versions; the two parts judged have not, from 2.1.290 (the
@@ -2092,15 +2290,20 @@ fn carries(declared: &Command, program: &str, argv: &[String]) -> bool {
 /// newlines and ended by `:`, `shopt -u extglob 2>/dev/null || true`
 /// (bash) or `setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null ||
 /// true` (zsh), and a `{ \builtin unalias -- ...; \builtin unset -f --
-/// ...; } >/dev/null 2>&1 || true` group, each of them one or more
-/// non-empty `&&` parts. What is not read here: the `>nul` rewrite it
-/// applies on Windows, and `CLAUDE_CODE_SHELL_PREFIX`, which runs the
-/// whole line through a program of the user's; neither is a form boxcar
-/// runs an agent under.
+/// ...; } >/dev/null 2>&1 || true` group. What is not read here: the
+/// `>nul` rewrite it applies on Windows, and `CLAUDE_CODE_SHELL_PREFIX`,
+/// which runs the whole line through a program of the user's; neither is
+/// a form boxcar runs an agent under.
 fn wraps(text: &str, declared: &str) -> bool {
     let Some(tokens) = lex(text) else {
         return false;
     };
+    if tokens
+        .iter()
+        .any(|token| matches!(token, Tok::Op(op) if op == "<<"))
+    {
+        return false;
+    }
     let parts: Vec<&[Tok]> = tokens
         .split(|t| matches!(t, Tok::Op(op) if op == "&&"))
         .collect();
@@ -2109,26 +2312,150 @@ fn wraps(text: &str, declared: &str) -> bool {
     };
     let last_ok = matches!(
         last,
-        [Tok::Word(pwd), Tok::Word(p), Tok::Op(to), Tok::Word(file)]
+        [Tok::Word { text: pwd, .. }, Tok::Word { text: p, .. }, Tok::Op(to), Tok::Word { text: file, expands: false }]
             if pwd == "pwd" && p == "-P" && to == ">|" && !file.is_empty()
     );
     let word = match eval {
-        [Tok::Word(e), Tok::Word(word)] if e == "eval" => word,
-        [Tok::Word(e), Tok::Word(word), Tok::Op(from), Tok::Word(null)]
+        [Tok::Word { text: e, .. }, Tok::Word {
+            text: word,
+            expands: false,
+        }] if e == "eval" => word,
+        [Tok::Word { text: e, .. }, Tok::Word {
+            text: word,
+            expands: false,
+        }, Tok::Op(from), Tok::Word { text: null, .. }]
             if e == "eval" && from == "<" && null == "/dev/null" =>
         {
             word
         }
         _ => return false,
     };
-    last_ok && word.trim() == declared && setup.iter().all(|part| !part.is_empty())
+    last_ok && word.trim() == declared && setup.iter().all(|part| setup_part(part))
+}
+
+/// Whether one `&&` part is a setup shape emitted by Claude Code.
+fn setup_part(part: &[Tok]) -> bool {
+    source_setup(part) || export_setup(part) || shell_option_setup(part) || unalias_setup(part)
+}
+
+fn source_setup(part: &[Tok]) -> bool {
+    matches!(
+        part,
+        [Tok::Word { text: source, expands: false }, Tok::Word { text: snapshot, expands: false }, Tok::Word { text: fd, expands: false }, Tok::Op(to), Tok::Word { text: null, expands: false }, Tok::Op(or), Tok::Word { text: yes, expands: false }]
+            if source == "source" && snapshot_path(snapshot) && fd == "2" && to == ">"
+                && null == "/dev/null" && or == "||" && yes == "true"
+    )
+}
+
+/// Whether `path` names a shell snapshot where Claude Code writes them:
+/// `<its config directory>/shell-snapshots/snapshot-<shell>-<id>.sh`.
+fn snapshot_path(path: &str) -> bool {
+    path.rsplit_once('/').is_some_and(|(dir, file)| {
+        dir.ends_with("/shell-snapshots") && file.starts_with("snapshot-") && file.ends_with(".sh")
+    })
+}
+
+fn export_setup(part: &[Tok]) -> bool {
+    let lines: Vec<&[Tok]> = part
+        .split(|token| matches!(token, Tok::Op(op) if op == "\n"))
+        .collect();
+    let (exports, ended) = match lines.split_last() {
+        Some((last, before)) if matches!(*last, [Tok::Word { text, .. }] if text == ":") => {
+            (before, true)
+        }
+        Some(_) => (lines.as_slice(), false),
+        None => return false,
+    };
+    !exports.is_empty()
+        && (exports.len() == 1 || ended)
+        && exports.iter().all(|line| match line {
+            [Tok::Word { text: export, .. }, assignments @ ..] if export == "export" => {
+                !assignments.is_empty() && assignments.iter().all(export_assignment)
+            }
+            _ => false,
+        })
+}
+
+fn export_assignment(token: &Tok) -> bool {
+    let Tok::Word { text, expands } = token else {
+        return false;
+    };
+    let Some((name, value)) = text.split_once('=') else {
+        return false;
+    };
+    shell_name(name)
+        && (!expands
+            || name == "PATH"
+                && value.strip_prefix("${PATH:+$PATH:}").is_some_and(|path| {
+                    !path.is_empty()
+                        && !path
+                            .chars()
+                            .any(|c| matches!(c, '$' | '`' | '*' | '?' | '[' | '~' | '{'))
+                }))
+}
+
+fn shell_option_setup(part: &[Tok]) -> bool {
+    matches!(part,
+        [Tok::Word { text: command, .. }, Tok::Word { text: flag, .. }, Tok::Word { text: option, .. }, Tok::Word { text: fd, .. }, Tok::Op(to), Tok::Word { text: null, .. }, Tok::Op(or), Tok::Word { text: yes, .. }]
+            if command == "shopt" && flag == "-u" && option == "extglob" && fd == "2"
+                && to == ">" && null == "/dev/null" && or == "||" && yes == "true")
+        || matches!(part,
+            [Tok::Word { text: command, .. }, Tok::Word { text: first, .. }, Tok::Word { text: second, .. }, Tok::Word { text: fd, .. }, Tok::Op(to), Tok::Word { text: null, .. }, Tok::Op(or), Tok::Word { text: yes, .. }]
+                if command == "setopt" && first == "NO_EXTENDED_GLOB"
+                    && second == "NO_BARE_GLOB_QUAL" && fd == "2" && to == ">"
+                    && null == "/dev/null" && or == "||" && yes == "true")
+        || matches!(part,
+            [Tok::Word { text: open, .. }, Tok::Word { text: shopt, .. }, Tok::Word { text: flag, .. }, Tok::Word { text: option, .. }, Tok::Op(or_shell), Tok::Word { text: setopt, .. }, Tok::Word { text: first, .. }, Tok::Word { text: second, .. }, Tok::Op(semi), Tok::Word { text: close, .. }, Tok::Op(to), Tok::Word { text: null, .. }, Tok::Word { text: fd, .. }, Tok::Op(to_fd), Tok::Word { text: one, .. }, Tok::Op(or_true), Tok::Word { text: yes, .. }]
+                if open == "{" && shopt == "shopt" && flag == "-u" && option == "extglob"
+                    && or_shell == "||" && setopt == "setopt" && first == "NO_EXTENDED_GLOB"
+                    && second == "NO_BARE_GLOB_QUAL" && semi == ";" && close == "}"
+                    && to == ">" && null == "/dev/null" && fd == "2" && to_fd == ">&"
+                    && one == "1" && or_true == "||" && yes == "true")
+}
+
+fn unalias_setup(part: &[Tok]) -> bool {
+    let Some(semi) = part
+        .iter()
+        .position(|token| matches!(token, Tok::Op(op) if op == ";"))
+    else {
+        return false;
+    };
+    let (unalias, rest) = part.split_at(semi);
+    let rest = &rest[1..];
+    let Some(second_semi) = rest
+        .iter()
+        .position(|token| matches!(token, Tok::Op(op) if op == ";"))
+    else {
+        return false;
+    };
+    let (unset, tail) = rest.split_at(second_semi);
+    let tail = &tail[1..];
+    matches!(unalias, [Tok::Word { text: open, .. }, Tok::Word { text: builtin, .. }, Tok::Word { text: command, .. }, Tok::Word { text: dash, .. }, names @ ..]
+        if open == "{" && builtin == "builtin" && command == "unalias" && dash == "--"
+            && !names.is_empty() && names.iter().all(|name| matches!(name, Tok::Word { text, expands: false } if !text.is_empty())))
+        && matches!(unset, [Tok::Word { text: builtin, .. }, Tok::Word { text: command, .. }, Tok::Word { text: flag, .. }, Tok::Word { text: dash, .. }, names @ ..]
+            if builtin == "builtin" && command == "unset" && flag == "-f" && dash == "--"
+                && !names.is_empty() && names.iter().all(|name| matches!(name, Tok::Word { text, expands: false } if !text.is_empty())))
+        && matches!(tail,
+            [Tok::Word { text: close, .. }, Tok::Op(to), Tok::Word { text: null, .. }, Tok::Word { text: fd, .. }, Tok::Op(to_fd), Tok::Word { text: one, .. }, Tok::Op(or), Tok::Word { text: yes, .. }]
+                if close == "}" && to == ">" && null == "/dev/null" && fd == "2"
+                    && to_fd == ">&" && one == "1" && or == "||" && yes == "true")
+}
+
+fn shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// A shell token at the top level of a command.
 #[derive(Debug, PartialEq, Eq)]
 enum Tok {
-    /// A word, its quotes and escapes resolved.
-    Word(String),
+    /// A word, its quotes and escapes resolved, and whether its unquoted
+    /// or double-quoted source invokes shell expansion.
+    Word { text: String, expands: bool },
     /// An operator (`&&`, `|`, `;`, `>|`, `<`, a newline...).
     Op(String),
 }
@@ -2138,20 +2465,26 @@ const TWO_CHAR_OPS: [&str; 7] = ["&&", "||", ">|", ">>", "<<", ">&", "<&"];
 
 /// `text` as a shell reads its top level: words (single quotes literal,
 /// double quotes with `\"`, `\\`, `\$` and `` \` `` escapes, a backslash
-/// outside quotes escaping the next character), operators, and comments (a
-/// `#` starting a word, to the line's end) dropped. `None` when a quote is
-/// left open.
+/// outside quotes escaping the next character), whether a word has active
+/// shell expansion, operators, and comments (a `#` starting a word, to the
+/// line's end) dropped. `None` when a quote is left open.
 fn lex(text: &str) -> Option<Vec<Tok>> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    let mut expands = false;
     let mut chars = text.chars().peekable();
-    let flush = |tokens: &mut Vec<Tok>, word: &mut String, in_word: &mut bool| {
-        if *in_word {
-            tokens.push(Tok::Word(std::mem::take(word)));
-            *in_word = false;
-        }
-    };
+    let flush =
+        |tokens: &mut Vec<Tok>, word: &mut String, in_word: &mut bool, expands: &mut bool| {
+            if *in_word {
+                tokens.push(Tok::Word {
+                    text: std::mem::take(word),
+                    expands: *expands,
+                });
+                *in_word = false;
+                *expands = false;
+            }
+        };
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
@@ -2176,6 +2509,10 @@ fn lex(text: &str) -> Option<Vec<Tok>> {
                                 word.push(c);
                             }
                         },
+                        c @ ('$' | '`') => {
+                            expands = true;
+                            word.push(c);
+                        }
                         c => word.push(c),
                     }
                 }
@@ -2200,12 +2537,12 @@ fn lex(text: &str) -> Option<Vec<Tok>> {
                 }
             }
             '\n' => {
-                flush(&mut tokens, &mut word, &mut in_word);
+                flush(&mut tokens, &mut word, &mut in_word, &mut expands);
                 tokens.push(Tok::Op("\n".to_owned()));
             }
-            c if c.is_whitespace() => flush(&mut tokens, &mut word, &mut in_word),
+            c if c.is_whitespace() => flush(&mut tokens, &mut word, &mut in_word, &mut expands),
             '&' | '|' | ';' | '<' | '>' | '(' | ')' => {
-                flush(&mut tokens, &mut word, &mut in_word);
+                flush(&mut tokens, &mut word, &mut in_word, &mut expands);
                 let mut op = c.to_string();
                 if let Some(&next) = chars.peek() {
                     let pair: String = [c, next].iter().collect();
@@ -2218,11 +2555,12 @@ fn lex(text: &str) -> Option<Vec<Tok>> {
             }
             c => {
                 in_word = true;
+                expands |= matches!(c, '$' | '`' | '*' | '?' | '[' | '~' | '{');
                 word.push(c);
             }
         }
     }
-    flush(&mut tokens, &mut word, &mut in_word);
+    flush(&mut tokens, &mut word, &mut in_word, &mut expands);
     Some(tokens)
 }
 
@@ -2374,6 +2712,9 @@ mod tests {
 
     #[test]
     fn a_wrapped_command_still_carries_the_declared_one() {
+        let carries = |declared: &Command, program: &str, argv: &[String]| {
+            carries(declared, program, argv, false)
+        };
         let declared = text("echo boxcar-m4 > marker.txt");
         let shell = |c: &str| words(&["bash", "-c", c]);
         assert!(carries(
@@ -2389,7 +2730,7 @@ mod tests {
         assert!(carries(&text("  ls -la\n"), "/bin/bash", &shell("ls -la")));
         // Claude Code's own setup before the eval is its own.
         assert!(carries(&declared, "/bin/bash", &shell(
-                "source /tmp/snapshot.sh 2>/dev/null || true && export PATH=\"${PATH:+$PATH:}\"'/x' && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
+                "source /root/.claude/shell-snapshots/snapshot-bash-1792541123845-tgt6wz.sh 2>/dev/null || true && export PATH=\"${PATH:+$PATH:}\"'/x' && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
             )
         ));
         // Its quoting of a quote, `'"'"'`, reads back as the quote.
@@ -2429,7 +2770,7 @@ mod tests {
         // both shells; the line is then run through the prefix program,
         // which is not read here.
         assert!(carries(&declared, "/bin/bash", &shell(concat!(
-            "source /tmp/s.sh 2>/dev/null || true",
+            "source /root/.claude/shell-snapshots/snapshot-bash-1792541123845-tgt6wz.sh 2>/dev/null || true",
             " && { shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true",
             " && eval 'echo boxcar-m4 > marker.txt' < /dev/null && pwd -P >| /tmp/c"
         ))));
@@ -2541,8 +2882,155 @@ mod tests {
     }
 
     #[test]
+    fn only_known_setup_parts_wrap_a_command() {
+        let declared = text("printf ready");
+        let shell = |setup: &str| {
+            words(&[
+                "bash",
+                "-c",
+                &format!("{setup} && eval 'printf ready' < /dev/null && pwd -P >| /tmp/c"),
+            ])
+        };
+        for setup in [
+            "false",
+            "printf preparing",
+            "export VALUE=`printf preparing`",
+            "source `printf snapshot` 2>/dev/null || true",
+            "source /tmp/setup.sh 2>/dev/null || true",
+            "source /root/.claude/shell-snapshots/setup.sh 2>/dev/null || true",
+        ] {
+            assert!(
+                !carries(&declared, "/bin/bash", &shell(setup), false),
+                "{setup}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_operands_have_no_outer_expansions_or_here_documents() {
+        let shell = |command: &str| words(&["bash", "-c", command]);
+        for (declared, command) in [
+            (
+                "echo $BOXCAR_VALUE",
+                "eval \"echo $BOXCAR_VALUE\" < /dev/null && pwd -P >| /tmp/c",
+            ),
+            (
+                "echo `date`",
+                "eval \"echo `date`\" < /dev/null && pwd -P >| /tmp/c",
+            ),
+            (
+                "printf ready",
+                "cat <<END\ntext && eval 'printf ready' < /dev/null && pwd -P >| /tmp/c",
+            ),
+            (
+                "printf ready",
+                "eval 'printf ready' < /dev/null && pwd -P >| \"$BOXCAR_DIR/c\"",
+            ),
+            (
+                "printf ready",
+                "{ \\builtin unalias -- \"$BOXCAR_NAME\"; \\builtin unset -f -- 'x'; } >/dev/null 2>&1 || true && eval 'printf ready' < /dev/null && pwd -P >| /tmp/c",
+            ),
+        ] {
+            assert!(
+                !carries(&text(declared), "/bin/bash", &shell(command), false),
+                "{command}"
+            );
+        }
+        assert!(carries(
+            &text("echo $BOXCAR_VALUE"),
+            "/bin/bash",
+            &shell("eval 'echo $BOXCAR_VALUE' < /dev/null && pwd -P >| /tmp/c"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn only_unchanged_system_shells_carry_text_commands() {
+        let declared = text("printf ready");
+        let argv = words(&["bash", "-c", "printf ready"]);
+        for program in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+            assert!(carries(&declared, program, &argv, false), "{program}");
+        }
+        assert!(!carries(&declared, "/tmp/bash", &argv, false));
+        assert!(!carries(&declared, "/bin/bash", &argv, true));
+        assert_eq!(
+            shell_command("/tmp/bash", &argv),
+            Some("printf ready".to_owned())
+        );
+        // What a finding quotes is the first operand after the options.
+        assert_eq!(
+            shell_command("/tmp/bash", &words(&["bash", "-c", "-l", "printf ready"])),
+            Some("printf ready".to_owned())
+        );
+    }
+
+    #[test]
+    fn explicit_program_paths_match_whole() {
+        let declared = Command::Argv(words(&["/usr/bin/tool", "check"]));
+        let argv = words(&["/usr/bin/tool", "check"]);
+        assert!(carries(&declared, "/usr/bin/tool", &argv, false));
+        assert!(!carries(&declared, "/tmp/tool", &argv, false));
+
+        let declared = text("/usr/bin/tool check");
+        assert!(carries(&declared, "/usr/bin/tool", &argv, false));
+        assert!(!carries(&declared, "/tmp/tool", &argv, false));
+    }
+
+    #[test]
+    fn only_command_running_shell_options_are_accepted() {
+        let declared = text("printf ready");
+        for argv in [
+            words(&["bash", "--version", "-c", "printf ready"]),
+            words(&["bash", "--help", "-c", "printf ready"]),
+            words(&["bash", "--unknown", "-c", "printf ready"]),
+            words(&["bash", "-D", "-c", "printf ready"]),
+            words(&["bash", "-Z", "-c", "printf ready"]),
+            words(&["bash", "+l", "-c", "printf ready"]),
+            words(&["bash", "-o", "unknown", "-c", "printf ready"]),
+            words(&["bash", "-O", "extglob", "-c", "printf ready"]),
+        ] {
+            assert!(!carries(&declared, "/bin/bash", &argv, false), "{argv:?}");
+        }
+        assert!(carries(
+            &declared,
+            "/bin/bash",
+            &words(&["bash", "-eux", "-o", "pipefail", "-c", "printf ready",]),
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_written_system_shell_sets_every_system_shell_aside() {
+        let mut spans = Spans::new(None, None);
+        spans.note_written_shell(&EffectKind::Fs {
+            op: "close",
+            mount: "root".to_owned(),
+            path: "bin/sh".to_owned(),
+            to: None,
+            wrote: false,
+        });
+        spans.file_written("workspace", "usr/bin/bash");
+        spans.file_written("root", "usr/bin/env");
+        assert!(!spans.shells_written());
+        spans.note_written_shell(&EffectKind::Fs {
+            op: "rename",
+            mount: "root".to_owned(),
+            path: "tmp/file".to_owned(),
+            to: Some("usr/bin/dash".to_owned()),
+            wrote: true,
+        });
+        assert!(spans.shells_written());
+        assert!(spans.written_shells.contains("dash"));
+        spans.file_written("root", "/bin/bash");
+        assert!(spans.written_shells.contains("bash"));
+    }
+
+    #[test]
     fn the_lexer_reads_quotes_escapes_and_comments() {
-        let word = |w: &str| Tok::Word(w.to_owned());
+        let word = |w: &str| Tok::Word {
+            text: w.to_owned(),
+            expands: false,
+        };
         let op = |o: &str| Tok::Op(o.to_owned());
         assert_eq!(
             lex(r#"a 'b c' "d\"e" f\ g && h >| i # j && k"#).unwrap(),
@@ -2583,16 +3071,16 @@ mod tests {
         let ran = words(&["bash", "-c", command]);
         // The record's copy alone: redacted, so it cannot tell.
         let span = Span::new(&open(scrubbed.clone()), None, 1, 1);
-        assert_eq!(span.carried_by("/bin/bash", &ran), None);
+        assert_eq!(span.carried_by("/bin/bash", &ran, false), None);
         // With the call's arguments as sent: exact.
         let raw = Some(Declared::Json(json!({"command": command})));
         let span = Span::new(&open(scrubbed), raw, 1, 1);
-        assert_eq!(span.carried_by("/bin/bash", &ran), Some(true));
+        assert_eq!(span.carried_by("/bin/bash", &ran, false), Some(true));
         assert!(!span.declared_display.unwrap().contains("k1"));
         // A copy with nothing redacted is the original.
         let span = Span::new(&open(json!({"command": "ls -la"})), None, 1, 1);
         assert_eq!(
-            span.carried_by("/bin/bash", &words(&["bash", "-c", "ls -la"])),
+            span.carried_by("/bin/bash", &words(&["bash", "-c", "ls -la"]), false,),
             Some(true)
         );
     }

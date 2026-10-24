@@ -532,6 +532,9 @@ pub fn observe(
                 record,
                 fs_effect("setattr", &setattr.mount, &setattr.path, None, false),
             );
+            if setattr.set.size.is_some() {
+                spans.file_written(&setattr.mount, &setattr.path);
+            }
         }
         Payload::FsCreate(create) if create.result.ok => {
             state.last_effect_ts = Some(ts);
@@ -545,6 +548,9 @@ pub fn observe(
         Payload::FsOpen(open) if open.result.ok => {
             state.last_effect_ts = Some(ts);
             out.extend(effect(state, cfg, record, &open.path));
+            if open.flags_decoded.iter().any(|flag| flag == "O_TRUNC") {
+                spans.file_written(&open.mount, &open.path);
+            }
         }
         Payload::FsMkdir(op) if op.result.ok => {
             state.last_effect_ts = Some(ts);
@@ -569,7 +575,22 @@ pub fn observe(
                 ),
             );
         }
-        Payload::FsWrite(_) | Payload::FsRead(_) => {
+        Payload::FsWrite(write) => {
+            state.last_effect_ts = Some(ts);
+            if write.result.ok {
+                spans.file_written(&write.mount, &write.path);
+            }
+        }
+        Payload::FsSymlink(op) if op.result.ok => {
+            spans.file_written(&op.mount, &op.path);
+        }
+        Payload::FsLink(op) if op.result.ok => {
+            spans.file_written(&op.mount, &op.path);
+        }
+        Payload::FsFallocate(op) if op.result.ok => {
+            spans.file_written(&op.mount, &op.path);
+        }
+        Payload::FsRead(_) => {
             state.last_effect_ts = Some(ts);
         }
         _ => {}

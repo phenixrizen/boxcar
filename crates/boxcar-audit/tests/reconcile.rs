@@ -17,7 +17,7 @@ use boxcar_audit::{
     Reconciler, SpanIndex,
 };
 use boxcar_proto::{
-    Attrib, ClockSync, Finding, FindingCategory, FsClose, FsCreate, FsDenied, FsPathOp, Hash,
+    Attrib, ClockSync, Finding, FindingCategory, FsClose, FsCreate, FsDenied, FsIo, FsPathOp, Hash,
     HashStatus, HttpRequest, NetConnect, NetDns, NetTls, OpResult, Payload, ProcExec,
     ProcExecDenied, ProcExit, ProcFork, ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus,
     ProcTcpConnect, ProcTlsIo, ProgramStatus, Record, Ring, SensorPhase, SessionId, SessionStart,
@@ -353,6 +353,24 @@ impl Log {
                 open_seq: None,
                 attrib: Attrib::Caller,
                 ts_release_ns: 0,
+            }),
+        )
+    }
+
+    fn fs_write(&mut self, at_ms: u64, tid: u32, mount: &str, path: &str) -> Step {
+        self.rec(
+            at_ms,
+            Ring::Host,
+            Some((tid, 1000, 1000)),
+            Payload::FsWrite(FsIo {
+                mount: mount.into(),
+                path: path.into(),
+                path_b64: None,
+                fh: 1,
+                offset: 0,
+                len: 1,
+                result: OpResult::ok(),
+                attrib: Attrib::Caller,
             }),
         )
     }
@@ -2261,6 +2279,91 @@ fn a_declared_command_in_a_comment_is_not_run() {
         assert!(
             findings_of(&out).iter().any(|f| f.rule == "argv"),
             "{shell}: {out:?}"
+        );
+    }
+}
+
+/// Shell forms without trusted command evidence retain the mismatch at
+/// the close, including a direct argv whose explicit path names another
+/// file.
+#[test]
+fn shell_forms_without_command_evidence_keep_the_argv_mismatch() {
+    let cases = [
+        (
+            json!({"command": "ls -la"}),
+            "/tmp/bash",
+            vec!["bash", "-c", "ls -la"],
+            false,
+        ),
+        (
+            json!({"command": "ls -la"}),
+            "/bin/bash",
+            vec!["bash", "-c", "ls -la"],
+            true,
+        ),
+        (
+            json!({"command": "ls -la"}),
+            "/bin/bash",
+            vec!["bash", "--version", "-c", "ls -la"],
+            false,
+        ),
+        (
+            json!({"command": "ls -la"}),
+            "/bin/bash",
+            vec![
+                "bash",
+                "-c",
+                "false && eval 'ls -la' < /dev/null && pwd -P >| /tmp/c",
+            ],
+            false,
+        ),
+        (
+            json!({"command": "echo $VALUE"}),
+            "/bin/bash",
+            vec![
+                "bash",
+                "-c",
+                "eval \"echo $VALUE\" < /dev/null && pwd -P >| /tmp/c",
+            ],
+            false,
+        ),
+        (
+            json!({"command": "ls -la"}),
+            "/bin/bash",
+            vec![
+                "bash",
+                "-c",
+                "cat <<END\ntext && eval 'ls -la' < /dev/null && pwd -P >| /tmp/c",
+            ],
+            false,
+        ),
+        (
+            json!({"command": ["/usr/bin/tool", "check"]}),
+            "/tmp/tool",
+            vec!["/usr/bin/tool", "check"],
+            false,
+        ),
+    ];
+    for (declared, program, argv, write_shell) in cases {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        if write_shell {
+            steps.push(log.fs_write(1500, 100, "root", "/bin/bash"));
+        }
+        steps.push(log.tool_open(2000, "toolu_01", "Bash", declared));
+        steps.push(log.exec_as(2100, 330, 100, 10, program, &argv));
+        steps.push(log.exit(2500, 330, 10));
+        steps.push(log.tool_close(3000, "toolu_01", "ok"));
+        for at in [4000, 5000] {
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        assert!(
+            findings_of(&out)
+                .iter()
+                .any(|finding| finding.rule == "argv"),
+            "{program} {argv:?}: {out:?}"
         );
     }
 }
