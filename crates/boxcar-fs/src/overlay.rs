@@ -926,16 +926,29 @@ impl<L: Layer, U: Layer> OverlayFs<L, U> {
         let result = loop {
             let mut got = 0;
             let mut last = offset;
+            // The first error `add` gives, which is the answer whatever
+            // the layer returns: a layer may end its listing at an error
+            // from this callback and say nothing of it (fuse-backend-rs's
+            // passthrough does once it has passed an entry on).
+            let mut failed = None;
             let read = layer.readdir(ctx, ino, handle, LIST_CHUNK, offset, &mut |entry| {
-                add(Listed {
+                let added = add(Listed {
                     name: entry.name.to_vec(),
                     ino: entry.ino,
                     type_: entry.type_,
-                })?;
+                });
+                if let Err(error) = added {
+                    let stop = errno(error.raw_os_error().unwrap_or(libc::EIO));
+                    failed = Some(error);
+                    return Err(stop);
+                }
                 last = entry.offset;
                 got += 1;
                 Ok(entry.name.len() + 24)
             });
+            if let Some(error) = failed {
+                break Err(error);
+            }
             if let Err(error) = read {
                 break Err(error);
             }
@@ -2290,6 +2303,133 @@ fn copy_xattrs(src: &OwnedFd, dst: &OwnedFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{passthrough_config, CachePolicyKind, FsShareConfig};
+    use fuse_backend_rs::passthrough::PassthroughFs;
+
+    /// A passthrough whose `readdir` ends at an error from its callback
+    /// and returns `Ok`, as a `FileSystem` may.
+    struct QuietReaddir {
+        inner: PassthroughFs,
+    }
+
+    impl FileSystem for QuietReaddir {
+        type Inode = u64;
+        type Handle = u64;
+
+        forward! {
+            init: forward,
+            destroy: forward,
+            lookup: forward,
+            forget: forward,
+            batch_forget: forward,
+            getattr: forward,
+            setattr: forward,
+            readlink: forward,
+            symlink: forward,
+            mknod: forward,
+            mkdir: forward,
+            unlink: forward,
+            rmdir: forward,
+            rename: forward,
+            link: forward,
+            open: forward,
+            create: forward,
+            read: forward,
+            write: forward,
+            flush: forward,
+            fsync: forward,
+            fallocate: forward,
+            release: forward,
+            statfs: forward,
+            setxattr: forward,
+            getxattr: forward,
+            listxattr: forward,
+            removexattr: forward,
+            opendir: forward,
+            readdir: audited,
+            readdirplus: forward,
+            fsyncdir: forward,
+            releasedir: forward,
+            setupmapping: forward,
+            removemapping: forward,
+            access: forward,
+            lseek: forward,
+            getlk: forward,
+            setlk: forward,
+            setlkw: forward,
+            ioctl: forward,
+            bmap: forward,
+            poll: forward,
+            notify_reply: forward,
+            id_remap: forward,
+        }
+
+        fn readdir(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            size: u32,
+            offset: u64,
+            add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+        ) -> io::Result<()> {
+            // `Ok(0)` ends the passthrough's listing without an error.
+            self.inner
+                .readdir(ctx, inode, handle, size, offset, &mut |entry| {
+                    Ok(add_entry(entry).unwrap_or(0))
+                })
+        }
+    }
+
+    fn quiet_layer(root: &std::path::Path) -> QuietReaddir {
+        let config = passthrough_config(&FsShareConfig {
+            tag: "root".into(),
+            host_dir: root.to_path_buf(),
+            guest_path: "/".into(),
+            cache: CachePolicyKind::Always,
+            lower: None,
+        });
+        let inner = PassthroughFs::<()>::new(config).unwrap();
+        inner.import().unwrap();
+        QuietReaddir { inner }
+    }
+
+    /// Past the bound, `opendir` fails even over a layer that says nothing
+    /// of the callback's error, and holds no listing cut short.
+    #[test]
+    fn a_listing_past_its_bound_fails_whatever_the_layer_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lower = dir.path().join("lower");
+        let upper = dir.path().join("upper");
+        std::fs::create_dir_all(lower.join("many")).unwrap();
+        std::fs::create_dir(&upper).unwrap();
+        for i in 0..24 {
+            std::fs::write(
+                lower
+                    .join("many")
+                    .join(format!("{i:04}-{}", "x".repeat(80))),
+                b"",
+            )
+            .unwrap();
+        }
+        let open = |path: &std::path::Path| OwnedFd::from(std::fs::File::open(path).unwrap());
+        let fs = OverlayFs::new(
+            quiet_layer(&lower),
+            open(&lower),
+            quiet_layer(&upper),
+            open(&upper),
+            &[],
+        )
+        .with_listing_limits(512, 4096);
+        fs.init(FsOptions::empty()).unwrap();
+        let many = fs.lookup(&ROOT_CTX, ROOT_ID, c"many").unwrap().inode;
+        let opened = fs.opendir(&ROOT_CTX, many, libc::O_RDONLY as u32);
+        assert_eq!(
+            opened.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ENOMEM)
+        );
+        assert_eq!(*fs.listing_bytes.lock().unwrap(), 0);
+    }
 
     #[test]
     fn listing_construction_holds_and_returns_aggregate_capacity() {
