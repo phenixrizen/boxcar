@@ -29,7 +29,7 @@ use super::{
 };
 use crate::gate::exchange::{Emit, Exchange};
 use crate::gate::Direction;
-use crate::http::{Headers, SseEvent};
+use crate::http::{Headers, SseEvent, SseItem};
 
 /// A response under way, by its provider.
 enum Stream {
@@ -93,6 +93,13 @@ struct Tracked {
     sse: bool,
     /// Over WebSocket: the responses are the events until completion.
     ws: bool,
+    /// The newest WebSocket response waiting for an earlier one to reach
+    /// its terminal event.
+    ws_pending: Option<(Stream, Instant)>,
+    /// Earlier pending responses already recorded and still to be drained.
+    ws_discard: u32,
+    /// The active WebSocket response has a newer request waiting behind it.
+    ws_superseded: bool,
     degraded: Option<&'static str>,
 }
 
@@ -142,6 +149,9 @@ impl Tracker {
                     stream: None,
                     sse: false,
                     ws: false,
+                    ws_pending: None,
+                    ws_discard: 0,
+                    ws_superseded: false,
                     degraded: None,
                 }),
             );
@@ -249,8 +259,11 @@ impl Tracker {
             return;
         };
         let mut opens = Vec::new();
-        for event in &exchange.sse_events {
-            opens.extend(parser.event(event));
+        for item in &exchange.sse_events {
+            match item {
+                SseItem::Event(event) => opens.extend(parser.event(event)),
+                SseItem::DroppedLine => parser.lose_calls(),
+            }
         }
         for open in opens {
             out.push(self.open_record(stream, open));
@@ -357,8 +370,28 @@ impl Tracker {
                     return;
                 }
                 let (info, closes) = openai_responses::request_value(&value);
-                tracked.started = now;
-                tracked.stream = Some(Stream::new(provider, &self.retained));
+                let parser = Stream::new(provider, &self.retained);
+                let displaced = if tracked.stream.is_some() || tracked.ws_discard > 0 {
+                    tracked.ws_superseded |= tracked.stream.is_some();
+                    tracked
+                        .ws_pending
+                        .replace((parser, now))
+                        .map(|(parser, started)| {
+                            tracked.ws_discard = tracked.ws_discard.saturating_add(1);
+                            (parser.finish(), started)
+                        })
+                } else {
+                    tracked.started = now;
+                    tracked.stream = Some(parser);
+                    None
+                };
+                if let Some(((mut response, opens), started)) = displaced {
+                    response.degraded = Some("overlapping_response");
+                    for open in opens {
+                        out.push(self.open_record(stream, open));
+                    }
+                    out.push(self.response_record(stream, provider, response, started, now));
+                }
                 let flow = self.flow;
                 out.push(Emit::plain(Payload::LlmRequest(LlmRequest {
                     flow,
@@ -379,20 +412,43 @@ impl Tracker {
                 }
             }
             Direction::ToGuest => {
-                let Some(Stream::Responses(parser)) = tracked.stream.as_mut() else {
-                    return;
-                };
-                let opens = parser.value(&value);
                 let completed = matches!(
                     kind,
                     "response.completed" | "response.incomplete" | "response.failed"
                 );
+                let Some(Stream::Responses(parser)) = tracked.stream.as_mut() else {
+                    if completed && tracked.ws_discard > 0 {
+                        tracked.ws_discard -= 1;
+                        if tracked.ws_discard == 0 {
+                            if let Some((parser, started)) = tracked.ws_pending.take() {
+                                tracked.stream = Some(parser);
+                                tracked.started = started;
+                                tracked.ws_superseded = false;
+                            }
+                        }
+                    }
+                    return;
+                };
+                let opens = parser.value(&value);
                 let started = tracked.started;
                 let finished = if completed {
                     tracked.stream.take().map(Stream::finish)
                 } else {
                     None
                 };
+                let finished = finished.map(|(mut info, late)| {
+                    if tracked.ws_superseded {
+                        info.degraded = Some("overlapping_response");
+                    }
+                    if tracked.ws_discard == 0 {
+                        if let Some((parser, started)) = tracked.ws_pending.take() {
+                            tracked.stream = Some(parser);
+                            tracked.started = started;
+                        }
+                    }
+                    tracked.ws_superseded = false;
+                    (info, late)
+                });
                 for open in opens {
                     out.push(self.open_record(stream, open));
                 }
@@ -437,19 +493,31 @@ impl Tracker {
     /// reset or could not be read): a response under way is recorded as it
     /// stands, and the stream is forgotten.
     pub fn end(&mut self, stream: u32, now: Instant, out: &mut Vec<Emit>) {
-        let Some(tracked) = self.forget(stream) else {
+        let Some(mut tracked) = self.forget(stream) else {
             return;
         };
-        let Some(parser) = tracked.stream else {
-            return;
-        };
-        let (mut info, opens) = parser.finish();
-        info.degraded
-            .get_or_insert(tracked.degraded.unwrap_or("flow_closed"));
-        for open in opens {
-            out.push(self.open_record(stream, open));
+        let mut responses = Vec::new();
+        if let Some(parser) = tracked.stream.take() {
+            let (mut info, opens) = parser.finish();
+            info.degraded.get_or_insert(if tracked.ws_superseded {
+                "overlapping_response"
+            } else {
+                tracked.degraded.unwrap_or("flow_closed")
+            });
+            responses.push((info, opens, tracked.started));
         }
-        out.push(self.response_record(stream, tracked.provider, info, tracked.started, now));
+        if let Some((parser, started)) = tracked.ws_pending.take() {
+            let (mut info, opens) = parser.finish();
+            info.degraded
+                .get_or_insert(tracked.degraded.unwrap_or("flow_closed"));
+            responses.push((info, opens, started));
+        }
+        for (info, opens, started) in responses {
+            for open in opens {
+                out.push(self.open_record(stream, open));
+            }
+            out.push(self.response_record(stream, tracked.provider, info, started, now));
+        }
     }
 
     fn span(&self, tool_use_id: &str) -> SpanRef {
@@ -1072,5 +1140,114 @@ mod tests {
         assert_eq!(resp.provider, "openai_responses");
         assert_eq!(resp.stop_reason.as_deref(), Some("completed"));
         assert_eq!(resp.tool_uses, 1);
+    }
+
+    #[test]
+    fn a_new_websocket_request_waits_for_the_prior_reply_to_end() {
+        let mut tracker = Tracker::new(3, "session-trace".to_owned());
+        let mut out = Vec::new();
+        let started = Instant::now();
+        tracker.request_head(1, Some("/v1/responses"), started);
+        tracker.upgraded(1);
+        tracker.ws_message(
+            1,
+            Direction::ToHost,
+            true,
+            br#"{"type":"response.create","model":"first","input":"one"}"#,
+            started,
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
+            started,
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":[\"ls\"]}"}"#,
+            started,
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToHost,
+            true,
+            br#"{"type":"response.create","model":"second","input":"two"}"#,
+            started + Duration::from_millis(5),
+            &mut out,
+        );
+        assert_eq!(kinds(&out), ["llm.request", "llm.request"], "{out:?}");
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":[\"ls\"]}"}}"#,
+            started + Duration::from_millis(6),
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.completed","response":{"id":"resp_first","status":"completed"}}"#,
+            started + Duration::from_millis(7),
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.created","response":{"id":"resp_second","model":"second-server"}}"#,
+            started + Duration::from_millis(8),
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.output_text.delta","delta":"new"}"#,
+            started + Duration::from_millis(9),
+            &mut out,
+        );
+        tracker.ws_message(
+            1,
+            Direction::ToGuest,
+            true,
+            br#"{"type":"response.completed","response":{"id":"resp_second","status":"completed"}}"#,
+            started + Duration::from_millis(10),
+            &mut out,
+        );
+        assert_eq!(
+            kinds(&out),
+            [
+                "llm.request",
+                "llm.request",
+                "tool.open",
+                "llm.response",
+                "llm.response"
+            ],
+            "{out:?}"
+        );
+        assert_eq!(
+            out[2].span.as_ref().map(|span| span.span_id.as_str()),
+            Some("call_1")
+        );
+        let Payload::LlmResponse(response) = &out[3].payload else {
+            panic!()
+        };
+        assert_eq!(response.degraded.as_deref(), Some("overlapping_response"));
+        assert_eq!(response.tool_uses, 1);
+        let Payload::LlmResponse(response) = &out[4].payload else {
+            panic!()
+        };
+        assert_eq!(response.model.as_deref(), Some("second-server"));
+        assert_eq!(response.text_b3, crate::model::b3(b"new"));
+        assert_eq!(response.degraded, None);
+        assert_eq!(response.tool_uses, 0);
     }
 }

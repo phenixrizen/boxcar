@@ -25,7 +25,7 @@ use boxcar_proto::{HttpDegraded, HttpRequest, HttpResponse, Payload, SpanRef};
 use super::Direction;
 use crate::dump::{self, DumpDir};
 use crate::http::{
-    BodySink, Connection, Event, Headers, Retained, Share, SseEvent, SseParser, Version,
+    BodySink, Connection, Event, Headers, Retained, Share, SseItem, SseParser, Version,
 };
 use crate::model::Tracker;
 
@@ -69,18 +69,24 @@ const SSE_SLICE: usize = 16 * 1024;
 const SSE_EVENTS_KEPT: usize = 64;
 
 /// Splits `slice` of `stream`'s decoded event stream into `exchange`'s
-/// events; a line dropped for size voids the calls under way.
+/// ordered events and dropped-line markers.
 fn feed_events(model: &mut Tracker, stream: u32, exchange: &mut Exchange, slice: &[u8]) {
     let Some(sse) = exchange.sse.as_mut() else {
         return;
     };
     let before = exchange.sse_events.len();
-    sse.feed(slice, &mut exchange.sse_events);
-    exchange.sse_count += (exchange.sse_events.len() - before) as u64;
-    if sse.take_drop() {
+    sse.feed_ordered(slice, &mut exchange.sse_events);
+    let added = &exchange.sse_events[before..];
+    exchange.sse_count += added
+        .iter()
+        .filter(|item| matches!(item, SseItem::Event(_)))
+        .count() as u64;
+    if added
+        .iter()
+        .any(|item| matches!(item, SseItem::DroppedLine))
+    {
         exchange.response_degraded.get_or_insert("sse_line");
         model.degraded(stream, "sse_line");
-        model.lose_calls(stream);
     }
 }
 
@@ -121,7 +127,7 @@ pub struct Exchange {
     sse: Option<SseParser>,
     /// The event stream's events completed since the model parsers last
     /// took them: dropped once they have.
-    pub sse_events: Vec<SseEvent>,
+    pub sse_events: Vec<SseItem>,
     sse_count: u64,
     ws_count: u64,
     upgraded: bool,
@@ -535,12 +541,20 @@ impl Observation {
                                 exchange.sse_events.clear();
                             }
                             if let Some(sse) = exchange.sse.as_mut() {
-                                sse.finish(&mut exchange.sse_events);
-                                exchange.sse_count += exchange.sse_events.len() as u64;
-                                if sse.take_drop() {
+                                let before = exchange.sse_events.len();
+                                sse.finish_ordered(&mut exchange.sse_events);
+                                let added = &exchange.sse_events[before..];
+                                exchange.sse_count += added
+                                    .iter()
+                                    .filter(|item| matches!(item, SseItem::Event(_)))
+                                    .count()
+                                    as u64;
+                                if added
+                                    .iter()
+                                    .any(|item| matches!(item, SseItem::DroppedLine))
+                                {
                                     exchange.response_degraded.get_or_insert("sse_line");
                                     self.model.degraded(stream, "sse_line");
-                                    self.model.lose_calls(stream);
                                 }
                             }
                         }
@@ -1135,6 +1149,45 @@ mod tests {
             _ => None,
         });
         assert_eq!(counted, Some(events as u64 + 1));
+    }
+
+    #[test]
+    fn a_budget_drop_voids_a_call_started_in_the_same_slice() {
+        let retained = Retained::with_limit(512);
+        let mut tracker = Tracker::new(5, "trace-test".to_owned());
+        let now = Instant::now();
+        tracker.request_head(1, Some("/v1/messages"), now);
+        let mut headers = Headers::new();
+        headers.push("content-type", b"text/event-stream").unwrap();
+        tracker.response_head(1, 200, &headers);
+
+        let mut exchange = Exchange::new(1, now);
+        exchange.sse = Some(SseParser::with_retained(retained));
+        let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_d\",\"name\":\"Bash\",\"input\":{}}}\n\ndata: ";
+        let mut first = start.to_owned();
+        first.push_str(&"x".repeat(1024));
+        feed_events(&mut tracker, 1, &mut exchange, first.as_bytes());
+        let mut out = Vec::new();
+        tracker.response_body(1, &exchange, &mut out);
+        exchange.sse_events.clear();
+
+        let delta = serde_json::json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "demo-pass\"}"}
+        });
+        let rest = format!(
+            "tail\n\nevent: content_block_delta\ndata: {delta}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n"
+        );
+        feed_events(&mut tracker, 1, &mut exchange, rest.as_bytes());
+        tracker.response_body(1, &exchange, &mut out);
+        let open = out.iter().find_map(|emit| match &emit.payload {
+            Payload::ToolOpen(open) => Some(open),
+            _ => None,
+        });
+        assert_eq!(
+            open.map(|open| open.args_summary.as_str()),
+            Some("[arguments not kept whole]")
+        );
     }
 
     #[test]
