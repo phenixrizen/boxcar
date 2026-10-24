@@ -50,7 +50,8 @@ pub use payloads::{
     ProcConnectAttempt, ProcExec, ProcExecDenied, ProcExit, ProcFileOpen, ProcFork, ProcHeartbeat,
     ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach, ProcTlsIo,
     ProgramStatus, SeccompMode, SensorPhase, SessionExit, SessionStart, SetAttr, ShareRef,
-    SpanEffects, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect,
+    SpanEffects, SpanUnverifiedReason, ToolClose, ToolOpen, Verdict, VmmStart, VmmStop, VsockClose,
+    VsockConnect, MAX_SPAN_EFFECTS, MAX_SPAN_PROCS, MAX_SPAN_UNVERIFIED_REASONS,
 };
 
 /// The value of a record's `v` field.
@@ -1808,12 +1809,18 @@ mod tests {
                     executor_tgid: Some(212),
                     procs: vec![230, 231],
                     effects: vec![41, 44, 52],
+                    attribution_unverified: vec![
+                        SpanUnverifiedReason::NoLineage,
+                        SpanUnverifiedReason::CloseUnattributed,
+                    ],
                     truncated: false,
                 }),
                 json!({
                     "span_id": "toolu_01", "tool_name": "Bash", "opened_seq": 40,
                     "closed_seq": 58, "executor_tgid": 212, "procs": [230, 231],
-                    "effects": [41, 44, 52], "truncated": false,
+                    "effects": [41, 44, 52],
+                    "attribution_unverified": ["no_lineage", "close_unattributed"],
+                    "truncated": false,
                 }),
             ),
             (
@@ -1923,6 +1930,7 @@ mod tests {
                     executor_tgid: None,
                     procs: Vec::new(),
                     effects: Vec::new(),
+                    attribution_unverified: Vec::new(),
                     truncated: false,
                 }),
                 json!({
@@ -2362,6 +2370,38 @@ mod tests {
         let bytes = serde_json::to_vec(&data).unwrap().len();
         assert!(bytes < 8 * 1024, "{bytes}");
         assert!(bytes < crate::limits::MAX_RECORD_BYTES);
+    }
+
+    /// The attribution reasons are a fixed, deduplicated set, and their
+    /// largest form leaves room in a `span.effects` record at its limits.
+    #[test]
+    fn span_effects_attribution_reasons_fit_the_record_limit() {
+        let reasons = vec![
+            SpanUnverifiedReason::NoLineage,
+            SpanUnverifiedReason::CloseUnattributed,
+        ];
+        assert_eq!(reasons.len(), MAX_SPAN_UNVERIFIED_REASONS);
+        let payload = Payload::SpanEffects(SpanEffects {
+            span_id: "\0".repeat(256),
+            tool_name: "\0".repeat(1024),
+            opened_seq: u64::MAX,
+            closed_seq: Some(u64::MAX),
+            executor_tgid: Some(u32::MAX),
+            procs: vec![u32::MAX; MAX_SPAN_PROCS],
+            effects: vec![u64::MAX; MAX_SPAN_EFFECTS],
+            attribution_unverified: reasons,
+            truncated: true,
+        });
+        let (kind, data) = payload.into_parts();
+        let mut record = record(&kind, Source::Reconciler, data);
+        record.span = Some(SpanRef {
+            trace_id: record.session_id.to_string(),
+            span_id: "\0".repeat(256),
+        });
+        let back = Payload::from_record(&record).unwrap();
+        assert_eq!(back, payload);
+        let bytes = serde_json::to_vec(&record).unwrap().len();
+        assert!(bytes <= crate::limits::MAX_RECORD_BYTES, "{bytes}");
     }
 
     /// `http.degraded` is made only from fixed labels and numbers; its

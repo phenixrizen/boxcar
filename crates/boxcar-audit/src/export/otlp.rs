@@ -580,6 +580,17 @@ fn effects_attributes(effects: &SpanEffects) -> Vec<KeyValue> {
     if let Some(tgid) = effects.executor_tgid {
         attributes.push(KeyValue::int("boxcar.span.executor_tgid", u64::from(tgid)));
     }
+    if !effects.attribution_unverified.is_empty() {
+        let reasons: Vec<String> = effects
+            .attribution_unverified
+            .iter()
+            .map(|reason| reason.as_str().to_owned())
+            .collect();
+        attributes.push(KeyValue::strings(
+            "boxcar.span.attribution_unverified",
+            &reasons,
+        ));
+    }
     attributes.push(KeyValue::bool("boxcar.span.truncated", effects.truncated));
     attributes
 }
@@ -790,6 +801,36 @@ mod tests {
     use super::*;
 
     /// A count past `i64::MAX` is a string, alone or in an array.
+    #[test]
+    fn unverified_attribution_is_exported() {
+        let effects = SpanEffects {
+            span_id: "toolu_1".into(),
+            tool_name: "Bash".into(),
+            opened_seq: 1,
+            closed_seq: Some(2),
+            executor_tgid: None,
+            procs: Vec::new(),
+            effects: Vec::new(),
+            attribution_unverified: vec![boxcar_proto::SpanUnverifiedReason::NoLineage],
+            truncated: false,
+        };
+        let attributes = effects_attributes(&effects);
+        let reasons = attributes
+            .iter()
+            .find(|kv| kv.key == "boxcar.span.attribution_unverified")
+            .expect("the reasons are exported");
+        assert!(serde_json::to_string(reasons)
+            .unwrap()
+            .contains("no_lineage"));
+        let none = effects_attributes(&SpanEffects {
+            attribution_unverified: Vec::new(),
+            ..effects
+        });
+        assert!(none
+            .iter()
+            .all(|kv| kv.key != "boxcar.span.attribution_unverified"));
+    }
+
     #[test]
     fn counts_past_i64_are_strings() {
         assert_eq!(unsigned(7), AnyValue::Int("7".into()));

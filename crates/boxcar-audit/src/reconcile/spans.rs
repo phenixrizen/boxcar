@@ -42,17 +42,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use boxcar_proto::control::{SpanEntry, MAX_SPAN_LIST};
 use boxcar_proto::redact::scrub_text;
-use boxcar_proto::{Finding, FindingCategory, ProcExec, Record, SpanEffects, ToolClose, ToolOpen};
+use boxcar_proto::{
+    Finding, FindingCategory, ProcExec, Record, SpanEffects, SpanUnverifiedReason, ToolClose,
+    ToolOpen, MAX_SPAN_EFFECTS, MAX_SPAN_PROCS, MAX_SPAN_UNVERIFIED_REASONS,
+};
 use serde_json::Value;
 
 use super::rules::Draft;
 use super::state::{ProcKey, State};
 use super::{EXEC_PENDING_NS, JOIN_WINDOW_NS, PENDING_NS};
 
-/// The most processes a span lists.
-pub const MAX_SPAN_PROCS: usize = 1024;
-/// The most effect records a span lists.
-pub const MAX_SPAN_EFFECTS: usize = 4096;
 /// The most bytes the effects of every span kept hold at once (the
 /// entries and their paths); past it a span takes no more, `truncated`.
 /// A span's are let go once it has settled and been recorded.
@@ -323,6 +322,8 @@ pub struct Span {
     status: Option<String>,
     members: Vec<Member>,
     effects: Vec<Effect>,
+    /// Why process attribution for this span is not verified.
+    attribution_unverified: Vec<SpanUnverifiedReason>,
     /// What `effects` holds of [`MAX_EFFECT_BYTES`].
     effect_bytes: usize,
     /// Effects let go once the span settled and was recorded: counted,
@@ -417,6 +418,7 @@ impl Span {
             status: None,
             members: Vec::new(),
             effects: Vec::new(),
+            attribution_unverified: Vec::new(),
             effect_bytes: 0,
             effects_let_go: 0,
             executor: None,
@@ -485,18 +487,31 @@ impl Span {
 
     /// Adds `effect`, its bytes counted in `held` (every span's) against
     /// [`MAX_EFFECT_BYTES`].
-    fn push_effect(&mut self, effect: Effect, held: &mut usize) {
+    fn push_effect(&mut self, effect: Effect, held: &mut usize) -> bool {
         if self.effects.iter().any(|e| e.seq == effect.seq) {
-            return;
+            return false;
         }
         let bytes = effect.bytes();
         if self.effects.len() >= MAX_SPAN_EFFECTS || *held + bytes > MAX_EFFECT_BYTES {
             self.truncated = true;
-            return;
+            return false;
         }
         *held += bytes;
         self.effect_bytes += bytes;
         self.effects.push(effect);
+        true
+    }
+
+    fn note_unverified(&mut self, reason: SpanUnverifiedReason) {
+        if self.attribution_unverified.len() < MAX_SPAN_UNVERIFIED_REASONS
+            && !self.attribution_unverified.contains(&reason)
+        {
+            self.attribution_unverified.push(reason);
+        }
+    }
+
+    fn clear_unverified(&mut self, reason: SpanUnverifiedReason) {
+        self.attribution_unverified.retain(|kept| *kept != reason);
     }
 
     /// Lets the effects go, keeping their count; gives back their bytes.
@@ -551,6 +566,7 @@ impl Span {
             executor_tgid: self.executor.map(|key| key.tgid).or(session_pid),
             procs: self.members.iter().map(|m| m.key.tgid).collect(),
             effects,
+            attribution_unverified: self.attribution_unverified.clone(),
             truncated: self.truncated,
         }
     }
@@ -650,6 +666,8 @@ pub struct Spans {
 enum Verdict {
     Apply,
     Drop,
+    /// The close could not be attributed and leaves the span open.
+    Unattributed,
     /// Who opened the span's request flow, or the close's, is not known yet.
     Wait,
 }
@@ -967,14 +985,24 @@ impl Spans {
     /// has nothing to hold a close to, and takes any.
     pub fn close(&mut self, state: &State, record: &Record, close: &ToolClose) -> Vec<Finding> {
         if !state.sensor.lineage_ok() {
+            self.note_unverified(&close.tool_use_id, SpanUnverifiedReason::NoLineage);
             return self.apply_close(state, record, close);
         }
         match self.close_verdict(state, close) {
             Verdict::Apply => self.apply_close(state, record, close),
             Verdict::Drop => Vec::new(),
+            Verdict::Unattributed => {
+                self.note_unverified(&close.tool_use_id, SpanUnverifiedReason::CloseUnattributed);
+                Vec::new()
+            }
             Verdict::Wait => {
                 if self.pending_closes.len() >= MAX_PENDING_CLOSES {
-                    self.pending_closes.pop_front();
+                    if let Some(pending) = self.pending_closes.pop_front() {
+                        self.note_unverified(
+                            &pending.close.tool_use_id,
+                            SpanUnverifiedReason::CloseUnattributed,
+                        );
+                    }
                 }
                 self.pending_closes.push_back(PendingClose {
                     record: record.clone(),
@@ -1005,13 +1033,21 @@ impl Spans {
             // Not on record, and flows have been let go for room: this one
             // may have been, and who opened it with it. Nothing shows the
             // close is the executor's: the span stays open.
-            (None, _) if state.flows_let_go => Verdict::Drop,
+            (None, _) if state.flows_let_go => Verdict::Unattributed,
             // No such flow on record (a log without the gate's flows):
             // nothing to hold the close to.
             (None, _) => Verdict::Apply,
             (Some(executor), Some(closer)) if executor == *closer => Verdict::Apply,
             (Some(_), Some(_)) => Verdict::Drop,
             (Some(_), None) => Verdict::Wait,
+        }
+    }
+
+    fn note_unverified(&mut self, id: &str, reason: SpanUnverifiedReason) {
+        if let Some(span) = self.spans.get_mut(id) {
+            if span.is_open() {
+                span.note_unverified(reason);
+            }
         }
     }
 
@@ -1024,6 +1060,7 @@ impl Spans {
         if span.closed.is_some() || span.abandoned {
             return Vec::new();
         }
+        span.clear_unverified(SpanUnverifiedReason::CloseUnattributed);
         span.closed = Some((record.seq, record.ts_host_ns));
         span.status = Some(close.status.clone());
         self.open.retain(|open| open != id);
@@ -1059,14 +1096,15 @@ impl Spans {
             let shell_written = self.shells_written();
             if let Some(span) = self.spans.get_mut(&id) {
                 span.note_exec(&exec.filename, &exec.argv, argv_complete, shell_written);
-                span.push_effect(
-                    Effect {
-                        seq,
-                        kind: EffectKind::Exec,
-                    },
-                    &mut self.effect_bytes,
-                );
             }
+            self.push_effect(
+                state,
+                &id,
+                Effect {
+                    seq,
+                    kind: EffectKind::Exec,
+                },
+            );
             self.index_update(&id);
             return Vec::new();
         }
@@ -1126,7 +1164,7 @@ impl Spans {
         match self.owner(state, who, ts) {
             Some(id) => {
                 if self.spans.get(&id).is_some_and(Span::is_open) {
-                    self.push_effect(&id, Effect { seq, kind });
+                    self.push_effect(state, &id, Effect { seq, kind });
                 }
                 // A member of a closed span: its later work is its own.
             }
@@ -1229,6 +1267,10 @@ impl Spans {
                     self.deferred_findings.extend(findings);
                 }
                 Verdict::Drop => {}
+                Verdict::Unattributed => self.note_unverified(
+                    &pending.close.tool_use_id,
+                    SpanUnverifiedReason::CloseUnattributed,
+                ),
                 Verdict::Wait => self.pending_closes.push_back(pending),
             }
         }
@@ -1236,11 +1278,10 @@ impl Spans {
         match self.by_proc.get(&key).cloned() {
             Some(id) => {
                 if self.spans.get(&id).is_some_and(Span::is_open) {
-                    self.push_effect(&id, Effect { seq, kind });
+                    self.push_effect(state, &id, Effect { seq, kind });
                 }
             }
             None => {
-                let _ = state;
                 self.remember(RecentEffect {
                     seq,
                     ts,
@@ -1259,7 +1300,12 @@ impl Spans {
             .front()
             .is_some_and(|p| now.saturating_sub(p.record.ts_host_ns) >= CLOSE_WAIT_NS)
         {
-            self.pending_closes.pop_front();
+            if let Some(pending) = self.pending_closes.pop_front() {
+                self.note_unverified(
+                    &pending.close.tool_use_id,
+                    SpanUnverifiedReason::CloseUnattributed,
+                );
+            }
         }
         let due: Vec<String> = self
             .order
@@ -1297,6 +1343,14 @@ impl Spans {
     /// `vmm.stop`: the spans still open get their `span.effects` as they
     /// stand.
     pub fn stop(&mut self) {
+        let waiting: Vec<String> = self
+            .pending_closes
+            .drain(..)
+            .map(|pending| pending.close.tool_use_id)
+            .collect();
+        for id in waiting {
+            self.note_unverified(&id, SpanUnverifiedReason::CloseUnattributed);
+        }
         let open: Vec<String> = self.open.clone();
         for id in open {
             self.write_record(&id);
@@ -1431,13 +1485,13 @@ impl Spans {
                     return false;
                 };
                 span.note_exec(&exec.program, &exec.argv, exec.argv_complete, shell_written);
-                span.push_effect(
-                    Effect {
-                        seq: exec.seq,
-                        kind: EffectKind::Exec,
-                    },
-                    &mut self.effect_bytes,
-                );
+                let effect = Effect {
+                    seq: exec.seq,
+                    kind: EffectKind::Exec,
+                };
+                if span.push_effect(effect, &mut self.effect_bytes) && !state.sensor.lineage_ok() {
+                    span.note_unverified(SpanUnverifiedReason::NoLineage);
+                }
                 self.index_update(id);
                 return true;
             }
@@ -1456,17 +1510,20 @@ impl Spans {
                 return false;
             }
             span.members.push(Member { key, exec_seq });
+            if !state.sensor.lineage_ok() {
+                span.note_unverified(SpanUnverifiedReason::NoLineage);
+            }
             if let Some(exec) = exec {
                 span.note_exec(&exec.program, &exec.argv, exec.argv_complete, shell_written);
             }
             if let Some(seq) = exec_seq {
-                span.push_effect(
-                    Effect {
-                        seq,
-                        kind: EffectKind::Exec,
-                    },
-                    &mut self.effect_bytes,
-                );
+                let effect = Effect {
+                    seq,
+                    kind: EffectKind::Exec,
+                };
+                if span.push_effect(effect, &mut self.effect_bytes) && !state.sensor.lineage_ok() {
+                    span.note_unverified(SpanUnverifiedReason::NoLineage);
+                }
             }
         }
         self.by_proc.insert(key, id.to_owned());
@@ -1478,6 +1535,7 @@ impl Spans {
             };
             if owner == Some(key) {
                 self.push_effect(
+                    state,
                     id,
                     Effect {
                         seq: effect.seq,
@@ -1569,20 +1627,25 @@ impl Spans {
             }
         };
         self.push_effect(
+            state,
             &id,
             Effect {
                 seq,
                 kind: kind.clone(),
             },
-        );
-        true
+        )
     }
 
-    fn push_effect(&mut self, id: &str, effect: Effect) {
-        if let Some(span) = self.spans.get_mut(id) {
-            span.push_effect(effect, &mut self.effect_bytes);
-        }
+    fn push_effect(&mut self, state: &State, id: &str, effect: Effect) -> bool {
+        let pushed = self.spans.get_mut(id).is_some_and(|span| {
+            let pushed = span.push_effect(effect, &mut self.effect_bytes);
+            if pushed && !state.sensor.lineage_ok() {
+                span.note_unverified(SpanUnverifiedReason::NoLineage);
+            }
+            pushed
+        });
         self.index_update(id);
+        pushed
     }
 
     fn remember(&mut self, effect: RecentEffect) {

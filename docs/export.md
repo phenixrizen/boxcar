@@ -286,7 +286,8 @@ own), which find it in the log.
 - **A tool call:** `gen_ai.operation.name` = `execute_tool`,
   `gen_ai.tool.name`, `gen_ai.tool.call.id`, `boxcar.tool.args_b3` (the
   arguments' hash); from its `span.effects`, `boxcar.span.procs` (tgids),
-  `boxcar.span.effects` (the effects' seqs), `boxcar.span.executor_tgid`
+  `boxcar.span.effects` (the effects' seqs), `boxcar.span.executor_tgid`,
+  `boxcar.span.attribution_unverified` (its reasons, when there are any)
   and `boxcar.span.truncated`; `boxcar.close.seq` when it closed.
 - **A finding event:** `boxcar.finding.category`, `.score`, `.rule`,
   `.summary`, `.evidence` (the evidence's seqs), `.low_confidence`, and

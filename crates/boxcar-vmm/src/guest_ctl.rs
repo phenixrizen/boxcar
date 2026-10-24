@@ -31,8 +31,9 @@
 //! The channel also pairs the clocks. A `ping` carries an id and the host
 //! notes its `CLOCK_MONOTONIC`; init answers `pong` with its own clock, and
 //! the VMM records a `sync` (`ClockSync`): the guest's clock against the
-//! host's at the round trip's midpoint, their difference, and the round
-//! trip. [`GuestCtl::start_sync`] pings on its own once the config is sent
+//! host's from a checked PTP pair or the round trip's midpoint, their
+//! difference, and the host-measured round trip. [`GuestCtl::start_sync`]
+//! pings on its own once the config is sent
 //! and then every interval ([`SYNC_INTERVAL`] in the VMM); a ping sent by
 //! hand ([`GuestCtlHandle::ping`]) is paired the same way.
 
@@ -215,43 +216,32 @@ impl GuestCtl {
     }
 
     /// Records the `sync` a pong makes with the ping it answers: from the
-    /// pair `ptp_kvm` gave the guest when it carries one (the host's wall
-    /// clock at the guest's read, moved onto the host's monotonic clock as
-    /// the two stand now; the pair is as sure as the window it was taken
-    /// in), else from the round trip.
+    /// pair `ptp_kvm` gave the guest when it carries one and its claimed
+    /// host time falls within this ping's host-measured round trip, else
+    /// from the round trip. The recorded round trip is always the host's.
     fn record_sync(&self, ping: Ping, guest_mono_ns: u64, ptp: Option<PtpPair>) {
-        let rtt_ns = monotonic_ns().saturating_sub(ping.sent_mono_ns);
-        let (method, guest_mono_ns, host_mono_ns, rtt_ns) = match ptp {
-            Some(pair) => {
-                let (real, mono) = (realtime_ns(), monotonic_ns());
-                let host_mono_ns =
-                    i128::from(pair.host_real_ns) - (i128::from(real) - i128::from(mono));
-                (
-                    SYNC_METHOD_PTP,
-                    pair.guest_mono_ns,
-                    u64::try_from(host_mono_ns).unwrap_or(0),
-                    pair.window_ns,
-                )
-            }
-            None => (
-                SYNC_METHOD,
-                guest_mono_ns,
-                ping.sent_mono_ns + rtt_ns / 2,
-                rtt_ns,
-            ),
-        };
+        let received_mono_ns = monotonic_ns();
+        let sample = sync_sample(
+            ping,
+            received_mono_ns,
+            guest_mono_ns,
+            ptp,
+            realtime_ns(),
+            monotonic_ns(),
+        );
+        let offset = i128::from(sample.host_mono_ns) - i128::from(sample.guest_mono_ns);
         let offset_ns =
-            i64::try_from(i128::from(host_mono_ns) - i128::from(guest_mono_ns)).unwrap_or(i64::MAX);
+            i64::try_from(offset).unwrap_or(if offset < 0 { i64::MIN } else { i64::MAX });
         let submission = Submission {
             ring: Ring::Host,
             ts_guest_ns: None,
             subject: None,
             payload: Payload::ClockSync(ClockSync {
-                method: method.to_owned(),
-                guest_mono_ns,
-                host_mono_ns,
+                method: sample.method.to_owned(),
+                guest_mono_ns: sample.guest_mono_ns,
+                host_mono_ns: sample.host_mono_ns,
                 offset_ns,
-                rtt_ns,
+                rtt_ns: sample.rtt_ns,
             }),
             span: None,
             priority: Priority::Normal,
@@ -566,6 +556,50 @@ impl GuestCtl {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyncSample {
+    method: &'static str,
+    guest_mono_ns: u64,
+    host_mono_ns: u64,
+    rtt_ns: u64,
+}
+
+/// Chooses the clock evidence for one pong. A PTP host time is moved from
+/// realtime to monotonic with the host's current clock pair, then accepted
+/// only when it falls between this ping's send and receive times.
+fn sync_sample(
+    ping: Ping,
+    received_mono_ns: u64,
+    guest_mono_ns: u64,
+    ptp: Option<PtpPair>,
+    host_real_now: u64,
+    host_mono_now: u64,
+) -> SyncSample {
+    let rtt_ns = received_mono_ns.saturating_sub(ping.sent_mono_ns);
+    let ptp = ptp.and_then(|pair| {
+        let claimed =
+            i128::from(pair.host_real_ns) - i128::from(host_real_now) + i128::from(host_mono_now);
+        let claimed = u64::try_from(claimed).ok()?;
+        (ping.sent_mono_ns..=received_mono_ns)
+            .contains(&claimed)
+            .then_some((pair.guest_mono_ns, claimed))
+    });
+    match ptp {
+        Some((guest_mono_ns, host_mono_ns)) => SyncSample {
+            method: SYNC_METHOD_PTP,
+            guest_mono_ns,
+            host_mono_ns,
+            rtt_ns,
+        },
+        None => SyncSample {
+            method: SYNC_METHOD,
+            guest_mono_ns,
+            host_mono_ns: ping.sent_mono_ns.saturating_add(rtt_ns / 2),
+            rtt_ns,
+        },
+    }
+}
+
 /// Says that a line over the limit closed the channel, and closes it.
 fn too_long(stream: &UnixStream) {
     boxcar_virtio::limited!(
@@ -779,6 +813,43 @@ mod tests {
             .collect()
     }
 
+    /// A PTP pair is used only when its host time maps into the host's
+    /// ping-to-pong interval; otherwise the round-trip midpoint is used.
+    /// Confidence always gets the host-measured round trip.
+    #[test]
+    fn a_ptp_pair_must_fall_within_the_host_round_trip() {
+        let ping = Ping {
+            id: 1,
+            sent_mono_ns: 100,
+        };
+        let pair = |host_real_ns| PtpPair {
+            host_real_ns,
+            guest_mono_ns: 7,
+            window_ns: 1,
+        };
+        let inside = sync_sample(ping, 200, 9, Some(pair(1_050)), 1_100, 200);
+        assert_eq!(
+            inside,
+            SyncSample {
+                method: SYNC_METHOD_PTP,
+                guest_mono_ns: 7,
+                host_mono_ns: 150,
+                rtt_ns: 100,
+            }
+        );
+        for host_real_ns in [999, 1_101] {
+            assert_eq!(
+                sync_sample(ping, 200, 9, Some(pair(host_real_ns)), 1_100, 200),
+                SyncSample {
+                    method: SYNC_METHOD,
+                    guest_mono_ns: 9,
+                    host_mono_ns: 150,
+                    rtt_ns: 100,
+                }
+            );
+        }
+    }
+
     /// A pong to an outstanding ping pairs the clocks: a `sync` record
     /// with the guest's clock, the host's at the round trip's midpoint, the
     /// difference, and the round trip. A pong nobody asked for records
@@ -845,8 +916,8 @@ mod tests {
 
     /// A pong that carries `ptp_kvm`'s pair makes a `sync` from it: the
     /// method says so, the guest's clock is the pair's, the host's is the
-    /// pair's wall clock moved onto the monotonic clock, and the bound is
-    /// the pair's window, not the round trip.
+    /// pair's wall clock moved onto the monotonic clock. The round trip is
+    /// still the host's ping-to-pong measurement.
     #[test]
     fn a_pong_with_a_ptp_pair_becomes_a_ptp_kvm_sync() {
         let tmp = tempfile::tempdir().unwrap();
@@ -864,15 +935,16 @@ mod tests {
         assert_eq!(init.recv(), HostMsg::Config(session()));
         let id = handle.ping().unwrap();
         assert_eq!(init.recv(), HostMsg::Ping { id });
-        // The guest read the host's wall clock 3 ms ago, as the host's
-        // clocks stand now.
+        std::thread::sleep(Duration::from_millis(10));
+        // The guest read the host's wall clock during the round trip, as
+        // the host's clocks stand now.
         let (real, mono) = (realtime_ns(), monotonic_ns());
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(10));
         init.send(&GuestMsg::Pong {
             id,
             guest_mono_ns: 5_000_000_000,
             ptp: Some(PtpPair {
-                host_real_ns: real - 3_000_000,
+                host_real_ns: real,
                 guest_mono_ns: 4_000_000_000,
                 window_ns: 1_200,
             }),
@@ -894,12 +966,15 @@ mod tests {
             data["guest_mono_ns"], 4_000_000_000_u64,
             "the pair's, not the pong's"
         );
-        assert_eq!(data["rtt_ns"], 1_200_u64, "the window, not the round trip");
-        let host_mono = data["host_mono_ns"].as_u64().unwrap();
-        let want = mono - 3_000_000;
+        let rtt = data["rtt_ns"].as_u64().unwrap();
         assert!(
-            host_mono.abs_diff(want) < 50_000_000,
-            "host_mono_ns {host_mono} is not 3 ms before {mono}"
+            (20_000_000..5_000_000_000).contains(&rtt),
+            "the round trip covers both waits: {rtt}"
+        );
+        let host_mono = data["host_mono_ns"].as_u64().unwrap();
+        assert!(
+            host_mono.abs_diff(mono) < 50_000_000,
+            "host_mono_ns {host_mono} is not near {mono}"
         );
         assert_eq!(
             data["offset_ns"].as_i64().unwrap(),
