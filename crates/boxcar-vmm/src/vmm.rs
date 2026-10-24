@@ -197,6 +197,9 @@ pub struct VmConfig {
     /// a TTY on stdin and [`VmConfig::stdin`], stdin is forwarded to the
     /// guest.
     pub console: ConsoleOut,
+    /// Most bytes written to a console file; zero means unlimited. Ignored
+    /// when the console goes to standard output.
+    pub console_max_bytes: u64,
     /// Whether the guest's serial console may read the host's stdin: when
     /// it is a TTY and the console is on stdout, the terminal goes into raw
     /// mode and what is typed goes to the guest. Off for a run that needs
@@ -304,6 +307,7 @@ impl VmConfig {
             cmdline_extra: Vec::new(),
             debug_boot: false,
             console: ConsoleOut::Stdio,
+            console_max_bytes: crate::console::DEFAULT_FILE_MAX_BYTES,
             stdin: true,
             audit,
             fs_shares: Vec::new(),
@@ -510,7 +514,8 @@ impl Vmm {
         };
 
         let (sink, console) =
-            ConsoleWriter::spawn(cfg.console.clone()).map_err(VmmError::Console)?;
+            ConsoleWriter::spawn_with_limit(cfg.console.clone(), cfg.console_max_bytes)
+                .map_err(VmmError::Console)?;
         let legacy = LegacyDevices::new(sink).map_err(setup("legacy devices"))?;
         let mut pio = Bus::new();
         legacy.attach(&mut pio)?;

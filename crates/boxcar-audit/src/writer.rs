@@ -59,7 +59,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use boxcar_proto::{Hash, Payload, Record, Ring, SessionId, SpanRef, Subject};
+use boxcar_proto::{Hash, Payload, Record, Ring, SessionId, SpanRef, Subject, VmmAuditLimit};
 use crossbeam_channel::{at, bounded, never, select, Receiver, Sender};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -71,6 +71,15 @@ use crate::subscribe::{SubscribeAck, SubscribeRequest, Subscribers};
 
 /// Most submissions written between two buffer flushes.
 const MAX_BATCH: usize = 1024;
+
+/// Default total for a session's event segments and checkpoint index: 8 GiB.
+/// Zero disables the total.
+pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Room held for `vmm.audit_limit`, the checkpoint that covers it and the
+/// checkpoint's index entry. The size test below keeps this above their
+/// widest serialized forms.
+pub const QUOTA_RESERVE: u64 = 2048;
 
 /// Where and how a session's log is written.
 #[derive(Clone, Debug)]
@@ -85,6 +94,9 @@ pub struct WriterConfig {
     pub checkpoint_interval: Duration,
     /// Seal a segment once it holds this many bytes. Default 256 MiB.
     pub segment_max_bytes: u64,
+    /// Most bytes in all event segments and `checkpoints.jsonl`. Default
+    /// 8 GiB; 0 means unlimited.
+    pub max_bytes: u64,
     /// Events the channel holds before `emit` waits and `try_emit` drops.
     /// Default 65536.
     pub channel_capacity: usize,
@@ -99,6 +111,7 @@ impl WriterConfig {
             checkpoint_every: 1024,
             checkpoint_interval: Duration::from_secs(2),
             segment_max_bytes: 256 * 1024 * 1024,
+            max_bytes: DEFAULT_MAX_BYTES,
             channel_capacity: 65536,
         }
     }
@@ -115,6 +128,12 @@ impl WriterConfig {
                     format!("audit writer: {name} must be at least 1"),
                 ));
             }
+        }
+        if self.max_bytes != 0 && self.max_bytes < QUOTA_RESERVE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit writer: max_bytes must be 0 or at least {QUOTA_RESERVE}"),
+            ));
         }
         Ok(())
     }
@@ -262,9 +281,27 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
         segments.syncer(),
     )?;
 
+    if !resume.terminal
+        && cfg.max_bytes != 0
+        && segments
+            .total_len()
+            .saturating_add(index.len())
+            .saturating_add(QUOTA_RESERVE)
+            > cfg.max_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "audit writer: existing log leaves no room below max_bytes {}",
+                cfg.max_bytes
+            ),
+        ));
+    }
+
     let (tx, rx) = bounded::<Msg>(cfg.channel_capacity);
     let (stop, stopped) = bounded(0);
     let shared = Arc::new(Shared::new(resume.last_seq + 1)?);
+    let terminal = resume.terminal;
     let pending_since = (!resume.window.is_empty()).then(Instant::now);
     let consistent_len = segments.len();
     let writer = Writer {
@@ -279,18 +316,30 @@ pub fn spawn_with_syncer<S: Syncer + Send + 'static>(
         checkpoint_every: cfg.checkpoint_every,
         checkpoint_interval: cfg.checkpoint_interval,
         segment_max_bytes: cfg.segment_max_bytes,
+        max_bytes: cfg.max_bytes,
         shared: shared.clone(),
         dropped_reported: 0,
         written: 0,
         consistent_len,
         unanswered: None,
+        quota_pending: None,
     };
-    let thread = thread::Builder::new()
-        .name("audit-writer".into())
-        .spawn(move || {
+    if terminal {
+        shared.close();
+    }
+    let builder = thread::Builder::new().name("audit-writer".into());
+    let thread = if terminal {
+        drop(rx);
+        builder.spawn(move || {
+            boxcar_confine::at_thread_start();
+            writer.wait_closed(stopped)
+        })?
+    } else {
+        builder.spawn(move || {
             boxcar_confine::at_thread_start();
             writer.run(rx, stopped)
-        })?;
+        })?
+    };
 
     let handle = WriterHandle {
         session_dir,
@@ -316,6 +365,7 @@ struct Writer<S: Syncer> {
     checkpoint_every: u64,
     checkpoint_interval: Duration,
     segment_max_bytes: u64,
+    max_bytes: u64,
     shared: Arc<Shared>,
     /// `shared.dropped` as the last checkpoint reported it.
     dropped_reported: u64,
@@ -328,9 +378,23 @@ struct Writer<S: Syncer> {
     /// A head request whose flush failed: kept until the failure is
     /// published, so that its requester hears a failure, not a close.
     unanswered: Option<Sender<Head>>,
+    /// The aggregate bytes an operation needed when it met the limit, and
+    /// whether its current submission was accepted but not written.
+    quota_pending: Option<(u64, u64)>,
 }
 
 impl<S: Syncer> Writer<S> {
+    fn wait_closed(self, stop: Receiver<()>) -> io::Result<CloseStats> {
+        let held = self;
+        let _ = stop.recv();
+        Ok(CloseStats {
+            records: 0,
+            dropped: 0,
+            last_seq: held.chain.last_seq(),
+            last_hash: held.chain.last_hash(),
+        })
+    }
+
     fn run(mut self, rx: Receiver<Msg>, stop: Receiver<()>) -> io::Result<CloseStats> {
         // Keeps the channel connected until the failure is published, so a
         // sink waiting for room is refused as `Failed`, not `Closed`.
@@ -392,20 +456,26 @@ impl<S: Syncer> Writer<S> {
             }
             if deadline.is_some_and(|d| d <= Instant::now()) && !self.window.is_empty() {
                 self.checkpoint()?;
+                self.finish_quota(&rx)?;
             }
         }
         // The sinks are closed, so the channel holds all there will ever be.
         while let Ok(msg) = rx.try_recv() {
             self.handle(msg)?;
+            self.finish_quota(&rx)?;
         }
         self.finish()
     }
 
     fn batch(&mut self, first: Msg, rx: &Receiver<Msg>) -> FileResult<()> {
         self.handle(first)?;
+        self.finish_quota(rx)?;
         for _ in 1..MAX_BATCH {
             match rx.try_recv() {
-                Ok(msg) => self.handle(msg)?,
+                Ok(msg) => {
+                    self.handle(msg)?;
+                    self.finish_quota(rx)?;
+                }
                 Err(_) => break,
             }
         }
@@ -457,8 +527,14 @@ impl<S: Syncer> Writer<S> {
 
     /// Writes one submission. It is never a checkpoint: the sink refuses those.
     fn write(&mut self, s: Submission) -> FileResult<()> {
-        let record = self.chain_next(s.ring, s.ts_guest_ns, s.subject, &s.payload, s.span);
-        self.append(&record)?;
+        let (record, chain) =
+            self.prepare_next(s.ring, s.ts_guest_ns, s.subject, &s.payload, s.span);
+        let line = self.line(&record)?;
+        if !self.has_room(line.len() as u64, QUOTA_RESERVE) {
+            self.quota_pending = Some((line.len() as u64, 1));
+            return Ok(());
+        }
+        self.commit(chain, &record, &line)?;
         self.consistent_len = self.segments.len();
         self.window.push(&record.hash);
         self.pending_since.get_or_insert_with(Instant::now);
@@ -475,16 +551,17 @@ impl<S: Syncer> Writer<S> {
         Ok(())
     }
 
-    fn chain_next(
-        &mut self,
+    fn prepare_next(
+        &self,
         ring: Ring,
         ts_guest_ns: Option<u64>,
         subject: Option<Subject>,
         payload: &Payload,
         span: Option<SpanRef>,
-    ) -> Record {
+    ) -> (Record, Chainer) {
         let (kind, data) = payload.into_parts();
-        let record = self.chain.next(PartialRecord {
+        let mut chain = self.chain.clone();
+        let record = chain.next(PartialRecord {
             session_id: self.session_id.clone(),
             ring,
             src: payload.source(),
@@ -496,40 +573,138 @@ impl<S: Syncer> Writer<S> {
             data,
             span,
         });
+        (record, chain)
+    }
+
+    fn commit(&mut self, chain: Chainer, record: &Record, line: &[u8]) -> FileResult<(u32, u64)> {
+        self.chain = chain;
         self.shared
             .next_seq
             .store(record.seq + 1, Ordering::Relaxed);
-        record
+        self.append_line(line)
     }
 
-    /// Appends a record's line; returns its segment and offset.
-    fn append(&mut self, record: &Record) -> FileResult<(u32, u64)> {
+    fn line(&self, record: &Record) -> FileResult<Vec<u8>> {
         let mut line = serde_json::to_vec(record)
             .map_err(|e| on("write to", self.segments.path())(e.into()))?;
         line.push(b'\n');
-        let at = self.segments.append(&line)?;
+        Ok(line)
+    }
+
+    /// Appends a serialized record; returns its segment and offset.
+    fn append_line(&mut self, line: &[u8]) -> FileResult<(u32, u64)> {
+        let at = self.segments.append(line)?;
         self.written += 1;
         Ok(at)
+    }
+
+    fn has_room(&self, bytes: u64, reserve: u64) -> bool {
+        self.max_bytes == 0
+            || self
+                .segments
+                .total_len()
+                .saturating_add(self.index.len())
+                .saturating_add(bytes)
+                .saturating_add(reserve)
+                <= self.max_bytes
     }
 
     /// Chains a checkpoint over the window, syncs it to disk, then lists it
     /// in `checkpoints.jsonl`. Only then is the log consistent after it.
     fn checkpoint(&mut self) -> FileResult<()> {
+        let (record, chain, checkpoint, line, index_bytes) = self.next_checkpoint()?;
+        let bytes = (line.len() as u64).saturating_add(index_bytes);
+        if !self.has_room(bytes, QUOTA_RESERVE) {
+            self.quota_pending = Some((bytes, 0));
+            return Ok(());
+        }
+        self.commit_checkpoint(record, chain, checkpoint, &line)
+    }
+
+    fn next_checkpoint(
+        &self,
+    ) -> FileResult<(Record, Chainer, boxcar_proto::Checkpoint, Vec<u8>, u64)> {
         let dropped = self.shared.dropped.load(Ordering::Relaxed);
-        let checkpoint = self
-            .window
-            .take(dropped.saturating_sub(self.dropped_reported));
+        let mut window = self.window.clone();
+        let checkpoint = window.take(dropped.saturating_sub(self.dropped_reported));
         let payload = Payload::Checkpoint(checkpoint.clone());
-        let record = self.chain_next(Ring::Host, None, None, &payload, None);
-        let (segment, offset) = self.append(&record)?;
+        let (record, chain) = self.prepare_next(Ring::Host, None, None, &payload, None);
+        let line = self.line(&record)?;
+        let entry = IndexEntry::new(
+            record.seq,
+            self.segments.segment(),
+            self.segments.len(),
+            &checkpoint,
+        );
+        let index_bytes = self.index.entry_len(&entry)?;
+        Ok((record, chain, checkpoint, line, index_bytes))
+    }
+
+    fn commit_checkpoint(
+        &mut self,
+        record: Record,
+        chain: Chainer,
+        checkpoint: boxcar_proto::Checkpoint,
+        line: &[u8],
+    ) -> FileResult<()> {
+        let (segment, offset) = self.commit(chain, &record, line)?;
         self.segments.sync()?;
         self.index
             .append(&IndexEntry::new(record.seq, segment, offset, &checkpoint))?;
         self.consistent_len = self.segments.len();
-        self.dropped_reported = dropped;
+        self.window = Window::default();
+        self.dropped_reported = self.dropped_reported.saturating_add(checkpoint.dropped);
         self.pending_since = None;
         self.subscribers.publish(record);
         Ok(())
+    }
+
+    fn checkpoint_without_reserve(&mut self) -> FileResult<()> {
+        let (record, chain, checkpoint, line, _) = self.next_checkpoint()?;
+        self.commit_checkpoint(record, chain, checkpoint, &line)
+    }
+
+    fn finish_quota(&mut self, rx: &Receiver<Msg>) -> FileResult<()> {
+        let Some((next_record_bytes, current_pending)) = self.quota_pending.take() else {
+            return Ok(());
+        };
+        let pending_records = current_pending.saturating_add(self.shared.close_and_drain(rx));
+        self.quota_reached(next_record_bytes, pending_records)
+    }
+
+    /// Writes the terminal limit record and the checkpoint that covers it,
+    /// then ends the writer through its ordinary failure path so the VMM's
+    /// audit eventfd stops the session.
+    fn quota_reached(&mut self, next_record_bytes: u64, pending_records: u64) -> FileResult<()> {
+        let written_bytes = self.segments.total_len().saturating_add(self.index.len());
+        let payload = Payload::VmmAuditLimit(VmmAuditLimit {
+            max_bytes: self.max_bytes,
+            written_bytes,
+            next_record_bytes,
+            pending_records,
+        });
+        let (record, chain) = self.prepare_next(Ring::Host, None, None, &payload, None);
+        let line = self.line(&record)?;
+        self.commit(chain, &record, &line)?;
+        self.consistent_len = self.segments.len();
+        self.window.push(&record.hash);
+        self.pending_since.get_or_insert_with(Instant::now);
+        self.subscribers.publish(record);
+        self.checkpoint_without_reserve()?;
+        self.segments.sync()?;
+        self.index.sync()?;
+        debug_assert!(
+            self.max_bytes == 0
+                || self.segments.total_len().saturating_add(self.index.len()) <= self.max_bytes
+        );
+        Err(FileError {
+            op: "write to",
+            path: self.segments.path().to_owned(),
+            error: io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("audit log byte limit {} reached", self.max_bytes),
+            ),
+        })
     }
 
     /// Ends the current segment with a checkpoint and starts the next. The
@@ -537,6 +712,9 @@ impl<S: Syncer> Writer<S> {
     fn seal(&mut self) -> FileResult<()> {
         if !self.window.is_empty() {
             self.checkpoint()?;
+            if self.quota_pending.is_some() {
+                return Ok(());
+            }
         }
         self.index.sync()?;
         self.segments.rotate()?;
@@ -548,7 +726,7 @@ impl<S: Syncer> Writer<S> {
     fn finish(&mut self) -> FileResult<CloseStats> {
         let dropped = self.shared.dropped.load(Ordering::Relaxed);
         if !self.window.is_empty() || dropped > self.dropped_reported {
-            self.checkpoint()?;
+            self.checkpoint_without_reserve()?;
         }
         self.segments.sync()?;
         self.index.sync()?;
@@ -589,4 +767,64 @@ fn clock_ns(clock: libc::clockid_t) -> u64 {
     let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
     let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
     secs.saturating_mul(1_000_000_000).saturating_add(nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use boxcar_proto::{Checkpoint, Source};
+
+    use super::*;
+
+    fn partial(session_id: &SessionId, payload: &Payload) -> PartialRecord {
+        let (kind, data) = payload.into_parts();
+        PartialRecord {
+            session_id: session_id.clone(),
+            ring: Ring::Host,
+            src: Source::Vmm,
+            kind,
+            ts_host_ns: u64::MAX,
+            ts_mono_ns: u64::MAX,
+            ts_guest_ns: None,
+            subject: None,
+            data,
+            span: None,
+        }
+    }
+
+    #[test]
+    fn the_session_limit_reserve_holds_its_terminal_entries() {
+        let session_id = SessionId::new();
+        let mut chain = Chainer::resume(u64::MAX - 2, Hash([0xff; 32]));
+        let limit = Payload::VmmAuditLimit(VmmAuditLimit {
+            max_bytes: u64::MAX,
+            written_bytes: u64::MAX,
+            next_record_bytes: u64::MAX,
+            pending_records: u64::MAX,
+        });
+        let limit = chain.next(partial(&session_id, &limit));
+        let checkpoint = Payload::Checkpoint(Checkpoint {
+            records_since: u64::MAX,
+            dropped: u64::MAX,
+            root_hash: Hash([0xff; 32]),
+        });
+        let checkpoint = chain.next(partial(&session_id, &checkpoint));
+        let bytes = serde_json::to_vec(&limit).unwrap().len()
+            + 1
+            + serde_json::to_vec(&checkpoint).unwrap().len()
+            + 1
+            + serde_json::to_vec(&IndexEntry::new(
+                u64::MAX,
+                u32::MAX,
+                u64::MAX,
+                &Checkpoint {
+                    records_since: u64::MAX,
+                    dropped: u64::MAX,
+                    root_hash: Hash([0xff; 32]),
+                },
+            ))
+            .unwrap()
+            .len()
+            + 1;
+        assert!(bytes <= QUOTA_RESERVE as usize, "{bytes}");
+    }
 }

@@ -185,7 +185,13 @@ says why.
 
 DIR is made mode 0700 and every file 0600. It must be new or empty, so a
 run's dump is its own: each file is created where nothing was, never
-through a link. It may be neither a share nor inside one, nor hold one. The dump is an aid, not part of the audit log:
+through a link. It may be neither a share nor inside one, nor hold one.
+One aggregate budget covers `frames.pcap`, the exchange files and the
+WebSocket files: 2 GiB (`--dump-max-bytes N`) and 100000 files
+(`--dump-max-files N`) by default; zero removes that part of the limit.
+Past either bound no more dump bytes or files are written, one
+`net.degraded{component:"dump",reason:"quota"}` is recorded, and traffic
+continues. The dump is an aid, not part of the audit log:
 nothing in it is hashed or chained, and `boxcar audit verify` does not
 look at it. Filesystem traffic has its own dump: `--audit-level verbose`.
 

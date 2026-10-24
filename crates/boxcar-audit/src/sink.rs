@@ -112,6 +112,9 @@ pub(crate) struct Shared {
     /// The seq the writer gives the next record it writes. Only the writer
     /// stores it, after each record it chains.
     pub(crate) next_seq: AtomicU64,
+    /// Set before close waits for sends that have already passed the gate.
+    /// New sends refuse admission as soon as this changes.
+    closing: AtomicBool,
     /// Set once, by [`Shared::close`]. Each send holds the read lock across
     /// the send itself, so the write lock is granted only when no send is in
     /// flight.
@@ -128,6 +131,7 @@ impl Shared {
         Ok(Shared {
             dropped: AtomicU64::new(0),
             next_seq: AtomicU64::new(next_seq),
+            closing: AtomicBool::new(false),
             closed: RwLock::new(false),
             failure: OnceLock::new(),
             failure_evt: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
@@ -139,7 +143,34 @@ impl Shared {
     /// that was ever accepted. The writer thread must keep draining while
     /// this waits, or an `emit` blocked on a full channel would never finish.
     pub(crate) fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
         *self.closed.write().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    /// Closes admission while the writer drains accepted channel messages.
+    /// Draining lets a sender already holding the admission lock finish even
+    /// when the bounded channel was full.
+    pub(crate) fn close_and_drain(&self, rx: &crossbeam_channel::Receiver<Msg>) -> u64 {
+        self.closing.store(true, Ordering::SeqCst);
+        let mut pending = 0u64;
+        let mut closed = loop {
+            match self.closed.try_write() {
+                Ok(closed) => break closed,
+                Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    while let Ok(msg) = rx.try_recv() {
+                        pending = pending.saturating_add(u64::from(matches!(msg, Msg::Event(_))));
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        };
+        *closed = true;
+        drop(closed);
+        while let Ok(msg) = rx.try_recv() {
+            pending = pending.saturating_add(u64::from(matches!(msg, Msg::Event(_))));
+        }
+        pending
     }
 
     /// Publishes the writer thread's failure: the sinks refuse everything
@@ -236,6 +267,9 @@ impl AuditSink {
         if matches!(s.payload, Payload::Checkpoint(_)) {
             return Err(EmitError::Checkpoint);
         }
+        if self.shared.closing.load(Ordering::SeqCst) {
+            return Err(self.shared.refusal());
+        }
         let closed = self
             .shared
             .closed
@@ -244,7 +278,7 @@ impl AuditSink {
         if self.shared.has_failed() {
             return Err(EmitError::Failed);
         }
-        if *closed {
+        if self.shared.closing.load(Ordering::SeqCst) || *closed {
             return Err(EmitError::Closed);
         }
         self.tx
@@ -260,6 +294,9 @@ impl AuditSink {
         if matches!(s.payload, Payload::Checkpoint(_)) {
             return false;
         }
+        if self.shared.closing.load(Ordering::SeqCst) {
+            return false;
+        }
         // `try_read`, not `read`: while `Shared::close` waits for the write
         // lock, std's RwLock makes new readers wait as well. A `try_emit`
         // that meets that is racing close, so it counts as closed.
@@ -268,7 +305,7 @@ impl AuditSink {
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => return false,
         };
-        if *closed || self.shared.has_failed() {
+        if self.shared.closing.load(Ordering::SeqCst) || *closed || self.shared.has_failed() {
             return false;
         }
         match self.tx.try_send(Msg::Event(s)) {
@@ -399,6 +436,30 @@ mod tests {
         closer.join().unwrap();
         assert_eq!(sink.emit(event(3)), Err(EmitError::Closed));
         assert!(!sink.try_emit(event(4)));
+        assert_eq!(sink.dropped(), 0);
+    }
+
+    #[test]
+    fn closing_refuses_new_sends_before_waiting_for_in_flight_sends() {
+        let (tx, rx) = bounded(1);
+        let shared = Arc::new(Shared::new(1).unwrap());
+        let sink = AuditSink::new(tx, shared.clone());
+        let in_flight = shared.closed.read().unwrap_or_else(PoisonError::into_inner);
+
+        let closer = thread::spawn({
+            let shared = shared.clone();
+            move || shared.close_and_drain(&rx)
+        });
+        while !shared.closing.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+
+        for n in 0..10_000 {
+            assert_eq!(sink.emit(event(n)), Err(EmitError::Closed));
+            assert!(!sink.try_emit(event(n)));
+        }
+        drop(in_flight);
+        assert_eq!(closer.join().unwrap(), 0);
         assert_eq!(sink.dropped(), 0);
     }
 }

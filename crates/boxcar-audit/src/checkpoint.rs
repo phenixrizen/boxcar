@@ -187,6 +187,18 @@ impl CheckpointIndex {
         Ok(())
     }
 
+    /// Bytes the entry occupies in the index, including its newline.
+    pub(crate) fn entry_len(&self, entry: &IndexEntry) -> FileResult<u64> {
+        serde_json::to_vec(entry)
+            .map(|line| line.len() as u64 + 1)
+            .map_err(|e| on("append to", &self.path)(e.into()))
+    }
+
+    /// Bytes currently present in the index.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
     pub(crate) fn sync(&self) -> FileResult<()> {
         self.file.sync_data().map_err(on("sync", &self.path))
     }

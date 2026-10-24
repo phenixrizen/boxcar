@@ -431,6 +431,10 @@ impl RawLine {
         self.fields.get("session_id").and_then(Value::as_str)
     }
 
+    pub(crate) fn kind(&self) -> Option<&str> {
+        self.fields.get("type").and_then(Value::as_str)
+    }
+
     /// The checks that mean something only once the line is known to be
     /// authentic: `v` is 1, `session_id` is `session`, `type` is a string,
     /// and a checkpoint's `data` has a checkpoint's fields. Returns the
@@ -446,11 +450,7 @@ impl RawLine {
             Some(id) => return Err(format!("session_id {id} is not the log's {session}")),
             None => return Err("missing or invalid `session_id`".into()),
         }
-        let kind = self
-            .fields
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or("missing or invalid `type`")?;
+        let kind = self.kind().ok_or("missing or invalid `type`")?;
         if kind != "checkpoint" {
             return Ok(None);
         }

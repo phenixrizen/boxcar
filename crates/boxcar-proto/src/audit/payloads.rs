@@ -173,9 +173,10 @@ pub struct VmmStop {
     /// Console bytes the guest wrote that the host never wrote out: the
     /// oldest bytes the console's ring dropped when the host's stdout (or
     /// the console file) fell behind, bytes a failed write lost, and what
-    /// was still undelivered when the stop sequence gave up waiting for a
-    /// stalled writer. 0 when the console kept up. Absent in logs written
-    /// before it existed, and read as 0.
+    /// was past the console file's byte limit or still undelivered when the
+    /// stop sequence gave up waiting for a stalled writer. 0 when the
+    /// console kept up. Absent in logs written before it existed, and read
+    /// as 0.
     #[serde(default)]
     pub console_dropped_bytes: u64,
     /// Bytes typed at the console that the host dropped because the guest
@@ -185,6 +186,22 @@ pub struct VmmStop {
     /// as 0.
     #[serde(default)]
     pub stdin_dropped_bytes: u64,
+}
+
+/// `vmm.audit_limit`: the audit writer stopped the session before its log
+/// files crossed their configured byte limit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct VmmAuditLimit {
+    /// The configured total for the event segments and checkpoint index.
+    pub max_bytes: u64,
+    /// Event-segment and checkpoint-index bytes present before this record.
+    pub written_bytes: u64,
+    /// Bytes the record that could not be admitted would have occupied,
+    /// including its newline and, for a checkpoint, its index entry.
+    pub next_record_bytes: u64,
+    /// Submissions accepted before admission closed but not written.
+    pub pending_records: u64,
 }
 
 /// `fs.mount`: a virtio-fs share was attached.

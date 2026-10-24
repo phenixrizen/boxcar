@@ -42,8 +42,8 @@ pub use audit::{
     ProcHeartbeat, ProcLsmDeny, ProcMemfd, ProcSensorStatus, ProcTcpConnect, ProcTlsAttach,
     ProcTlsIo, ProgramStatus, Record, Ring, SeccompMode, SensorPhase, SessionExit, SessionStart,
     SetAttr, ShareRef, Source, SpanEffects, SpanRef, SpanUnverifiedReason, Subject, ToolClose,
-    ToolOpen, Verdict, VmmStart, VmmStop, VsockClose, VsockConnect, MAX_SPAN_EFFECTS,
-    MAX_SPAN_PROCS, MAX_SPAN_UNVERIFIED_REASONS, SCHEMA_VERSION,
+    ToolOpen, Verdict, VmmAuditLimit, VmmStart, VmmStop, VsockClose, VsockConnect,
+    MAX_SPAN_EFFECTS, MAX_SPAN_PROCS, MAX_SPAN_UNVERIFIED_REASONS, SCHEMA_VERSION,
 };
 pub use guestcmd::GuestCmdError;
 pub use ids::{ParseSessionIdError, SessionId};

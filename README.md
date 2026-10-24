@@ -186,11 +186,20 @@ and the blake3 of the file as it was when it was closed. Each record's
 - Reads the guest kernel serves from its page cache never reach the host
   and are not seen. The root filesystem is cached aggressively; the
   workspace is revalidated.
+- Event segments and the checkpoint index are limited to 8 GiB per session
+  by default (`--audit-max-bytes N`; 0 removes the limit, and a nonzero
+  limit is at least 2048). The writer keeps room for `vmm.audit_limit`, its
+  checkpoint and the checkpoint's index entry. At the limit boxcar records
+  them, stops the VM and exits 3, so the log never goes silently incomplete.
 - If the log cannot be written (a full disk, an I/O error), boxcar stops
   the VM, refuses every further change to the shares with EIO in the
   meantime, and exits 3 with `audit log failed: <why>`. The records the
   guest's last operations produced before the failure may be lost; the log
   is cut back to its last complete record and still verifies.
+- A serial console written to `console.log` or `--console-log PATH` is
+  limited to 64 MiB by default (`--console-max-bytes N`; 0 removes the
+  limit). Later bytes are discarded, counted in
+  `vmm.stop.console_dropped_bytes`, and reported once on stderr.
 - `boxcar audit verify` proves that the chain is intact and complete up to
   its last record: nothing was changed, removed or reordered. It does not
   prove that the session ended cleanly; look for its `vmm.stop`.
@@ -339,6 +348,11 @@ its own dump, `--audit-level verbose`. With `--dump-payloads`,
 `frames.pcap` also keeps what the gate sends the guest on flows whose TLS
 it ends (its own TLS records, ciphertext whose keys never leave the VMM);
 what the guest sends, and every other payload, is still cut.
+
+The whole dump shares a 2 GiB and 100000-file budget. Set them with
+`--dump-max-bytes N` and `--dump-max-files N`; zero removes the corresponding
+limit. Reaching either records one `net.degraded` for the dump and stops
+dumping, while the guest's traffic continues.
 
 `boxcar run --scrub-argv` records each process's arguments, and the
 session's command, scrubbed as free text is (secret-looking values

@@ -1841,6 +1841,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/VmmAuditLimit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.audit_limit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/FsMount"
             },
             "type": {
@@ -3692,6 +3710,24 @@
           ],
           "properties": {
             "data": {
+              "$ref": "#/definitions/VmmAuditLimit"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "vmm.audit_limit"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "data",
+            "type"
+          ],
+          "properties": {
+            "data": {
               "$ref": "#/definitions/FsMount"
             },
             "type": {
@@ -5202,6 +5238,42 @@
         "deny"
       ]
     },
+    "VmmAuditLimit": {
+      "description": "`vmm.audit_limit`: the audit writer stopped the session before its log files crossed their configured byte limit.",
+      "type": "object",
+      "required": [
+        "max_bytes",
+        "next_record_bytes",
+        "pending_records",
+        "written_bytes"
+      ],
+      "properties": {
+        "max_bytes": {
+          "description": "The configured total for the event segments and checkpoint index.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "next_record_bytes": {
+          "description": "Bytes the record that could not be admitted would have occupied, including its newline and, for a checkpoint, its index entry.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "pending_records": {
+          "description": "Submissions accepted before admission closed but not written.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "written_bytes": {
+          "description": "Event-segment and checkpoint-index bytes present before this record.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
     "VmmStart": {
       "description": "`vmm.start`: the VM was built and is about to run.",
       "type": "object",
@@ -5289,7 +5361,7 @@
       ],
       "properties": {
         "console_dropped_bytes": {
-          "description": "Console bytes the guest wrote that the host never wrote out: the oldest bytes the console's ring dropped when the host's stdout (or the console file) fell behind, bytes a failed write lost, and what was still undelivered when the stop sequence gave up waiting for a stalled writer. 0 when the console kept up. Absent in logs written before it existed, and read as 0.",
+          "description": "Console bytes the guest wrote that the host never wrote out: the oldest bytes the console's ring dropped when the host's stdout (or the console file) fell behind, bytes a failed write lost, and what was past the console file's byte limit or still undelivered when the stop sequence gave up waiting for a stalled writer. 0 when the console kept up. Absent in logs written before it existed, and read as 0.",
           "default": 0,
           "type": "integer",
           "format": "uint64",
