@@ -24,13 +24,9 @@ pub const CREDENTIAL_NAMES: [&str; 8] = [
 ];
 
 /// Whether `name` (lowercase) carries a credential: one of
-/// [`CREDENTIAL_NAMES`], or a name ending in `-token`, `-secret` or
-/// `-password`.
+/// [`CREDENTIAL_NAMES`], or a name that the shared redactor recognizes.
 pub fn is_credential(name: &str) -> bool {
-    CREDENTIAL_NAMES.contains(&name)
-        || name.ends_with("-token")
-        || name.ends_with("-secret")
-        || name.ends_with("-password")
+    CREDENTIAL_NAMES.contains(&name) || boxcar_proto::redact::is_secret_key(name)
 }
 
 /// The most header bytes a message may carry before it is degraded.
@@ -201,8 +197,9 @@ mod tests {
         h.push("Proxy-Authorization", b"Basic xyz").unwrap();
         h.push("X-Foo-Token", b"tokval").unwrap();
         h.push("My-Secret", b"s").unwrap();
+        h.push("X-Litellm-Api-Key", b"gateway-key").unwrap();
         h.push("Content-Type", b"application/json").unwrap();
-        assert_eq!(h.len(), 7);
+        assert_eq!(h.len(), 8);
         assert!(h.has("authorization") && h.has("x-api-key") && h.has("cookie"));
         for name in [
             "authorization",
@@ -211,6 +208,7 @@ mod tests {
             "proxy-authorization",
             "x-foo-token",
             "my-secret",
+            "x-litellm-api-key",
         ] {
             assert_eq!(h.get(name), None, "{name}");
             assert!(h.get_all(name).is_empty(), "{name}");
@@ -225,9 +223,24 @@ mod tests {
             "session=abc",
             "Basic xyz",
             "tokval",
+            "gateway-key",
         ] {
             assert!(!debug.contains(secret), "{debug}");
         }
+    }
+
+    #[test]
+    fn credential_header_stems_never_keep_values() {
+        let mut headers = Headers::new();
+        for name in [
+            "X-Service-Api-Key",
+            "X-Service-Authorization-Mode",
+            "X-Service-Cookie-Value",
+        ] {
+            headers.push(name, b"plain-value").unwrap();
+        }
+        assert!(headers.visible().next().is_none());
+        assert_eq!(headers.names().count(), 3);
     }
 
     #[test]
