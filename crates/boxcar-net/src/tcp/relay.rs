@@ -875,20 +875,18 @@ fn pump(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step {
         return Step::Done(if flow.guest_rst { "reset" } else { "timeout" });
     }
     if flow.state == FlowState::Gating {
+        let before_fin = flow.guest_fin.then(|| {
+            let next = flow.first_seq.wrapping_add(flow.taken);
+            flow.fin_at
+                .and_then(|fin| usize::try_from(fin.wrapping_sub(next) as i32).ok())
+                .unwrap_or(0)
+        });
         let Some(held) = flow.gate.as_mut() else {
             // Not reached: a gated flow has its gate.
             return Step::Abort("error");
         };
         let before = held.seen.len();
-        let step = gate(
-            flow.id,
-            flow.dst,
-            flow.gated,
-            held,
-            flow.guest_fin,
-            socket,
-            env,
-        );
+        let step = gate(flow.id, flow.dst, flow.gated, held, before_fin, socket, env);
         flow.taken = flow.taken.wrapping_add(count(held.seen.len() - before));
         match step {
             GateStep::Wait => return Step::Open,
@@ -1162,21 +1160,27 @@ fn gate(
     dst: SocketAddrV4,
     gated: bool,
     held: &mut GateBuf,
-    guest_fin: bool,
+    before_fin: Option<usize>,
     socket: &mut tcp::Socket,
     env: &Env,
 ) -> GateStep {
     let port = dst.port();
-    while held.seen.len() < env.gate_limit && socket.can_recv() {
-        let room = env.gate_limit - held.seen.len();
+    let guest_fin = before_fin.is_some();
+    let mut before_fin = before_fin.unwrap_or(usize::MAX);
+    while held.seen.len() < env.gate_limit && before_fin > 0 && socket.can_recv() {
+        let room = (env.gate_limit - held.seen.len()).min(before_fin);
         let taken = socket.recv(|data| {
             let part = data.get(..room).unwrap_or(data);
             held.seen.extend_from_slice(part);
             (part.len(), part.len())
         });
-        if !matches!(taken, Ok(n) if n > 0) {
+        let Ok(taken) = taken else {
+            break;
+        };
+        if taken == 0 {
             break;
         }
+        before_fin = before_fin.saturating_sub(taken);
     }
     let shown = read_new(held).flatten();
     let Shown { name, alpn, hello } = match shown {
@@ -1270,13 +1274,43 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
     let Some(host) = flow.host.as_mut() else {
         return Step::Open;
     };
-    // Guest TLS bytes in, as far as rustls takes them; the rest wait in
-    // the socket, and the guest's window closes as it fills.
-    while inspect.wants_guest_read() && socket.can_recv() {
-        let taken = socket.recv(|data| match inspect.guest_in(data) {
-            Ok(n) => (n, n),
-            Err(_) => (0, 0),
-        });
+    // Guest TLS bytes in, as far as rustls takes them and no farther than
+    // the guest's FIN; the rest wait in the socket, and the guest's window
+    // closes as it fills.
+    let mut past_fin = false;
+    while !flow.fin_taken && inspect.wants_guest_read() && socket.can_recv() {
+        let limit = if flow.guest_fin {
+            let Some(fin) = flow.fin_at else {
+                // Not reached: the dispatcher sees every FIN before
+                // smoltcp does.
+                past_fin = true;
+                break;
+            };
+            let next = flow.first_seq.wrapping_add(flow.taken);
+            let ahead = fin.wrapping_sub(next) as i32;
+            let Ok(ahead) = usize::try_from(ahead) else {
+                past_fin = true;
+                break;
+            };
+            if ahead > socket.recv_queue() {
+                past_fin = true;
+                break;
+            }
+            ahead
+        } else {
+            usize::MAX
+        };
+        if limit == 0 {
+            flow.fin_taken = true;
+            inspect.guest_eof();
+            break;
+        }
+        let taken = socket.recv(
+            |data| match inspect.guest_in(&data[..data.len().min(limit)]) {
+                Ok(n) => (n, n),
+                Err(_) => (0, 0),
+            },
+        );
         match taken {
             Ok(n) if n > 0 => {
                 flow.taken = flow.taken.wrapping_add(count(n));
@@ -1286,10 +1320,39 @@ fn pump_inspected(flow: &mut Flow, socket: &mut tcp::Socket, env: &Env) -> Step 
             _ => break,
         }
     }
-    // The guest's FIN, once every byte before it is in.
-    if flow.guest_fin && !flow.fin_taken && !socket.can_recv() {
-        flow.fin_taken = true;
-        inspect.guest_eof();
+    // The guest's FIN, once every byte before it is in. Anything queued
+    // after that point ends the flow and is never given to rustls.
+    if flow.guest_fin && !flow.fin_taken && !past_fin {
+        let Some(fin) = flow.fin_at else {
+            // Not reached: the dispatcher sees every FIN before smoltcp
+            // does.
+            return Step::Violation;
+        };
+        let next = flow.first_seq.wrapping_add(flow.taken);
+        if fin == next {
+            flow.fin_taken = true;
+            inspect.guest_eof();
+        }
+    }
+    past_fin |= flow.fin_taken && socket.recv_queue() > 0;
+    if past_fin {
+        if let Phase::Failed(reason) = inspect.phase() {
+            if !flow.inspect_recorded {
+                flow.inspect_recorded = true;
+                audit::record(
+                    env.sink,
+                    inspect_record(
+                        flow.id,
+                        inspect.name().map(str::to_owned),
+                        None,
+                        None,
+                        reason,
+                        flow.inspect_rule.clone(),
+                    ),
+                );
+            }
+        }
+        return Step::Violation;
     }
     // The host socket both ways, the legs' phases and plaintext, and the
     // TLS bytes for the guest: again while a round moved something, so

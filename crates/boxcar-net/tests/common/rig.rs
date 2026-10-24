@@ -19,9 +19,9 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, TcpControl, TcpPacket};
 
-use super::{segment, FakeEventLoop, Harness, GATEWAY, GUEST, GUEST_MAC};
+use super::{ipv4, segment, FakeEventLoop, Harness, GATEWAY, GATEWAY_MAC, GUEST, GUEST_MAC};
 
 pub const FRAME_MTU: usize = 1514;
 
@@ -269,6 +269,143 @@ impl Rig {
 
     pub fn events(self) -> Vec<Payload> {
         self.h.events()
+    }
+}
+
+/// A guest that plays TCP by hand, one segment at a time: what the stack
+/// last acknowledged and offered, the payload it sent, and its resets.
+pub struct RawGuest {
+    pub h: Harness,
+    pub events: FakeEventLoop,
+    pub guest: SocketAddrV4,
+    pub server: SocketAddrV4,
+    /// The next sequence number the guest sends, and what it acknowledges.
+    pub seq: u32,
+    pub ack: u32,
+    pub acked: u32,
+    pub window: u32,
+    pub resets: usize,
+    pub received: Vec<u8>,
+}
+
+impl RawGuest {
+    /// A guest connected through `h` to `server`.
+    pub fn connect(h: Harness, server: SocketAddrV4) -> RawGuest {
+        let mut raw = RawGuest {
+            h,
+            events: FakeEventLoop::new(),
+            guest: SocketAddrV4::new(GUEST, 40_000),
+            server,
+            seq: 1000,
+            ack: 0,
+            acked: 0,
+            window: 0,
+            resets: 0,
+            received: Vec::new(),
+        };
+        raw.turn();
+        raw.h.stack.push_guest_frame(&super::guest_arp());
+        raw.h.drain();
+        raw.h
+            .stack
+            .push_guest_frame(&super::syn(raw.guest, server, 1000));
+        let start = Instant::now();
+        while raw.ack == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no SYN-ACK");
+            raw.events
+                .dispatch(&mut raw.h.stack, Duration::from_millis(10));
+            raw.turn();
+        }
+        raw.seq = 1001;
+        raw.send(TcpControl::None, &[]);
+        raw
+    }
+
+    /// The stack's turn: its poll, the host fds, its poll again; what it
+    /// sent the guest is read.
+    pub fn turn(&mut self) {
+        let outcome = self.h.stack.poll(Instant::now());
+        self.events.apply(&outcome.fd_changes);
+        self.events.dispatch(&mut self.h.stack, Duration::ZERO);
+        let outcome = self.h.stack.poll(Instant::now());
+        self.events.apply(&outcome.fd_changes);
+        for frame in self.h.drain() {
+            let Some(s) = segment(&frame) else { continue };
+            if s.rst {
+                self.resets += 1;
+            } else {
+                let end = s
+                    .seq
+                    .wrapping_add(s.payload.len() as u32)
+                    .wrapping_add(u32::from(s.syn))
+                    .wrapping_add(u32::from(s.fin));
+                if s.syn && s.ack {
+                    self.ack = end;
+                    self.acked = s.ack_number;
+                    self.window = u32::from(s.window);
+                } else if s.ack {
+                    self.ack = self.ack.max(end);
+                    self.acked = s.ack_number;
+                    self.window = u32::from(s.window);
+                    self.received.extend_from_slice(&s.payload);
+                }
+            }
+        }
+    }
+
+    /// The guest sends `payload` (and `control`) at its next sequence
+    /// number, and the stack takes its turn.
+    pub fn send(&mut self, control: TcpControl, payload: &[u8]) {
+        let frame = self.segment(control, payload);
+        self.h.stack.push_guest_frame(&frame);
+        self.seq = self
+            .seq
+            .wrapping_add(payload.len() as u32 + u32::from(control == TcpControl::Fin));
+        self.turn();
+    }
+
+    /// A segment at the guest's next sequence number, acknowledging
+    /// everything (no window scaling).
+    pub fn segment(&self, control: TcpControl, payload: &[u8]) -> Vec<u8> {
+        let repr = smoltcp::wire::TcpRepr {
+            src_port: self.guest.port(),
+            dst_port: self.server.port(),
+            control,
+            seq_number: smoltcp::wire::TcpSeqNumber(self.seq as i32),
+            ack_number: Some(smoltcp::wire::TcpSeqNumber(self.ack as i32)),
+            window_len: 65_535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        ipv4(
+            GATEWAY_MAC,
+            *self.guest.ip(),
+            *self.server.ip(),
+            smoltcp::wire::IpProtocol::Tcp,
+            repr.buffer_len(),
+            |buf| {
+                repr.emit(
+                    &mut TcpPacket::new_unchecked(buf),
+                    &(*self.guest.ip()).into(),
+                    &(*self.server.ip()).into(),
+                    &smoltcp::phy::ChecksumCapabilities::default(),
+                )
+            },
+        )
+    }
+
+    /// Room in the stack's window at the guest's next sequence number.
+    pub fn room(&self) -> u32 {
+        let room = self.acked.wrapping_add(self.window).wrapping_sub(self.seq);
+        if room < 1 << 30 {
+            room
+        } else {
+            0
+        }
     }
 }
 
