@@ -439,7 +439,10 @@ impl Observation {
                         if let Some(sink) = exchange.request_body.as_mut() {
                             sink.release();
                         }
-                        self.exchanges.insert(stream, exchange);
+                        // A response that ended first ended the exchange.
+                        if !exchange.done() {
+                            self.exchanges.insert(stream, exchange);
+                        }
                     }
                 }
                 Event::ResponseHead {
@@ -534,6 +537,11 @@ impl Observation {
                         }
                         self.model.response_end(stream, &exchange, now, out);
                         exchange.sse_events.clear();
+                        // Recorded, parsed and dumped: the body's bytes go
+                        // while the request is still under way.
+                        if let Some(sink) = exchange.response_body.as_mut() {
+                            sink.release();
+                        }
                         if !exchange.done() {
                             self.exchanges.insert(stream, exchange);
                         }
@@ -1031,6 +1039,45 @@ mod tests {
             "{}",
             obs.exchanges().capacity()
         );
+    }
+
+    #[test]
+    fn a_response_that_ends_first_lets_its_body_go() {
+        let mut obs = observation(Some("h2"));
+        let mut out = Vec::new();
+        let now = Instant::now();
+        obs.handle(
+            vec![
+                get(1),
+                Event::ResponseHead {
+                    stream: 1,
+                    status: 200,
+                    headers: Headers::new(),
+                },
+                Event::ResponseBody {
+                    stream: 1,
+                    bytes: vec![b'x'; 4096],
+                },
+            ],
+            now,
+            &mut out,
+        );
+        let held = obs.retained.held();
+        obs.handle(vec![Event::ResponseEnd { stream: 1 }], now, &mut out);
+        // The body's bytes went back to the observer's budget.
+        assert!(
+            obs.retained.held() + 4096 <= held,
+            "{} then {}",
+            held,
+            obs.retained.held()
+        );
+        let exchange = &obs.exchanges()[&1];
+        assert!(exchange
+            .response_body
+            .as_ref()
+            .is_some_and(|body| body.kept().is_empty()));
+        obs.handle(vec![Event::RequestEnd { stream: 1 }], now, &mut out);
+        assert!(obs.exchanges().is_empty());
     }
 
     #[test]

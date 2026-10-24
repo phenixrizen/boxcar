@@ -98,7 +98,8 @@ struct Tracked {
 pub struct Tracker {
     flow: u64,
     trace_id: String,
-    streams: HashMap<u32, Tracked>,
+    /// Boxed: a parser is large, and a map keeps its slots' room.
+    streams: HashMap<u32, Box<Tracked>>,
     /// Where the calls' arguments as sent go, for the reconciler.
     declared: Option<DeclaredArgs>,
     /// Whether `tool.open` keeps the arguments, inline and summarized.
@@ -131,7 +132,7 @@ impl Tracker {
         if let Some(provider) = Provider::for_request(path) {
             self.streams.insert(
                 stream,
-                Tracked {
+                Box::new(Tracked {
                     provider,
                     started: now,
                     requested: false,
@@ -139,9 +140,19 @@ impl Tracker {
                     sse: false,
                     ws: false,
                     degraded: None,
-                },
+                }),
             );
         }
+    }
+
+    /// Takes `stream` out, and gives the map's room back once it is mostly
+    /// empty, as a flow's exchanges do.
+    fn forget(&mut self, stream: u32) -> Option<Box<Tracked>> {
+        let tracked = self.streams.remove(&stream);
+        if self.streams.capacity() > 2 * self.streams.len() + 16 {
+            self.streams.shrink_to(self.streams.len());
+        }
+        tracked
     }
 
     /// A request's body ended: `llm.request`, and the `tool.close`s it
@@ -246,7 +257,7 @@ impl Tracker {
         out: &mut Vec<Emit>,
     ) {
         self.response_body(stream, exchange, out);
-        let Some(mut tracked) = self.streams.remove(&stream) else {
+        let Some(mut tracked) = self.forget(stream) else {
             return;
         };
         let summary = exchange
@@ -412,7 +423,7 @@ impl Tracker {
     /// reset or could not be read): a response under way is recorded as it
     /// stands, and the stream is forgotten.
     pub fn end(&mut self, stream: u32, now: Instant, out: &mut Vec<Emit>) {
-        let Some(tracked) = self.streams.remove(&stream) else {
+        let Some(tracked) = self.forget(stream) else {
             return;
         };
         let Some(parser) = tracked.stream else {
@@ -531,6 +542,7 @@ mod tests {
 
     use boxcar_proto::Payload;
 
+    use super::Tracker;
     use crate::gate::exchange::{Emit, Observation};
     use crate::gate::Direction;
 
@@ -567,6 +579,26 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn a_tracker_gives_back_the_room_of_streams_that_went() {
+        let mut tracker = Tracker::new(9, "session-trace".to_owned());
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for stream in 1..=300 {
+            tracker.request_head(stream, Some("/v1/messages"), now);
+        }
+        assert!(tracker.streams.capacity() >= 300);
+        for stream in 1..=300 {
+            tracker.end(stream, now, &mut out);
+        }
+        assert!(tracker.streams.is_empty());
+        assert!(
+            tracker.streams.capacity() <= 16,
+            "{}",
+            tracker.streams.capacity()
+        );
     }
 
     /// A reply whose event stream lost a line keeps no arguments for the
