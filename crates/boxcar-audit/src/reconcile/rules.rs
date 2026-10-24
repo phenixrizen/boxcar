@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddrV4};
 use boxcar_proto::limits::MAX_SUMMARY;
 use boxcar_proto::{Evidence, Finding, FindingCategory, Payload, ProcExec, Record, Verdict};
 
-use super::argv::ExecKey;
+use super::argv::{recorded_argv_is_complete, ExecKey};
 use super::dns;
 use super::paths::indicator;
 use super::spans::{EffectKind, Spans};
@@ -154,18 +154,22 @@ pub fn observe(
                     p.ppid = ppid;
                     p.uid = uid;
                 });
+                spans.process_named(key);
                 spans.fork(state, parent, key);
             }
             out.extend(resolve_pending(state, cfg, ts));
         }
         Payload::ProcExec(exec) => {
-            // Recorded scrubbed: the argv as run, kept in memory, is what
-            // is compared and joined by.
+            // When recorded scrubbed, the argv as run kept in memory is
+            // what is compared and joined by.
+            let argv_scrubbed = cfg.raw_argv.is_some();
             let raw = cfg
                 .raw_argv
                 .as_ref()
                 .zip(record.ts_guest_ns)
                 .and_then(|(raw, ts)| raw.take(ExecKey::of(exec, ts)));
+            let argv_complete = !exec.argv_truncated
+                && (!argv_scrubbed || raw.is_some() || recorded_argv_is_complete(&exec.argv));
             let as_run;
             let exec = match raw {
                 Some(argv) => {
@@ -187,11 +191,13 @@ pub fn observe(
                 p.uid = exec.uid;
                 p.filename.clone_from(&exec.filename);
                 p.argv.clone_from(&exec.argv);
+                p.argv_complete = argv_complete;
                 p.exec_seq = Some(seq);
             });
             state.join_thread(exec.tid, key, ts);
+            spans.process_named(key);
             out.extend(resolve_pending(state, cfg, ts));
-            out.extend(spans.exec(state, record, exec));
+            out.extend(spans.exec(state, record, exec, argv_complete));
         }
         Payload::ProcExit(exit) => {
             if exit.group_dead {
@@ -199,18 +205,21 @@ pub fn observe(
                     tgid: exit.tgid,
                     start_ns: exit.start_ns,
                 };
+                if state.proc(key).is_some() {
+                    spans.process_named(key);
+                }
                 if let Some(proc) = state.proc_mut(key) {
                     proc.exit_ts = Some(ts);
                 }
             }
         }
         Payload::ProcTcpConnect(connect) => {
-            if let IpAddr::V4(dst) = connect.dst {
+            if let (IpAddr::V4(src), IpAddr::V4(dst)) = (connect.src, connect.dst) {
                 let sensor = SensorConnect {
                     seq: record.seq,
                     ts,
                     tid: connect.tid,
-                    src_port: connect.src_port,
+                    src: SocketAddrV4::new(src, connect.src_port),
                     dst: SocketAddrV4::new(dst, connect.dst_port),
                 };
                 if let Some(flow_id) = join_flow_with_sensor(state, &sensor) {
@@ -300,7 +309,7 @@ pub fn observe(
         // Ring 0: the session and the clocks.
         Payload::SessionStart(start) => {
             state.session_start = Some((ts, record.seq));
-            spans.session_started(start.pid);
+            spans.session_started(start.pid, state.attribute(start.pid, ts));
         }
         Payload::ClockSync(sync) => state.last_sync = Some((ts, sync.rtt_ns)),
         Payload::VmmStop(_) => {
@@ -870,17 +879,27 @@ fn dns_spike(state: &mut State, seq: u64, ts: u64) -> Vec<Finding> {
 /// either order within the window. Returns the flow it joined, if any.
 fn join_flow_with_sensor(state: &mut State, sensor: &SensorConnect) -> Option<u64> {
     let key = state.attribute(sensor.tid, sensor.ts);
-    let matching = state.flows.iter_mut().find(|(_, flow)| {
-        flow.proc_key.is_none()
-            && flow.proto == "tcp"
-            && flow.dst == sensor.dst
-            && flow.src.port() == sensor.src_port
-            && flow.ts.abs_diff(sensor.ts) <= JOIN_WINDOW_NS
-    });
-    if let Some((id, flow)) = matching {
+    let matches: Vec<u64> = state
+        .flows
+        .iter()
+        .filter(|(_, flow)| {
+            flow.proc_key.is_none()
+                && flow.proto == "tcp"
+                && flow.dst == sensor.dst
+                && flow.src == sensor.src
+                && flow.ts.abs_diff(sensor.ts) <= JOIN_WINDOW_NS
+        })
+        .map(|(id, _)| *id)
+        .take(2)
+        .collect();
+    if let [id] = matches.as_slice() {
+        let flow = state.flows.get_mut(id)?;
         flow.proc_key = key;
         flow.proc_seq = Some(sensor.seq);
         return key.map(|_| *id);
+    }
+    if !matches.is_empty() {
+        return None;
     }
     state.sensor_connects.push_back(sensor.clone());
     while state
@@ -899,14 +918,21 @@ fn join_flow_with_pending_sensor(state: &mut State, flow_id: u64) -> bool {
     let Some(flow) = state.flows.get(&flow_id).cloned() else {
         return false;
     };
-    let position = state.sensor_connects.iter().position(|c| {
-        flow.proto == "tcp"
-            && flow.dst == c.dst
-            && flow.src.port() == c.src_port
-            && flow.ts.abs_diff(c.ts) <= JOIN_WINDOW_NS
-    });
-    if let Some(index) = position {
-        if let Some(sensor) = state.sensor_connects.remove(index) {
+    let matches: Vec<usize> = state
+        .sensor_connects
+        .iter()
+        .enumerate()
+        .filter(|(_, connect)| {
+            flow.proto == "tcp"
+                && flow.dst == connect.dst
+                && flow.src == connect.src
+                && flow.ts.abs_diff(connect.ts) <= JOIN_WINDOW_NS
+        })
+        .map(|(index, _)| index)
+        .take(2)
+        .collect();
+    if let [index] = matches.as_slice() {
+        if let Some(sensor) = state.sensor_connects.remove(*index) {
             let key = state.attribute(sensor.tid, sensor.ts);
             if let Some(flow) = state.flows.get_mut(&flow_id) {
                 flow.proc_key = key;

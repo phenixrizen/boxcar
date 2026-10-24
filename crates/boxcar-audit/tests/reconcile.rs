@@ -244,6 +244,17 @@ impl Log {
     }
 
     fn tcp_connect(&mut self, at_ms: u64, pid: u32, src_port: u16, dst: &str) -> Step {
+        self.tcp_connect_from(at_ms, pid, "10.0.2.15", src_port, dst)
+    }
+
+    fn tcp_connect_from(
+        &mut self,
+        at_ms: u64,
+        pid: u32,
+        src: &str,
+        src_port: u16,
+        dst: &str,
+    ) -> Step {
         let dst: SocketAddrV4 = dst.parse().unwrap();
         self.rec(
             at_ms,
@@ -252,7 +263,7 @@ impl Log {
             Payload::ProcTcpConnect(ProcTcpConnect {
                 tid: pid,
                 tgid: pid,
-                src: IpAddr::V4("10.0.2.15".parse().unwrap()),
+                src: IpAddr::V4(src.parse().unwrap()),
                 src_port,
                 dst: IpAddr::V4(*dst.ip()),
                 dst_port: dst.port(),
@@ -1574,6 +1585,75 @@ fn a_process_on_the_executors_old_pid_is_not_the_agent() {
     assert!(spans[0].effects.is_empty(), "{:?}", spans[0]);
 }
 
+/// Once lineage names the session root, a later process with its pid is
+/// not the agent and neither are that process's children.
+#[test]
+fn a_process_on_the_session_roots_old_pid_is_not_the_agent() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 100, 1, 1, &["agent", "run"]));
+    steps.push(log.tool_open(
+        2000,
+        "toolu_01",
+        "Write",
+        json!({"file_path": "/workspace/notes.txt", "content": "hello"}),
+    ));
+    steps.push(log.exit(2100, 100, 1));
+    steps.push(log.exec(2200, 100, 1, 50, &["sh", "-c", "echo x > notes.txt"]));
+    steps.push(log.fork(2250, 100, 101, 60, false));
+    steps.push(log.exec(2260, 101, 100, 60, &["touch", "other.txt"]));
+    steps.push(log.fs_create(2270, 101, "/other.txt"));
+    let create = log.fs_create(2300, 100, "/notes.txt");
+    let close = log.fs_close(2310, 100, "/notes.txt", 2);
+    let seqs = [seq_of(&create), seq_of(&close)];
+    steps.push(create);
+    steps.push(close);
+    steps.push(log.heartbeat(3000));
+    steps.push(log.vmm_stop(3100));
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert!(
+        seqs.iter().all(|seq| !spans[0].effects.contains(seq)),
+        "{:?}",
+        spans[0]
+    );
+    assert!(spans[0].procs.is_empty(), "{:?}", spans[0]);
+    assert!(spans[0].effects.is_empty(), "{:?}", spans[0]);
+}
+
+/// A descendant beyond the bounded ancestry walk still joins the open
+/// tool span instead of falling out of attribution.
+#[test]
+fn a_deep_descendant_still_joins_its_span() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "true"})));
+    let mut parent = 100;
+    for depth in 0..70u32 {
+        let child = 200 + depth;
+        steps.push(log.fork(
+            2010 + u64::from(depth),
+            parent,
+            child,
+            10 + u64::from(depth),
+            false,
+        ));
+        parent = child;
+    }
+    steps.push(log.exec(2100, parent, parent - 1, 79, &["sh", "-c", "true"]));
+    steps.push(log.exit(2200, parent, 79));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [4000, 5000] {
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    assert_eq!(spans_of(&out)[0].procs, [parent]);
+}
+
 /// A Bash tool call whose process connected somewhere the command never
 /// named, and said ok.
 #[test]
@@ -1738,8 +1818,8 @@ fn a_redacted_argument_is_compared_as_sent() {
 /// With `--scrub-argv` the log records an exec's argv scrubbed, and the
 /// reconciler compares the declared command with the argv as run, kept
 /// in memory: a command that differs only in what the record redacts is
-/// told apart. With the argv as run gone, the scrubbed copy does not
-/// carry the command, and the `argv` rule says so.
+/// told apart. With the argv as run gone, the scrubbed copy cannot decide
+/// whether it carries the command, so the `argv` rule says nothing.
 #[test]
 fn an_argv_recorded_scrubbed_is_compared_as_run() {
     let sent = "0123456789abcdef0123456789abcdef01234567";
@@ -1748,7 +1828,7 @@ fn an_argv_recorded_scrubbed_is_compared_as_run() {
     for (ran, kept, mismatch) in [
         (sent, true, false),
         (other, true, true),
-        (sent, false, true),
+        (sent, false, false),
     ] {
         let declared = DeclaredArgs::new();
         declared.put(
@@ -1801,6 +1881,94 @@ fn an_argv_recorded_scrubbed_is_compared_as_run() {
             "the argv as run stays in memory: {text}"
         );
     }
+}
+
+/// An exec known only by a scrubbed record does not join one of several
+/// spans merely because a declared command contains the same mark.
+#[test]
+fn a_scrubbed_exec_without_its_as_run_argv_does_not_join_by_argv() {
+    let declared = DeclaredArgs::new();
+    declared.put(
+        "toolu_a",
+        Declared::Json(json!({"command": "client --token=[redacted]"})),
+        32,
+    );
+    declared.put(
+        "toolu_b",
+        Declared::Json(json!({"command": "echo ready"})),
+        10,
+    );
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(
+        2000,
+        "toolu_a",
+        "Bash",
+        json!({"command": "client --token=[redacted]"}),
+    ));
+    steps.push(log.tool_open(2010, "toolu_b", "Bash", json!({"command": "echo ready"})));
+    let mut step = log.exec(2100, 330, 100, 10, &["bash", "-c", "client --token=actual"]);
+    if let Step::Record(record) = &mut step {
+        record.data["argv"] = json!(["bash", "-c", "client --token=[redacted]"]);
+    }
+    steps.push(step);
+    steps.push(log.exit(2500, 330, 10));
+    steps.push(log.vmm_stop(3000));
+    let (out, _) = run_scrubbed(true, steps, Some(declared), Some(RawArgv::new()));
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 2, "{out:?}");
+    assert!(spans.iter().all(|span| span.procs.is_empty()), "{out:?}");
+}
+
+/// An argv recorded as run may contain the marker literally and still
+/// choose the command it matches.
+#[test]
+fn a_literal_marker_in_argv_can_match() {
+    let command = "printf '%s' [redacted]";
+    let declared = DeclaredArgs::new();
+    declared.put(
+        "toolu_a",
+        Declared::Json(json!({"command": command})),
+        command.len(),
+    );
+    declared.put(
+        "toolu_b",
+        Declared::Json(json!({"command": "echo ready"})),
+        10,
+    );
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_a", "Bash", json!({"command": command})));
+    steps.push(log.tool_open(2010, "toolu_b", "Bash", json!({"command": "echo ready"})));
+    steps.push(log.exec(2100, 330, 100, 10, &["bash", "-c", command]));
+    steps.push(log.vmm_stop(3000));
+    let (out, _) = run_with(true, steps, Some(declared));
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 2, "{out:?}");
+    assert_eq!(spans[0].procs, [330], "{out:?}");
+    assert!(spans[1].procs.is_empty(), "{out:?}");
+}
+
+/// A partial argv cannot choose one of several matching candidates.
+#[test]
+fn a_partial_argv_does_not_choose_between_spans() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_a", "Bash", json!({"command": "echo ready"})));
+    steps.push(log.tool_open(2010, "toolu_b", "Bash", json!({"command": "echo later"})));
+    let mut exec = log.exec(2100, 330, 100, 10, &["bash", "-c", "echo ready"]);
+    if let Step::Record(record) = &mut exec {
+        record.data["argv_truncated"] = json!(true);
+    }
+    steps.push(exec);
+    steps.push(log.vmm_stop(3000));
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 2, "{out:?}");
+    assert!(spans.iter().all(|span| span.procs.is_empty()), "{out:?}");
 }
 
 /// A finding quotes what the call declared scrubbed, as the record has
@@ -2257,6 +2425,136 @@ fn execs_that_waited_for_the_open_all_join() {
     );
 }
 
+/// Each exec waiting for a tool call keeps the command data from its own
+/// record even when the same process execs again.
+#[test]
+fn a_waiting_exec_keeps_its_command_data() {
+    for changed in ["program", "argv", "completeness"] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        steps.push(log.exec(1000, 330, 100, 10, &["bash", "-c", "echo ready"]));
+        let mut later = match changed {
+            "program" => log.exec_as(
+                1100,
+                330,
+                100,
+                10,
+                "/usr/bin/python3",
+                &["bash", "-c", "echo ready"],
+            ),
+            "argv" => log.exec(1100, 330, 100, 10, &["bash", "-c", "echo later"]),
+            _ => log.exec(1100, 330, 100, 10, &["bash", "-c", "echo ready"]),
+        };
+        if changed == "completeness" {
+            if let Step::Record(record) = &mut later {
+                record.data["argv_truncated"] = json!(true);
+            }
+        }
+        steps.push(later);
+        steps.push(log.tool_open(1800, "toolu_01", "Bash", json!({"command": "echo ready"})));
+        steps.push(log.vmm_stop(2000));
+        let (out, _) = run_all(true, steps);
+        let spans = spans_of(&out);
+        assert_eq!(spans[0].procs, [330], "{changed}: {out:?}");
+        assert_eq!(spans[0].effects.len(), 1, "{changed}: {out:?}");
+    }
+}
+
+/// A waiting exec is compared from its own record when a later record for
+/// the process describes an earlier host time.
+#[test]
+fn a_waiting_exec_is_compared_from_its_record() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1900, 330, 100, 10, &["bash", "-c", "echo later"]));
+    steps.push(log.exec_as(
+        1000,
+        330,
+        100,
+        10,
+        "/usr/bin/python3",
+        &["python3", "worker.py"],
+    ));
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "echo ready"})));
+    steps.push(log.tool_close(2100, "toolu_01", "ok"));
+    let (out, _) = run_all(true, steps);
+    assert!(
+        findings_of(&out).iter().any(|item| item.rule == "argv"),
+        "{out:?}"
+    );
+}
+
+/// A waiting record assigned by one open call cannot supply command
+/// evidence to a later call.
+#[test]
+fn an_exec_is_judged_only_by_the_span_that_takes_it() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(
+        1900,
+        "toolu_guard_a",
+        "Read",
+        json!({"file_path": "/workspace/input.txt"}),
+    ));
+    steps.push(log.tool_open(
+        1910,
+        "toolu_guard_b",
+        "Read",
+        json!({"file_path": "/workspace/output.txt"}),
+    ));
+    steps.push(log.exec(2000, 330, 100, 10, &["bash", "-c", "echo first"]));
+    steps.push(log.exec(2010, 330, 100, 10, &["bash", "-c", "echo setup"]));
+    steps.push(log.tool_open(
+        2100,
+        "toolu_first",
+        "Bash",
+        json!({"command": "echo first"}),
+    ));
+    steps.push(log.tool_close(2200, "toolu_guard_a", "ok"));
+    steps.push(log.tool_close(2210, "toolu_guard_b", "ok"));
+    steps.push(log.tool_close(2220, "toolu_first", "ok"));
+    steps.push(log.tool_open(
+        2300,
+        "toolu_second",
+        "Bash",
+        json!({"command": "echo second"}),
+    ));
+    steps.push(log.tool_close(2400, "toolu_second", "ok"));
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    let spans = spans_of(&out);
+    let first = spans
+        .iter()
+        .find(|span| span.span_id == "toolu_first")
+        .expect("first span");
+    let second = spans
+        .iter()
+        .find(|span| span.span_id == "toolu_second")
+        .expect("second span");
+    assert_eq!(first.procs, [330], "{out:?}");
+    assert!(second.procs.is_empty(), "{out:?}");
+}
+
+/// An exit record alone does not establish the session root's lifetime,
+/// so a child recorded later can still use its parent pid.
+#[test]
+fn an_exit_alone_keeps_pid_parentage_provisional() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exit(3000, 100, 1));
+    steps.push(log.tool_open(3100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2000, 330, 100, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(3150, 330, 10));
+    steps.push(log.tool_close(3200, "toolu_01", "ok"));
+    let (out, _) = run_all(true, steps);
+    assert!(findings_of(&out).is_empty(), "{out:?}");
+    assert_eq!(spans_of(&out)[0].procs, [330], "{out:?}");
+}
+
 /// The declared command written in a comment, or beside another, is not
 /// the command run.
 #[test]
@@ -2556,6 +2854,29 @@ fn an_exec_past_the_wait_is_let_go() {
     assert!(spans[0].procs.is_empty(), "{out:?}");
 }
 
+/// Waiting exec timestamps need not arrive in order; each one expires by
+/// its own timestamp.
+#[test]
+fn pending_exec_expiry_checks_each_timestamp() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(8000, 371, 100, 11, &["sh", "-c", "echo current"]));
+    steps.push(log.exec(2000, 370, 100, 10, &["sh", "-c", "echo earlier"]));
+    steps.push(Step::Tick(12_000));
+    steps.push(log.tool_open(
+        12_100,
+        "toolu_01",
+        "Bash",
+        json!({"command": "echo earlier"}),
+    ));
+    steps.push(log.tool_close(12_200, "toolu_01", "ok"));
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans.len(), 1, "{out:?}");
+    assert!(spans[0].procs.is_empty(), "{out:?}");
+}
+
 /// A TLS write sized like the request's body, 100 ms before the gate's
 /// `http.request`, names the process that made the request: the span the
 /// reply opens has it as its executor, and its children join the span.
@@ -2669,6 +2990,97 @@ fn the_flows_opener_is_the_executor() {
     let spans = spans_of(&out);
     assert_eq!(spans[0].executor_tgid, Some(200), "{out:?}");
     assert_eq!(spans[0].procs, [300]);
+}
+
+/// A sensor connect with the same ports and destination but another source
+/// address does not name a flow's opener, in either arrival order.
+#[test]
+fn a_flow_and_its_opener_match_the_full_source_address() {
+    for sensor_first in [false, true] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+        steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+        steps.push(log.dns(1300, "api.example", &["203.0.113.5"], Verdict::Allow));
+        if sensor_first {
+            steps.push(log.tcp_connect_from(1350, 400, "10.0.2.99", 41000, "203.0.113.5:443"));
+            steps.push(log.tcp_connect(1355, 200, 41000, "203.0.113.5:443"));
+            steps.push(log.connect(
+                1360,
+                1,
+                41000,
+                "203.0.113.5:443",
+                &["api.example"],
+                Verdict::Allow,
+            ));
+        } else {
+            steps.push(log.connect(
+                1350,
+                1,
+                41000,
+                "203.0.113.5:443",
+                &["api.example"],
+                Verdict::Allow,
+            ));
+            steps.push(log.tcp_connect_from(1360, 400, "10.0.2.99", 41000, "203.0.113.5:443"));
+            steps.push(log.tcp_connect(1370, 200, 41000, "203.0.113.5:443"));
+        }
+        steps.push(log.http_request(2000, 1, 1, 4800));
+        steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+        steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+        steps.push(log.exit(2300, 300, 10));
+        steps.push(log.tool_close(3000, "toolu_01", "ok"));
+        for at in [3000, 4000, 5000] {
+            steps.push(log.heartbeat(at));
+            steps.push(Step::Tick(at));
+        }
+        let (out, _) = run_all(true, steps);
+        let spans = spans_of(&out);
+        assert_eq!(spans[0].executor_tgid, Some(200), "{sensor_first}: {out:?}");
+        assert_eq!(spans[0].procs, [300]);
+    }
+}
+
+/// A full tuple shared by more than one candidate names no opener, in
+/// either arrival order.
+#[test]
+fn a_shared_flow_tuple_names_no_opener() {
+    let api = "203.0.113.5:443";
+    for sensor_first in [false, true] {
+        let mut log = Log::new();
+        let mut steps = Vec::new();
+        attached(&mut log, &mut steps);
+        steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+        steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+        if sensor_first {
+            steps.push(log.tcp_connect(1300, 200, 41000, api));
+            steps.push(log.tcp_connect(1310, 400, 41000, api));
+            steps.push(log.connect(1320, 1, 41000, api, &["api.example"], Verdict::Allow));
+            steps.push(log.http_request(2000, 1, 1, 4800));
+            steps.push(log.tool_open(2100, "toolu_a", "Bash", json!({"command": "echo ready"})));
+        } else {
+            steps.push(log.connect(1300, 1, 41000, api, &["api.example"], Verdict::Allow));
+            steps.push(log.connect(1310, 2, 41000, api, &["api.example"], Verdict::Allow));
+            steps.push(log.tcp_connect(1320, 200, 41000, api));
+            steps.push(log.http_request(2000, 1, 1, 4800));
+            steps.push(log.http_request(2010, 2, 1, 4800));
+            steps.push(log.tool_open(2100, "toolu_a", "Bash", json!({"command": "echo ready"})));
+            let mut open = log.tool_open(2110, "toolu_b", "Bash", json!({"command": "echo later"}));
+            if let Step::Record(record) = &mut open {
+                record.data["flow"] = json!(2);
+            }
+            steps.push(open);
+        }
+        steps.push(log.vmm_stop(3000));
+        let (out, _) = run_all(true, steps);
+        let spans = spans_of(&out);
+        assert_eq!(spans.len(), if sensor_first { 1 } else { 2 }, "{out:?}");
+        assert!(
+            spans.iter().all(|span| span.executor_tgid == Some(100)),
+            "{sensor_first}: {out:?}"
+        );
+    }
 }
 
 /// The seq of a step's record.
@@ -2920,6 +3332,33 @@ fn two_fitting_writers_name_no_executor() {
     let spans = spans_of(&out);
     assert_eq!(spans[0].executor_tgid, Some(100), "{out:?}");
     assert_eq!(spans[0].procs, [300], "reached the root through node");
+}
+
+/// A whole-write fit and another process's summed fit are two fitting
+/// writers, so neither is named as the executor.
+#[test]
+fn a_single_and_summed_fit_name_no_executor() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 200, 100, 5, &["node", "cli.js"]));
+    steps.push(log.exec(1210, 400, 100, 6, &["python3", "other.py"]));
+    steps.push(log.tls_io(1900, 200, "write", 4800));
+    steps.push(log.tls_io(1910, 400, "write", 2400));
+    steps.push(log.tls_io(1920, 400, "write", 2400));
+    steps.push(log.http_request(2000, 1, 1, 4800));
+    steps.push(log.tool_open(2100, "toolu_01", "Bash", json!({"command": "ls"})));
+    steps.push(log.exec(2200, 300, 200, 10, &["sh", "-c", "ls"]));
+    steps.push(log.exit(2300, 300, 10));
+    steps.push(log.tool_close(3000, "toolu_01", "ok"));
+    for at in [3000, 4000, 5000] {
+        steps.push(log.heartbeat(at));
+        steps.push(Step::Tick(at));
+    }
+    let (out, _) = run_all(true, steps);
+    let spans = spans_of(&out);
+    assert_eq!(spans[0].executor_tgid, Some(100), "{out:?}");
+    assert_eq!(spans[0].procs, [300]);
 }
 
 /// The sensor reads the programs the session runs (for the TLS symbols):

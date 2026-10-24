@@ -22,8 +22,9 @@ tool spans, writes each one's membership as `span.effects`, and answers
   widened by 500 ms on both sides, covers *t*. An effect whose thread no
   process owns yet waits 2 s for a late `proc.exec` before it is judged.
 - **A TCP flow to a process.** `net.connect` (ring 0) and `proc.tcp_connect`
-  (ring 1) carry the same 4-tuple; they join when they fall within 500 ms
-  of each other, in either order.
+  (ring 1) carry the same 4-tuple; they join only when both source address
+  and port and both destination address and port match within 500 ms, in
+  either order.
 - **Time.** `ts_host_ns` is the one clock across rings. `sync` records say
   how far the guest's clock stands from it and how surely (`rtt_ns`: a
   ping's round trip, or, through `ptp_kvm` where the guest has its clock,
@@ -47,16 +48,19 @@ tool use id as the span id. In between, the reconciler attributes
 processes and ring 0 effects to the span:
 
 - **The agent.** The session's root process (`session.start.pid`) is the
-  agent, and so is a span's bound executor: the process that opened the
+  agent. It is matched by pid until a lineage record names it, then by pid
+  and start time, so later reuse of the pid is another process. A span's
+  bound executor is also the agent: the process that opened the
   flow the model request the span came from went over (its
   `proc.tcp_connect` joined the flow's `net.connect`, before or after the
   request). Until that join, the process whose `proc.tls_io` write,
   within 500 ms of the gate's `http.request` and sized like its body
   (within a tenth plus 1 KiB, as one write or as the process's writes of
   the window summed), carried the request is a provisional executor, when
-  it is the only process that fits; it is reconsidered with every write of
-  the window (two that fit name none) and replaced by the flow's opener
-  when that comes. A provisional executor is reported in `span.effects`
+  it is the only process that fits, considering both individual writes and
+  each process's sum together; it is reconsidered with every write of the
+  window (two that fit by either form name none) and replaced by the flow's
+  opener when that comes. A provisional executor is reported in `span.effects`
   and is never the agent: ancestry is traced to the root instead, and its
   own work is judged as any process's. The agent itself is in no span.
 - **The close.** A span's executor is its request's bound executor, or,
@@ -92,10 +96,10 @@ processes and ring 0 effects to the span:
   arguments as sent. With `boxcar run --scrub-argv` the log records each
   `proc.exec`'s argv scrubbed, and the sensor's ingest keeps each argv
   that scrubbing changed, as run, in memory (4096 execs and 8 MiB at
-  most) for the reconciler, which compares and joins by it. An argv let
-  go before the reconciler took it is compared as recorded: what was
-  redacted then does not carry the declared command, and the `argv` rule
-  says so.
+  most) for the reconciler, which compares and joins by it. When that argv
+  has gone before the reconciler takes it, a recorded copy containing a
+  redaction mark is indeterminate: it neither joins a span by argv nor
+  decides the `argv` rule.
 - **A process.** A `proc.exec` while spans are open joins one when its
   ancestry (through `ppid`) reaches the agent: first by argv, for a shell
   tool (`Bash`, `bash`, `shell`, `exec_command`, `local_shell`, `exec`)
@@ -124,7 +128,10 @@ processes and ring 0 effects to the span:
   forked or exec'd by a span's process joins that span, and a process
   that exec's again stays in its span; when a process ran before the
   gate recorded the call (a runtime that runs its tool at once, as
-  Codex), every exec of it that waited joins with it.
+  Codex), every exec of it that waited joins with it. An ancestry walk is
+  bounded at 64 parents; exhausting that bound is treated conservatively
+  as reaching the agent, so a deeper descendant does not silently fall out
+  of attribution.
 - **An effect.** `fs.create`, `fs.close`, `fs.rename`, `fs.unlink`,
   `fs.mkdir` and `fs.setattr` join the span of the thread's process, and
   `net.connect` the span of the process its `proc.tcp_connect` named. A
