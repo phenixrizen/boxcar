@@ -186,7 +186,8 @@ fn in_log_a_thread_off_its_role_goes_on() {
 
 /// A thread's role takes nothing from another's: the net thread keeps its
 /// sockets and loses files, which the queue thread keeps. A thread with no
-/// role (a vCPU's name) is left to the process list.
+/// role (a vCPU's name) is left to the process list. The net thread's open
+/// fails (`EACCES`) and the process goes on.
 #[test]
 fn each_role_keeps_its_own_calls() {
     let code = in_child("each_role_keeps_its_own_calls", || {
@@ -223,11 +224,50 @@ fn each_role_keeps_its_own_calls() {
         if !opens("fs-workspace-q1") || !sockets("net") || !opens("vcpu0") || !sockets("vcpu0") {
             return 2;
         }
-        // The net thread, given a file: the process dies.
-        opens("net");
-        3
+        // The net thread, given a file: the open fails, the process goes on.
+        if opens("net") {
+            return 3;
+        }
+        0
     });
-    assert_eq!(code, Some(128 + libc::SIGSYS));
+    assert_eq!(code, Some(0));
+}
+
+/// glibc's own lazy read on a thread that opens no files: the open fails
+/// with `EACCES` and the thread, and the process, go on.
+#[test]
+fn a_role_without_files_gets_eacces_for_an_open() {
+    let code = in_child("a_role_without_files_gets_eacces_for_an_open", || {
+        seccomp::set_mode(SeccompMode::Enforce);
+        seccomp::install(SeccompMode::Enforce).unwrap();
+        let worker = thread::Builder::new()
+            .name("net".into())
+            .spawn(|| {
+                boxcar_confine::at_thread_start();
+                // SAFETY: a valid path and flags; the filter answers first.
+                let fd = unsafe {
+                    libc::openat(
+                        libc::AT_FDCWD,
+                        c"/proc/sys/vm/overcommit_memory".as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                let errno = io::Error::last_os_error().raw_os_error();
+                if fd >= 0 {
+                    // SAFETY: a descriptor this thread opened.
+                    unsafe { libc::close(fd) };
+                    return 2;
+                }
+                if errno == Some(libc::EACCES) {
+                    0
+                } else {
+                    3
+                }
+            })
+            .unwrap();
+        worker.join().unwrap_or(4)
+    });
+    assert_eq!(code, Some(0));
 }
 
 /// A thread started before the process list is in keeps that list alone
