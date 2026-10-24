@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use boxcar_proto::redact::scrub_argv;
 use boxcar_proto::ProcExec;
 
+/// What a redacted value reads as in an argv record.
+const REDACTED: &str = "[redacted]";
+
 /// The most execs whose argv as run waits for the reconciler; past it the
 /// oldest goes.
 pub const MAX_RAW_ARGV: usize = 4096;
@@ -119,6 +122,13 @@ impl RawArgv {
     }
 }
 
+/// Whether an argv taken only from its record is complete enough to
+/// compare. A redaction mark may stand for any value; the as-run copy is
+/// needed to distinguish it from a literal mark.
+pub fn recorded_argv_is_complete(argv: &[String]) -> bool {
+    !argv.iter().any(|arg| arg.contains(REDACTED))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +187,17 @@ mod tests {
         }
         let held = raw.inner.lock().unwrap().bytes;
         assert!(held <= MAX_RAW_ARGV_BYTES, "{held}");
+    }
+
+    #[test]
+    fn a_recorded_redaction_needs_the_as_run_copy() {
+        assert!(recorded_argv_is_complete(&[
+            "curl".into(),
+            "https://example.test/".into()
+        ]));
+        assert!(!recorded_argv_is_complete(&[
+            "curl".into(),
+            "--token=[redacted]".into()
+        ]));
     }
 }

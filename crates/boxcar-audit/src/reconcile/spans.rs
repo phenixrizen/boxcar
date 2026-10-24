@@ -70,7 +70,8 @@ pub const MAX_OPEN_SPANS: usize = 256;
 const MAX_RECENT: usize = 4096;
 /// The most execs waiting for a late `tool.open`; past it the oldest goes.
 const MAX_PENDING_EXECS: usize = 4096;
-/// How many parents are followed when looking for the agent.
+/// How many parents are followed when looking for the agent. Exhausting
+/// this bounded walk is treated conservatively as reaching it.
 const MAX_ANCESTRY: usize = 64;
 /// How far apart a TLS write and the `http.request` it carried may be.
 pub const EXECUTOR_WINDOW_NS: u64 = 500 * 1_000_000;
@@ -445,8 +446,14 @@ impl Span {
     }
 
     /// An exec joined the span: notes whether it ran the declared command.
-    fn note_exec(&mut self, program: &str, argv: &[String], shell_written: bool) {
-        if self.carried_by(program, argv, shell_written) == Some(true) {
+    fn note_exec(
+        &mut self,
+        program: &str,
+        argv: &[String],
+        argv_complete: bool,
+        shell_written: bool,
+    ) {
+        if self.carried_by(program, argv, argv_complete, shell_written) == Some(true) {
             self.carried = true;
         }
     }
@@ -455,11 +462,18 @@ impl Span {
     /// ([`carries`]): with the call's arguments as sent, or with the
     /// record's copy when that has nothing redacted (a scrub only ever
     /// puts in the redaction mark, so such a copy is the original). `None`
-    /// when that cannot tell: no declared command, or a copy with a
-    /// redacted part (two different values read the same once redacted).
-    fn carried_by(&self, program: &str, argv: &[String], shell_written: bool) -> Option<bool> {
+    /// when that cannot tell: no declared command, or a declared or executed
+    /// record copy with a redacted part (two different values read the same
+    /// once redacted).
+    fn carried_by(
+        &self,
+        program: &str,
+        argv: &[String],
+        argv_complete: bool,
+        shell_written: bool,
+    ) -> Option<bool> {
         let declared = self.declared.as_ref()?;
-        if !self.declared_raw && declared.mentions(REDACTED) {
+        if !argv_complete || (!self.declared_raw && declared.mentions(REDACTED)) {
             return None;
         }
         Some(carries(declared, program, argv, shell_written))
@@ -543,11 +557,14 @@ impl Span {
 }
 
 /// A `proc.exec` that joined no span, waiting for a late `tool.open`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PendingExec {
     key: ProcKey,
     seq: u64,
     ts: u64,
+    program: String,
+    argv: Vec<String>,
+    argv_complete: bool,
 }
 
 /// Who made an effect that joined no span yet.
@@ -601,6 +618,8 @@ pub struct Spans {
     index: Option<SpanIndex>,
     /// The session's root process, from `session.start`.
     session_pid: Option<u32>,
+    /// The root's process identity, once a lineage record names it.
+    session_root: Option<ProcKey>,
     tls_writes: VecDeque<TlsWrite>,
     requests: VecDeque<Request>,
     /// The process behind each request, by the request's flow and stream
@@ -654,6 +673,7 @@ impl Spans {
             records: Vec::new(),
             index,
             session_pid: None,
+            session_root: None,
             tls_writes: VecDeque::new(),
             requests: VecDeque::new(),
             executors: HashMap::new(),
@@ -734,30 +754,30 @@ impl Spans {
         }
     }
 
-    /// The process whose writes carried `request`: the one process with
-    /// a write of the window sized like the body, else the one process
-    /// whose writes of the window sum to it. Two processes that fit name
+    /// The process whose writes carried `request`: the only process with
+    /// either one write of the window sized like the body or writes of the
+    /// window whose sum is. Two processes that fit by either form name
     /// nobody: a size and a time are evidence, not proof.
     fn carrier(&self, request: &Request) -> Option<u32> {
         let (ts, body) = (request.ts, request.body_bytes);
-        let mut one = self
-            .tls_writes
-            .iter()
-            .filter(|w| within(w.ts, ts) && sized(w.bytes, body))
-            .map(|w| w.tgid);
-        if let Some(first) = one.next() {
-            return one.all(|tgid| tgid == first).then_some(first);
-        }
-        let mut sums: Vec<(u32, u64)> = Vec::new();
+        let mut candidates: Vec<(u32, u64, bool)> = Vec::new();
         for write in self.tls_writes.iter().filter(|w| within(w.ts, ts)) {
-            match sums.iter_mut().find(|(tgid, _)| *tgid == write.tgid) {
-                Some((_, sum)) => *sum += write.bytes,
-                None => sums.push((write.tgid, write.bytes)),
+            match candidates
+                .iter_mut()
+                .find(|(tgid, _, _)| *tgid == write.tgid)
+            {
+                Some((_, sum, single)) => {
+                    *sum += write.bytes;
+                    *single |= sized(write.bytes, body);
+                }
+                None => candidates.push((write.tgid, write.bytes, sized(write.bytes, body))),
             }
         }
-        let mut fits = sums.into_iter().filter(|(_, sum)| sized(*sum, body));
+        let mut fits = candidates
+            .into_iter()
+            .filter(|(_, sum, single)| *single || sized(*sum, body));
         match (fits.next(), fits.next()) {
-            (Some((tgid, _)), None) => Some(tgid),
+            (Some((tgid, _, _)), None) => Some(tgid),
             _ => None,
         }
     }
@@ -822,8 +842,17 @@ impl Spans {
     }
 
     /// `session.start` named the root process.
-    pub fn session_started(&mut self, pid: u32) {
+    pub fn session_started(&mut self, pid: u32, key: Option<ProcKey>) {
         self.session_pid = Some(pid);
+        self.session_root = key.filter(|key| key.tgid == pid);
+    }
+
+    /// An exec or fork record established a process. The first identity
+    /// for the session pid fixes the root; later reuse of that pid does not.
+    pub fn process_named(&mut self, key: ProcKey) {
+        if self.session_root.is_none() && self.session_pid == Some(key.tgid) {
+            self.session_root = Some(key);
+        }
     }
 
     /// The `span.effects` records made since the last call.
@@ -884,29 +913,27 @@ impl Spans {
         let mut findings = Vec::new();
         let waiting: Vec<PendingExec> = self.pending_execs.drain(..).collect();
         for pending in waiting {
-            let Some(proc) = state.proc(pending.key) else {
-                continue;
-            };
-            let (program, argv) = (proc.filename.clone(), proc.argv.clone());
-            match self.choose(state, pending.key, &program, &argv) {
+            match self.choose(
+                state,
+                pending.key,
+                &pending.program,
+                &pending.argv,
+                pending.argv_complete,
+            ) {
                 Some((_, true))
                     if record.ts_host_ns.saturating_sub(pending.ts) > JOIN_WINDOW_NS =>
                 {
-                    self.pending_execs.push_back(pending);
-                }
-                Some((span_id, judge)) => {
-                    self.join(state, &span_id, pending.key, Some(pending.seq));
-                    if judge {
-                        findings.extend(self.judge_argv(
-                            &span_id,
-                            pending.key,
-                            pending.seq,
-                            pending.ts,
-                            &program,
-                            &argv,
-                        ));
+                    if !self.by_proc.contains_key(&pending.key) {
+                        self.pending_execs.push_back(pending);
                     }
                 }
+                Some((span_id, judge)) => {
+                    let joined = self.join(state, &span_id, pending.key, Some(&pending));
+                    if joined && judge {
+                        findings.extend(self.judge_argv(&span_id, &pending));
+                    }
+                }
+                None if self.by_proc.contains_key(&pending.key) => {}
                 None => self.pending_execs.push_back(pending),
             }
         }
@@ -1011,7 +1038,13 @@ impl Spans {
     }
 
     /// A `proc.exec`, once the state knows the process.
-    pub fn exec(&mut self, state: &State, record: &Record, exec: &ProcExec) -> Vec<Finding> {
+    pub fn exec(
+        &mut self,
+        state: &State,
+        record: &Record,
+        exec: &ProcExec,
+        argv_complete: bool,
+    ) -> Vec<Finding> {
         let key = ProcKey {
             tgid: exec.tgid,
             start_ns: exec.start_ns,
@@ -1025,7 +1058,7 @@ impl Spans {
             // A member that exec'd again (a shell running its command).
             let shell_written = self.shells_written();
             if let Some(span) = self.spans.get_mut(&id) {
-                span.note_exec(&exec.filename, &exec.argv, shell_written);
+                span.note_exec(&exec.filename, &exec.argv, argv_complete, shell_written);
                 span.push_effect(
                     Effect {
                         seq,
@@ -1037,15 +1070,23 @@ impl Spans {
             self.index_update(&id);
             return Vec::new();
         }
+        let pending = PendingExec {
+            key,
+            seq,
+            ts,
+            program: exec.filename.clone(),
+            argv: exec.argv.clone(),
+            argv_complete,
+        };
         if let Some(id) = self.parent_span(state, key) {
-            self.join(state, &id, key, Some(seq));
+            self.join(state, &id, key, Some(&pending));
             return Vec::new();
         }
-        match self.choose(state, key, &exec.filename, &exec.argv) {
+        match self.choose(state, key, &exec.filename, &exec.argv, argv_complete) {
             Some((id, judge)) => {
-                self.join(state, &id, key, Some(seq));
+                self.join(state, &id, key, Some(&pending));
                 if judge {
-                    self.judge_argv(&id, key, seq, ts, &exec.filename, &exec.argv)
+                    self.judge_argv(&id, &pending)
                 } else {
                     Vec::new()
                 }
@@ -1054,7 +1095,7 @@ impl Spans {
                 if self.pending_execs.len() >= MAX_PENDING_EXECS {
                     self.pending_execs.pop_front();
                 }
-                self.pending_execs.push_back(PendingExec { key, seq, ts });
+                self.pending_execs.push_back(pending);
                 Vec::new()
             }
         }
@@ -1241,13 +1282,8 @@ impl Spans {
             findings.extend(self.orphaned_work(state, &id, now));
             self.let_go_effects(&id);
         }
-        while self
-            .pending_execs
-            .front()
-            .is_some_and(|p| now.saturating_sub(p.ts) >= EXEC_PENDING_NS)
-        {
-            self.pending_execs.pop_front();
-        }
+        self.pending_execs
+            .retain(|pending| now.saturating_sub(pending.ts) < EXEC_PENDING_NS);
         while self
             .recent
             .front()
@@ -1278,15 +1314,16 @@ impl Spans {
         key: ProcKey,
         program: &str,
         argv: &[String],
+        argv_complete: bool,
     ) -> Option<(String, bool)> {
         if self.open.is_empty() {
             return None;
         }
         let shell_written = self.shells_written();
         let by_argv = self.open.iter().find(|id| {
-            self.spans
-                .get(*id)
-                .is_some_and(|span| span.carried_by(program, argv, shell_written) == Some(true))
+            self.spans.get(*id).is_some_and(|span| {
+                span.carried_by(program, argv, argv_complete, shell_written) == Some(true)
+            })
         });
         if let Some(id) = by_argv {
             if self.reaches_agent(state, key, id) {
@@ -1306,7 +1343,8 @@ impl Spans {
     fn is_agent(&self, key: ProcKey) -> bool {
         // An executor by its identity, not its pid: one that has exited
         // may have left its pid to another process.
-        self.session_pid == Some(key.tgid)
+        self.session_root
+            .map_or(self.session_pid == Some(key.tgid), |root| root == key)
             || self.open.iter().any(|id| {
                 self.spans
                     .get(id)
@@ -1317,7 +1355,8 @@ impl Spans {
     /// Whether `key`'s ancestry reaches the span's executor or the session
     /// root (`key` itself being the agent reaches nothing: the agent is in
     /// no span). With neither known there is nothing to reach: every
-    /// process is the agent's.
+    /// process is the agent's. Exhausting the bounded walk counts as
+    /// reaching it, so a deep descendant is not silently left out.
     fn reaches_agent(&self, state: &State, key: ProcKey, span_id: &str) -> bool {
         // A provisional executor (a TLS write's) is evidence, never the
         // agent: only one that opened the request's flow is.
@@ -1331,10 +1370,14 @@ impl Spans {
         }
         // The agent: the bound executor by its identity (one that has
         // exited may have left its pid to another process), else the
-        // session root by its pid.
+        // session root by identity once known, or provisionally by pid.
         let is_agent = |candidate: ProcKey| match executor {
             Some(executor) => candidate == executor,
-            None => self.session_pid == Some(candidate.tgid),
+            None => self
+                .session_root
+                .map_or(self.session_pid == Some(candidate.tgid), |root| {
+                    candidate == root
+                }),
         };
         let mut current = key;
         for depth in 0..MAX_ANCESTRY {
@@ -1353,10 +1396,14 @@ impl Spans {
                 Some(parent) => current = parent,
                 // A parent not on record: the session root, alone, is
                 // known by its pid.
-                None => return executor.is_none() && self.session_pid == Some(proc.ppid),
+                None => {
+                    return executor.is_none()
+                        && self.session_root.is_none()
+                        && self.session_pid == Some(proc.ppid);
+                }
             }
         }
-        false
+        true
     }
 
     /// The open span of `key`'s parent, if the parent is in one.
@@ -1372,43 +1419,45 @@ impl Spans {
 
     /// `key` joins the span: its exec is an effect, the effects that
     /// waited for it follow, and so do its children that waited.
-    fn join(&mut self, state: &State, id: &str, key: ProcKey, exec_seq: Option<u64>) {
+    fn join(&mut self, state: &State, id: &str, key: ProcKey, exec: Option<&PendingExec>) -> bool {
+        let shell_written = self.shells_written();
         if let Some(member_of) = self.by_proc.get(&key).cloned() {
             // Already this span's: a later exec of the same process (one
             // that waited for the span's open with its first, as when the
             // runtime runs the tool before the gate records the call) is
             // the span's effect too.
-            if let (true, Some(seq)) = (member_of == id, exec_seq) {
-                if let Some(span) = self.spans.get_mut(id) {
-                    span.push_effect(
-                        Effect {
-                            seq,
-                            kind: EffectKind::Exec,
-                        },
-                        &mut self.effect_bytes,
-                    );
-                }
+            if let (true, Some(exec)) = (member_of == id, exec) {
+                let Some(span) = self.spans.get_mut(id) else {
+                    return false;
+                };
+                span.note_exec(&exec.program, &exec.argv, exec.argv_complete, shell_written);
+                span.push_effect(
+                    Effect {
+                        seq: exec.seq,
+                        kind: EffectKind::Exec,
+                    },
+                    &mut self.effect_bytes,
+                );
                 self.index_update(id);
+                return true;
             }
-            return;
+            return false;
         }
-        let shell_written = self.shells_written();
+        let exec_seq = exec.map(|exec| exec.seq);
         {
             let Some(span) = self.spans.get_mut(id) else {
-                return;
+                return false;
             };
             if span.has_member(key) {
-                return;
+                return false;
             }
             if span.members.len() >= MAX_SPAN_PROCS {
                 span.truncated = true;
-                return;
+                return false;
             }
             span.members.push(Member { key, exec_seq });
-            if exec_seq.is_some() {
-                if let Some(proc) = state.proc(key) {
-                    span.note_exec(&proc.filename, &proc.argv, shell_written);
-                }
+            if let Some(exec) = exec {
+                span.note_exec(&exec.program, &exec.argv, exec.argv_complete, shell_written);
             }
             if let Some(seq) = exec_seq {
                 span.push_effect(
@@ -1441,6 +1490,7 @@ impl Spans {
         }
         self.index_update(id);
         self.adopt_descendants(state);
+        true
     }
 
     /// Pending execs whose parent is now in an open span join it, until
@@ -1453,13 +1503,13 @@ impl Spans {
                 .enumerate()
                 .find_map(|(i, pending)| {
                     self.parent_span(state, pending.key)
-                        .map(|id| (i, id, *pending))
+                        .map(|id| (i, id, pending.clone()))
                 });
             let Some((index, id, pending)) = found else {
                 return;
             };
             self.pending_execs.remove(index);
-            self.join(state, &id, pending.key, Some(pending.seq));
+            self.join(state, &id, pending.key, Some(&pending));
         }
     }
 
@@ -1621,16 +1671,10 @@ impl Spans {
 
     /// Notes an exec the span took by ancestry alone whose command does
     /// not carry the declared one; [`Spans::argv_at_close`] judges it.
-    fn judge_argv(
-        &mut self,
-        id: &str,
-        key: ProcKey,
-        exec_seq: u64,
-        ts: u64,
-        program: &str,
-        argv: &[String],
-    ) -> Vec<Finding> {
+    fn judge_argv(&mut self, id: &str, exec: &PendingExec) -> Vec<Finding> {
         let shell_written = self.shells_written();
+        let (program, argv, argv_complete) =
+            (&exec.program, exec.argv.as_slice(), exec.argv_complete);
         let Some(span) = self.spans.get_mut(id) else {
             return Vec::new();
         };
@@ -1652,9 +1696,11 @@ impl Spans {
                 (command, true)
             }
         };
-        match span.carried_by(program, argv, shell_written) {
+        match span.carried_by(program, argv, argv_complete, shell_written) {
             Some(true) => span.carried = true,
-            Some(false) => span.mismatch = Some((key, exec_seq, ts, command, shell)),
+            Some(false) => {
+                span.mismatch = Some((exec.key, exec.seq, exec.ts, command, shell));
+            }
             None => {}
         }
         Vec::new()
@@ -3071,16 +3117,21 @@ mod tests {
         let ran = words(&["bash", "-c", command]);
         // The record's copy alone: redacted, so it cannot tell.
         let span = Span::new(&open(scrubbed.clone()), None, 1, 1);
-        assert_eq!(span.carried_by("/bin/bash", &ran, false), None);
+        assert_eq!(span.carried_by("/bin/bash", &ran, true, false), None);
         // With the call's arguments as sent: exact.
         let raw = Some(Declared::Json(json!({"command": command})));
         let span = Span::new(&open(scrubbed), raw, 1, 1);
-        assert_eq!(span.carried_by("/bin/bash", &ran, false), Some(true));
+        assert_eq!(span.carried_by("/bin/bash", &ran, true, false), Some(true));
+        assert_eq!(
+            span.carried_by("/bin/bash", &ran, false, false),
+            None,
+            "the exec's record copy cannot tell either"
+        );
         assert!(!span.declared_display.unwrap().contains("k1"));
         // A copy with nothing redacted is the original.
         let span = Span::new(&open(json!({"command": "ls -la"})), None, 1, 1);
         assert_eq!(
-            span.carried_by("/bin/bash", &words(&["bash", "-c", "ls -la"]), false,),
+            span.carried_by("/bin/bash", &words(&["bash", "-c", "ls -la"]), true, false,),
             Some(true)
         );
     }

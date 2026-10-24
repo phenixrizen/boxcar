@@ -29,6 +29,8 @@ pub struct Proc {
     pub uid: u32,
     pub filename: String,
     pub argv: Vec<String>,
+    /// The argv is complete enough for an exact comparison.
+    pub argv_complete: bool,
     /// Host time of the record that first named it (fork or exec).
     pub first_ts: u64,
     /// The seq of its `proc.exec`, when one came.
@@ -110,7 +112,7 @@ pub struct SensorConnect {
     pub seq: u64,
     pub ts: u64,
     pub tid: u32,
-    pub src_port: u16,
+    pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
 }
 
@@ -227,6 +229,7 @@ impl State {
             uid: 0,
             filename: String::new(),
             argv: Vec::new(),
+            argv_complete: true,
             first_ts: ts,
             exec_seq: None,
             exit_ts: None,
