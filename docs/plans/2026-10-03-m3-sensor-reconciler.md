@@ -16,7 +16,7 @@
 
 ## 1. Where things stand
 
-- Repository `/home/nater/go/src/github.com/phenixrizen/boxcar`, branch `m3`, created from `m2` at `412e940`. M2 is PR #2 against `main` (https://github.com/phenixrizen/boxcar/pull/2), CI green, not merged when this was written. When PR #2 merges, rebase or merge `m3` onto `main` before opening M3's PR; do not rewrite commits that are already pushed without asking.
+- Repository `/home/nater/go/src/github.com/rocksolidlabs/boxcar`, branch `m3`, created from `m2` at `412e940`. M2 is PR #2 against `main` (https://github.com/rocksolidlabs/boxcar/pull/2), CI green, not merged when this was written. When PR #2 merges, rebase or merge `m3` onto `main` before opening M3's PR; do not rewrite commits that are already pushed without asking.
 - What M3 can already lean on, with the file that has it:
 
 | Exists | Where |

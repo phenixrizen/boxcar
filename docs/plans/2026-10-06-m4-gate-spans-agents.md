@@ -12,7 +12,7 @@ The design this plan argues from is `docs/specs/2026-09-29-boxcar-design.md` as 
 
 ## 1. Where things stand
 
-- Repository `/home/nater/go/src/github.com/phenixrizen/boxcar`, branch `m4`, created from `m3` at `8ea1913`. M3 is PR #3 against `main` (https://github.com/phenixrizen/boxcar/pull/3), CI green, mergeable, not merged when this was written. When PR #3 merges, merge `main` into `m4` before opening M4's PR; do not rewrite commits that are already pushed without asking.
+- Repository `/home/nater/go/src/github.com/rocksolidlabs/boxcar`, branch `m4`, created from `m3` at `8ea1913`. M3 is PR #3 against `main` (https://github.com/rocksolidlabs/boxcar/pull/3), CI green, mergeable, not merged when this was written. When PR #3 merges, merge `main` into `m4` before opening M4's PR; do not rewrite commits that are already pushed without asking.
 - What M4 can lean on, with the file that has it:
 
 | Exists | Where |
