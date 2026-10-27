@@ -12,7 +12,7 @@ The design this plan argues from is `docs/specs/2026-09-29-boxcar-design.md` (mi
 
 ## 1. Where things stand
 
-- Repository `/home/nater/go/src/github.com/phenixrizen/boxcar`, branch `m5`, rebased onto `main` at `35981d7`: M4 (PR #4) and the process rules in `AGENTS.md` (PRs #18, #19) are merged. The branch holds this plan only; section 2 says how the tasks ship. Do not rewrite pushed commits without asking.
+- Repository `/home/nater/go/src/github.com/rocksolidlabs/boxcar`, branch `m5`, rebased onto `main` at `35981d7`: M4 (PR #4) and the process rules in `AGENTS.md` (PRs #18, #19) are merged. The branch holds this plan only; section 2 says how the tasks ship. Do not rewrite pushed commits without asking.
 - Historical private findings and remediation decisions belong in this repository's draft security advisories. Task 1 still needs explicit owner remediation authorization; disclosure and moving revealing changes into public history require a separate owner decision. See `docs/security-workflow.md`.
 - What M5 can lean on, with the file that has it:
 

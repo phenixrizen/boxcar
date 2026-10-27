@@ -17,7 +17,7 @@ It succeeds bitvessel, a 2017 Go fork of Google's novm whose founding idea was
 serving a VM's root filesystem from the host instead of a disk image. That idea
 is kept. The rest is rebuilt in Rust on rust-vmm crates.
 
-Conductor (github.com/phenixrizen/conductor) will drive boxcar as a child
+Conductor (github.com/rocksolidlabs/conductor) will drive boxcar as a child
 process to run agent sessions in isolates. boxcar is designed so conductor is
 just a client of its control protocol; nothing in boxcar depends on conductor.
 

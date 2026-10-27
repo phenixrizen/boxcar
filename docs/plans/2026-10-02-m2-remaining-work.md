@@ -10,7 +10,7 @@ Written 2026-10-02 so that a fresh session can pick up M2 from here with no othe
 
 ## 1. Where things stand
 
-- Repository: `/home/nater/go/src/github.com/phenixrizen/boxcar`, branch `m2`, based on `main` at `d3be817` (M1 is merged). Head is the `docs:` commit on top of `2bb5800` (Task 13a committed, unreviewed; see below). Nothing is pushed or in a PR for M2 yet.
+- Repository: `/home/nater/go/src/github.com/rocksolidlabs/boxcar`, branch `m2`, based on `main` at `d3be817` (M1 is merged). Head is the `docs:` commit on top of `2bb5800` (Task 13a committed, unreviewed; see below). Nothing is pushed or in a PR for M2 yet.
 - Tasks 1 to 12 are done, reviewed and committed. What exists:
 
 | Area | Commits (newest last) |

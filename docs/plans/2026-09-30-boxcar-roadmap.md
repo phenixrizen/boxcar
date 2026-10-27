@@ -4,7 +4,7 @@
 
 bitvessel (this repo) is a 2017 fork of Google's novm, a Go/KVM type-2 hypervisor whose founding idea was serving a VM's root filesystem from the host instead of a disk image. The user wants to run AI coding agents (Claude Code, Codex, ...) inside microVMs and derive a complete, trustworthy record of what each agent did: every file operation, every network call, every process, joined to what the model said it intended. Go did not break bitvessel (it builds on Go 1.26 with a six-line kernel-header patch), but its 2017 device model (legacy virtio 0.9, 9P2000.u, no vsock, no virtio-fs, cgo-heavy) is not worth carrying forward, and the parts a port would translate are exactly what rust-vmm already provides.
 
-Decision: rebuild as **boxcar**, a new Apache-2.0 Rust project at `github.com/phenixrizen/boxcar` (remote exists and is empty; check out to `/home/nater/go/src/github.com/phenixrizen/boxcar`). Conductor (`github.com/phenixrizen/conductor`, Go) will later drive boxcar as a child process over the control protocol; that integration is a separate plan in the conductor repo. No changes to bitvessel.
+Decision: rebuild as **boxcar**, a new Apache-2.0 Rust project at `github.com/rocksolidlabs/boxcar` (remote exists and is empty; check out to `/home/nater/go/src/github.com/rocksolidlabs/boxcar`). Conductor (`github.com/rocksolidlabs/conductor`, Go) will later drive boxcar as a child process over the control protocol; that integration is a separate plan in the conductor repo. No changes to bitvessel.
 
 ### The design in one paragraph
 
@@ -227,7 +227,7 @@ Sizes: S <= 1 day, M 2–3 days, L 4–7 days. "KVM" steps need `/dev/kvm` and t
 
 ### M0: repo bootstrap (S)
 
-1. `git clone https://github.com/phenixrizen/boxcar.git /home/nater/go/src/github.com/phenixrizen/boxcar` (empty repo; `git init` + remote if clone refuses). `sudo modprobe kvm_amd && setfacl -m u:$USER:rw /dev/kvm`.
+1. `git clone https://github.com/rocksolidlabs/boxcar.git /home/nater/go/src/github.com/rocksolidlabs/boxcar` (empty repo; `git init` + remote if clone refuses). `sudo modprobe kvm_amd && setfacl -m u:$USER:rw /dev/kvm`.
 2. Commit LICENSE (Apache-2.0), LICENSE-BSD-3-Clause, NOTICE (Firecracker, Cloud Hypervisor, vmm-reference, vhost-device attributions), CLA.md, CONTRIBUTING.md (DCO), README stub, and `docs/specs/2026-09-29-boxcar-design.md` written from the brainstorm (rings, reconciler, gateway, conductor seam, license reasoning).
 3. Toolchain: `rustup target add x86_64-unknown-linux-musl`, `cargo install cargo-binstall`, `cargo binstall cargo-deny cargo-nextest`.
 

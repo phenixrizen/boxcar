@@ -10,7 +10,7 @@ exclude = ["crates/boxcar-sensor-ebpf"]
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.96"
-repository = "https://github.com/phenixrizen/boxcar"
+repository = "https://github.com/rocksolidlabs/boxcar"
 
 [workspace.dependencies]
 # Internal crates. boxcar-proto is declared without default features because
