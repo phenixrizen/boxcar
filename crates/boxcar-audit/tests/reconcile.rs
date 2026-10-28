@@ -49,6 +49,7 @@ const PROGRAMS: [&str; 9] = [
 enum Step {
     Record(Box<Record>),
     Tick(u64),
+    Gap(u64),
 }
 
 /// Builds records with running seqs.
@@ -150,6 +151,10 @@ impl Log {
     }
 
     fn heartbeat(&mut self, at_ms: u64) -> Step {
+        self.heartbeat_with_drops(at_ms, 0)
+    }
+
+    fn heartbeat_with_drops(&mut self, at_ms: u64, ringbuf_drops: u64) -> Step {
         self.rec(
             at_ms,
             Ring::Guest,
@@ -157,7 +162,7 @@ impl Log {
             Payload::ProcHeartbeat(ProcHeartbeat {
                 uptime_ns: at_ms * MS,
                 events_emitted: 0,
-                ringbuf_drops: 0,
+                ringbuf_drops,
                 frames_sent: 0,
             }),
         )
@@ -684,6 +689,11 @@ fn run_configured(
             Step::Tick(at_ms) => {
                 clock.set(T0 + at_ms * MS);
                 reconciler.on_tick(T0 + at_ms * MS)
+            }
+            Step::Gap(at_ms) => {
+                clock.set(T0 + at_ms * MS);
+                reconciler.on_gap(T0 + at_ms * MS);
+                Vec::new()
             }
         };
         out.extend(findings.into_iter().map(Out::Finding));
@@ -1505,6 +1515,250 @@ fn phantom_write() {
     check_all("phantom_write", &out);
 }
 
+/// A shell tool call that said ok, with no process in its span: judged one
+/// second after the close, once a clean heartbeat has followed it.
+#[test]
+fn phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let (out, _) = run_all(true, steps);
+    let findings = findings_of(&out);
+    assert_eq!(findings.len(), 1, "{out:?}");
+    assert_eq!(findings[0].rule, "phantom_exec");
+    assert_eq!(findings[0].score, 35);
+    assert_eq!(findings[0].span_id.as_deref(), Some("toolu_01"));
+    assert!(findings[0].low_confidence);
+    let seqs: Vec<u64> = findings[0].evidence.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [4, 5], "the tool.open and the tool.close");
+    check_all("phantom_exec", &out);
+}
+
+#[test]
+fn a_shell_call_with_a_process_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.exec(2100, 340, 100, 10, &["sh", "-c", "make test"]));
+    steps.push(log.exit(2200, 340, 10));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn an_unsuccessful_shell_call_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "error"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_without_a_command_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(
+        2000,
+        "toolu_01",
+        "Bash",
+        json!({"description": "build the project"}),
+    ));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_without_lineage_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = vec![log.session_start(0, 100)];
+    let without_exec: Vec<&str> = PROGRAMS
+        .iter()
+        .copied()
+        .filter(|program| *program != "sched_process_exec")
+        .collect();
+    steps.push(log.sensor_status(100, &without_exec));
+    steps.push(log.heartbeat(1000));
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_with_sensor_loss_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat_with_drops(3000, 1));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_without_a_later_heartbeat_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_whose_command_is_recorded_after_the_close_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.exec(2600, 340, 100, 10, &["sh", "-c", "make test"]));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn another_command_after_the_close_leaves_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.exec(2600, 340, 100, 10, &["sh", "-c", "make other"]));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rule, "phantom_exec");
+}
+
+#[test]
+fn a_shell_call_whose_sensor_detaches_after_the_close_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    let without_exec: Vec<&str> = PROGRAMS
+        .iter()
+        .copied()
+        .filter(|program| *program != "sched_process_exec")
+        .collect();
+    steps.push(log.sensor_status(2700, &without_exec));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn two_calls_of_one_command_side_by_side_are_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_open(2010, "toolu_02", "Bash", json!({"command": "make test"})));
+    steps.push(log.exec(2100, 340, 100, 10, &["sh", "-c", "make test"]));
+    steps.push(log.exit(2200, 340, 10));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.tool_close(2510, "toolu_02", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3600));
+    let findings = run(true, steps);
+    assert!(
+        findings.iter().all(|f| f.rule != "phantom_exec"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_drop_count_that_starts_again_is_sensor_loss() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.heartbeat_with_drops(1500, 3));
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat_with_drops(2600, 0));
+    steps.push(log.heartbeat_with_drops(3000, 3));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_write_call_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.exec(1200, 100, 1, 1, &["claude", "-p", "write notes"]));
+    steps.push(log.tool_open(
+        2000,
+        "toolu_01",
+        "Write",
+        json!({"file_path": "/workspace/notes.txt", "content": "hello"}),
+    ));
+    steps.push(log.fs_create(2100, 100, "/notes.txt"));
+    steps.push(log.fs_close(2110, 100, "/notes.txt", 5));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_crossed_by_heartbeat_silence_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(log.tool_close(4500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(4600));
+    steps.push(Step::Tick(5500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_shell_call_crossed_by_subscription_lag_is_not_phantom_exec() {
+    let mut log = Log::new();
+    let mut steps = Vec::new();
+    attached(&mut log, &mut steps);
+    steps.push(log.tool_open(2000, "toolu_01", "Bash", json!({"command": "make test"})));
+    steps.push(Step::Gap(2200));
+    steps.push(log.tool_close(2500, "toolu_01", "ok"));
+    steps.push(log.heartbeat(3000));
+    steps.push(Step::Tick(3500));
+    let findings = run(true, steps);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
 /// The same Write tool call with the agent's own write on the path: quiet.
 #[test]
 fn a_write_by_the_agent_itself_lands_in_the_span() {
@@ -1566,7 +1820,7 @@ fn a_process_on_the_executors_old_pid_is_not_the_agent() {
         .iter()
         .map(|step| match step {
             Step::Record(record) => record.seq,
-            Step::Tick(_) => unreachable!(),
+            Step::Tick(_) | Step::Gap(_) => unreachable!(),
         })
         .collect();
     steps.push(create);
@@ -3149,7 +3403,7 @@ fn a_shared_flow_tuple_names_no_opener() {
 fn seq_of(step: &Step) -> u64 {
     match step {
         Step::Record(record) => record.seq,
-        Step::Tick(_) => panic!("a tick has no seq"),
+        Step::Tick(_) | Step::Gap(_) => panic!("a timer step has no seq"),
     }
 }
 

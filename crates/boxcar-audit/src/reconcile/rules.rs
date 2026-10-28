@@ -232,11 +232,13 @@ pub fn observe(
                 }
             }
         }
-        Payload::ProcHeartbeat(_) => {
-            state.sensor.heartbeat = Some((ts, record.seq));
-            state.sensor.silence_open = false;
+        Payload::ProcHeartbeat(heartbeat) => {
+            state
+                .sensor
+                .note_heartbeat(ts, record.seq, heartbeat.ringbuf_drops);
         }
         Payload::ProcSensorStatus(status) => {
+            let lineage_ok = state.sensor.lineage_ok();
             state.sensor.status = Some((ts, record.seq));
             state.sensor.pid = Some(status.pid);
             state.sensor.threads = status.threads.iter().copied().collect();
@@ -246,6 +248,9 @@ pub fn observe(
                 .filter(|p| p.attached)
                 .map(|p| p.name.clone())
                 .collect();
+            if state.sensor.lineage_ok() != lineage_ok {
+                state.sensor.lineage_changes = state.sensor.lineage_changes.saturating_add(1);
+            }
             state.sensor.heartbeat.get_or_insert((ts, record.seq));
         }
         Payload::ProcLsmDeny(deny) => {
